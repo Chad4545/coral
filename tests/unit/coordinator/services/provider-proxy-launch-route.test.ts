@@ -70,7 +70,7 @@ function authority(): DurableProviderProxyOperationAuthority {
       adoptionWindowMs: Number.MAX_SAFE_INTEGER,
       heartbeatHoldBound: {
         spanMs: Number.MAX_SAFE_INTEGER,
-        materialSchedulerLatenessMs: Number.MAX_SAFE_INTEGER,
+        materialSchedulerLatenessMs: Math.floor(Number.MAX_SAFE_INTEGER / 4),
       },
     },
     onFault: () => () => undefined,
@@ -99,6 +99,7 @@ function authority(): DurableProviderProxyOperationAuthority {
     },
     registerSuccessionOperation: async () => ({ kind: 'registered' as const }),
     stopAndReap: async () => ({ disappearanceReceipt: 'gone' }),
+    commitContainment: async () => ({ kind: 'containment-absent', disappearanceReceipt: 'gone' }),
     stopHeartbeats: () => undefined,
     initiateControlClose: async () => undefined,
     prepareOperation: vi.fn(),
@@ -240,7 +241,7 @@ describe('createAppServerProxyRoute', () => {
       executePipeline(parseExpression('architect'), 'seed', 'codex', executionSvc, ctx, {
         workflowJobId,
         ids: { uuid: () => atomJobId },
-        time: { now: () => 10 },
+        time: { now: () => 10, monotonicNow: () => 10n },
       }),
     ).resolves.toMatchObject({ finalOutput: 'done' });
 

@@ -1,8 +1,14 @@
 import { basename, join } from 'node:path';
 
-import { probeProcessIncarnation, type ProcessIncarnation } from '../infra/node-process.js';
+import type { ProcessIncarnation } from '../infra/node-process.js';
 import type { ChildProcessLike } from '../infra/port-types.js';
-import { gracefulKill } from '../infra/process-supervision.js';
+import {
+  gracefulKill,
+  observeUnattributableSpawnedProcessGroup,
+  type GracefulKillOutcome,
+  type GracefulKillPendingDisposition,
+  type SpawnedProcessGroupAbsenceEvidence,
+} from '../infra/process-supervision.js';
 import type { Runtime } from '../runtime/ports.js';
 import {
   connectControlClient,
@@ -45,10 +51,6 @@ export class RoleSpawnError extends Error {
 
 export type RoleSpawnPorts = Readonly<{
   process: Pick<Runtime['process'], 'spawn'>;
-  /** Passed whole, not narrowed to `time`, because `gracefulKill` (`infra/process-supervision.ts`) takes a
-   *  full `Runtime` — used only to escalate a spawn that must be killed before it ever became a role this
-   *  module tracks (`role_spawn_no_pid` / `role_spawn_incarnation_unavailable`) from SIGTERM to SIGKILL after
-   *  a grace period. */
   runtime: Runtime;
   platform: NodeJS.Platform;
   /** Injected so a test can fake a spawned pid's incarnation without a real process existing. */
@@ -68,6 +70,7 @@ export type RoleSpawnOptions = Readonly<{
 }>;
 
 export type SpawnedRoleProcess = Readonly<{
+  kind: 'spawned';
   child: ChildProcessLike;
   pid: number;
   incarnation: ProcessIncarnation;
@@ -81,6 +84,88 @@ export type SpawnedRoleProcess = Readonly<{
   spawnFailed: Promise<never>;
 }>;
 
+type HeldRoleSpawnFor<Subject extends RoleSpawnCleanupSubject> = Readonly<{
+  kind: 'held';
+  child: ChildProcessLike;
+  error: RoleSpawnError;
+  subject: Subject;
+  settled: Promise<void>;
+  operatorExit: RoleSpawnOperatorExit<Subject>;
+  retry(signal?: AbortSignal): Promise<RoleSpawnCleanupDisposition<Subject>>;
+}>;
+
+export type RoleSpawnCleanupSubject =
+  | Readonly<{ kind: 'process'; pid: number | null }>
+  | Readonly<{ kind: 'unattributable-process-group'; processGroupId: number | null }>;
+
+export type RoleSpawnOperatorAbandonment<Subject extends RoleSpawnCleanupSubject> = Readonly<{
+  kind: 'operator-abandoned';
+  subject: Subject;
+  processAbsenceProven: false;
+  successor: Readonly<{ owner: 'operator-command'; acceptance: 'accepted' }>;
+}>;
+
+export type RoleSpawnOperatorExit<Subject extends RoleSpawnCleanupSubject> = Readonly<{
+  kind: 'abandon-provider-proxy-acquisition';
+  subject: Subject;
+  abandon(): RoleSpawnOperatorAbandonment<Subject>;
+}>;
+
+type HeldRoleSpawnVariants<Subject extends RoleSpawnCleanupSubject> = Subject extends RoleSpawnCleanupSubject
+  ? HeldRoleSpawnFor<Subject>
+  : never;
+
+export type HeldRoleSpawn = HeldRoleSpawnVariants<RoleSpawnCleanupSubject>;
+
+export type RoleSpawnDisposition = SpawnedRoleProcess | HeldRoleSpawn;
+
+const roleSpawnAbsenceEvidenceBrand: unique symbol = Symbol('coral.provider-proxy.role-spawn-absence');
+
+type RoleSpawnProcessSubject = Extract<RoleSpawnCleanupSubject, { kind: 'process' }>;
+type RoleSpawnUnattributableProcessGroupSubject = Extract<
+  RoleSpawnCleanupSubject,
+  { kind: 'unattributable-process-group' }
+>;
+
+type RoleSpawnUnattributableProcessGroupAbsenceEvidence<Subject extends RoleSpawnUnattributableProcessGroupSubject> =
+  Readonly<{
+    subject: Subject;
+    processGroupEvidence: SpawnedProcessGroupAbsenceEvidence;
+    [roleSpawnAbsenceEvidenceBrand]: true;
+  }>;
+
+export type RoleSpawnAbsenceEvidence<Subject extends RoleSpawnCleanupSubject = RoleSpawnCleanupSubject> =
+  Subject extends Extract<RoleSpawnCleanupSubject, { kind: 'process' }>
+    ? Readonly<{
+        subject: Subject;
+        [roleSpawnAbsenceEvidenceBrand]: true;
+      }>
+    : Subject extends RoleSpawnUnattributableProcessGroupSubject
+      ? RoleSpawnUnattributableProcessGroupAbsenceEvidence<Subject>
+      : never;
+
+export type RoleSpawnCleanupDisposition<Subject extends RoleSpawnCleanupSubject = RoleSpawnCleanupSubject> =
+  | Readonly<{
+      kind: 'observed-absent';
+      evidence: RoleSpawnAbsenceEvidence<Subject>;
+    }>
+  | Readonly<{
+      kind: 'held-alive';
+      subject: Subject;
+      observation: 'alive';
+      operatorExit: RoleSpawnOperatorExit<Subject>;
+      settled: Promise<void>;
+      retry(signal?: AbortSignal): Promise<RoleSpawnCleanupDisposition<Subject>>;
+    }>
+  | Readonly<{
+      kind: 'held-unobservable';
+      subject: Subject;
+      observation: 'unobservable';
+      operatorExit: RoleSpawnOperatorExit<Subject>;
+      settled: Promise<void>;
+      retry(signal?: AbortSignal): Promise<RoleSpawnCleanupDisposition<Subject>>;
+    }>;
+
 /** Mirrors `kb-daemon-supervisor.ts`'s own entrypoint resolution: reuse the artifact already running when
  *  its basename matches, otherwise resolve it under the plugin root's bundled bridge. */
 function resolveBackendArtifact(pluginRoot: string, currentEntrypoint: string | undefined): string {
@@ -90,19 +175,13 @@ function resolveBackendArtifact(pluginRoot: string, currentEntrypoint: string | 
   return join(pluginRoot, 'bridge', 'coral-backend.cjs');
 }
 
-/**
- * Spawns one role process from the existing backend artifact and verifies its identity before returning it.
- *
- * A pid alone is not an identity — it is recycled — so a spawn whose incarnation cannot be read fails rather
- * than handing back a bare pid nothing could later verify against. The failed child is killed rather than
- * left to run unaccounted for.
- */
+/** A failed role spawn remains owned until exact absence or accepted operator abandonment. */
 export function spawnRoleProcess(
   role: ProviderRole,
   capsulePath: string,
   ports: RoleSpawnPorts,
   options: RoleSpawnOptions,
-): SpawnedRoleProcess {
+): RoleSpawnDisposition {
   const entrypoint = resolveBackendArtifact(options.pluginRoot, options.currentEntrypoint ?? process.argv[1]);
   const command = options.command ?? process.execPath;
   const child = ports.process.spawn({
@@ -123,43 +202,168 @@ export function spawnRoleProcess(
   });
   spawnFailed.catch(() => {});
 
-  // Nothing in this process reads the role's stdout/stderr. Draining keeps the OS pipe buffer from filling
-  // and backpressuring the role's own writes, and the `'error'` listeners keep a later stream error from
-  // reaching this process as an uncaught exception — the same guard `kb-daemon-supervisor.ts` installs on
-  // its own spawned child's stdin.
+  let childClosed = false;
+  const childSettled = new Promise<void>((resolve) => {
+    child.on('close', () => {
+      childClosed = true;
+      resolve();
+    });
+  });
+  let killInFlight: GracefulKillPendingDisposition | null = null;
+  let killOutcome: GracefulKillOutcome | null = null;
+  // Piped output must be drained so a full OS pipe cannot block the child.
   child.stdout?.on('data', () => {});
   child.stdout?.on('error', () => {});
   child.stderr?.on('data', () => {});
   child.stderr?.on('error', () => {});
-  // A role is meant to outlive the process that spawned it, exactly like `runtime/real.ts`'s own detached,
-  // unref'd durable-CLI wrapper spawn — so holding this handle must not itself keep this process's event
-  // loop alive.
-  child.unref?.();
+  const operatorExitFor = <Subject extends RoleSpawnCleanupSubject>(
+    subject: Subject,
+    acceptTransfer: () => void = () => undefined,
+  ): RoleSpawnOperatorExit<Subject> => ({
+    kind: 'abandon-provider-proxy-acquisition',
+    subject,
+    abandon: () => {
+      acceptTransfer();
+      return {
+        kind: 'operator-abandoned',
+        subject,
+        processAbsenceProven: false,
+        successor: { owner: 'operator-command', acceptance: 'accepted' },
+      };
+    },
+  });
+  const observedProcessAbsent = (
+    subject: RoleSpawnProcessSubject,
+  ): Extract<RoleSpawnCleanupDisposition<RoleSpawnProcessSubject>, { kind: 'observed-absent' }> => ({
+    kind: 'observed-absent',
+    evidence: Object.freeze({ subject, [roleSpawnAbsenceEvidenceBrand]: true as const }),
+  });
+  const holdFailedSpawn = (error: RoleSpawnError): HeldRoleSpawn => {
+    if (options.detached) {
+      const subject = { kind: 'unattributable-process-group', processGroupId: child.pid ?? null } as const;
+      let resolveSettled!: () => void;
+      const settled = new Promise<void>((resolve) => {
+        resolveSettled = resolve;
+      });
+      const operatorExit = operatorExitFor(subject, resolveSettled);
+      const retry = async (_signal?: AbortSignal): Promise<RoleSpawnCleanupDisposition<typeof subject>> => {
+        if (subject.processGroupId !== null) {
+          const observation = observeUnattributableSpawnedProcessGroup(subject.processGroupId, ports.runtime);
+          if (observation.kind === 'observed-absent') {
+            resolveSettled();
+            return {
+              kind: 'observed-absent',
+              evidence: Object.freeze({
+                subject,
+                processGroupEvidence: observation.evidence,
+                [roleSpawnAbsenceEvidenceBrand]: true as const,
+              }),
+            };
+          }
+        }
+        return {
+          kind: 'held-unobservable',
+          subject,
+          observation: 'unobservable',
+          operatorExit,
+          settled,
+          retry,
+        };
+      };
+      return { kind: 'held', child, error, subject, settled, operatorExit, retry };
+    }
 
-  const killFailedSpawn = (): void => gracefulKill(child, ports.runtime);
+    const subject = { kind: 'process', pid: child.pid ?? null } as const;
+    const operatorExit = operatorExitFor(subject);
+    const retry = async (signal?: AbortSignal): Promise<RoleSpawnCleanupDisposition<typeof subject>> => {
+      if (childClosed) return observedProcessAbsent(subject);
+      if (killOutcome?.kind === 'observed-absent') return observedProcessAbsent(subject);
+      if (signal?.aborted) {
+        return {
+          kind: 'held-unobservable',
+          subject,
+          observation: 'unobservable',
+          operatorExit,
+          settled: childSettled,
+          retry,
+        };
+      }
+      if (killInFlight === null) {
+        const disposition = gracefulKill(child, ports.runtime, (pid) => ports.runtime.process.observeLiveness(pid));
+        if ('settlement' in disposition) {
+          killInFlight = disposition;
+          void disposition.settlement.then((outcome) => {
+            if (killInFlight === disposition) {
+              killInFlight = null;
+              killOutcome = outcome;
+            }
+          });
+        } else {
+          killOutcome = disposition;
+        }
+      }
+      if (childClosed) return observedProcessAbsent(subject);
+      if (typeof child.pid === 'number') {
+        try {
+          const observation = ports.runtime.process.observeLiveness(child.pid);
+          if (childClosed) return observedProcessAbsent(subject);
+          if (observation === 'absent') return observedProcessAbsent(subject);
+          if (observation === 'alive') {
+            return { kind: 'held-alive', subject, observation, operatorExit, settled: childSettled, retry };
+          }
+        } catch {
+          // A close observation remains required when leader liveness cannot answer.
+        }
+      }
+      if (childClosed) return observedProcessAbsent(subject);
+      return {
+        kind: 'held-unobservable',
+        subject,
+        observation: 'unobservable',
+        operatorExit,
+        settled: childSettled,
+        retry,
+      };
+    };
+    return { kind: 'held', child, error, subject, settled: childSettled, operatorExit, retry };
+  };
 
   if (typeof child.pid !== 'number') {
-    killFailedSpawn();
-    throw new RoleSpawnError('role_spawn_no_pid', role, `Spawning the ${role} role did not return a pid.`);
-  }
-
-  const readIncarnation = ports.readProcessIncarnation ?? probeProcessIncarnation;
-  const incarnation = readIncarnation(child.pid, ports.platform);
-  if (incarnation === null) {
-    killFailedSpawn();
-    throw new RoleSpawnError(
-      'role_spawn_incarnation_unavailable',
-      role,
-      `Could not read the incarnation of the spawned ${role} process (pid ${child.pid}).`,
+    return holdFailedSpawn(
+      new RoleSpawnError('role_spawn_no_pid', role, `Spawning the ${role} role did not return a pid.`),
     );
   }
 
-  return { child, pid: child.pid, incarnation, spawnFailed };
+  const readIncarnation = ports.readProcessIncarnation ?? ports.runtime.process.readProcessIncarnation;
+  let incarnation: ProcessIncarnation | null;
+  try {
+    incarnation = readIncarnation(child.pid, ports.platform);
+  } catch {
+    incarnation = null;
+  }
+  if (incarnation === null) {
+    return holdFailedSpawn(
+      new RoleSpawnError(
+        'role_spawn_incarnation_unavailable',
+        role,
+        `Could not read the incarnation of the spawned ${role} process (pid ${child.pid}).`,
+      ),
+    );
+  }
+
+  // Only an incarnation-bound role may stop keeping its current owner alive.
+  child.unref?.();
+  return { kind: 'spawned', child, pid: child.pid, incarnation, spawnFailed };
 }
 
-/** Adapts the `Runtime` time port to the shape every control endpoint and client in this domain expects.
- *  Both role main and the coordinator's own acquisition steps need this exact adapter, so it lives here
- *  rather than being rebuilt at each call site. */
+/** A held role cannot be translated into spawn success or failure until exact-subject absence is observed. */
+export async function requireSpawnedRole(disposition: RoleSpawnDisposition): Promise<RoleSpawnDisposition> {
+  if (disposition.kind === 'spawned') return disposition;
+  const cleanup = await disposition.retry();
+  if (cleanup.kind !== 'observed-absent') return disposition;
+  throw disposition.error;
+}
+
 export function runtimeControlTimer(runtime: Pick<Runtime, 'time'>): ControlEndpointTimer & ControlClientTimer {
   return {
     setTimeout: (callback, ms) => runtime.time.setTimeout(callback, ms),
@@ -171,7 +375,7 @@ export type RoleConnectRetryOptions = Readonly<{
   connectTimeoutMs: number;
   retryIntervalMs: number;
   overallDeadlineMs: number;
-  now(): number;
+  monotonicNow(): bigint;
   sleep(ms: number): Promise<void>;
 }>;
 
@@ -191,12 +395,13 @@ export async function connectRoleControlWithRetry(
   options: RoleConnectRetryOptions,
   onProviderEvent?: ProviderEventHandler,
 ): Promise<ControlClient> {
-  const deadline = options.now() + options.overallDeadlineMs;
+  // Retry exhaustion must measure elapsed time, including connection attempts.
+  const deadlineMonotonicMs = options.monotonicNow() + BigInt(options.overallDeadlineMs);
   while (true) {
     try {
       return await connectControlClient(socketPath, timer, options.connectTimeoutMs, onProviderEvent);
     } catch (error: unknown) {
-      if (options.now() >= deadline) throw error;
+      if (options.monotonicNow() >= deadlineMonotonicMs) throw error;
       await options.sleep(options.retryIntervalMs);
     }
   }

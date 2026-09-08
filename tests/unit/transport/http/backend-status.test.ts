@@ -43,6 +43,7 @@ vi.mock('#src/infra/bundle-manifest.js', () => ({
               bundleHash: '0123456789abcdef',
               cliBundleHash: '0123456789abcdef',
               claudeAppserverBundleHash: '0123456789abcdef',
+              durableWrapperBundleHash: '0123456789abcdef',
             },
           }
         : { ok: false, reason: 'embedded_identity_unavailable' },
@@ -602,14 +603,26 @@ describe('getBackendStatusFull maps each answer to the word that describes it', 
         hostFingerprint: 'a'.repeat(64),
         proxyInstanceId: '22222222-2222-4222-8222-222222222222',
       }),
-      disposition: 'held',
-      incidentReason: 'control_channel_reattaching',
-      waitingFor: 'control-reattachment',
+      liveClaims: 0,
+      operatorExit: { kind: 'contain' },
+      holds: [
+        {
+          disposition: 'held',
+          incidentReason: 'control_channel_reattaching',
+          waitingFor: 'control-reattachment',
+        },
+      ],
     };
     const forwardShapedDetailed = {
       ...JSON.parse(detailed('ok')),
       diagnostics: {
-        providerProxySets: [understoodRow, { ...understoodRow, disposition: 'released-by-successor' }],
+        providerProxySets: [
+          understoodRow,
+          {
+            ...understoodRow,
+            holds: [{ ...understoodRow.holds[0], disposition: 'released-by-successor' }],
+          },
+        ],
       },
     };
     stubProbes(

@@ -1,5 +1,6 @@
 import { describe, expect, it, vi } from 'vitest';
 import { LaunchCoordinator } from '#src/coordinator/live/admission.js';
+import type { DurableProcessCleanup } from '#src/coordinator/live/durable-transport.js';
 import { DefaultProviderHostManager } from '#src/coordinator/live/provider-hosts/index.js';
 import { createProviderHostContainmentReaper } from '#src/coordinator/live/provider-hosts/drain.js';
 import { PROVIDER_SERVER_INITIALIZE_TIMEOUT_MS } from '#src/providers/app-server-transport.js';
@@ -80,10 +81,11 @@ describe('provider transport concurrency hardening', () => {
     runtime.time.tick(PROVIDER_SERVER_INITIALIZE_TIMEOUT_MS - 1);
     await flushMicrotasks();
     expect(observed.settled).toBe(false);
-    expect(runtime.spawner.killCalls).toEqual([{ pid: -20_000, signal: 0 }]);
+    // Admitting the spawned group is an observation, never a signal aimed at the group number.
+    expect(runtime.spawner.killCalls).toEqual([]);
 
     runtime.time.tick(1);
-    await flushMicrotasks(200);
+    await flushMicrotasks(2_000);
 
     expect(observed.settled).toBe(true);
     expect(observed.error).toBeInstanceOf(Error);
@@ -107,7 +109,7 @@ describe('provider transport concurrency hardening', () => {
     expect(observed.settled).toBe(false);
 
     runtime.time.tick(1);
-    await flushMicrotasks(200);
+    await flushMicrotasks(2_000);
 
     expect(observed.settled).toBe(true);
     expect((observed.error as Error | undefined)?.message).toContain('initialize timed out after 250ms');
@@ -131,7 +133,7 @@ describe('provider transport concurrency hardening', () => {
     expect(observed.settled).toBe(false);
 
     runtime.time.tick(1);
-    await flushMicrotasks(200);
+    await flushMicrotasks(2_000);
 
     expect(observed.settled).toBe(true);
     expect((observed.error as Error | undefined)?.message).toContain(
@@ -191,11 +193,18 @@ describe('provider transport concurrency hardening', () => {
       },
     });
     const launchCoordinator = new LaunchCoordinator({ runtime });
-    const handle = await launchCoordinator.spawnProviderServer({
-      provider: 'codex',
-      command: 'codex',
-      args: ['app-server'],
-    });
+    const handle = await launchCoordinator.spawnProviderServer(
+      {
+        provider: 'codex',
+        command: 'codex',
+        args: ['app-server'],
+      },
+      undefined,
+      undefined,
+      undefined,
+      (hold) => ({ kind: 'accepted', owner: 'provider-host-manager', settlement: hold.settled }),
+    );
+    if ('kind' in handle) throw new Error('Expected a contained provider server handle.');
 
     handle.onNotification(() => {
       throw new Error('consumer queue full');
@@ -209,28 +218,84 @@ describe('provider transport concurrency hardening', () => {
     await expect(handle.closePromise).resolves.toBeInstanceOf(Error);
   });
 
-  it('kills a durable child that finishes launching after terminateAll already drained cleanup handles', async () => {
+  it('joins a launch in flight and confirms its eventual observed absence', async () => {
     const runtime = new SimulationRuntime();
+    vi.spyOn(runtime.process, 'readProcessIncarnation').mockReturnValue(null);
     runtime.spawner.enqueueDurable({
       pid: 30_001,
       runtimeDelayMs: 5,
-      exit: null,
+      exit: { delayMs: 20, exitCode: 0, signal: null },
     });
     const launchCoordinator = new LaunchCoordinator({ runtime });
 
-    void launchCoordinator.spawnDurableJob({
-      provider: 'codex',
-      command: 'codex',
-      args: ['exec'],
-      jobDir: '/tmp/sim/jobs/late-durable',
-      permitGranted: true,
-    });
+    const observed = observePromise(
+      launchCoordinator.spawnDurableJob({
+        provider: 'codex',
+        command: 'codex',
+        args: ['exec'],
+        jobDir: '/tmp/sim/jobs/late-durable',
+        permitGranted: true,
+      }),
+    );
     await flushMicrotasks();
 
-    launchCoordinator.terminateAll();
+    const termination = observePromise(launchCoordinator.terminateAll());
+    expect(termination.settled).toBe(false);
+
     runtime.time.tick(5);
     await flushMicrotasks();
 
-    expect(runtime.spawner.killCalls).toContainEqual({ pid: 30_001, signal: 'SIGTERM' });
+    expect(termination.settled).toBe(false);
+    for (let attempt = 0; attempt < 30 && !termination.settled; attempt += 1) {
+      runtime.time.tick(50);
+      await flushMicrotasks(200);
+    }
+
+    expect(runtime.spawner.killCalls).not.toContainEqual({ pid: 30_001, signal: 'SIGTERM' });
+    expect(termination.settled).toBe(true);
+    expect(termination.value).toEqual({ kind: 'all-observed-absent' });
+    expect(observed).toMatchObject({
+      settled: true,
+      value: { stdout: '', stderr: '', code: 0, aborted: false },
+    });
+  });
+
+  it('cleans up through the child root when process-group SIGTERM delivery fails', async () => {
+    const runtime = new SimulationRuntime();
+    runtime.spawner.enqueueDurable({ pid: 30_002, runtimeDelayMs: 0, exit: null });
+    const launchCoordinator = new LaunchCoordinator({ runtime });
+    const observed = observePromise(
+      launchCoordinator.spawnDurableJob({
+        provider: 'codex',
+        command: 'codex',
+        args: ['exec'],
+        jobDir: '/tmp/sim/jobs/failed-signal-durable',
+        permitGranted: true,
+      }),
+    );
+    runtime.time.tick(0);
+    await flushMicrotasks();
+    const kill = runtime.process.kill.bind(runtime.process);
+    vi.spyOn(runtime.process, 'kill').mockReturnValueOnce(false).mockImplementation(kill);
+
+    const termination = launchCoordinator.terminateAll();
+    const observedTermination = observePromise(termination);
+    await flushMicrotasks();
+    for (let attempt = 0; attempt < 50 && !observedTermination.settled; attempt += 1) {
+      runtime.time.tick(25);
+      await flushMicrotasks(200);
+    }
+
+    await expect(termination).resolves.toEqual({ kind: 'all-observed-absent' });
+    expect(runtime.spawner.killCalls).toEqual([{ pid: 20_000, signal: 'SIGTERM' }]);
+
+    const cleanupHandles = (
+      launchCoordinator as unknown as { readonly cleanupHandles: Map<symbol, DurableProcessCleanup> }
+    ).cleanupHandles;
+    expect(cleanupHandles.size).toBe(0);
+    expect(observed).toMatchObject({
+      settled: true,
+      value: { stdout: '', stderr: '', code: null, aborted: false },
+    });
   });
 });

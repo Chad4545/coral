@@ -1,4 +1,9 @@
-import { bindProviderRunner, type ProviderDurableSpawner } from '../../providers/cli-runner.js';
+import {
+  bindProviderRunner,
+  type DurableContainmentOperatorControl,
+  type DurableProcessPublicationDisposition,
+  type ProviderDurableSpawner,
+} from '../../providers/cli-runner.js';
 import type {
   HostRef,
   ProviderEventBody,
@@ -38,7 +43,12 @@ import type {
 import type { ExecutionOwner } from '../../runtime/execution-owner.js';
 import type { DiscussionRunDescriptor } from '../discussion-run.js';
 import type { JobProgressStore, TerminalWriteOptions } from '../contracts/job-store.js';
-import type { Runtime } from '../../runtime/ports.js';
+import type {
+  DurableCliProcessSubject,
+  DurableContainmentStatus,
+  DurableProvisionalProcessSubject,
+  Runtime,
+} from '../../runtime/ports.js';
 import type { SessionInitialLaunchPort, SessionJobClaimPort } from '../../sessions/contracts.js';
 import type { CoralEventInput } from '../../store/envelope.js';
 import type { CommitEventsFn } from '../../store/append.js';
@@ -55,8 +65,11 @@ import { ProviderBindingRuntimeError } from '../../providers/contracts/binding.j
 import { ProviderHostUnserviceableError } from '../../providers/host-admission.js';
 import type { ProviderBindingCatalog } from '../../providers/catalog.js';
 import { jobLaunchRequestedEvent } from '../store.js';
-import { writeDurableCliProcessRuntimeMeta } from '../runtime-meta-store.js';
-import { DURABLE_CLI_PROCESS_RUNTIME_META_VERSION } from '../runtime-meta.js';
+import {
+  deleteDurableCliContainmentStatus,
+  writeDurableCliContainmentStatus,
+  writeDurableCliProcessRuntimeMeta,
+} from '../runtime-meta-store.js';
 import type { AppServerProxyRoute } from '../contracts/app-server-proxy-route.js';
 import type {
   ProviderOperationChildAuthorization,
@@ -1403,33 +1416,131 @@ export class LaunchOrchestrator implements ProviderOperationCleanupOwner {
       };
     }
 
+    const publishDurableContainmentDisposition = (publication: {
+      persist(): void;
+      persistenceFailure: string;
+      onPersistenceFailure?(reason: string): void;
+      afterPersistence?(): void;
+      progress: string;
+      progressFailure: string;
+    }): DurableProcessPublicationDisposition => {
+      try {
+        publication.persist();
+      } catch (error: unknown) {
+        const reason = `${publication.persistenceFailure}: ${errorMessage(error)}`;
+        publication.onPersistenceFailure?.(reason);
+        return { kind: 'retained', reason };
+      }
+      publication.afterPersistence?.();
+      try {
+        this.appendProgressEvent(jobId, requestForRoute.sessionId, publication.progress);
+      } catch (error: unknown) {
+        backendLog.warn(
+          `Failed to append durable containment ${publication.progressFailure} for ${jobId}: ${errorMessage(error)}`,
+        );
+      }
+      return { kind: 'published' };
+    };
+
     const runCli = bindProviderRunner(
       this.deps.durableSpawner,
       provider.name,
       signal,
       pool,
       this.deps.progressStore.jobDir(jobId),
-      (record) => {
-        this.deps.progressStore.appendRuntimeStarted(jobId, record);
+      (record, provisionalIdentity) => {
+        this.deps.progressStore.appendRuntimeStarted(
+          jobId,
+          record,
+          provisionalIdentity === undefined
+            ? undefined
+            : {
+                pid: provisionalIdentity.pid,
+                incarnation: provisionalIdentity.incarnation,
+                processGroupId: provisionalIdentity.processGroupId,
+              },
+        );
       },
-      // Recorded once, at the only moment it can be captured honestly (see `durable-transport.ts`). Never a
-      // substitute for the `job.runtime.started` append above — this is `meta`, not journal truth.
-      //
-      // Which is why a failed write must not fail the launch. This callback runs between the child's spawn
-      // and its cleanup registration, so a throw here would fault the job over bookkeeping and strand the
-      // very process it was describing. Losing the record only costs a later carrier verdict its `absent`,
-      // leaving `unknown` — the conservative direction the tri-state exists to fall back to.
-      (identity) => {
-        try {
-          writeDurableCliProcessRuntimeMeta(this.deps.progressStore.getDb(), {
-            version: DURABLE_CLI_PROCESS_RUNTIME_META_VERSION,
-            jobId,
-            ...identity,
-          });
-        } catch (error: unknown) {
-          backendLog.warn(`Failed to record durable process identity for ${jobId}: ${errorMessage(error)}`);
+      (
+        identity: DurableCliProcessSubject | DurableProvisionalProcessSubject,
+        containmentStatus?: DurableContainmentStatus,
+        control?: DurableContainmentOperatorControl,
+      ) => {
+        const provisional = 'kind' in identity;
+        if (containmentStatus === undefined) {
+          if (!provisional) {
+            writeDurableCliProcessRuntimeMeta(this.deps.progressStore.getDb(), {
+              jobId,
+              ...identity,
+            });
+          }
+          return { kind: 'published' };
+        }
+        const evidence = provisional
+          ? { kind: 'unavailable' as const, reason: 'missing' as const }
+          : ({ kind: 'current' as const, record: { jobId, ...identity } } as const);
+        switch (containmentStatus.kind) {
+          case 'held': {
+            if (control !== undefined) {
+              this.deps.abortRegistry.hold(
+                jobId,
+                containmentStatus.reason,
+                `Run coral-cli abort jobs ${jobId} again to abandon job ownership without proving process absence or sending another signal.`,
+                control.abandon,
+              );
+            }
+            return publishDurableContainmentDisposition({
+              persist: () =>
+                writeDurableCliContainmentStatus(this.deps.progressStore.getDb(), {
+                  jobId,
+                  evidence,
+                  disposition: containmentStatus,
+                }),
+              persistenceFailure: 'durable containment hold persistence failed',
+              ...(control === undefined
+                ? {}
+                : {
+                    onPersistenceFailure: (reason: string) =>
+                      this.deps.abortRegistry.hold(
+                        jobId,
+                        reason,
+                        `Run coral-cli abort jobs ${jobId} again to retry durable abandonment without sending another signal.`,
+                        control.abandon,
+                      ),
+                  }),
+              progress:
+                `Durable containment pid=${identity.pid} is held (${containmentStatus.reason}). ` +
+                `Cleanup retries every ${containmentStatus.retryIntervalMs}ms. Run coral-cli abort jobs ${jobId} to ` +
+                'abandon the hold; abandonment releases job ownership without proving process absence or terminating the process.',
+              progressFailure: 'hold progress',
+            });
+          }
+          case 'absence-confirmed': {
+            return publishDurableContainmentDisposition({
+              persist: () => deleteDurableCliContainmentStatus(this.deps.progressStore.getDb(), jobId),
+              persistenceFailure: 'durable containment absence publication failed',
+              afterPersistence: () => this.deps.abortRegistry.releaseHold(jobId),
+              progress: `Durable containment pid=${identity.pid} is absent.`,
+              progressFailure: 'absence progress',
+            });
+          }
+          case 'operator-abandoned': {
+            return publishDurableContainmentDisposition({
+              persist: () =>
+                writeDurableCliContainmentStatus(this.deps.progressStore.getDb(), {
+                  jobId,
+                  evidence,
+                  disposition: containmentStatus,
+                }),
+              persistenceFailure: 'durable containment abandonment publication failed',
+              afterPersistence: () => this.deps.abortRegistry.releaseHold(jobId),
+              progress: `Durable containment pid=${identity.pid} was abandoned without proof of process absence or termination.`,
+              progressFailure: 'abandonment progress',
+            });
+          }
         }
       },
+      jobId,
     );
     return {
       kind: 'local',

@@ -1,7 +1,8 @@
 import { createProviderProxySetContainmentProver } from '#src/coordinator/services/provider-proxy-set/containment-proof.js';
 import { testIncarnation } from '#tests/helpers/process-incarnation.js';
 import { randomBytes, randomUUID } from 'node:crypto';
-import { existsSync, mkdtempSync, readdirSync, rmSync } from 'node:fs';
+import { EventEmitter } from 'node:events';
+import { existsSync, mkdtempSync, rmSync } from 'node:fs';
 import { createServer, Socket } from 'node:net';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -9,11 +10,16 @@ import { afterEach, describe, expect, it, vi } from 'vitest';
 import { z } from 'zod';
 
 import type { createEnforcerDeadlineStateMachine } from '#src/provider-proxy/orphan-deadline.js';
-import { runtimeControlTimer, type connectRoleControlWithRetry } from '#src/provider-proxy/role-spawn.js';
+import {
+  runtimeControlTimer,
+  type connectRoleControlWithRetry,
+  type SpawnedRoleProcess,
+} from '#src/provider-proxy/role-spawn.js';
 import {
   createTestProviderProxyContainmentProofProducer,
   createTestProviderProxyRecoveryDispatcher,
 } from '#tests/helpers/provider-proxy-recovery-dispatcher.js';
+import { testProviderProxySetLifecycleDurability } from '#tests/helpers/provider-proxy-set-lifecycle-durability.js';
 
 type CreateEnforcerDeadlineStateMachine = typeof createEnforcerDeadlineStateMachine;
 type ConnectRoleControlWithRetry = typeof connectRoleControlWithRetry;
@@ -122,6 +128,7 @@ vi.mock('#src/infra/bundle-manifest.js', async (importOriginal) => {
         bundleHash: '1'.repeat(16),
         cliBundleHash: '2'.repeat(16),
         claudeAppserverBundleHash: '3'.repeat(16),
+        durableWrapperBundleHash: '4'.repeat(16),
       },
     }),
   };
@@ -137,10 +144,11 @@ import {
   providerReaperBootstrapCapsulePath,
   providerReaperEndpoint,
 } from '#src/infra/path/index.js';
-import { probeProcessIncarnation, type ProcessIncarnation } from '#src/infra/node-process.js';
+import { probeProcessIncarnation, type ProcessIncarnation, type ProcessLiveness } from '#src/infra/node-process.js';
 import type { ChildProcessLike } from '#src/infra/port-types.js';
 import { createProviderProxyAcquisitionSteps } from '#src/coordinator/live/provider-proxy/acquisition-steps.js';
 import { acquireProviderProxySet } from '#src/coordinator/live/provider-proxy/index.js';
+import { buildGuardianSpawnUndo } from '#src/coordinator/live/provider-proxy/spawn-undo.js';
 import { isProviderProxyOperationAuthority } from '#src/coordinator/live/provider-proxy/operation-route.js';
 import { createProviderProxyAuthorityHeartbeatAssembly } from '#src/coordinator/live/provider-proxy/heartbeat.js';
 import { establishRoleControl } from '#src/coordinator/live/provider-proxy/role-control.js';
@@ -178,6 +186,7 @@ import {
 import type { CoordinatorIdentity } from '#src/provider-proxy/protocol.js';
 import { PROVIDER_ROLE_FLAGS, type ProviderRole } from '#src/provider-proxy/role-argv.js';
 import {
+  GuardianConstructionCleanupHeldError,
   runProviderRoleMain,
   startProviderGuardianRole,
   startProviderProxyRole,
@@ -196,6 +205,10 @@ import { VirtualTime } from '#tools/simulation/core/virtual-time.js';
 import { CURRENT_HANDOFF_CAPSULE_VERSION } from '#src/provider-proxy/handoff-capsule.js';
 
 const FIXTURE_BUILD_SET_ID = '00000000-0000-4000-8000-000000000004';
+const acceptHoldForTest = () => ({
+  kind: 'accepted' as const,
+  owner: 'durable-provider-proxy-acquisition-hold-store' as const,
+});
 
 /**
  * Drives the real spawn topology in-process rather than against the built backend artifact.
@@ -233,6 +246,7 @@ function strictIdentity(buildSetId: string): StrictBundleIdentityResult {
       bundleHash: '1'.repeat(16),
       cliBundleHash: '2'.repeat(16),
       claudeAppserverBundleHash: '3'.repeat(16),
+      durableWrapperBundleHash: '4'.repeat(16),
     },
   };
 }
@@ -262,6 +276,8 @@ type FakeRoleEnvironmentOptions = Readonly<{
    *  else here can reach: everything up to it has already succeeded. */
   onProxySpawning?(): void;
   onGuardianListening?(): void;
+  observeSpawnedProcessBeforeRoleReady?: boolean;
+  incarnationAfterSigterm?(role: ProviderRole, pid: number): ProcessIncarnation | null | undefined;
 }>;
 
 type FakeRoleEnvironment = Readonly<{
@@ -298,11 +314,16 @@ function createFakeRoleEnvironment(options: FakeRoleEnvironmentOptions): FakeRol
   const handles: FakeRoleEnvironment['handles'] = {};
   const sequenceLog: string[] = [];
   const exitLog: number[] = [];
+  const livePids = new Set<number>();
   const pidHandles = new Map<number, ProviderRoleHandle>();
   const incarnationByPid = new Map<number, ProcessIncarnation | null>();
+  const childrenByPid = new Map<number, { collect(code: number | null, signal: NodeJS.Signals | null): void }>();
 
   const readProcessIncarnation = (pid: number, platform: NodeJS.Platform): ProcessIncarnation | null => {
-    if (incarnationByPid.has(pid)) return incarnationByPid.get(pid) ?? null;
+    if (incarnationByPid.has(pid)) {
+      if (options.observeSpawnedProcessBeforeRoleReady && !livePids.has(pid)) return null;
+      return incarnationByPid.get(pid) ?? null;
+    }
     return probeProcessIncarnation(pid, platform);
   };
 
@@ -310,8 +331,28 @@ function createFakeRoleEnvironment(options: FakeRoleEnvironmentOptions): FakeRol
     return {
       ...options.base,
       ...(pidOverride === undefined ? {} : { env: { ...options.base.env, pid: () => pidOverride } }),
-      process: { ...options.base.process, spawn: fakeSpawn, kill: fakeKill },
+      process: {
+        ...options.base.process,
+        spawn: fakeSpawn,
+        kill: fakeKill,
+        observeLiveness: fakeObserveLiveness,
+        observeRecordedProcessAsync: async (identity) => {
+          const liveness = fakeObserveLiveness(identity.pid);
+          if (liveness !== 'alive') return liveness;
+          const observed = readProcessIncarnation(identity.pid, options.base.env.platform() as NodeJS.Platform);
+          return observed === null ? 'unknown' : observed === identity.incarnation ? 'alive' : 'absent';
+        },
+      },
     };
+  }
+
+  /** Fixture pids must not identify live OS processes. */
+  function fakeObserveLiveness(pid: number): ProcessLiveness {
+    const observablePids = options.observeSpawnedProcessBeforeRoleReady ? livePids : new Set(pidHandles.keys());
+    if (pid < 0) {
+      return [...observablePids].some((candidate) => groupLeaderPidOf(candidate) === -pid) ? 'alive' : 'absent';
+    }
+    return observablePids.has(pid) ? 'alive' : 'absent';
   }
 
   function portsFor(pidOverride: number | undefined): ProviderRoleMainPorts {
@@ -342,18 +383,42 @@ function createFakeRoleEnvironment(options: FakeRoleEnvironmentOptions): FakeRol
     nextPid += 1;
     const selfPid = options.selfPidFor?.(role, pid) ?? pid;
     const incarnation = (options.incarnationFor ?? ((_role, p) => testIncarnation(`base-${p}`)))(role, pid);
+    livePids.add(pid);
     incarnationByPid.set(pid, incarnation);
     if (selfPid !== pid) incarnationByPid.set(selfPid, incarnation);
     spawnLog.push({ role, capsulePath, detached: spawnOptions.detached === true, pid });
 
+    const events = new EventEmitter();
+    let exitCode: number | null = null;
+    let signalCode: NodeJS.Signals | null = null;
+    let collected = false;
     const child: ChildProcessLike = {
       pid,
+      get exitCode() {
+        return exitCode;
+      },
+      get signalCode() {
+        return signalCode;
+      },
       stdin: null,
       stdout: null,
       stderr: null,
-      on: () => child,
-      kill: () => true,
+      on(event, listener) {
+        events.on(event, listener);
+        return this;
+      },
+      kill: (signal = 'SIGTERM') => fakeKill(pid, signal),
     };
+    childrenByPid.set(pid, {
+      collect(code, signal) {
+        if (collected) return;
+        collected = true;
+        exitCode = code;
+        signalCode = signal;
+        events.emit('exit', code, signal);
+        events.emit('close', code, signal);
+      },
+    });
 
     // Fire-and-forget, exactly as a real `child_process.spawn` returns before the child has done anything —
     // the caller learns readiness only by reaching the endpoint, never from the spawn call itself.
@@ -363,15 +428,15 @@ function createFakeRoleEnvironment(options: FakeRoleEnvironmentOptions): FakeRol
         if (role === 'guardian') {
           const handle = await startProviderGuardianRole(capsulePath, rolePorts);
           handles.guardian = handle;
-          pidHandles.set(pid, handle);
+          if (!options.observeSpawnedProcessBeforeRoleReady || livePids.has(pid)) pidHandles.set(pid, handle);
         } else if (role === 'reaper') {
           const handle = await startProviderReaperRole(capsulePath, rolePorts);
           handles.reaper = handle;
-          pidHandles.set(pid, handle);
+          if (!options.observeSpawnedProcessBeforeRoleReady || livePids.has(pid)) pidHandles.set(pid, handle);
         } else {
           const handle = await startProviderProxyRole(capsulePath, rolePorts);
           handles.proxy = handle;
-          pidHandles.set(pid, handle);
+          if (!options.observeSpawnedProcessBeforeRoleReady || livePids.has(pid)) pidHandles.set(pid, handle);
         }
       } catch (error: unknown) {
         nestedErrors.push(error);
@@ -392,14 +457,28 @@ function createFakeRoleEnvironment(options: FakeRoleEnvironmentOptions): FakeRol
 
   function fakeKill(pid: number, signal: NodeJS.Signals | 0): boolean {
     killLog.push({ pid, signal: String(signal) });
+    if (signal === 0) return fakeObserveLiveness(pid) === 'alive';
     // A negative pid is the group-signal convention: every registered handle whose group leader is `-pid`
     // receives it, exactly as a real OS `kill(-pid, …)` reaches every process in that group.
-    const targets =
-      pid < 0 ? [...pidHandles.keys()].filter((candidate) => groupLeaderPidOf(candidate) === -pid) : [pid];
+    const observablePids = options.observeSpawnedProcessBeforeRoleReady ? livePids : new Set(pidHandles.keys());
+    const targets = pid < 0 ? [...observablePids].filter((candidate) => groupLeaderPidOf(candidate) === -pid) : [pid];
     for (const target of targets) {
       const handle = pidHandles.get(target);
-      if (handle === undefined) continue;
+      const role = spawnLog.find((entry) => entry.pid === target)?.role;
+      if (signal === 'SIGTERM' && role !== undefined) {
+        const replacement = options.incarnationAfterSigterm?.(role, target);
+        if (replacement !== undefined) {
+          childrenByPid.get(target)?.collect(null, signal);
+          childrenByPid.delete(target);
+          incarnationByPid.set(target, replacement);
+          continue;
+        }
+      }
+      livePids.delete(target);
       pidHandles.delete(target);
+      childrenByPid.get(target)?.collect(null, signal);
+      childrenByPid.delete(target);
+      if (handle === undefined) continue;
       if (signal !== 'SIGTERM') continue; // SIGKILL is not catchable; nothing left to run.
       // Mirrors `runProviderRoleMain`'s own shutdown dispatch: a guardian or reaper must reap what it holds
       // before it exits (`giveUp`); the proxy holds no containment of its own and just closes.
@@ -634,7 +713,7 @@ async function runGuardianBootstrapSchedule(initialHeartbeatAcceptanceMs: number
         connectTimeoutMs: 2_000,
         retryIntervalMs: 20,
         overallDeadlineMs: 10_000,
-        now: () => outerTime.now(),
+        monotonicNow: () => BigInt(outerTime.now()),
         sleep: (ms) => outerTime.sleep(ms),
       },
       {
@@ -970,6 +1049,67 @@ describe('provider-proxy process topology: guardian role main', () => {
     expect(environment.killLog).toContainEqual({ pid: reaperPid, signal: 'SIGTERM' });
   });
 
+  it('treats a reused reaper pid as confirmation that the spawned reaper is absent', async () => {
+    const baseDir = scopedTempDir('coral-topology-pairing-reuse-');
+    const shared = mintSharedSetIdentity();
+    const environment = createFakeRoleEnvironment({
+      base: createRealRuntime(FLAVOR),
+      pluginRoot: baseDir,
+      baseDir,
+      resolveStrictIdentity: () => strictIdentity(shared.buildSetId),
+      incarnationAfterSigterm: (role) => (role === 'reaper' ? testIncarnation('replacement') : undefined),
+    });
+    cleanups.push(() => closeHandles(environment));
+    const { guardianCapsulePath } = writeCapsuleSet(environment.outerRuntime(), baseDir, shared, {
+      reaperGuardianReaperAuthSecret: randomBytes(32).toString('hex'),
+    });
+
+    await expect(startProviderGuardianRole(guardianCapsulePath, environment.topLevelPorts())).rejects.toThrow(
+      /shared secret/u,
+    );
+
+    const reaperPid = environment.spawnLog[0]?.pid;
+    expect(environment.killLog).toContainEqual({ pid: reaperPid, signal: 'SIGTERM' });
+    expect(environment.killLog).not.toContainEqual({ pid: reaperPid, signal: 'SIGKILL' });
+  });
+
+  it('holds the recorded reaper identity when construction cleanup cannot observe its absence', async () => {
+    const baseDir = scopedTempDir('coral-topology-pairing-unobservable-');
+    const shared = mintSharedSetIdentity();
+    const environment = createFakeRoleEnvironment({
+      base: createRealRuntime(FLAVOR),
+      pluginRoot: baseDir,
+      baseDir,
+      resolveStrictIdentity: () => strictIdentity(shared.buildSetId),
+      incarnationAfterSigterm: (role) => (role === 'reaper' ? null : undefined),
+    });
+    cleanups.push(() => closeHandles(environment));
+    const { guardianCapsulePath } = writeCapsuleSet(environment.outerRuntime(), baseDir, shared, {
+      reaperGuardianReaperAuthSecret: randomBytes(32).toString('hex'),
+    });
+
+    const failure = await startProviderGuardianRole(guardianCapsulePath, environment.topLevelPorts()).catch(
+      (error: unknown) => error,
+    );
+
+    expect(failure).toBeInstanceOf(GuardianConstructionCleanupHeldError);
+    const hold = (failure as GuardianConstructionCleanupHeldError).hold;
+    const reaper = environment.spawnLog[0];
+    if (reaper === undefined) throw new Error('guardian construction did not spawn a reaper');
+    expect(hold.pending).toMatchObject([
+      {
+        kind: 'reaper-process',
+        identity: { pid: reaper.pid, incarnation: testIncarnation(`base-${reaper.pid}`) },
+      },
+    ]);
+    expect(environment.killLog).toContainEqual({ pid: reaper.pid, signal: 'SIGTERM' });
+    expect(environment.killLog).not.toContainEqual({ pid: reaper.pid, signal: 'SIGKILL' });
+    await expect(hold.retry()).resolves.toMatchObject({
+      kind: 'holding',
+      pending: [{ kind: 'reaper-process', identity: { pid: reaper.pid } }],
+    });
+  });
+
   it('leaves no live child when the guardian endpoint itself fails to bind', async () => {
     const baseDir = scopedTempDir('coral-topology-listen-fails-');
     const shared = mintSharedSetIdentity();
@@ -1015,6 +1155,7 @@ describe('provider-proxy process topology: guardian role main', () => {
       onProxySpawning: () => {
         void environment.handles.reaper?.close();
       },
+      observeSpawnedProcessBeforeRoleReady: true,
     });
     cleanups.push(() => closeHandles(environment));
     const { guardianCapsulePath } = writeCapsuleSet(environment.outerRuntime(), baseDir, shared);
@@ -1032,6 +1173,88 @@ describe('provider-proxy process topology: guardian role main', () => {
     const proxyPid = environment.spawnLog[1]?.pid;
     expect(environment.killLog).toContainEqual({ pid: reaperPid, signal: 'SIGTERM' });
     expect(environment.killLog).toContainEqual({ pid: -proxyPid, signal: 'SIGTERM' });
+  });
+
+  it('holds the exact detached proxy group when its leader disappears but the group remains', async () => {
+    const baseDir = scopedTempDir('coral-topology-forward-holds-');
+    const shared = mintSharedSetIdentity();
+    const environment = createFakeRoleEnvironment({
+      base: createRealRuntime(FLAVOR),
+      pluginRoot: baseDir,
+      baseDir,
+      resolveStrictIdentity: () => strictIdentity(shared.buildSetId),
+      onProxySpawning: () => {
+        void environment.handles.reaper?.close();
+      },
+      observeSpawnedProcessBeforeRoleReady: true,
+      incarnationAfterSigterm: (role) => (role === 'proxy' ? testIncarnation('reused-proxy-pid') : undefined),
+    });
+    cleanups.push(() => closeHandles(environment));
+    const { guardianCapsulePath } = writeCapsuleSet(environment.outerRuntime(), baseDir, shared);
+
+    const failure = await startProviderGuardianRole(guardianCapsulePath, environment.topLevelPorts()).catch(
+      (error: unknown) => error,
+    );
+
+    expect(failure).toBeInstanceOf(GuardianConstructionCleanupHeldError);
+    const hold = (failure as GuardianConstructionCleanupHeldError).hold;
+    const proxyPid = environment.spawnLog.find((entry) => entry.role === 'proxy')?.pid;
+    expect(hold.pending).toMatchObject([
+      { kind: 'proxy-process-group', identity: { pid: proxyPid, processGroupId: proxyPid } },
+    ]);
+    expect(hold.reason).toContain('unattributable');
+    expect(environment.killLog).toContainEqual({ pid: -proxyPid!, signal: 'SIGTERM' });
+    expect(environment.killLog).not.toContainEqual({ pid: -proxyPid!, signal: 'SIGKILL' });
+    await expect(hold.retry()).resolves.toMatchObject({
+      kind: 'holding',
+      pending: [{ kind: 'proxy-process-group', identity: { pid: proxyPid, processGroupId: proxyPid } }],
+    });
+  });
+
+  it('retains both spawned identities when neither cleanup can confirm absence', async () => {
+    const baseDir = scopedTempDir('coral-topology-forward-holds-both-');
+    const shared = mintSharedSetIdentity();
+    const environment = createFakeRoleEnvironment({
+      base: createRealRuntime(FLAVOR),
+      pluginRoot: baseDir,
+      baseDir,
+      resolveStrictIdentity: () => strictIdentity(shared.buildSetId),
+      onProxySpawning: () => {
+        void environment.handles.reaper?.close();
+      },
+      observeSpawnedProcessBeforeRoleReady: true,
+      incarnationAfterSigterm: (role) =>
+        role === 'proxy' ? testIncarnation('reused-proxy-pid') : role === 'reaper' ? null : undefined,
+    });
+    cleanups.push(() => closeHandles(environment));
+    const { guardianCapsulePath } = writeCapsuleSet(environment.outerRuntime(), baseDir, shared);
+
+    const failure = await startProviderGuardianRole(guardianCapsulePath, environment.topLevelPorts()).catch(
+      (error: unknown) => error,
+    );
+
+    expect(failure).toBeInstanceOf(GuardianConstructionCleanupHeldError);
+    const hold = (failure as GuardianConstructionCleanupHeldError).hold;
+    const reaper = environment.spawnLog.find((entry) => entry.role === 'reaper');
+    const proxy = environment.spawnLog.find((entry) => entry.role === 'proxy');
+    if (reaper === undefined || proxy === undefined) throw new Error('guardian construction did not spawn both peers');
+    expect(hold.pending).toMatchObject([
+      {
+        kind: 'proxy-process-group',
+        identity: { pid: proxy.pid, processGroupId: proxy.pid },
+      },
+      {
+        kind: 'reaper-process',
+        identity: { pid: reaper.pid, incarnation: testIncarnation(`base-${reaper.pid}`) },
+      },
+    ]);
+    await expect(hold.retry()).resolves.toMatchObject({
+      kind: 'holding',
+      pending: [
+        { kind: 'proxy-process-group', identity: { pid: proxy.pid, processGroupId: proxy.pid } },
+        { kind: 'reaper-process', identity: { pid: reaper.pid } },
+      ],
+    });
   });
 });
 
@@ -1072,7 +1295,12 @@ describe('provider-proxy process topology: acquisition', () => {
     cleanups.push(() => closeHandles(environment));
 
     const steps = createProviderProxyAcquisitionSteps(acquisitionOptions(environment, baseDir, shared));
-    const result = await acquireProviderProxySet({ steps, deadlineSignal: AbortSignal.timeout(15_000) });
+    const result = await acquireProviderProxySet({
+      steps,
+      time: environment.outerRuntime().time,
+      acceptHold: acceptHoldForTest,
+      deadlineSignal: AbortSignal.timeout(15_000),
+    });
 
     expect(result.kind).toBe('acquired');
     if (result.kind !== 'acquired') throw new Error(`unreachable: ${JSON.stringify(result)}`);
@@ -1118,6 +1346,7 @@ describe('provider-proxy process topology: acquisition', () => {
       claims,
       controlEstablished: () => undefined,
       time: environment.outerRuntime().time,
+      ...testProviderProxySetLifecycleDurability(environment.outerRuntime().storage, environment.outerRuntime().time),
       recoveryDispatcher: createTestProviderProxyRecoveryDispatcher({
         'containment-proof': createTestProviderProxyContainmentProofProducer(
           environment.outerRuntime(),
@@ -1133,6 +1362,7 @@ describe('provider-proxy process topology: acquisition', () => {
       },
       reportLifecycle: () => undefined,
     });
+    lifecycle.activateDurableOperatorDispositions();
     lifecycle.initializeClaimSlots();
     lifecycle.completeStartupDiscovery();
     const routeKey = 'fresh-reaper-channel';
@@ -1141,12 +1371,14 @@ describe('provider-proxy process topology: acquisition', () => {
 
     const acquired = await acquireProviderProxySet({
       steps: createProviderProxyAcquisitionSteps(acquisitionOptions(environment, baseDir, shared)),
+      time: environment.outerRuntime().time,
+      acceptHold: acceptHoldForTest,
       deadlineSignal: AbortSignal.timeout(15_000),
     });
     if (acquired.kind !== 'acquired') throw new Error(`acquisition failed: ${JSON.stringify(acquired)}`);
     if (!isProviderProxyOperationAuthority(acquired.set)) throw new Error('expected durable authority');
     const set = acquired.set;
-    lifecycle.acquisitionSucceeded(admission.slotId, set);
+    lifecycle.acquisitionSucceeded(admission.slotId, set, acquired.publicationReceipt);
     expect(lifecycle.routeFor(routeKey)).toBe(set);
 
     const channelIncident = new Promise<ProviderProxyAuthorityObservation>((resolve) => {
@@ -1190,6 +1422,8 @@ describe('provider-proxy process topology: acquisition', () => {
 
     const acquired = await acquireProviderProxySet({
       steps: createProviderProxyAcquisitionSteps(acquisitionOptions(environment, baseDir, shared)),
+      time: environment.outerRuntime().time,
+      acceptHold: acceptHoldForTest,
       deadlineSignal: AbortSignal.timeout(15_000),
     });
     if (acquired.kind !== 'acquired') throw new Error(`acquisition failed: ${JSON.stringify(acquired)}`);
@@ -1247,6 +1481,7 @@ describe('provider-proxy process topology: acquisition', () => {
       flavor: FLAVOR,
       buildSetId: shared.buildSetId,
     };
+    const containmentProver = createProviderProxySetContainmentProver(environment.outerRuntime());
     const recovered = await attemptProviderProxySetInheritance(
       reference,
       db,
@@ -1256,12 +1491,7 @@ describe('provider-proxy process topology: acquisition', () => {
         coordinatorIdentity: successorIdentity,
         operationRegistry: { operationsFor: () => [], providerRootsFor: () => [] },
         reapRecordedContainment: createProviderProxySetRecordedContainmentReaper(environment.outerRuntime()),
-        collectContainmentProof: (authorization, proofDb, proofSignal) =>
-          createProviderProxySetContainmentProver(environment.outerRuntime()).collectContainmentProof(
-            authorization,
-            proofDb,
-            proofSignal,
-          ),
+        collectContainmentProof: containmentProver.collectContainmentProof,
       },
       AbortSignal.timeout(15_000),
     );
@@ -1278,7 +1508,7 @@ describe('provider-proxy process topology: acquisition', () => {
     await recovered.set.initiateControlClose();
   });
 
-  it('unwinds the capsules and reaps the guardian when a later cut fails control establishment', async () => {
+  it('reaps the guardian when a later cut fails control establishment', async () => {
     const baseDir = scopedTempDir('coral-topology-cut-');
     const shared = mintSharedSetIdentity();
     const environment = createFakeRoleEnvironment({
@@ -1293,24 +1523,16 @@ describe('provider-proxy process topology: acquisition', () => {
     });
     cleanups.push(() => closeHandles(environment));
 
-    const runtime = environment.outerRuntime();
-    const rmSyncCalls: Array<{ path: string; force: boolean | undefined }> = [];
-    const spiedRuntime: Runtime = {
-      ...runtime,
-      storage: {
-        ...runtime.storage,
-        rmSync: (path, opts) => {
-          rmSyncCalls.push({ path, force: opts?.force });
-          runtime.storage.rmSync(path, opts);
-        },
-      },
-    };
-
     const steps = createProviderProxyAcquisitionSteps({
       ...acquisitionOptions(environment, baseDir, shared),
-      runtime: spiedRuntime,
+      runtime: environment.outerRuntime(),
     });
-    const result = await acquireProviderProxySet({ steps, deadlineSignal: AbortSignal.timeout(15_000) });
+    const result = await acquireProviderProxySet({
+      steps,
+      time: environment.outerRuntime().time,
+      acceptHold: acceptHoldForTest,
+      deadlineSignal: AbortSignal.timeout(15_000),
+    });
 
     expect(result).toMatchObject({
       kind: 'provider_proxy_acquisition_failed',
@@ -1318,33 +1540,64 @@ describe('provider-proxy process topology: acquisition', () => {
       strandedArtifacts: [],
     });
 
-    // Reaps the guardian by its own group (it is spawned `detached: true`, a leader in its own right): the
-    // undo targets the exact pid this acquisition itself spawned and observed, not the mismatched pid the
-    // guardian self-reported.
     const guardianSpawn = environment.spawnLog.find((entry) => entry.role === 'guardian');
     expect(guardianSpawn).toBeDefined();
     expect(environment.killLog).toContainEqual({ pid: -(guardianSpawn?.pid as number), signal: 'SIGTERM' });
-
-    // BLOCKING: the guardian's own construction had already spawned and recorded the proxy containment by
-    // this point (it only rejects the coordinator's identity check *after* its own listen and
-    // recordContainment already succeeded), so the group SIGTERM above must make it (and the reaper right
-    // alongside it, sharing its process group) actually reap that containment, not merely disarm and
-    // disappear leaving the detached, out-of-group proxy held by no one. `exitProcess` is only ever called
-    // with `0` for a settled `containment-absent` outcome (`ROLE_ENFORCEMENT_FAILURE_EXIT_CODE` otherwise) —
-    // a plain `close()` never reaches it at all — so this is proof enforcement actually ran, not merely that
-    // a signal was sent.
     await vi.waitFor(() => expect(environment.exitLog).toContain(0), { timeout: 5_000 });
+  });
 
-    // Unwinds the capsules: the capsule paths this acquisition itself minted were all handed to
-    // `rmSync` with `force: true`, regardless of whether the underlying process had already consumed them.
-    expect(rmSyncCalls).toHaveLength(3);
-    expect(rmSyncCalls.every((call) => call.force === true)).toBe(true);
+  // Already-absent groups must not be signalled; unobservable groups must retain cleanup ownership.
+  function undoRuntimeWithLiveness(observeLiveness: (pid: number) => ProcessLiveness): {
+    runtime: Runtime;
+    kill: ReturnType<typeof vi.fn>;
+  } {
+    const kill = vi.fn(() => true);
+    const base = createRealRuntime(FLAVOR);
+    return { runtime: { ...base, process: { ...base.process, kill, observeLiveness } }, kill };
+  }
 
-    const runDir = join(baseDir, GENERATION, 'run');
-    if (existsSync(runDir)) {
-      const remaining = readdirSync(runDir).filter((name) => name.endsWith('.bootstrap.json'));
-      expect(remaining).toEqual([]);
-    }
+  // A spawned-process fixture must retain the child handle that authorizes undo signalling.
+  const uncollectedChild = (pid: number): ChildProcessLike => ({
+    pid,
+    exitCode: null,
+    signalCode: null,
+    stdin: null,
+    stdout: null,
+    stderr: null,
+    on() {
+      return this;
+    },
+    kill: () => true,
+  });
+
+  it('does not signal a guardian process group already observed absent', async () => {
+    const spawned = {
+      kind: 'spawned',
+      pid: 900_101,
+      incarnation: testIncarnation('base-900101'),
+      child: uncollectedChild(900_101),
+    } as SpawnedRoleProcess;
+    const { runtime, kill } = undoRuntimeWithLiveness(() => 'absent');
+    const undo = buildGuardianSpawnUndo(runtime, spawned, 'linux', () => spawned.incarnation);
+
+    await expect(undo()).resolves.toBeUndefined();
+    expect(kill).not.toHaveBeenCalled();
+  });
+
+  it('holds rather than claiming success when a guardian process group cannot be observed at all', async () => {
+    const spawned = {
+      kind: 'spawned',
+      pid: 900_102,
+      incarnation: testIncarnation('base-900102'),
+      child: uncollectedChild(900_102),
+    } as SpawnedRoleProcess;
+    const { runtime, kill } = undoRuntimeWithLiveness(() => 'unknown');
+    const undo = buildGuardianSpawnUndo(runtime, spawned, 'linux', () => spawned.incarnation);
+
+    await expect(undo()).rejects.toThrow(
+      'guardian process-group cleanup is holding because identity observation did not authorize a signal',
+    );
+    expect(kill).not.toHaveBeenCalled();
   });
 });
 

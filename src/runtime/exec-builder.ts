@@ -1,5 +1,11 @@
-import { EXEC_MAXBUFFER_CODE, EXEC_TIMEOUT_CODE, SIGTERM_GRACE_MS } from '../infra/process-constants.js';
+import {
+  EXEC_MAXBUFFER_CODE,
+  EXEC_TIMEOUT_CODE,
+  SIGKILL_GRACE_MS,
+  SIGTERM_GRACE_MS,
+} from '../infra/process-constants.js';
 import type { ChildProcessLike, ExecResult, TimerHandle } from '../infra/port-types.js';
+import { signalOwnedProcessGroup } from '../infra/process-supervision.js';
 import type { RuntimeSpawnOptions } from './ports.js';
 
 export interface BuildExecPromiseOptions {
@@ -58,6 +64,10 @@ function appendOutput(
 }
 
 export function buildExecPromise(options: BuildExecPromiseOptions): Promise<ExecResult> {
+  // Group containment requires an uncollected leader; after collection, its process-group id must
+  // not be treated as attributable or signalled. An exec settlement never claims descendant absence,
+  // only the command's answer or its absence. A caller requiring an owned tree must retain cleanup authority
+  // or use the durable wrapper. See retainSpawnedProcessGroupCleanup in src/infra/process-supervision.ts.
   const {
     args,
     clearTimeout,
@@ -82,7 +92,8 @@ export function buildExecPromise(options: BuildExecPromiseOptions): Promise<Exec
     let stderrBytes = 0;
     let resolved = false;
     let timeoutHandle: TimerHandle | null = null;
-    let killTimer: TimerHandle | null = null;
+    let escalationTimer: TimerHandle | null = null;
+    let settlementDeadlineTimer: TimerHandle | null = null;
     let wrapperKilled: ExecKillReason | null = null;
 
     const child = spawn({
@@ -94,14 +105,15 @@ export function buildExecPromise(options: BuildExecPromiseOptions): Promise<Exec
       ...(shell === undefined ? {} : { shell }),
       ...(killProcessGroup ? { detached: true } : {}),
     });
-
     child.stdin?.end();
 
     const clearTimers = (): void => {
       clearTimeout(timeoutHandle);
       timeoutHandle = null;
-      clearTimeout(killTimer);
-      killTimer = null;
+      clearTimeout(escalationTimer);
+      escalationTimer = null;
+      clearTimeout(settlementDeadlineTimer);
+      settlementDeadlineTimer = null;
     };
 
     const finish = (result: ExecResult): void => {
@@ -114,28 +126,63 @@ export function buildExecPromise(options: BuildExecPromiseOptions): Promise<Exec
     };
 
     const signalChild = (signal: NodeJS.Signals): void => {
-      if (child.pid === undefined) {
+      if (killProcessGroup) {
+        signalOwnedProcessGroup(child, kill, signal);
         return;
       }
-      const groupSignaled = killProcessGroup ? kill(-child.pid, signal) : false;
-      if (!groupSignaled) {
-        kill(child.pid, signal);
-      }
+      child.kill(signal);
+    };
+
+    const killedResult = (heldDetail?: string): ExecResult => {
+      const prefix = wrapperKilled === 'maxBuffer' ? 'maxBuffer exceeded' : 'timeout';
+      const code = wrapperKilled === 'maxBuffer' ? EXEC_MAXBUFFER_CODE : EXEC_TIMEOUT_CODE;
+      const detail = heldDetail === undefined ? '' : `; ${heldDetail}`;
+      return {
+        stdout,
+        stderr,
+        status: null,
+        error: Object.assign(new Error(`${prefix}: ${command}${detail}`), { code }),
+      };
     };
 
     const scheduleKill = (reason: 'timeout' | 'maxBuffer'): void => {
-      if (resolved || wrapperKilled !== null || child.pid === undefined) {
+      if (resolved || wrapperKilled !== null) {
         return;
       }
       wrapperKilled = reason;
       signalChild('SIGTERM');
-      killTimer = setTimeout(() => {
-        if (resolved || child.pid === undefined) {
+      escalationTimer = setTimeout(() => {
+        if (resolved) {
           return;
         }
         signalChild('SIGKILL');
       }, SIGTERM_GRACE_MS);
-      killTimer.unref?.();
+      escalationTimer.unref?.();
+      settlementDeadlineTimer = setTimeout(() => {
+        const childCollected = child.exitCode !== null || child.signalCode !== null;
+        if (child.pid === undefined) {
+          const signalAttempts = killProcessGroup
+            ? 'SIGTERM and SIGKILL delivery were not attempted because no pid or pgid could be attributed'
+            : 'SIGTERM and SIGKILL were attempted through the child handle without an identified pid';
+          const unobserved = childCollected
+            ? 'descendant absence remains unobserved'
+            : 'child collection and descendant absence remain unobserved';
+          finish(
+            killedResult(
+              `the command has no identified signal target; ${signalAttempts}; ${unobserved}; exec will not attempt further signals`,
+            ),
+          );
+          return;
+        }
+        const processId = String(child.pid);
+        const leaderIdentity = killProcessGroup ? `leader pid ${processId}` : `child pid ${processId}`;
+        const signalSubject = killProcessGroup ? `pgid ${processId}` : `pid ${processId}`;
+        const detail = childCollected
+          ? `${leaderIdentity} was collected; a process holding this exec's inherited stdio remains running and can no longer be attributed to ${signalSubject}; ${signalSubject} will not be signalled`
+          : `collection of ${leaderIdentity} remains unobserved within the escalation grace after SIGTERM and SIGKILL were attempted for ${signalSubject}; exec will not attempt further signals`;
+        finish(killedResult(detail));
+      }, SIGTERM_GRACE_MS + SIGKILL_GRACE_MS);
+      settlementDeadlineTimer.unref?.();
     };
 
     if (child.stdout) {
@@ -163,18 +210,7 @@ export function buildExecPromise(options: BuildExecPromiseOptions): Promise<Exec
     }
 
     child.on('close', (status) => {
-      let error: Error | undefined;
-      if (wrapperKilled === 'timeout') {
-        error = Object.assign(new Error(`timeout: ${command}`), { code: EXEC_TIMEOUT_CODE });
-      } else if (wrapperKilled === 'maxBuffer') {
-        error = Object.assign(new Error(`maxBuffer exceeded: ${command}`), { code: EXEC_MAXBUFFER_CODE });
-      }
-      finish({
-        stdout,
-        stderr,
-        status: error ? null : status,
-        ...(error ? { error } : {}),
-      });
+      finish(wrapperKilled === null ? { stdout, stderr, status } : killedResult());
     });
 
     child.on('error', (error) => {

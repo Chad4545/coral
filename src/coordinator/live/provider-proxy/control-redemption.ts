@@ -15,20 +15,23 @@ import {
   reaperHandoffRotateParamsSchema,
   type CoordinatorIdentity,
   type OperationIdentity,
+  type ProxyIdentity,
 } from '../../../provider-proxy/protocol.js';
 import { runtimeControlTimer, type RoleConnectRetryOptions } from '../../../provider-proxy/role-spawn.js';
 import type { Runtime } from '../../../runtime/ports.js';
 import {
   createProviderProxyAuthorityFaultLatch,
+  type ProviderProxyAuthorityFault,
+  type ProviderProxyAuthorityObservation,
   type ProviderProxyAuthorityFaultLatch,
-  type ProviderProxyRoleClients,
 } from '../../services/provider-proxy-authority-fault.js';
 import type { ProviderProxySetIdentity } from '../../services/provider-proxy-set/identity.js';
+import { commitProviderProxyGuardianContainment, type ProviderProxyContainmentAuthority } from './authority.js';
 import {
   createProviderProxyAuthorityHeartbeatAssembly,
   type ProviderProxyAuthorityHeartbeatAssembly,
-  type ProviderProxyRoleHeartbeats,
 } from './heartbeat.js';
+import type { ProviderProxyControlSessionBundle } from './control-session.js';
 import {
   establishRoleControl,
   ProviderProxyRoleControlRemoteError,
@@ -38,6 +41,11 @@ import {
   ESTABLISH_CONTROL_READY_DEADLINE_MS,
   ESTABLISH_CONTROL_RETRY_INTERVAL_MS,
 } from './role-control.js';
+import {
+  runProviderProxySetPublicationTransaction,
+  type ProviderProxySetPublicationUnknown,
+  type PublicationReceipt,
+} from './set-publication.js';
 
 const redeemedProviderProxyControlBrand: unique symbol = Symbol('RedeemedProviderProxyControl');
 
@@ -53,33 +61,45 @@ export const proxyHandoffRedeemResultSchema = proxyHandoffRedeemFieldsSchema.ext
 type GuardianHandoffRedemption = z.infer<typeof guardianHandoffRedeemResultSchema>;
 type ReaperHandoffRotation = z.infer<typeof reaperHandoffRotateResultSchema>;
 type ProxyHandoffRedemption = z.infer<typeof proxyHandoffRedeemResultSchema>;
+type EstablishedGuardianSession = Readonly<{
+  client: ControlClient;
+  opened: GuardianHandoffRedemption;
+  nextHeartbeatChallenge: string;
+}>;
 
 /** A complete three-role redemption result that is published only after identities and membership agree. */
-export type ProviderProxyControlRedemptionBundle = Readonly<{
-  setIdentity: ProviderProxySetIdentity;
-  clients: ProviderProxyRoleClients<ControlClient>;
-  heartbeats: ProviderProxyRoleHeartbeats;
-  faults: ProviderProxyAuthorityFaultLatch;
-  guardianIdentity: GuardianHandoffRedemption['guardian'];
-  reaperIdentity: ReaperHandoffRotation['reaper'];
-  proxyIdentity: ProxyHandoffRedemption['proxy'];
-  recoveryOperations: readonly OperationIdentity[];
-}>;
+export type ProviderProxyControlRedemptionBundle = ProviderProxyControlSessionBundle &
+  Readonly<{
+    recoveryOperations: readonly OperationIdentity[];
+    publicationReceipt: PublicationReceipt;
+  }>;
 
 export type RedeemedProviderProxyControl = Readonly<{
   kind: 'redeemed';
   [redeemedProviderProxyControlBrand]: ProviderProxyControlRedemptionBundle;
 }>;
 
+export interface ProviderProxyGuardianRedemptionAuthority extends ProviderProxyContainmentAuthority {
+  readonly faulted: Promise<ProviderProxyAuthorityFault>;
+  onFault(listener: (fault: ProviderProxyAuthorityFault) => void): () => void;
+  onIncident(listener: (observation: ProviderProxyAuthorityObservation) => void): () => void;
+}
+
 export type ProviderProxyControlRedemptionRefusal =
-  | Readonly<{ kind: 'role-refused'; error: ProviderProxyRoleControlRemoteError }>
+  | Readonly<{ kind: 'guardian-role-refused'; error: ProviderProxyRoleControlRemoteError }>
+  | Readonly<{
+      kind: 'downstream-role-refused';
+      error: ProviderProxyRoleControlRemoteError;
+      guardianAuthority: ProviderProxyGuardianRedemptionAuthority;
+    }>
   | Readonly<{
       kind: 'protocol-incompatible';
       incident: Extract<ProviderProxyRoleControlAvailabilityIncident, { kind: 'role-heartbeat-indeterminate' }>;
       error: ProviderProxyRoleControlUnavailableError;
     }>
   | Readonly<{ kind: 'identity-disagreement' }>
-  | Readonly<{ kind: 'operation-membership-disagreement' }>;
+  | Readonly<{ kind: 'operation-membership-disagreement' }>
+  | Readonly<{ kind: 'publication-refused'; role: 'guardian' | 'proxy'; reason: string }>;
 
 export type ProviderProxyControlRedemptionOutcome =
   | RedeemedProviderProxyControl
@@ -88,7 +108,8 @@ export type ProviderProxyControlRedemptionOutcome =
       kind: 'unavailable';
       incident: ProviderProxyRoleControlAvailabilityIncident;
       error: ProviderProxyRoleControlUnavailableError;
-    }>;
+    }>
+  | Readonly<{ kind: 'unavailable'; incident: ProviderProxySetPublicationUnknown }>;
 
 function canonicalOperationSet(operations: readonly OperationIdentity[]): string[] {
   return [
@@ -117,12 +138,26 @@ function identityFieldsAgree(
   return Object.entries(expected).every(([field, value]) => actual[field] === value);
 }
 
-function returnedIdentitiesMatch(
+function expectedProxyIdentity(target: ProviderProxySetIdentity, successor: CoordinatorIdentity): ProxyIdentity {
+  return {
+    proxyInstanceId: target.proxyInstanceId,
+    pid: target.proxyPid,
+    incarnation: target.proxyIncarnation,
+    processGroupId: target.proxyProcessGroupId,
+    guardianInstanceId: target.guardianInstanceId,
+    reaperInstanceId: target.reaperInstanceId,
+    generation: successor.generation,
+    flavor: successor.flavor,
+    buildSetId: target.buildSetId,
+    hostFingerprint: target.hostFingerprint,
+    canonicalEndpoint: target.canonicalEndpoint,
+  };
+}
+
+function returnedGuardianIdentityMatches(
   target: ProviderProxySetIdentity,
   successor: CoordinatorIdentity,
   guardian: GuardianHandoffRedemption,
-  reaper: ReaperHandoffRotation,
-  proxy: ProxyHandoffRedemption,
 ): boolean {
   const shared = {
     generation: successor.generation,
@@ -148,33 +183,50 @@ function returnedIdentitiesMatch(
       canonicalControlEndpoint: target.guardianControlEndpoint,
     }) &&
     identityFieldsAgree(guardian.reaper, expectedReaper) &&
-    identityFieldsAgree(reaper.reaper, expectedReaper) &&
     identityFieldsAgree(guardian.containment, {
       pid: target.proxyPid,
       incarnation: target.proxyIncarnation,
       processGroupId: target.proxyProcessGroupId,
       containmentKind: target.containmentKind,
-    }) &&
-    identityFieldsAgree(proxy.proxy, {
-      ...shared,
-      proxyInstanceId: target.proxyInstanceId,
-      pid: target.proxyPid,
-      incarnation: target.proxyIncarnation,
-      processGroupId: target.proxyProcessGroupId,
-      guardianInstanceId: target.guardianInstanceId,
-      reaperInstanceId: target.reaperInstanceId,
-      canonicalEndpoint: target.canonicalEndpoint,
     })
   );
 }
 
+function returnedIdentitiesMatch(
+  target: ProviderProxySetIdentity,
+  successor: CoordinatorIdentity,
+  guardian: GuardianHandoffRedemption,
+  reaper: ReaperHandoffRotation,
+  proxy: ProxyHandoffRedemption,
+): boolean {
+  const shared = {
+    generation: successor.generation,
+    flavor: successor.flavor,
+    buildSetId: target.buildSetId,
+    hostFingerprint: target.hostFingerprint,
+  };
+  const expectedReaper = {
+    ...shared,
+    reaperInstanceId: target.reaperInstanceId,
+    pid: target.reaperPid,
+    incarnation: target.reaperIncarnation,
+    guardianInstanceId: target.guardianInstanceId,
+    canonicalControlEndpoint: target.reaperControlEndpoint,
+    containmentKind: target.containmentKind,
+  };
+  return (
+    returnedGuardianIdentityMatches(target, successor, guardian) &&
+    identityFieldsAgree(reaper.reaper, expectedReaper) &&
+    identityFieldsAgree(proxy.proxy, expectedProxyIdentity(target, successor))
+  );
+}
+
 function roleConnectRetry(runtime: Runtime): RoleConnectRetryOptions {
-  const startedAtMonotonicMs = runtime.time.monotonicNow();
   return {
     connectTimeoutMs: ESTABLISH_CONTROL_CONNECT_TIMEOUT_MS,
     retryIntervalMs: ESTABLISH_CONTROL_RETRY_INTERVAL_MS,
     overallDeadlineMs: ESTABLISH_CONTROL_READY_DEADLINE_MS,
-    now: () => Number(runtime.time.monotonicNow() - startedAtMonotonicMs),
+    monotonicNow: () => runtime.time.monotonicNow(),
     sleep: (ms: number) => runtime.time.sleep(ms),
   };
 }
@@ -185,6 +237,33 @@ function abandonAttempt(
 ): void {
   heartbeatAssembly.stop();
   for (const client of opened) client.close();
+}
+
+function guardianRedemptionAuthority(
+  setIdentity: ProviderProxySetIdentity,
+  coordinatorIdentity: CoordinatorIdentity,
+  guardianSession: EstablishedGuardianSession,
+  heartbeatAssembly: ProviderProxyAuthorityHeartbeatAssembly,
+  opened: readonly ControlClient[],
+  faults: ProviderProxyAuthorityFaultLatch,
+): ProviderProxyGuardianRedemptionAuthority {
+  const clients = [...opened];
+  const containment = {
+    client: guardianSession.client,
+    guardian: guardianSession.opened.guardian,
+    reaper: guardianSession.opened.reaper,
+    proxy: expectedProxyIdentity(setIdentity, coordinatorIdentity),
+  };
+  return {
+    faulted: faults.faulted,
+    onFault: (listener) => faults.onFault(listener),
+    onIncident: (listener) => faults.onIncident(listener),
+    commitContainment: (signal) => commitProviderProxyGuardianContainment(containment, signal),
+    stopHeartbeats: () => heartbeatAssembly.stop(),
+    initiateControlClose: async () => {
+      for (const client of clients) client.close();
+    },
+  };
 }
 
 export function providerProxyControlRedemptionBundle(
@@ -220,42 +299,59 @@ export async function redeemProviderProxyControl(
   const opened: ControlClient[] = [];
   const faults = createProviderProxyAuthorityFaultLatch();
   const heartbeatAssembly = createProviderProxyAuthorityHeartbeatAssembly(runtime, faults);
+  let guardianSession: EstablishedGuardianSession | null = null;
 
   try {
-    const guardianSession = await establishRoleControl(opened, timer, roleConnectRetry(runtime), {
-      role: 'guardian',
-      endpoint: capsule.guardianControlEndpoint,
-      openMethod: 'guardian.handoff-redeem.v1',
-      openParams: { grantId: capsule.grantId, secret: capsule.secret, successor: coordinatorIdentity },
-      openParamsSchema: guardianHandoffRedeemParamsSchema,
-      openResultSchema: guardianHandoffRedeemResultSchema,
-      identity: (result) => result.guardian,
-      heartbeatMethod: 'guardian.heartbeat.v1',
-      expectedIdentity: {},
-    });
+    guardianSession = await establishRoleControl(
+      opened,
+      timer,
+      roleConnectRetry(runtime),
+      {
+        role: 'guardian',
+        endpoint: capsule.guardianControlEndpoint,
+        openMethod: 'guardian.handoff-redeem.v1',
+        openParams: { grantId: capsule.grantId, secret: capsule.secret, successor: coordinatorIdentity },
+        openParamsSchema: guardianHandoffRedeemParamsSchema,
+        openResultSchema: guardianHandoffRedeemResultSchema,
+        identity: (result) => result.guardian,
+        heartbeatMethod: 'guardian.heartbeat.v1',
+        expectedIdentity: {},
+      },
+      signal,
+    );
     heartbeatAssembly.startRole('guardian', {
       client: guardianSession.client,
       controlEpoch: guardianSession.opened.controlEpoch,
       nextHeartbeatChallenge: guardianSession.nextHeartbeatChallenge,
       instanceId: guardianSession.opened.guardian.guardianInstanceId,
     });
+    if (!returnedGuardianIdentityMatches(setIdentity, coordinatorIdentity, guardianSession.opened)) {
+      abandonAttempt(heartbeatAssembly, opened);
+      return { kind: 'refused', refusal: { kind: 'identity-disagreement' } };
+    }
     signal.throwIfAborted();
 
-    const reaperSession = await establishRoleControl(opened, timer, roleConnectRetry(runtime), {
-      role: 'reaper',
-      endpoint: capsule.reaperControlEndpoint,
-      openMethod: 'reaper.handoff-rotate.v1',
-      openParams: {
-        grantId: capsule.grantId,
-        successor: coordinatorIdentity,
-        guardianRedemptionReceipt: guardianSession.opened.redemptionReceipt,
+    const reaperSession = await establishRoleControl(
+      opened,
+      timer,
+      roleConnectRetry(runtime),
+      {
+        role: 'reaper',
+        endpoint: capsule.reaperControlEndpoint,
+        openMethod: 'reaper.handoff-rotate.v1',
+        openParams: {
+          grantId: capsule.grantId,
+          successor: coordinatorIdentity,
+          guardianRedemptionReceipt: guardianSession.opened.redemptionReceipt,
+        },
+        openParamsSchema: reaperHandoffRotateParamsSchema,
+        openResultSchema: reaperHandoffRotateResultSchema,
+        identity: (result) => result.reaper,
+        heartbeatMethod: 'reaper.heartbeat.v1',
+        expectedIdentity: {},
       },
-      openParamsSchema: reaperHandoffRotateParamsSchema,
-      openResultSchema: reaperHandoffRotateResultSchema,
-      identity: (result) => result.reaper,
-      heartbeatMethod: 'reaper.heartbeat.v1',
-      expectedIdentity: {},
-    });
+      signal,
+    );
     heartbeatAssembly.startRole('reaper', {
       client: reaperSession.client,
       controlEpoch: reaperSession.opened.controlEpoch,
@@ -264,26 +360,32 @@ export async function redeemProviderProxyControl(
     });
     signal.throwIfAborted();
 
-    const proxySession = await establishRoleControl(opened, timer, roleConnectRetry(runtime), {
-      role: 'proxy',
-      endpoint: capsule.proxyEndpoint,
-      openMethod: 'handoff.redeem.v1',
-      openParams: {
-        grantId: capsule.grantId,
-        secret: capsule.secret,
-        successor: coordinatorIdentity,
-        generation: coordinatorIdentity.generation,
-        hostFingerprint: capsule.hostFingerprint,
-        buildSetId: capsule.buildSetId,
-        proxyInstanceId: capsule.proxyInstanceId,
+    const proxySession = await establishRoleControl(
+      opened,
+      timer,
+      roleConnectRetry(runtime),
+      {
+        role: 'proxy',
+        endpoint: capsule.proxyEndpoint,
+        openMethod: 'handoff.redeem.v1',
+        openParams: {
+          grantId: capsule.grantId,
+          secret: capsule.secret,
+          successor: coordinatorIdentity,
+          generation: coordinatorIdentity.generation,
+          hostFingerprint: capsule.hostFingerprint,
+          buildSetId: capsule.buildSetId,
+          proxyInstanceId: capsule.proxyInstanceId,
+        },
+        openParamsSchema: proxyHandoffRedeemParamsSchema,
+        openResultSchema: proxyHandoffRedeemResultSchema,
+        identity: (result) => result.proxy,
+        heartbeatMethod: 'control.heartbeat.v1',
+        expectedIdentity: {},
+        ...(deps.onProviderEvent === undefined ? {} : { onProviderEvent: deps.onProviderEvent() }),
       },
-      openParamsSchema: proxyHandoffRedeemParamsSchema,
-      openResultSchema: proxyHandoffRedeemResultSchema,
-      identity: (result) => result.proxy,
-      heartbeatMethod: 'control.heartbeat.v1',
-      expectedIdentity: {},
-      ...(deps.onProviderEvent === undefined ? {} : { onProviderEvent: deps.onProviderEvent() }),
-    });
+      signal,
+    );
     heartbeatAssembly.startRole('proxy', {
       client: proxySession.client,
       controlEpoch: proxySession.opened.controlEpoch,
@@ -312,6 +414,26 @@ export async function redeemProviderProxyControl(
     }
 
     signal.throwIfAborted();
+    const publication = await runProviderProxySetPublicationTransaction(
+      guardianSession.client,
+      proxySession.client,
+      guardianSession.opened.guardian,
+      reaperSession.opened.reaper,
+      proxySession.opened.proxy,
+    );
+    if (publication.kind === 'publication-unknown') {
+      abandonAttempt(heartbeatAssembly, opened);
+      return { kind: 'unavailable', incident: publication };
+    }
+    if (publication.kind === 'not-attempted') {
+      abandonAttempt(heartbeatAssembly, opened);
+      return {
+        kind: 'refused',
+        refusal: { kind: 'publication-refused', role: publication.role, reason: publication.reason },
+      };
+    }
+
+    signal.throwIfAborted();
     const bundle: ProviderProxyControlRedemptionBundle = {
       setIdentity,
       clients: {
@@ -325,11 +447,13 @@ export async function redeemProviderProxyControl(
       reaperIdentity: reaperSession.opened.reaper,
       proxyIdentity: proxySession.opened.proxy,
       recoveryOperations: guardianSession.opened.operations,
+      publicationReceipt: publication.receipt,
     };
     return { kind: 'redeemed', [redeemedProviderProxyControlBrand]: bundle };
   } catch (error: unknown) {
-    abandonAttempt(heartbeatAssembly, opened);
     if (error instanceof ProviderProxyRoleControlUnavailableError) {
+      abandonAttempt(heartbeatAssembly, opened);
+      signal.throwIfAborted();
       if (
         error.incident.kind === 'role-heartbeat-indeterminate' &&
         error.incident.observation.kind === 'reply' &&
@@ -343,8 +467,31 @@ export async function redeemProviderProxyControl(
       return { kind: 'unavailable', incident: error.incident, error };
     }
     if (error instanceof ProviderProxyRoleControlRemoteError) {
-      return { kind: 'refused', refusal: { kind: 'role-refused', error } };
+      if (signal.aborted) {
+        abandonAttempt(heartbeatAssembly, opened);
+        signal.throwIfAborted();
+      }
+      if (guardianSession !== null && error.role !== 'guardian') {
+        return {
+          kind: 'refused',
+          refusal: {
+            kind: 'downstream-role-refused',
+            error,
+            guardianAuthority: guardianRedemptionAuthority(
+              setIdentity,
+              coordinatorIdentity,
+              guardianSession,
+              heartbeatAssembly,
+              opened,
+              faults,
+            ),
+          },
+        };
+      }
+      abandonAttempt(heartbeatAssembly, opened);
+      return { kind: 'refused', refusal: { kind: 'guardian-role-refused', error } };
     }
+    abandonAttempt(heartbeatAssembly, opened);
     throw error;
   }
 }

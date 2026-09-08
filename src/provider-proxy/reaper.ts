@@ -1,11 +1,14 @@
-import type { ProcessIncarnation } from '../infra/node-process.js';
+import type { AsyncRecordedProcessObserver, ProcessIncarnation } from '../infra/node-process.js';
 import type { z } from 'zod';
 
 import type { MonotonicClock } from '../infra/monotonic-clock.js';
 import type { ProcessContainmentEnvironment, RecordedContainmentIdentity } from '../infra/process-containment.js';
 import { createBootstrapNonceCredential, type ReaperBootstrapCapsule } from './bootstrap-capsule.js';
 import {
+  controlTenancyHolderOf,
   createControlEndpoint,
+  sameControlTenancyHolder,
+  type ControlTenancyHolder,
   type ControlEndpoint,
   type ControlEndpointTimer,
   type ControlMethod,
@@ -22,6 +25,7 @@ import {
   grantBindingFromCapsule,
   guardianReaperHandoffInstallParamsSchema,
   handoffOperationSetSchema,
+  holderStatusParamsSchema,
   reaperHandoffRotateFieldsSchema,
   reaperRecordRedemptionParamsSchema,
   sameOperations,
@@ -35,25 +39,34 @@ import {
   assertNamedCoordinatorBuild,
   assertNamedOrphanTimeout,
   assertNamedProxyIdentity,
-  assertNamedReaperIdentity,
   assertNamedTeardownReserve,
-  assertRecordedSetAgreement,
+  containmentPrepareTokenSchema,
+  type enforcementHoldStatusSchema,
+  holderStatusResultSchema,
+  providerProxyRoleAbandonmentParamsSchema,
+  providerProxyRoleAbandonmentResultSchema,
+  reaperAcquisitionPublishParamsSchema,
+  reaperAcquisitionPublishResultSchema,
   type guardianIdentitySchema,
   reaperConfirmProviderRootParamsSchema,
   reaperConfirmProviderRootResultSchema,
+  reaperContainmentAbortParamsSchema,
+  reaperContainmentAbortResultSchema,
+  reaperContainmentPrepareParamsSchema,
+  reaperContainmentPrepareResultSchema,
   type reaperIdentitySchema,
   recordedContainmentSchema,
   reaperRecordContainmentResultSchema,
   reaperRecordRedemptionResultSchema,
   reaperRegisterProviderRootParamsSchema,
   reaperRegisterProviderRootResultSchema,
-  reaperStopAndReapParamsSchema as stopAndReapParamsSchema,
-  reaperStopAndReapResultSchema,
   sameRecordedContainment,
+  type ContainmentPrepareToken,
   type OperationIdentity,
   reaperHandoffRotateParamsSchema,
   reaperOpenParamsSchema as openParamsSchema,
 } from './protocol.js';
+import type { ControlHolderAuthority } from './holder-lifecycle.js';
 import { PROXY_TEARDOWN_RESERVE_MS, type EnforcerDeadlineStateMachine } from './orphan-deadline.js';
 
 /**
@@ -95,16 +108,22 @@ export type ReaperOptions<Scope extends symbol> = Readonly<{
   mintReceipt(): string;
   /** The reaper's own pid/start identity, reported in `ReaperIdentity`. */
   self: Readonly<{ pid: number; incarnation: ProcessIncarnation }>;
+  /** Reaper deadlines and endpoint enforcement must share one holder authority. */
+  holderAuthority: ControlHolderAuthority;
+  /** Holder observation must not block the reaper's answering loop. */
+  observeHolder: AsyncRecordedProcessObserver;
+  enforcementHoldStatus?(): z.infer<typeof enforcementHoldStatusSchema> | null;
+  abandonUnattributable(): boolean;
   onOutcome(outcome: EnforcementOutcome): void;
-  /** A wake later than the model's bound. Reported, but teardown still proceeds. */
+  /** A late wake is diagnostic and does not itself authorize teardown. */
   onProgressViolation(observedWakeLatencyMs: number): void;
 }>;
 
-export interface Reaper<Scope extends symbol> {
+export interface Reaper {
   listen(): Promise<void>;
   close(): Promise<void>;
   /** Null until the guardian has recorded the containment this reaper is to enforce. */
-  enforcer(): ArmedEnforcer<Scope> | null;
+  enforcer(): ArmedEnforcer | null;
 }
 
 /**
@@ -119,14 +138,13 @@ export interface Reaper<Scope extends symbol> {
  * reaper be told to enforce a containment nobody verified. The guardian is the one party that observes the
  * group being created, so it is the one party that may name it.
  */
-export function createReaper<Scope extends symbol>(options: ReaperOptions<Scope>): Reaper<Scope> {
-  const { capsule, clock, deadlines, scheduler, timer, mintReceipt, self } = options;
+export function createReaper<Scope extends symbol>(options: ReaperOptions<Scope>): Reaper {
+  const { capsule, clock, deadlines, scheduler, timer, mintReceipt, self, holderAuthority, observeHolder } = options;
   let recorded: (RecordedContainmentIdentity & { readonly containmentKind: string }) | null = null;
-  let enforcer: ArmedEnforcer<Scope> | null = null;
+  let enforcer: ArmedEnforcer | null = null;
+  let pairingLost = false;
 
-  /** Every field a grant is bound to except the orphan timeout, mirroring `guardian.ts`'s own `setIdentity`:
-   *  built from this reaper's own capsule so a coordinator can never install a grant for a set it does not
-   *  belong to. */
+  /** Grant binding must derive from this role's capsule. */
   const setIdentity: GrantBinding = grantBindingFromCapsule(capsule);
   const grants = createGrantRegistry(mintReceipt, {
     mayReplaceRedemption: () => !deadlines.controlIsLive(),
@@ -138,12 +156,12 @@ export function createReaper<Scope extends symbol>(options: ReaperOptions<Scope>
   // own caller presents, which is why that method's own request carries none to check it against.
   let recordedRedemption: Readonly<{
     grantId: string;
-    successorInstanceId: string;
+    successor: ControlTenancyHolder;
     operations: readonly OperationIdentity[];
     redemptionReceipt: string;
   }> | null = null;
 
-  const requireEnforcer = (): ArmedEnforcer<Scope> => {
+  const requireEnforcer = (): ArmedEnforcer => {
     if (enforcer === null) {
       throw new ProxyControlProtocolError('invalid_state', 'This reaper has not been given a containment to hold.');
     }
@@ -167,6 +185,10 @@ export function createReaper<Scope extends symbol>(options: ReaperOptions<Scope>
     });
 
   const bootstrapNonce = createBootstrapNonceCredential(capsule.bootstrapNonce);
+
+  // Root registration must close before the reaper snapshots containment.
+  let registrationGateOpen = true;
+  let preparedToken: ContainmentPrepareToken | null = null;
 
   // Staging arrives over the guardian pairing channel, not the coordinator's control connection: the
   // guardian must be able to stage a root while the coordinator's own control is still provisional.
@@ -198,7 +220,10 @@ export function createReaper<Scope extends symbol>(options: ReaperOptions<Scope>
           }
           assertNamedGuardianCapsuleIdentity(request.guardian, capsule);
           assertNamedProxyIdentity('reaper', request.proxy, capsule);
-          return { holder: request.coordinator.instanceId, fields: { reaper: identityOf(recorded) } };
+          return {
+            holder: controlTenancyHolderOf(request.coordinator),
+            fields: { reaper: identityOf(recorded) },
+          };
         },
       },
     ],
@@ -227,6 +252,11 @@ export function createReaper<Scope extends symbol>(options: ReaperOptions<Scope>
             containment: request,
             containmentEnvironment: options.containmentEnvironment,
             scheduler,
+            holderAuthority,
+            observeHolder,
+            // Pairing loss may authorize accelerated absence only when no successor can remain in flight.
+            acceleratedCheckMayAuthorizeAbsence: true,
+            pairingLossObserved: () => pairingLost,
             onOutcome: options.onOutcome,
             onProgressViolation: options.onProgressViolation,
           });
@@ -245,6 +275,12 @@ export function createReaper<Scope extends symbol>(options: ReaperOptions<Scope>
       {
         authority: 'pairing',
         handle: (params) => {
+          if (!registrationGateOpen) {
+            throw new ProxyControlProtocolError(
+              'invalid_state',
+              'Provider-root registration is closed for a containment commit in progress.',
+            );
+          }
           const request = reaperRegisterProviderRootParamsSchema.parse(params);
           try {
             // Idempotent by construction, not by a receipt this handler manages: the enforcer's own record
@@ -290,13 +326,14 @@ export function createReaper<Scope extends symbol>(options: ReaperOptions<Scope>
           assertNamedCoordinatorBuild(request.successor, capsule);
           assertNamedTeardownReserve(request.teardownReserveMs, PROXY_TEARDOWN_RESERVE_MS);
           assertNamedOrphanTimeout(request.orphanTimeoutMs, deadlines.orphanTimeoutMs());
-          return grants.install({
+          const result = grants.install({
             grantId: request.grantId,
             secretSha256: request.secretSha256,
             ...setIdentity,
             operations: request.operations,
             orphanTimeoutMs: request.orphanTimeoutMs,
           });
+          return result;
         },
       },
     ],
@@ -309,10 +346,11 @@ export function createReaper<Scope extends symbol>(options: ReaperOptions<Scope>
         authority: 'pairing',
         handle: (params) => {
           const request = reaperRecordRedemptionParamsSchema.parse(params);
+          const successor = controlTenancyHolderOf(request.successor);
           if (recordedRedemption !== null) {
             const different =
               recordedRedemption.grantId !== request.grantId ||
-              recordedRedemption.successorInstanceId !== request.successor.instanceId ||
+              !sameControlTenancyHolder(recordedRedemption.successor, successor) ||
               recordedRedemption.redemptionReceipt !== request.redemptionReceipt ||
               !sameOperations(recordedRedemption.operations, request.operations);
             if (different && deadlines.controlIsLive()) {
@@ -327,7 +365,7 @@ export function createReaper<Scope extends symbol>(options: ReaperOptions<Scope>
           }
           recordedRedemption = {
             grantId: request.grantId,
-            successorInstanceId: request.successor.instanceId,
+            successor,
             operations: request.operations,
             redemptionReceipt: request.redemptionReceipt,
           };
@@ -374,10 +412,11 @@ export function createReaper<Scope extends symbol>(options: ReaperOptions<Scope>
         handle: (params) => {
           const request = reaperHandoffRotateParamsSchema.parse(params);
           assertNamedCoordinatorBuild(request.successor, capsule);
+          const successor = controlTenancyHolderOf(request.successor);
           if (
             recordedRedemption === null ||
             recordedRedemption.grantId !== request.grantId ||
-            recordedRedemption.successorInstanceId !== request.successor.instanceId ||
+            !sameControlTenancyHolder(recordedRedemption.successor, successor) ||
             recordedRedemption.redemptionReceipt !== request.guardianRedemptionReceipt
           ) {
             throw new ProxyControlProtocolError(
@@ -386,7 +425,7 @@ export function createReaper<Scope extends symbol>(options: ReaperOptions<Scope>
             );
           }
           return {
-            holder: request.successor.instanceId,
+            holder: successor,
             fields: reaperHandoffRotateFieldsSchema.parse({
               // A wire result describing what this call did, not a deadline-model state — the deadline
               // machine this endpoint shares with the guardian has exactly one enum, and this is not a
@@ -401,28 +440,134 @@ export function createReaper<Scope extends symbol>(options: ReaperOptions<Scope>
       },
     ],
     [
-      'reaper.stop-and-reap.v1',
+      'reaper.containment-prepare.v1',
       {
-        authority: 'active',
-        // Teardown spends the TERM and KILL graces plus a disappearance confirmation, which is longer than
-        // a mutation RPC's budget; the caller's own deadline governs instead.
-        budgetMs: 'caller-deadline',
-        handle: async (params) => {
-          const request = stopAndReapParamsSchema.parse(params);
+        // Only paired guardian authority may close the reaper's registration gate and request its root snapshot.
+        authority: 'pairing',
+        handle: (params) => {
+          reaperContainmentPrepareParamsSchema.parse(params);
           const armed = requireEnforcer();
-          // `recorded` and `enforcer` are set together in `reaper.record-containment.v1`, so a live enforcer
-          // guarantees a recorded identity to name the claimed reaper and proxy against.
-          const containment = recorded as RecordedContainmentIdentity & { readonly containmentKind: string };
-          assertNamedReaperIdentity(request.reaper, identityOf(containment));
-          assertNamedProxyIdentity('reaper', request.proxy, capsule);
-          assertRecordedSetAgreement('reaper', request.providerRoots, armed.recordedRoots());
-          const outcome = await armed.stopAndReap(deadlines.bounds().exitDeadline);
-          if (outcome.kind !== 'containment-absent') {
-            throw new ProxyControlProtocolError('invalid_state', `Reaper teardown did not complete: ${outcome.kind}.`);
+          registrationGateOpen = false;
+          const token = containmentPrepareTokenSchema.parse(mintReceipt());
+          preparedToken = token;
+          return reaperContainmentPrepareResultSchema.parse({
+            state: 'containment-prepared',
+            token,
+            providerRoots: armed.recordedRoots(),
+          });
+        },
+      },
+    ],
+    [
+      'reaper.containment-abort.v1',
+      {
+        authority: 'pairing',
+        handle: (params) => {
+          const request = reaperContainmentAbortParamsSchema.parse(params);
+          if (preparedToken === request.token) {
+            preparedToken = null;
+            registrationGateOpen = true;
+          } else if (preparedToken !== null) {
+            // A stale or replayed token names a prepare this reaper has already superseded — refused rather
+            // than silently reopening the *current* one out from under it.
+            throw new ProxyControlProtocolError(
+              'identity_mismatch',
+              'This reaper holds a different prepared containment token.',
+            );
           }
-          return reaperStopAndReapResultSchema.parse({
-            state: 'containment-absent',
-            disappearanceReceipt: outcome.disappearanceReceipt,
+          // Replaying an already-aborted prepare token must remain idempotent.
+          return reaperContainmentAbortResultSchema.parse({ state: 'containment-registration-reopened' });
+        },
+      },
+    ],
+    [
+      'reaper.acquisition-publish.v1',
+      {
+        authority: 'pairing',
+        handle: (params) => {
+          reaperAcquisitionPublishParamsSchema.parse(params);
+          holderAuthority.publish();
+          return reaperAcquisitionPublishResultSchema.parse({ state: 'acquisition-published' });
+        },
+      },
+    ],
+    [
+      'reaper.holder-status.v1',
+      {
+        authority: 'observation',
+        handle: (params) => {
+          const request = holderStatusParamsSchema.parse(params);
+          const verified = grants.verifyInstalledGrant({
+            grantId: request.grantId,
+            secret: request.secret,
+            binding: {
+              generation: request.generation,
+              flavor: request.flavor,
+              buildSetId: request.buildSetId,
+              hostFingerprint: request.hostFingerprint,
+              guardianInstanceId: request.guardianInstanceId,
+              reaperInstanceId: request.reaperInstanceId,
+              proxyInstanceId: request.proxyInstanceId,
+            },
+          });
+          if (!verified) {
+            throw new ProxyControlProtocolError('grant_invalid', 'Status did not present the installed grant.');
+          }
+          const current = holderAuthority.status();
+          if (current === null) {
+            throw new ProxyControlProtocolError('invalid_state', 'This reaper holds no observed holder yet.');
+          }
+          return holderStatusResultSchema.parse({
+            disposition: current.disposition,
+            phase: holderAuthority.phase(),
+            holder: {
+              instanceId: current.identity.holder.instanceId,
+              pid: current.identity.holder.pid,
+              incarnation: current.identity.holder.incarnation,
+            },
+            controlEpoch: current.identity.controlEpoch,
+            transitionSequence: current.transitionSequence,
+            changedAtMs: current.changedAtMs,
+            enforcementHold: options.enforcementHoldStatus?.() ?? null,
+          });
+        },
+      },
+    ],
+    [
+      'reaper.abandon-unattributable.v1',
+      {
+        authority: 'operator',
+        handle: (params) => {
+          const request = providerProxyRoleAbandonmentParamsSchema.parse(params);
+          const credential = holderStatusParamsSchema.parse(request.credential);
+          const verified = grants.verifyInstalledGrant({
+            grantId: credential.grantId,
+            secret: credential.secret,
+            binding: {
+              generation: credential.generation,
+              flavor: credential.flavor,
+              buildSetId: credential.buildSetId,
+              hostFingerprint: credential.hostFingerprint,
+              guardianInstanceId: credential.guardianInstanceId,
+              reaperInstanceId: credential.reaperInstanceId,
+              proxyInstanceId: credential.proxyInstanceId,
+            },
+          });
+          if (!verified) {
+            throw new ProxyControlProtocolError('grant_invalid', 'Abandonment did not present the installed grant.');
+          }
+          if (
+            request.roleIdentity.role !== 'reaper' ||
+            request.roleIdentity.pid !== self.pid ||
+            request.roleIdentity.incarnation !== self.incarnation
+          ) {
+            throw new ProxyControlProtocolError('identity_mismatch', 'Abandonment named a different reaper.');
+          }
+          if (!options.abandonUnattributable()) {
+            throw new ProxyControlProtocolError('invalid_state', 'This reaper has no unattributable hold to abandon.');
+          }
+          return providerProxyRoleAbandonmentResultSchema.parse({
+            state: 'unattributable-containment-abandoned',
           });
         },
       },
@@ -446,9 +591,13 @@ export function createReaper<Scope extends symbol>(options: ReaperOptions<Scope>
       // What it does mean is that the party that linearizes an ordered redemption is gone, so admitting a
       // successor can now only fail — hence its own vocabulary, `observePairingLoss`, rather than folding
       // it into `observeEof` and collapsing two separate authorities into one.
-      onPairingLost: () => deadlines.observePairingLoss(),
+      onPairingLost: () => {
+        pairingLost = true;
+        deadlines.observePairingLoss();
+      },
     },
     timer,
+    holderAuthority,
     requestTimeoutMs: PROXY_CONTROL_RPC_TIMEOUT_MS,
     // Teardown may legitimately spend the TERM and KILL graces plus the disappearance confirmation, which
     // is longer than a mutation RPC's budget. Cutting it off would report a failure for a reap in progress.
@@ -464,7 +613,7 @@ export function createReaper<Scope extends symbol>(options: ReaperOptions<Scope>
       enforcer?.disarm();
       await endpoint.close();
     },
-    enforcer(): ArmedEnforcer<Scope> | null {
+    enforcer(): ArmedEnforcer | null {
       return enforcer;
     },
   };

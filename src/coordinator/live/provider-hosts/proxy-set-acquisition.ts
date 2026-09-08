@@ -1,11 +1,17 @@
-import { probeProcessIncarnation } from '../../../infra/node-process.js';
 import type { Runtime } from '../../../runtime/ports.js';
 import type { CoordinatorIdentity as ProviderProxyCoordinatorIdentity } from '../../../provider-proxy/protocol.js';
 import type { ProviderEventHandler } from '../../../provider-proxy/control-client.js';
 import type { ProviderProxyOperationSnapshot } from '../../services/operation-registry.js';
-import { acquireProviderProxySet } from '../provider-proxy/index.js';
+import { acquireProviderProxySet, type ProviderProxyAcquisitionHeld } from '../provider-proxy/index.js';
 import { createProviderProxyAcquisitionSteps } from '../provider-proxy/acquisition-steps.js';
+import type { ProviderProxyAcquisitionAbsenceEvidence } from '../provider-proxy/spawn-undo.js';
 import type { ProviderProxyOperationAuthority } from '../provider-proxy/operation-route.js';
+import type { PublicationReceipt } from '../provider-proxy/set-publication.js';
+import {
+  handOverProviderProxyAcquisitionControlSession,
+  providerProxyControlSessionOwner,
+  type ProviderProxyAcquisitionSessionHandedOver,
+} from '../provider-proxy/control-session.js';
 import { hostFingerprintFromSpec, type ProviderHostEntry } from './state.js';
 
 /**
@@ -38,65 +44,138 @@ export type ProviderProxySetAcquisitionConfig = Readonly<{
   identity: ProviderProxySetAcquisitionIdentity;
   /** Supplies the live provider roots used for stop-and-reap agreement. */
   operationRegistry: ProviderProxyOperationSnapshot;
-  /**
-   * Builds the durable-effect handler for `provider.event.v1` fresh, once per acquisition, rather than
-   * accepting an already-built handler: this config is composed once, before the store exists
-   * (`composition/world.ts` runs ahead of store open), while the handler itself needs the store. A factory
-   * lets construction stay eager while evaluation stays lazy — it is only ever called once control is
-   * actually established on the proxy role, by which point real provider work is already running and the
-   * store is certainly open. Absent in every composition that does not wire proxy event application (every
-   * test, and any coordinator build with W2.3 disabled) — the proxy connection is then opened with no
-   * `onProviderEvent` handler installed at all, so a peer sending `provider.event.v1` over it gets the
-   * protocol's own `protocol_violation` refusal instead of silence.
-   */
+  /** Invocation is permitted only after provider-proxy control is established. */
   onProviderEvent?: () => ProviderEventHandler;
 }>;
 
 export type ProviderProxySetAcquisitionEnvironment = ProviderProxySetAcquisitionConfig &
   Readonly<{
     runtime: Runtime;
-    /**
-     * Aborted by the provider host manager's `stopAndClose` the instant it begins (see that field's own
-     * doc), independent of and in addition to this attempt's own `PROVIDER_PROXY_SET_ACQUISITION_DEADLINE_MS`
-     * budget. Combined with it below via `AbortSignal.any`, so a stop mid-handshake reaches
-     * `acquireProviderProxySet`'s own final gate the same way its internal timeout already does: unwound,
-     * reported failed, and never published to the caller's `liveSets()` — whether or not the in-flight
-     * handshake itself had a chance to notice the abort before finishing.
-     */
+    /** Cancellation must not classify publication uncertainty as an ordinary failure. */
     signal: AbortSignal;
+    acceptHold: NonNullable<Parameters<typeof acquireProviderProxySet>[0]['acceptHold']>;
   }>;
 
 export type ProviderProxySetAcquisitionOutcome =
-  | Readonly<{ kind: 'acquired'; set: ProviderProxyOperationAuthority }>
-  | Readonly<{ kind: 'failed'; reason: string }>;
+  | Readonly<{
+      kind: 'acquired';
+      set: ProviderProxyOperationAuthority;
+      publicationReceipt: PublicationReceipt;
+    }>
+  | Readonly<{ kind: 'failed'; reason: string; strandedArtifacts: readonly string[] }>
+  | Readonly<{ kind: 'outcome-unknown'; reason: string }>
+  | ProviderProxyAcquisitionHeld<'provider-host-manager'>
+  | ProviderProxyAcquisitionSessionHandedOver<'provider-host-manager'>;
+
+export type ProviderProxySetAcquisitionStopDisposition = 'contain' | 'handoff';
+
+type TransferableProviderProxySetAcquisition = Extract<
+  ProviderProxySetAcquisitionOutcome,
+  { kind: 'acquired' | 'handed-over' }
+>;
+
+export type ProviderProxySetAcquisitionCleanupDisposition =
+  | Readonly<{
+      kind: 'absence-confirmed';
+      evidence?: ProviderProxyAcquisitionAbsenceEvidence;
+      strandedArtifacts: readonly string[];
+    }>
+  | Readonly<{
+      kind: 'transfer-required';
+      successor: 'provider-proxy-set-lifecycle';
+      acquisition: TransferableProviderProxySetAcquisition;
+    }>
+  | Readonly<{ kind: 'held'; reason: string }>;
+
+export type ProviderProxySetAcquisitionCleanupOutcome =
+  | Extract<ProviderProxySetAcquisitionCleanupDisposition, { kind: 'absence-confirmed' | 'held' }>
+  | Readonly<{ kind: 'delegated'; owner: 'provider-proxy-set-lifecycle' }>;
+
+export type ProviderProxySetAcquisitionCleanupHold =
+  | ProviderProxyAcquisitionHeld<'provider-host-manager'>
+  | Readonly<{
+      kind: 'provider_proxy_acquisition_pending_cleanup';
+      owner: 'provider-host-manager';
+      target: string;
+      reason: string;
+      recoveryCapability: Readonly<{
+        retry(signal: AbortSignal): Promise<ProviderProxySetAcquisitionCleanupOutcome>;
+      }>;
+    }>
+  | Readonly<{
+      kind: 'provider_proxy_acquisition_publication_cleanup';
+      owner: 'provider-proxy-set-lifecycle';
+      target: string;
+      reason: string;
+      exit: 'publication-confirmation-or-control-reattachment';
+      recoveryCapability: Readonly<{
+        retry(signal: AbortSignal): Promise<ProviderProxySetAcquisitionCleanupOutcome>;
+      }>;
+    }>;
+
+export async function disposeStoppedProviderProxySetAcquisition(
+  outcome: ProviderProxySetAcquisitionOutcome,
+  disposition: ProviderProxySetAcquisitionStopDisposition,
+  signal?: AbortSignal,
+): Promise<ProviderProxySetAcquisitionCleanupDisposition> {
+  if (outcome.kind === 'failed') {
+    return { kind: 'absence-confirmed', strandedArtifacts: outcome.strandedArtifacts };
+  }
+  if (outcome.kind === 'outcome-unknown') return { kind: 'held', reason: outcome.reason };
+  if (outcome.kind === 'provider_proxy_acquisition_held') {
+    try {
+      return await outcome.recoveryCapability.retry(signal ?? new AbortController().signal);
+    } catch (error: unknown) {
+      return { kind: 'held', reason: error instanceof Error ? error.message : String(error) };
+    }
+  }
+  if (outcome.kind === 'handed-over') {
+    return {
+      kind: 'transfer-required',
+      successor: 'provider-proxy-set-lifecycle',
+      acquisition: outcome,
+    };
+  }
+  if (disposition === 'contain') {
+    try {
+      const containment = await outcome.set.stopAndReap(signal ?? new AbortController().signal);
+      return 'unconfirmed' in containment
+        ? { kind: 'held', reason: `provider_proxy_set_acquisition_containment_unconfirmed: ${containment.unconfirmed}` }
+        : { kind: 'absence-confirmed', strandedArtifacts: [] };
+    } catch (error: unknown) {
+      return { kind: 'held', reason: error instanceof Error ? error.message : String(error) };
+    }
+  }
+  return {
+    kind: 'transfer-required',
+    successor: 'provider-proxy-set-lifecycle',
+    acquisition: outcome,
+  };
+}
 
 /**
- * Starts one acquisition attempt for `entry`'s guardian/reaper/proxy set and reports how it settled.
- *
- * Never rejects and is never awaited by its caller: the caller of `acquireHostLease` gets its real app-server
- * session exactly as before, unaffected by whether this succeeds, fails, or is still running when that
- * session opens — a slow or failed acquisition here must add neither latency nor failure to it. Single-
- * flighting one attempt per entry is the caller's responsibility (mirrors `ensureProviderServerHandle` in
- * `recovery.ts`); this function always starts a fresh attempt when called.
- *
- * `env.signal` lets a caller retract this attempt without waiting for it: aborting it never shortens an
- * in-flight handshake, but it guarantees the eventual outcome is `failed`, never `acquired` — see
- * `ProviderProxySetAcquisitionEnvironment.signal`'s own doc.
+ * `onSettled` must be invoked before rejection. Abortion must not turn possible publication into ordinary
+ * failure or release its recovery owner.
  */
 export function ensureProviderProxySet(
   entry: ProviderHostEntry,
   env: ProviderProxySetAcquisitionEnvironment,
-  onSettled: (outcome: ProviderProxySetAcquisitionOutcome) => void,
-): void {
+  onSettled: (outcome: ProviderProxySetAcquisitionOutcome) => void | Promise<void>,
+): Promise<void> {
   const pid = env.runtime.env.pid();
   const platform = env.runtime.env.platform() as NodeJS.Platform;
-  const incarnation = probeProcessIncarnation(pid, platform);
+  const incarnation = env.runtime.process.readProcessIncarnation(pid, platform);
   if (incarnation === null) {
     // This process's own incarnation is not a value this file may guess at: the coordinator identity it feeds
     // the handshake is a security-relevant field, not a diagnostic one, so an unreadable read is a failed
     // attempt rather than a fabricated `0`.
-    onSettled({ kind: 'failed', reason: 'could not read this coordinator process’s own incarnation' });
-    return;
+    return Promise.resolve(
+      onSettled({
+        kind: 'failed',
+        reason: 'could not read this coordinator process’s own incarnation',
+        strandedArtifacts: [],
+      }),
+    );
   }
   const coordinatorIdentity: ProviderProxyCoordinatorIdentity = {
     instanceId: env.identity.instanceId,
@@ -114,17 +193,37 @@ export function ensureProviderProxySet(
     operationRegistry: env.operationRegistry,
     ...(env.onProviderEvent === undefined ? {} : { onProviderEvent: env.onProviderEvent }),
   });
-  void acquireProviderProxySet({
+  return acquireProviderProxySet({
     steps,
+    time: env.runtime.time,
+    acceptHold: env.acceptHold,
     deadlineSignal: AbortSignal.any([AbortSignal.timeout(PROVIDER_PROXY_SET_ACQUISITION_DEADLINE_MS), env.signal]),
-  }).then(
-    (result) => {
-      onSettled(
-        result.kind === 'acquired' ? { kind: 'acquired', set: result.set } : { kind: 'failed', reason: result.reason },
-      );
-    },
-    (error: unknown) => {
-      onSettled({ kind: 'failed', reason: error instanceof Error ? error.message : String(error) });
-    },
-  );
+  })
+    .then(
+      (result) => {
+        if (result.kind === 'provider_proxy_acquisition_failed') {
+          return onSettled({ kind: 'failed', reason: result.reason, strandedArtifacts: result.strandedArtifacts });
+        }
+        if (result.kind === 'provider_proxy_acquisition_held') {
+          return onSettled({ ...result, owner: 'provider-host-manager' });
+        }
+        if (result.kind === 'handed-over') {
+          return onSettled(
+            handOverProviderProxyAcquisitionControlSession(
+              result.session,
+              providerProxyControlSessionOwner.providerHostManager,
+              result.incident,
+            ),
+          );
+        }
+        return onSettled(result);
+      },
+      (error: unknown) => {
+        return onSettled({
+          kind: 'outcome-unknown',
+          reason: error instanceof Error ? error.message : String(error),
+        });
+      },
+    )
+    .then(() => undefined);
 }

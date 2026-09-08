@@ -1,4 +1,4 @@
-import type { ProcessIncarnation, ProcessLiveness } from '../infra/node-process.js';
+import type { AsyncRecordedProcessObserver, ProcessIncarnation, ProcessLiveness } from '../infra/node-process.js';
 import type { BuildFlavor } from '../infra/build-flavor.js';
 import type { CoralPaths } from '../infra/path/index.js';
 import type {
@@ -10,6 +10,7 @@ import type {
   TimePort,
 } from '../infra/port-types.js';
 import type { RecordedProcessIdentity } from '../infra/process-containment.js';
+import type { GracefulKillDisposition, LiveChildAuthority } from '../infra/process-supervision.js';
 import type { DurableCliRuntimeRecord, DurableProcessExit } from './durable-runtime.js';
 
 export interface RuntimePaths {
@@ -66,17 +67,95 @@ export type DurableLaunchOptions = {
   envAdditions?: Record<string, string>;
   /** Complete child environment; when present, envAdditions is ignored. */
   env?: Record<string, string>;
+  onWrapperSpawned?(obligation: DurablePendingLaunchObligation): DurableLaunchOwnershipAcceptance;
+  onWrapperIdentified?(
+    launch: Readonly<{
+      runtimeRecord: DurableCliRuntimeRecord;
+      pid: number;
+      leaderIncarnation: ProcessIncarnation;
+      signalAuthority?: DurableLaunchSignalAuthority;
+    }>,
+  ): void;
+  /** Launch readiness must not be returned before this callback completes. */
+  onSpawned?(launch: DurableProvisionalLaunch): void;
 };
 
+export type DurablePendingLaunchObligation = Readonly<{
+  pid: number | null;
+  settled: Promise<void>;
+  requestTermination(): GracefulKillDisposition;
+}>;
+
+export type DurableLaunchOwnershipAcceptance = Readonly<{ kind: 'accepted' }>;
+
+export type DurableCliProcessSubject = RecordedProcessIdentity &
+  Readonly<{
+    processGroupId: number;
+    childRoot: RecordedProcessIdentity;
+  }>;
+
+export type DurableProvisionalProcessSubject = Readonly<{
+  kind: 'provisional-wrapper';
+  pid: number;
+  incarnation: ProcessIncarnation;
+  processGroupId: number;
+  provider: string;
+  jobDir: string;
+}>;
+
+export type DurableProvisionalLaunch = Readonly<{
+  runtimeRecord: DurableCliRuntimeRecord;
+  leaderIncarnation: ProcessIncarnation | null;
+  childRoot: RecordedProcessIdentity | null;
+  signalAuthority?: DurableLaunchSignalAuthority;
+}>;
+
+export type DurableLaunchSignalAuthority = LiveChildAuthority &
+  Readonly<{
+    requestTermination?(): GracefulKillDisposition;
+  }>;
+
+export type DurableContainmentStatus =
+  | Readonly<{
+      kind: 'held';
+      reason: string;
+      retryIntervalMs: number;
+      abandonment: 'abort-job';
+    }>
+  | Readonly<{ kind: 'absence-confirmed' }>
+  | Readonly<{ kind: 'operator-abandoned'; processAbsenceProven: false }>;
+
+declare const durableLaunchHandleBrand: unique symbol;
+
+/** Only the runtime that accepted a launch may mint its exit-registration handle. */
+export type DurableLaunchHandle = string & { readonly [durableLaunchHandleBrand]: true };
+
 export type DurableLaunchResult = {
+  disposition: 'launched';
+  launchHandle: DurableLaunchHandle;
   pid: number;
   stdoutPath: string;
   stderrPath: string;
   runtimeRecord: DurableCliRuntimeRecord;
+  processSubject: DurableCliProcessSubject;
+  signalAuthority?: DurableLaunchSignalAuthority;
 };
 
+export type DurableLaunchHeld = Readonly<{
+  disposition: 'held';
+  owner: 'launch-caller';
+  pid: number | null;
+  reason: string;
+  retryAfter: Promise<void>;
+  retry(): Promise<DurableLaunchRetryDisposition>;
+}>;
+
+export type DurableLaunchRetryDisposition = DurableLaunchHeld | Readonly<{ disposition: 'settled' }>;
+
+export type DurableLaunchDisposition = DurableLaunchResult | DurableLaunchHeld;
+
 export interface DurableExecutionTransport {
-  launch(options: DurableLaunchOptions): Promise<DurableLaunchResult>;
+  launch(options: DurableLaunchOptions): Promise<DurableLaunchDisposition>;
   waitForExit(handle: DurableLaunchResult): Promise<DurableProcessExit>;
 }
 
@@ -98,6 +177,8 @@ export interface ProcessPort {
   kill(pid: number, signal: NodeJS.Signals | 0): boolean;
   observeLiveness(pid: number): ProcessLiveness;
   readProcessIncarnation(pid: number, platform: NodeJS.Platform): ProcessIncarnation | null;
+  /** Process observation must remain non-blocking, tri-state, and bound to exact identity. */
+  observeRecordedProcessAsync: AsyncRecordedProcessObserver;
   observeProcessIdentities(
     owners: readonly RecordedProcessIdentity[],
     deadlineMs: number,

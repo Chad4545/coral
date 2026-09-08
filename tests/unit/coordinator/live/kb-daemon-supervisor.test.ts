@@ -11,6 +11,7 @@ import type { Runtime, RuntimeSpawnOptions } from '#src/runtime/ports.js';
 import { CORAL_KB_EXTRA_LANGS_ENV } from '#src/kb/extra-langs.js';
 import { VirtualTime, flushMicrotasks } from '#tools/simulation/core/virtual-time.js';
 import { fixtureCanonicalWorkDir } from '#tests/helpers/canonical-work-dir.js';
+import type { ChildProcessLike } from '#src/infra/port-types.js';
 
 class FakeStdin extends EventEmitter {
   destroyed = false;
@@ -29,7 +30,9 @@ class FakeStdin extends EventEmitter {
   }
 }
 
-class FakeDaemonProcess extends EventEmitter {
+class FakeDaemonProcess extends EventEmitter implements ChildProcessLike {
+  exitCode: number | null = null;
+  signalCode: NodeJS.Signals | null = null;
   readonly stdin = new FakeStdin();
   readonly stdout = new PassThrough();
   readonly stderr = new PassThrough();
@@ -47,6 +50,9 @@ class FakeDaemonProcess extends EventEmitter {
   }
 
   emitClose(code: number | null, signal: NodeJS.Signals | null): void {
+    this.exitCode = code;
+    this.signalCode = signal;
+    this.emit('exit', code, signal);
     this.emit('close', code, signal);
   }
 }
@@ -68,6 +74,7 @@ function createRuntime(
         }
         return daemonProcess;
       }),
+      observeLiveness: () => 'alive' as const,
     },
     storage: {},
     env: {
@@ -1097,6 +1104,90 @@ describe('KB daemon supervisor', () => {
     expect(supervisor.read()).toMatchObject({ phase: 'stopped', generation: 1, pendingRequests: 0 });
   });
 
+  it('holds disposal after the stop timeout until the daemon close settles the obligation', async () => {
+    const daemonProcess = new FakeDaemonProcess(183);
+    const { runtime, time } = createRuntime([daemonProcess]);
+    const supervisor = createKbDaemonSupervisor({
+      runtime,
+      pluginRoot: '/plugin',
+      entrypoint: '/plugin/bridge/coral-backend.cjs',
+      command: '/node',
+      stopTimeoutMs: 100,
+    });
+
+    const start = supervisor.start();
+    await flushMicrotasks();
+    writeReady(daemonProcess);
+    await start;
+
+    const disposal = supervisor.dispose('shutdown');
+    await flushMicrotasks();
+    time.tick(100);
+    await flushMicrotasks(12);
+    const held = await disposal;
+
+    expect(held).toMatchObject({
+      kind: 'holding',
+      snapshot: { phase: 'failed', pid: 183 },
+      reason: expect.stringContaining('has not been observed absent'),
+      exit: 'kb-daemon-process-close',
+      retryAfter: expect.any(Promise),
+      retry: expect.any(Function),
+    });
+    if (held.kind !== 'holding') throw new Error('Expected daemon disposal to remain held');
+
+    const retry = held.retry();
+    await flushMicrotasks();
+    daemonProcess.emitClose(0, null);
+
+    await expect(held.retryAfter).resolves.toBeUndefined();
+    await expect(retry).resolves.toMatchObject({
+      kind: 'confirmed-absent',
+      snapshot: { phase: 'stopped', pid: null },
+    });
+  });
+
+  it('retains a live daemon whose piped handles are unavailable until disposal observes close', async () => {
+    const daemonProcess = new FakeDaemonProcess(184);
+    Object.defineProperty(daemonProcess, 'stdout', { value: null });
+    const { runtime, time } = createRuntime([daemonProcess]);
+    const supervisor = createKbDaemonSupervisor({
+      runtime,
+      pluginRoot: '/plugin',
+      entrypoint: '/plugin/bridge/coral-backend.cjs',
+      command: '/node',
+      stopTimeoutMs: 100,
+    });
+
+    await expect(supervisor.start()).resolves.toMatchObject({ phase: 'failed', pid: 184 });
+    expect(daemonProcess.killedSignals).toEqual(['SIGTERM']);
+
+    const disposal = supervisor.dispose('shutdown');
+    await flushMicrotasks();
+    time.tick(100);
+    await flushMicrotasks(12);
+    const held = await disposal;
+
+    expect(held).toMatchObject({
+      kind: 'holding',
+      snapshot: { phase: 'failed', pid: 184 },
+      exit: 'kb-daemon-process-close',
+      retryAfter: expect.any(Promise),
+      retry: expect.any(Function),
+    });
+    if (held.kind !== 'holding') throw new Error('Expected the pipe-less daemon disposal to remain held');
+
+    const retry = held.retry();
+    await flushMicrotasks();
+    daemonProcess.emitClose(0, 'SIGTERM');
+
+    await expect(held.retryAfter).resolves.toBeUndefined();
+    await expect(retry).resolves.toMatchObject({
+      kind: 'confirmed-absent',
+      snapshot: { phase: 'stopped', pid: null },
+    });
+  });
+
   it('does not allow a restart queued after dispose to revive the daemon', async () => {
     const first = new FakeDaemonProcess(181);
     const second = new FakeDaemonProcess(182);
@@ -1344,6 +1435,9 @@ describe('createDisabledKbDaemonSupervisor', () => {
       aborted: [],
       notFound: ['jb-1', 'jb-2'],
     });
-    await expect(supervisor.dispose()).resolves.toBeUndefined();
+    await expect(supervisor.dispose()).resolves.toMatchObject({
+      kind: 'confirmed-absent',
+      snapshot: { phase: 'disabled', enabled: false },
+    });
   });
 });

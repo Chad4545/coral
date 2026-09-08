@@ -1,8 +1,17 @@
 import { backendLog } from '../infra/backend-log.js';
-import { probeProcessIncarnation, type ProcessIncarnation } from '../infra/node-process.js';
+import type { JsonValue } from '../infra/json-value.js';
+import type { ProcessIncarnation } from '../infra/node-process.js';
 import type { Runtime } from '../runtime/ports.js';
 import {
+  isAcceptedProviderServerOperatorAbandonment,
+  requestJoinableProviderServerShutdown,
   spawnProviderServerTransport,
+  type HeldProviderServerSpawn,
+  type ProviderServerFailedSpawnCleanupAcceptance,
+  type ProviderServerFailedSpawnCleanupDisposition,
+  type ProviderServerFailedSpawnCleanupHold,
+  type ProviderServerCleanupHold,
+  type ProviderServerCloseDisposition,
   type ProviderServerHandle,
   type SpawnProviderServerOptions,
 } from '../providers/app-server-transport.js';
@@ -10,13 +19,23 @@ import type { ProviderHostDiagnosticsSnapshot } from '../providers/host-diagnost
 import {
   admissionSlotKey,
   canonicalProviderHostSpecMetadata,
+  exactHostRefIdentityKey,
   exactHostRefsMatch,
   type AdmissionSlotKey,
   type HostAdmissionCollection,
   type HostAdmissionReservation,
   type HostAdmissionSnapshot,
 } from '../providers/host-admission.js';
-import type { AppServerTransport, HostRef, ProviderServerSpec } from '../providers/contract.js';
+import {
+  providerServerShutdownResultSchema,
+  type AppServerTransport,
+  type HostRef,
+  type ProviderHostEvictionDisposition,
+  type ProviderHostTerminalEvictionDisposition,
+  type ProviderServerFailedSpawnOperatorAbandonment,
+  type ProviderServerShutdownResult,
+  type ProviderServerSpec,
+} from '../providers/contract.js';
 import type { AppServerHostAuthority, ManagedHostSession } from '../providers/internal/app-server-host.js';
 import type { ProviderOperationKey } from './ledger.js';
 import type { ProviderHostInventoryRecordWire, ProxyPrepareCapacityCode } from './protocol.js';
@@ -95,25 +114,133 @@ function transportFor(handle: ProviderServerHandle): AppServerTransport {
   };
 }
 
-/** Best-effort graceful shutdown through the spec's own `shutdownCapability` RPC, if any, then the shared
- *  transport's own SIGTERM/SIGKILL escalation regardless of how the graceful attempt went. `handle.close()` is
- *  idempotent (`entry.closed` is checked before signalling), so running it after an already-graceful exit
- *  costs nothing but one no-op signal to a process that is already gone. */
+function isHeldProviderServerSpawn(
+  disposition: ProviderServerHandle | HeldProviderServerSpawn,
+): disposition is HeldProviderServerSpawn {
+  return 'kind' in disposition && (disposition.kind === 'held-alive' || disposition.kind === 'held-unobservable');
+}
+
 async function closeSpawnedHandle(
   handle: ProviderServerHandle,
   spec: ProviderServerSpec,
   runtime: Runtime,
-): Promise<void> {
+  acceptCleanupHold: (hold: ProviderServerCleanupHold) => ProviderServerFailedSpawnCleanupAcceptance,
+): Promise<ProviderServerCloseDisposition | ProviderServerShutdownHoldWithoutRetry> {
   const capability = spec.shutdownCapability;
   if (capability !== undefined) {
     handle.markExpectedClose();
-    try {
-      await Promise.race([handle.rpc.request(capability.method, {}), runtime.time.sleep(capability.timeoutMs)]);
-    } catch {
-      /* best effort; the escalation below still runs */
+    const resultDisposition = capability.resultDisposition;
+    if (resultDisposition?.kind === 'provider-server-shutdown-v1') {
+      let result: ProviderServerShutdownResult | null = null;
+      try {
+        const response = await Promise.race([
+          requestJoinableProviderServerShutdown(handle, capability.method).then((value) => ({
+            kind: 'response' as const,
+            value,
+          })),
+          runtime.time.sleep(capability.timeoutMs).then(() => ({ kind: 'timeout' as const })),
+        ]);
+        if (response.kind === 'response') result = providerServerShutdownResultSchema.parse(response.value);
+      } catch {
+        result = null;
+      }
+      if (result === null) {
+        return {
+          kind: 'provider-shutdown-held-unobservable',
+          observation: 'unobservable',
+          subject: { kind: 'provider-server', pid: handle.pid },
+          obligations: [],
+          successor: null,
+          operatorExit: { kind: 'retry-provider-shutdown' },
+        };
+      }
+      if (
+        result.disposition !== 'observed-absent' &&
+        (result.successor.owner !== resultDisposition.successorOwner ||
+          result.operatorExit.kind !== resultDisposition.operatorExit)
+      ) {
+        result = null;
+      }
+      if (result === null) {
+        return {
+          kind: 'provider-shutdown-held-unobservable',
+          observation: 'unobservable',
+          subject: { kind: 'provider-server', pid: handle.pid },
+          obligations: [],
+          successor: null,
+          operatorExit: { kind: 'retry-provider-shutdown' },
+        };
+      }
+      if (result.disposition !== 'observed-absent') {
+        return {
+          kind:
+            result.disposition === 'held-alive'
+              ? 'provider-shutdown-held-alive'
+              : 'provider-shutdown-held-unobservable',
+          observation: result.observation,
+          subject: { kind: 'provider-server', pid: handle.pid },
+          obligations: result.subjects,
+          successor: result.successor,
+          operatorExit: result.operatorExit,
+        };
+      }
+      return handle.close(acceptCleanupHold);
     }
+    await Promise.race([
+      requestJoinableProviderServerShutdown(handle, capability.method),
+      runtime.time.sleep(capability.timeoutMs),
+    ]).catch(() => undefined);
   }
-  await handle.close();
+  return handle.close(acceptCleanupHold);
+}
+
+type ProviderServerShutdownHoldWithoutRetry = Readonly<{
+  kind: 'provider-shutdown-held-alive' | 'provider-shutdown-held-unobservable';
+  observation: 'alive' | 'unobservable';
+  subject: Readonly<{ kind: 'provider-server'; pid: number }>;
+  obligations: readonly JsonValue[];
+  successor: Readonly<{ kind: 'accepted'; owner: string }> | null;
+  operatorExit: Readonly<{ kind: string }>;
+}>;
+
+export type ProviderServerShutdownHold = Omit<ProviderServerShutdownHoldWithoutRetry, 'operatorExit'> &
+  Readonly<{
+    retry(): Promise<ProxyProviderRootCloseDisposition>;
+    operatorExit: Readonly<{
+      kind: string;
+      retry(): Promise<ProxyProviderRootCloseDisposition>;
+    }>;
+  }>;
+
+export type ProxyProviderRootCloseDisposition = ProviderServerCloseDisposition | ProviderServerShutdownHold;
+
+function isProviderServerShutdownHold(
+  disposition: ProviderServerCloseDisposition | ProviderServerShutdownHoldWithoutRetry,
+): disposition is ProviderServerShutdownHoldWithoutRetry {
+  return (
+    disposition.kind === 'provider-shutdown-held-alive' || disposition.kind === 'provider-shutdown-held-unobservable'
+  );
+}
+
+type ProviderServerCleanupAbandonmentResult =
+  | Readonly<{ kind: 'no-hold' }>
+  | Readonly<{ kind: 'refused'; hold: ProviderServerFailedSpawnCleanupHold }>
+  | Readonly<{ kind: 'accepted'; disposition: ProviderServerFailedSpawnOperatorAbandonment }>;
+
+export type ProxyProviderHostEvictionV1Disposition =
+  | Extract<ProviderHostEvictionDisposition, { kind: 'evicted' | 'stale' }>
+  | Readonly<{ kind: 'requires-v2' }>;
+
+function providerHostEvictionHold(
+  hold: Readonly<{ observation: 'alive' | 'unobservable'; operatorExit: Readonly<{ kind: string }> }>,
+  successorOwner: string | null,
+): Extract<ProviderHostEvictionDisposition, { kind: 'held' }> {
+  return {
+    kind: 'held',
+    observation: hold.observation,
+    successorOwner,
+    operatorExit: hold.operatorExit.kind,
+  };
 }
 
 /** Recursively re-keys every plain object in `value` (at every nesting depth) into ascending key order,
@@ -188,7 +315,10 @@ type HostPoolEntry = {
   readonly cancellationMode: ProxyHostCancellationMode;
   refCount: number;
   rootTokenReleased: boolean;
-  closePromise: Promise<void> | null;
+  closePromise: Promise<ProxyProviderRootCloseDisposition> | null;
+  cleanupHold: ProviderServerFailedSpawnCleanupHold | null;
+  shutdownHold: ProviderServerShutdownHold | null;
+  cleanupAttempts: number;
 };
 
 function hostKeyFor(
@@ -247,15 +377,17 @@ export interface ProxyAppServerHostAuthority {
    *  when the reference no longer names a live entry this authority holds. */
   rootIdentity(hostRef: HostRef): Readonly<{ pid: number; incarnation: ProcessIncarnation }> | null;
   closed(hostRef: HostRef): Promise<Error | void> | null;
-  forceClose(hostRef: HostRef): Promise<void>;
-  evictHost(hostRef: HostRef): Promise<boolean>;
+  forceClose(hostRef: HostRef): Promise<ProxyProviderRootCloseDisposition | undefined>;
+  evictHost(hostRef: HostRef): Promise<ProviderHostEvictionDisposition>;
 }
 
 export interface ProxyProviderHostAdministrationAuthority {
   admissionSnapshot(): HostAdmissionSnapshot;
   listProviderHosts(): readonly ProxyProviderHostInventoryRecord[];
   inspectProviderHost(hostRef: HostRef): ProxyProviderHostInventoryRecord | null;
-  evictHost(hostRef: HostRef): Promise<boolean>;
+  terminalEviction(hostRef: HostRef): ProviderHostTerminalEvictionDisposition | null;
+  evictHostV1(hostRef: HostRef): Promise<ProxyProviderHostEvictionV1Disposition>;
+  evictHost(hostRef: HostRef): Promise<ProviderHostEvictionDisposition>;
 }
 
 export type ProxyProviderHostInventoryRecord = ProviderHostInventoryRecordWire;
@@ -280,12 +412,8 @@ type RootSpawnTransaction = {
   readonly instanceId: string;
   readonly reservedRef: HostRef;
   handle: ProviderServerHandle | null;
+  cleanupHold: ProviderServerFailedSpawnCleanupHold | null;
   liveRootCommitted: boolean;
-};
-
-type RootRetirement = {
-  entry: HostPoolEntry | null;
-  releasedBeforeEntry: boolean;
 };
 
 class ProxyProviderRootPool {
@@ -293,6 +421,10 @@ class ProxyProviderRootPool {
   private readonly admission: HostAdmissionCollection;
   private readonly entries = new Map<string, HostPoolEntry>();
   private readonly closingEntries = new Set<HostPoolEntry>();
+  private readonly failedSpawnCleanups = new Set<RootSpawnTransaction>();
+  /** Terminal eviction outcomes must remain replayable for the owning process's lifetime; earlier removal
+   *  makes a lost reply unrecoverable. */
+  private readonly terminalEvictions = new Map<string, ProviderHostTerminalEvictionDisposition>();
   private nextGeneration = 0;
   private liveRoots = 0;
   private spawningRoots = 0;
@@ -330,6 +462,26 @@ class ProxyProviderRootPool {
     return matches;
   }
 
+  terminalEviction(hostRef: HostRef): ProviderHostTerminalEvictionDisposition | null {
+    return this.terminalEvictions.get(exactHostRefIdentityKey(hostRef)) ?? null;
+  }
+
+  retainTerminalEviction<Disposition extends ProviderHostTerminalEvictionDisposition>(
+    hostRef: HostRef,
+    disposition: Disposition,
+  ): Disposition {
+    const key = exactHostRefIdentityKey(hostRef);
+    const retained = this.terminalEvictions.get(key);
+    if (retained !== undefined) {
+      if (retained.kind !== disposition.kind) {
+        throw new Error('provider_host_identity_integrity: exact host ref acquired conflicting terminal outcomes');
+      }
+      return retained as Disposition;
+    }
+    this.terminalEvictions.set(key, disposition);
+    return disposition;
+  }
+
   rootIdentity(hostRef: HostRef): Readonly<{ pid: number; incarnation: ProcessIncarnation }> | null {
     for (const entry of this.entries.values()) {
       if (this.matches(hostRef, entry)) {
@@ -346,9 +498,9 @@ class ProxyProviderRootPool {
     return null;
   }
 
-  async forceClose(hostRef: HostRef): Promise<void> {
+  async forceClose(hostRef: HostRef): Promise<ProxyProviderRootCloseDisposition | undefined> {
     const matched = this.takeForceCloseTarget(hostRef);
-    if (matched !== undefined) await this.close(matched);
+    return matched === undefined ? undefined : this.close(matched);
   }
 
   async spawn(request: RootSpawnRequest): Promise<HostPoolEntry> {
@@ -362,7 +514,9 @@ class ProxyProviderRootPool {
         options: spawnOptionsFor(spec, options?.signal),
         generation: transaction.generation,
         observeProviderResponse: (fact) => admission.observe(placement.slot, reservedRef, fact),
+        acceptFailedSpawnCleanup: (hold) => this.acceptFailedSpawnCleanup(transaction, hold),
       });
+      if (isHeldProviderServerSpawn(handle)) throw handle.error;
       transaction.handle = handle;
       return this.commitSpawnedRoot(transaction, handle);
     } catch (error: unknown) {
@@ -371,16 +525,50 @@ class ProxyProviderRootPool {
     }
   }
 
-  close(entry: HostPoolEntry): Promise<void> {
+  close(entry: HostPoolEntry): Promise<ProxyProviderRootCloseDisposition> {
     if (entry.closePromise !== null) return entry.closePromise;
     this.closingEntries.add(entry);
-    const closePromise = closeSpawnedHandle(entry.handle, entry.spec, this.runtime).then(() =>
-      this.releaseLiveRoot(entry),
-    );
+    const retryHold = entry.cleanupHold;
+    const closePromise = (
+      retryHold === null
+        ? closeSpawnedHandle(entry.handle, entry.spec, this.runtime, (hold) => this.acceptCloseCleanup(entry, hold))
+        : retryHold.retry().then((cleanup): ProviderServerCloseDisposition => {
+            if (cleanup.kind !== 'held-alive' && cleanup.kind !== 'held-unobservable') return cleanup;
+            const successor = this.acceptCloseCleanup(entry, cleanup);
+            return { ...cleanup, successor };
+          })
+    ).then((disposition): ProxyProviderRootCloseDisposition => {
+      if (isProviderServerShutdownHold(disposition)) {
+        const retry = (): Promise<ProxyProviderRootCloseDisposition> => this.close(entry);
+        const hold = { ...disposition, retry, operatorExit: { ...disposition.operatorExit, retry } };
+        entry.shutdownHold = hold;
+        return hold;
+      }
+      entry.shutdownHold = null;
+      if (disposition.kind === 'held-alive' || disposition.kind === 'held-unobservable') {
+        return disposition;
+      }
+      if (
+        disposition.kind === 'operator-abandoned' &&
+        (retryHold === null || !isAcceptedProviderServerOperatorAbandonment(retryHold, disposition))
+      ) {
+        throw new Error('provider_host_operator_transfer_invalid: cleanup ownership transfer did not match the hold');
+      }
+      entry.cleanupHold = null;
+      if (!entry.rootTokenReleased) {
+        const hostRef = hostRefFor(entry, this.runtime);
+        if (disposition.kind === 'operator-abandoned') this.retainTerminalEviction(hostRef, disposition);
+        this.releaseLiveRoot(entry);
+        this.closingEntries.delete(entry);
+        if (disposition.kind === 'observed-absent') this.admission.observeRetired(hostRef, 'closed');
+        else this.admission.abandon(hostRef);
+      }
+      return disposition;
+    });
     entry.closePromise = closePromise;
     void closePromise.then(
       () => {
-        if (entry.closePromise === closePromise) this.closingEntries.delete(entry);
+        if (entry.closePromise === closePromise) entry.closePromise = null;
       },
       () => {
         if (entry.closePromise === closePromise) entry.closePromise = null;
@@ -415,6 +603,7 @@ class ProxyProviderRootPool {
       instanceId,
       reservedRef: hostRefForIdentity(spec, instanceId, options?.jobId, this.runtime),
       handle: null,
+      cleanupHold: null,
       liveRootCommitted: false,
     };
     placement.reservation.reserveCandidate({
@@ -443,8 +632,10 @@ class ProxyProviderRootPool {
     this.generationRootSlotsSpent += 1;
     transaction.liveRootCommitted = true;
 
-    const retirement = this.installRetirement(transaction, handle);
-    const incarnation = probeProcessIncarnation(handle.pid, this.runtime.env.platform() as NodeJS.Platform);
+    const incarnation = this.runtime.process.readProcessIncarnation(
+      handle.pid,
+      this.runtime.env.platform() as NodeJS.Platform,
+    );
     if (incarnation === null || handle.isClosed()) {
       throw new Error(`Provider server ${spec.provider} could not have its own incarnation read after spawn.`);
     }
@@ -458,40 +649,52 @@ class ProxyProviderRootPool {
       jobId: options?.jobId,
       cancellationMode,
       refCount: 0,
-      rootTokenReleased: retirement.releasedBeforeEntry,
+      rootTokenReleased: false,
       closePromise: null,
+      cleanupHold: null,
+      shutdownHold: null,
+      cleanupAttempts: 0,
     };
-    retirement.entry = entry;
+    this.installRetirement(entry, handle);
     this.entries.set(hostKey, entry);
     placement.reservation.markLive(reservedRef, generation);
     return entry;
   }
 
-  private installRetirement(transaction: RootSpawnTransaction, handle: ProviderServerHandle): RootRetirement {
-    const retirement: RootRetirement = { entry: null, releasedBeforeEntry: false };
+  private installRetirement(entry: HostPoolEntry, handle: ProviderServerHandle): void {
     const retire = (): void => {
-      if (retirement.entry !== null) this.remove(retirement.entry);
-      transaction.request.placement.reservation.observeRetired(transaction.reservedRef, 'closed');
-      if (retirement.entry !== null) {
-        this.releaseLiveRoot(retirement.entry);
-      } else if (!retirement.releasedBeforeEntry) {
-        retirement.releasedBeforeEntry = true;
-        this.liveRoots -= 1;
-      }
+      this.remove(entry);
+      if (entry.rootTokenReleased) return;
+      entry.cleanupHold = null;
+      entry.shutdownHold = null;
+      this.releaseLiveRoot(entry);
+      this.closingEntries.delete(entry);
+      this.admission.observeRetired(hostRefFor(entry, this.runtime), 'closed');
     };
-    void handle.closePromise.then(retire, retire);
-    return retirement;
+    handle.child.on('close', retire);
   }
 
   private async compensateFailedSpawn(transaction: RootSpawnTransaction): Promise<void> {
     const { placement } = transaction.request;
+    if (transaction.cleanupHold !== null) return;
     if (!transaction.liveRootCommitted) {
       this.spawningRoots -= 1;
       placement.reservation.observeRetired(transaction.reservedRef, 'closed');
     } else if (transaction.handle !== null) {
       try {
-        await transaction.handle.close();
-        placement.reservation.observeRetired(transaction.reservedRef, 'closed');
+        const cleanup = await transaction.handle.close((hold) =>
+          this.acceptFailedSpawnCleanup(transaction, {
+            ...hold,
+            error: new Error(`Provider server ${transaction.request.spec.provider} failed-spawn cleanup held.`),
+          }),
+        );
+        if (cleanup.kind === 'observed-absent' || cleanup.kind === 'operator-abandoned') {
+          if (cleanup.kind === 'observed-absent')
+            placement.reservation.observeRetired(transaction.reservedRef, 'closed');
+          else this.admission.abandon(transaction.reservedRef);
+          this.liveRoots -= 1;
+          transaction.liveRootCommitted = false;
+        }
       } catch {
         // A failed close retains the live-root token because process absence was not confirmed.
       }
@@ -502,6 +705,116 @@ class ProxyProviderRootPool {
     if (entry.rootTokenReleased) return;
     entry.rootTokenReleased = true;
     this.liveRoots -= 1;
+  }
+
+  private acceptFailedSpawnCleanup(
+    transaction: RootSpawnTransaction,
+    hold: ProviderServerFailedSpawnCleanupHold,
+  ): ProviderServerFailedSpawnCleanupAcceptance {
+    transaction.cleanupHold = hold;
+    this.failedSpawnCleanups.add(transaction);
+    const settlement = this.settleAcceptedFailedSpawnCleanup(transaction, hold).then(() => undefined);
+    return { kind: 'accepted', owner: 'provider-proxy-root-pool', settlement };
+  }
+
+  private async settleAcceptedFailedSpawnCleanup(
+    transaction: RootSpawnTransaction,
+    initialHold: ProviderServerFailedSpawnCleanupHold,
+  ): Promise<ProviderServerFailedSpawnCleanupDisposition> {
+    let hold = initialHold;
+    while (true) {
+      await hold.settled;
+      if (transaction.cleanupHold?.operatorExit !== hold.operatorExit) {
+        return transaction.cleanupHold ?? hold;
+      }
+      let disposition: ProviderServerFailedSpawnCleanupDisposition;
+      try {
+        disposition = await hold.retry();
+      } catch {
+        await this.runtime.time.sleep(1_000);
+        continue;
+      }
+      if (transaction.cleanupHold?.operatorExit !== hold.operatorExit) {
+        return transaction.cleanupHold ?? hold;
+      }
+      if (disposition.kind === 'observed-absent') {
+        this.releaseFailedSpawnCleanup(transaction, 'observed-absent');
+        return disposition;
+      }
+      if (disposition.kind === 'operator-abandoned') {
+        if (!isAcceptedProviderServerOperatorAbandonment(hold, disposition)) {
+          await this.runtime.time.sleep(1_000);
+          continue;
+        }
+        const retained = this.retainTerminalEviction(transaction.reservedRef, disposition);
+        this.releaseFailedSpawnCleanup(transaction, 'operator-abandoned');
+        return retained;
+      }
+      hold = { ...disposition, error: hold.error };
+      transaction.cleanupHold = hold;
+      await this.runtime.time.sleep(1_000);
+    }
+  }
+
+  private acceptCloseCleanup(
+    entry: HostPoolEntry,
+    hold: ProviderServerCleanupHold,
+  ): ProviderServerFailedSpawnCleanupAcceptance {
+    entry.cleanupAttempts += 1;
+    entry.cleanupHold = {
+      ...hold,
+      error: new Error(`Provider server ${entry.spec.provider} close held.`),
+    };
+    return { kind: 'accepted', owner: 'provider-proxy-root-pool', settlement: hold.settled };
+  }
+
+  failedSpawnCleanup(hostRef: HostRef): RootSpawnTransaction | undefined {
+    return [...this.failedSpawnCleanups].find((transaction) => this.matchesTransaction(hostRef, transaction));
+  }
+
+  async abandonFailedSpawnCleanup(transaction: RootSpawnTransaction): Promise<ProviderServerCleanupAbandonmentResult> {
+    const hold = transaction.cleanupHold;
+    if (hold === null) return { kind: 'no-hold' };
+    const disposition = await hold.operatorExit.abandon();
+    if (!isAcceptedProviderServerOperatorAbandonment(hold, disposition)) return { kind: 'refused', hold };
+    const retained = this.retainTerminalEviction(transaction.reservedRef, disposition);
+    this.releaseFailedSpawnCleanup(transaction, 'operator-abandoned');
+    return { kind: 'accepted', disposition: retained };
+  }
+
+  async abandonClose(entry: HostPoolEntry): Promise<ProviderServerCleanupAbandonmentResult> {
+    const hold = entry.cleanupHold;
+    if (hold === null) return { kind: 'no-hold' };
+    const disposition = await hold.operatorExit.abandon();
+    if (!isAcceptedProviderServerOperatorAbandonment(hold, disposition)) return { kind: 'refused', hold };
+    const retained = this.retainTerminalEviction(hostRefFor(entry, this.runtime), disposition);
+    entry.cleanupHold = null;
+    this.releaseLiveRoot(entry);
+    this.closingEntries.delete(entry);
+    return { kind: 'accepted', disposition: retained };
+  }
+
+  private releaseFailedSpawnCleanup(
+    transaction: RootSpawnTransaction,
+    disposition: 'observed-absent' | 'operator-abandoned',
+  ): void {
+    if (!this.failedSpawnCleanups.delete(transaction)) return;
+    transaction.cleanupHold = null;
+    if (transaction.liveRootCommitted) {
+      this.liveRoots -= 1;
+      transaction.liveRootCommitted = false;
+    } else {
+      this.spawningRoots -= 1;
+    }
+    if (disposition === 'observed-absent') {
+      transaction.request.placement.reservation.observeRetired(transaction.reservedRef, 'closed');
+    } else {
+      this.admission.abandon(transaction.reservedRef);
+    }
+  }
+
+  private matchesTransaction(hostRef: HostRef, transaction: RootSpawnTransaction): boolean {
+    return exactHostRefsMatch(hostRef, transaction.reservedRef);
   }
 
   private takeForceCloseTarget(hostRef: HostRef): HostPoolEntry | undefined {
@@ -608,7 +921,7 @@ class ProxyProviderHostSessions {
         if (released) return;
         released = true;
         entry.refCount -= 1;
-        if (entry.refCount > 0) return;
+        if (entry.refCount > 0 || entry.rootTokenReleased) return;
         this.pool.remove(entry);
         void this.pool.close(entry).catch((error: unknown) => {
           backendLog.error(
@@ -635,12 +948,85 @@ class ProxyProviderHostAdministration {
     const processEntries = this.pool.allEntries();
     const records: ProxyProviderHostInventoryRecord[] = [];
     for (const admissionEntry of snapshot.state.values()) {
-      if (admissionEntry.phase === 'spawning' || admissionEntry.phase === 'retired-blocked') continue;
+      if (admissionEntry.phase === 'spawning') {
+        const transaction = this.pool.failedSpawnCleanup(admissionEntry.ref);
+        const hold = transaction?.cleanupHold;
+        if (transaction === undefined || hold === null || hold === undefined) continue;
+        const process = hold.subject.kind === 'process' && hold.subject.pid !== null ? { pid: hold.subject.pid } : {};
+        records.push(
+          Object.freeze({
+            ref: admissionEntry.ref,
+            status: 'reclamation-failed',
+            spec: canonicalProviderHostSpecMetadata(transaction.request.spec),
+            host: Object.freeze({
+              owner: 'provider-proxy',
+              hostKey: transaction.request.hostKey,
+              ownerJobId: transaction.request.options?.jobId ?? null,
+              ...process,
+              reclamationAttempts: 1,
+              reclamationFailure: hold.error.message,
+              reclamationRetryable: true,
+            }),
+            diagnostics: emptyDiagnostics(),
+            diagnosticsRetention: Object.freeze({ ownerBudgetTruncated: false }),
+          }),
+        );
+        continue;
+      }
+      if (admissionEntry.phase === 'retired-blocked') continue;
       const matches = [...processEntries].filter((entry) => this.pool.matches(admissionEntry.ref, entry));
       if (matches.length !== 1) {
         throw new Error('provider_host_inventory_unavailable: live proxy host could not be revalidated');
       }
       const entry = matches[0];
+      const shutdownHold = entry.shutdownHold;
+      if (shutdownHold !== null) {
+        records.push(
+          Object.freeze({
+            ref: admissionEntry.ref,
+            status: 'shutdown-held',
+            spec: canonicalProviderHostSpecMetadata(entry.spec),
+            host: Object.freeze({
+              owner: 'provider-proxy',
+              hostKey: entry.hostKey,
+              ownerJobId: entry.jobId ?? null,
+              pid: shutdownHold.subject.pid,
+              observation: shutdownHold.observation,
+              successorOwner: shutdownHold.successor?.owner ?? null,
+              operatorExit: shutdownHold.operatorExit.kind,
+            }),
+            diagnostics: entry.handle.inspectDiagnostics(),
+            diagnosticsRetention: Object.freeze({ ownerBudgetTruncated: false }),
+          }),
+        );
+        continue;
+      }
+      const cleanupHold = entry.cleanupHold;
+      if (cleanupHold !== null) {
+        const process =
+          cleanupHold.subject.kind === 'process' && cleanupHold.subject.pid !== null
+            ? { pid: cleanupHold.subject.pid }
+            : {};
+        records.push(
+          Object.freeze({
+            ref: admissionEntry.ref,
+            status: 'reclamation-failed',
+            spec: canonicalProviderHostSpecMetadata(entry.spec),
+            host: Object.freeze({
+              owner: 'provider-proxy',
+              hostKey: entry.hostKey,
+              ownerJobId: entry.jobId ?? null,
+              ...process,
+              reclamationAttempts: entry.cleanupAttempts,
+              reclamationFailure: cleanupHold.error.message,
+              reclamationRetryable: true,
+            }),
+            diagnostics: entry.handle.inspectDiagnostics(),
+            diagnosticsRetention: Object.freeze({ ownerBudgetTruncated: false }),
+          }),
+        );
+        continue;
+      }
       if (entry.handle.isClosed()) {
         throw new Error('provider_host_inventory_unavailable: live proxy host process is unavailable');
       }
@@ -683,12 +1069,27 @@ class ProxyProviderHostAdministration {
     return matches[0] ?? null;
   }
 
-  async evictHost(hostRef: HostRef): Promise<boolean> {
+  terminalEviction(hostRef: HostRef): ProviderHostTerminalEvictionDisposition | null {
+    return this.pool.terminalEviction(hostRef);
+  }
+
+  async evictHost(hostRef: HostRef): Promise<ProviderHostEvictionDisposition> {
+    const terminal = this.pool.terminalEviction(hostRef);
+    if (terminal !== null) return terminal;
+
     const snapshot = this.admission.snapshot();
     const owned =
       [...snapshot.state.values()].some((entry) => exactHostRefsMatch(entry.ref, hostRef)) ||
       snapshot.tombstones.some((tombstone) => exactHostRefsMatch(tombstone.ref, hostRef));
-    if (!owned) return false;
+    if (!owned) return { kind: 'stale' };
+
+    const failedSpawn = this.pool.failedSpawnCleanup(hostRef);
+    if (failedSpawn !== undefined) {
+      const abandonment = await this.pool.abandonFailedSpawnCleanup(failedSpawn);
+      if (abandonment.kind === 'no-hold') return { kind: 'stale' };
+      if (abandonment.kind === 'accepted') return abandonment.disposition;
+      return providerHostEvictionHold(abandonment.hold, null);
+    }
 
     const matches = this.pool.matchingEntries(hostRef);
     if (matches.size > 1) {
@@ -697,18 +1098,59 @@ class ProxyProviderHostAdministration {
     const matched = matches.values().next().value;
     if (matched !== undefined) {
       this.pool.remove(matched);
-      await this.pool.close(matched);
-      this.admission.confirmEvicted(hostRef);
-      return true;
+      const cleanup = await this.pool.close(matched);
+      if (isProviderServerShutdownHold(cleanup)) {
+        return providerHostEvictionHold(cleanup, cleanup.successor?.owner ?? null);
+      }
+      if (cleanup.kind === 'held-alive' || cleanup.kind === 'held-unobservable') {
+        const abandonment = await this.pool.abandonClose(matched);
+        if (abandonment.kind === 'no-hold') return { kind: 'stale' };
+        if (abandonment.kind === 'accepted') {
+          // The terminal disposition must be retained before its representation is released.
+          const retained = this.pool.retainTerminalEviction(hostRef, abandonment.disposition);
+          this.admission.abandon(hostRef);
+          return retained;
+        }
+        return providerHostEvictionHold(abandonment.hold, cleanup.successor.owner);
+      } else if (cleanup.kind === 'observed-absent') {
+        const disposition = { kind: 'evicted' } as const;
+        const retained = this.pool.retainTerminalEviction(hostRef, disposition);
+        this.admission.confirmEvicted(hostRef);
+        return retained;
+      } else {
+        this.admission.abandon(hostRef);
+        return cleanup;
+      }
     }
 
+    return this.evictProcessAbsentTombstone(hostRef);
+  }
+
+  async evictHostV1(hostRef: HostRef): Promise<ProxyProviderHostEvictionV1Disposition> {
+    const terminal = this.pool.terminalEviction(hostRef);
+    if (terminal !== null) return terminal.kind === 'evicted' ? terminal : { kind: 'requires-v2' };
+    if (this.pool.failedSpawnCleanup(hostRef) !== undefined) return { kind: 'requires-v2' };
+    const matches = this.pool.matchingEntries(hostRef);
+    if (matches.size > 1) {
+      throw new Error('provider_host_identity_integrity: exact host ref matched multiple proxy entries');
+    }
+    if (matches.size === 1) return { kind: 'requires-v2' };
+    return this.evictProcessAbsentTombstone(hostRef);
+  }
+
+  private evictProcessAbsentTombstone(
+    hostRef: HostRef,
+  ): Extract<ProviderHostEvictionDisposition, { kind: 'evicted' | 'stale' }> {
     const tombstones = this.admission
       .snapshot()
       .tombstones.filter(
         (tombstone) => tombstone.retirement.processAbsent && exactHostRefsMatch(tombstone.ref, hostRef),
       );
-    if (tombstones.length !== 1) return false;
-    return this.admission.confirmEvicted(hostRef);
+    if (tombstones.length !== 1) return { kind: 'stale' };
+    const disposition = { kind: 'evicted' } as const;
+    const retained = this.pool.retainTerminalEviction(hostRef, disposition);
+    this.admission.confirmEvicted(hostRef);
+    return retained;
   }
 
   admissionSnapshot(): HostAdmissionSnapshot {
@@ -739,6 +1181,8 @@ export function createProxyAppServerHostAuthority(
     forceClose: (hostRef) => pool.forceClose(hostRef),
     listProviderHosts: () => administration.listProviderHosts(),
     inspectProviderHost: (hostRef) => administration.inspectProviderHost(hostRef),
+    terminalEviction: (hostRef) => administration.terminalEviction(hostRef),
+    evictHostV1: (hostRef) => administration.evictHostV1(hostRef),
     evictHost: (hostRef) => administration.evictHost(hostRef),
     admissionSnapshot: () => administration.admissionSnapshot(),
   };

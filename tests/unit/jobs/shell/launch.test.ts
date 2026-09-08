@@ -25,6 +25,8 @@ import { encodeHostRef } from '#src/providers/host-ref-codec.js';
 import type { DurableCliRuntimeRecord as _DurableCliRuntimeRecord } from '#src/runtime/durable-runtime.js';
 import type { AppServerProxyRoute } from '#src/jobs/contracts/app-server-proxy-route.js';
 import { appendJobTerminalRecorded } from '#src/jobs/terminal/recording.js';
+import { readDurableCliContainmentStatus } from '#src/jobs/runtime-meta-store.js';
+import { durableCliContainmentStatusKey, durableCliProcessRuntimeMetaKey } from '#src/jobs/runtime-meta.js';
 
 import { jobsDir } from '#src/jobs/paths.js';
 import { pluginRootNamespace } from '#src/infra/plugin-identity.js';
@@ -38,6 +40,7 @@ import {
   type AgentRef,
 } from '#src/jobs/agent-resolution.js';
 import { LaunchCoordinator } from '#src/coordinator/live/admission.js';
+import type { DurableProcessCleanup } from '#src/coordinator/live/durable-transport.js';
 import { ChildPrincipalRegistry } from '#src/coordinator/child-principal-registry.js';
 import { getMaxWorkers } from '#src/coordinator/live/worker-limits.js';
 import { TypedEventBus } from '#src/coordinator/event-bus.js';
@@ -50,6 +53,7 @@ import { createRealRuntime } from '#src/runtime/real.js';
 import type { SessionManager } from '#src/sessions/shell.js';
 import type { InvocationContext } from '#src/runtime/invocation-context.js';
 import { ExecutionService } from '#src/coordinator/execution-service.js';
+import { formatAbortResult } from '#src/cli/format/jobs.js';
 import { LaunchOrchestrator } from '#src/jobs/shell/launch.js';
 import { ProviderRegistry } from '#src/providers/registry.js';
 import { createEventBodyCodec } from '#src/store/event-body-codec.js';
@@ -68,6 +72,7 @@ import { executeCatalogRequest } from '#src/transport/dispatch.js';
 import { rpcCatalog } from '#src/transport/rpc/catalog.js';
 import type { HttpHandlerPorts } from '#src/transport/server-ports.js';
 import { testProjectPrincipal } from '#tests/helpers/principal.js';
+import { testIncarnation } from '#tests/helpers/process-incarnation.js';
 import {
   TEST_CODEX_BINDING,
   TEST_CODEX_SCOPE,
@@ -960,6 +965,408 @@ describe('ExecutionService launch', () => {
     expect(runtimeRecord?.tailWatermark).toBeGreaterThan(0);
     expect(history.some((event) => event.type === 'progress' && event.message?.includes('step-1'))).toBe(true);
     expect(history.some((event) => event.type === 'progress' && event.message?.includes('step-2'))).toBe(true);
+  });
+
+  it('keeps durable abandonment committed when its progress diagnostic fails', async () => {
+    const base = createRealRuntime('prod');
+    const retryHandle = {};
+    let retryActive = false;
+    const clearInterval = vi.fn(() => {
+      retryActive = false;
+    });
+    const kill = vi.fn(() => true);
+    const runtimeRecord = {
+      transport: 'durable-cli' as const,
+      pid: 91_001,
+      stdoutPath: join(mockState.tmpRoot, 'abandonment-stdout'),
+      stderrPath: join(mockState.tmpRoot, 'abandonment-stderr'),
+      startTime: new Date(0).toISOString(),
+    };
+    runtime = {
+      ...base,
+      env: { ...base.env, platform: () => 'darwin' },
+      time: {
+        ...base.time,
+        setInterval: () => {
+          retryActive = true;
+          return retryHandle;
+        },
+        clearInterval,
+      },
+      process: {
+        ...base.process,
+        kill,
+        readProcessIncarnation: () => null,
+        observeLiveness: () => 'unknown',
+        durable: {
+          launch: async (options) => {
+            const processSubject = {
+              pid: runtimeRecord.pid,
+              incarnation: testIncarnation('abandonment-wrapper'),
+              processGroupId: runtimeRecord.pid,
+              childRoot: { pid: runtimeRecord.pid + 1, incarnation: testIncarnation('abandonment-child') },
+            };
+            options.onSpawned?.({
+              runtimeRecord,
+              leaderIncarnation: processSubject.incarnation,
+              childRoot: processSubject.childRoot,
+            });
+            return {
+              disposition: 'launched',
+              launchHandle: 'abandonment-launch' as never,
+              pid: runtimeRecord.pid,
+              stdoutPath: runtimeRecord.stdoutPath,
+              stderrPath: runtimeRecord.stderrPath,
+              runtimeRecord,
+              processSubject,
+            };
+          },
+          waitForExit: async () => ({ exitCode: 0, signal: null, endTime: new Date(1).toISOString() }),
+        },
+      },
+    };
+    launchCoordinator = new LaunchCoordinator({ runtime });
+    const provider: Provider = {
+      name: 'codex',
+      execute: (_request, providerRuntime) =>
+        streamProviderEvents(async (emit) => {
+          if (providerRuntime.transport !== 'standalone') throw new Error('expected standalone runtime');
+          const result = await providerRuntime.runCli({ command: 'fixture', args: [] });
+          emit(providerTerminalEvent({ content: result.stdout, outcome: { kind: 'completed' }, durationMs: 0 }));
+        }),
+    };
+    mockState.getNewProvider.mockReturnValue(provider);
+    const service = createService(ctx);
+    const { abortRegistry, progressStore } = getInternals(service);
+    const appendProgress = progressStore.appendProgress.bind(progressStore);
+    let statusAtDiagnosticFailure: ReturnType<typeof readDurableCliContainmentStatus> | null = null;
+    vi.spyOn(progressStore, 'appendProgress').mockImplementation((jobId, sessionId, message) => {
+      if (message.includes('was abandoned without proof')) {
+        statusAtDiagnosticFailure = readDurableCliContainmentStatus(progressStore.getDb(), jobId);
+        throw new Error('synthetic progress append failure');
+      }
+      return appendProgress(jobId, sessionId, message);
+    });
+
+    const decision = await service.start('codex', { prompt: 'hello' }, ctx);
+    if (decision.status !== 'running') throw new Error('expected running launch');
+    trackJob(decision.jobId);
+    await vi.waitFor(() => expect(retryActive).toBe(true));
+
+    expect(abortRegistry.abort([decision.jobId]).refused).toHaveLength(1);
+    // Abandonment refuses while a cleanup attempt is settling; its named exit is repeating the abort.
+    let abandonment = abortRegistry.abort([decision.jobId]);
+    await vi.waitFor(() => {
+      abandonment = abortRegistry.abort([decision.jobId]);
+      expect(abandonment.abandoned).toHaveLength(1);
+    });
+    expect(abandonment).toEqual({
+      aborted: [],
+      notFound: [],
+      abandoned: [
+        {
+          jobId: decision.jobId,
+          reason: 'job ownership was released without proof of process absence',
+          nextStep: 'Inspect the recorded process because it may still be live.',
+        },
+      ],
+    });
+    expect(formatAbortResult(abandonment)).toContain('Warning: Process absence remains unproven.');
+    await vi.waitFor(() => expect(retryActive).toBe(false));
+
+    expect(statusAtDiagnosticFailure).toMatchObject({
+      kind: 'valid',
+      status: { disposition: { kind: 'operator-abandoned', processAbsenceProven: false } },
+    });
+    expect(clearInterval).toHaveBeenCalledWith(retryHandle);
+    const signalCount = kill.mock.calls.length;
+    await Promise.resolve();
+    expect(kill).toHaveBeenCalledTimes(signalCount);
+  });
+
+  it('keeps the abandonment control when durable publication is temporarily unwritable', async () => {
+    const base = createRealRuntime('prod');
+    const retryHandle = {};
+    const clearInterval = vi.fn();
+    const exitRecord = { exitCode: 0, signal: null, endTime: new Date(1).toISOString() } as const;
+    let resolveExit!: (record: typeof exitRecord) => void;
+    const exit = new Promise<typeof exitRecord>((resolve) => {
+      resolveExit = resolve;
+    });
+    const runtimeRecord = {
+      transport: 'durable-cli' as const,
+      pid: 91_003,
+      stdoutPath: join(mockState.tmpRoot, 'identity-publication-failure-stdout'),
+      stderrPath: join(mockState.tmpRoot, 'identity-publication-failure-stderr'),
+      startTime: new Date(0).toISOString(),
+    };
+    runtime = {
+      ...base,
+      env: { ...base.env, platform: () => 'darwin' },
+      time: {
+        ...base.time,
+        setInterval: () => retryHandle,
+        clearInterval,
+      },
+      process: {
+        ...base.process,
+        kill: vi.fn(() => true),
+        readProcessIncarnation: () => null,
+        observeLiveness: () => 'unknown',
+        durable: {
+          launch: async (options) => {
+            const processSubject = {
+              pid: runtimeRecord.pid,
+              incarnation: testIncarnation('identity-publication-failure-wrapper'),
+              processGroupId: runtimeRecord.pid,
+              childRoot: {
+                pid: runtimeRecord.pid + 1,
+                incarnation: testIncarnation('identity-publication-failure-child'),
+              },
+            };
+            options.onSpawned?.({
+              runtimeRecord,
+              leaderIncarnation: processSubject.incarnation,
+              childRoot: processSubject.childRoot,
+            });
+            return {
+              disposition: 'launched',
+              launchHandle: 'identity-publication-failure' as never,
+              pid: runtimeRecord.pid,
+              stdoutPath: runtimeRecord.stdoutPath,
+              stderrPath: runtimeRecord.stderrPath,
+              runtimeRecord,
+              processSubject,
+            };
+          },
+          waitForExit: () => exit,
+        },
+      },
+    };
+    launchCoordinator = new LaunchCoordinator({ runtime });
+    const provider: Provider = {
+      name: 'codex',
+      execute: (_request, providerRuntime) =>
+        streamProviderEvents(async (emit) => {
+          if (providerRuntime.transport !== 'standalone') throw new Error('expected standalone runtime');
+          const result = await providerRuntime.runCli({ command: 'fixture', args: [] });
+          emit(providerTerminalEvent({ content: result.stdout, outcome: { kind: 'completed' }, durationMs: 0 }));
+        }),
+    };
+    mockState.getNewProvider.mockReturnValue(provider);
+    const service = createService(ctx);
+    const { abortRegistry, progressStore } = getInternals(service);
+
+    const decision = await service.start('codex', { prompt: 'hello' }, ctx);
+    if (decision.status !== 'running') throw new Error('expected running launch');
+    trackJob(decision.jobId);
+    await vi.waitFor(() => {
+      expect(progressStore.readRuntimeProjection(decision.jobId)).toMatchObject({ transport: 'durable-cli' });
+    });
+
+    const runtimeMetaKey = durableCliProcessRuntimeMetaKey(decision.jobId);
+    const containmentKey = durableCliContainmentStatusKey(decision.jobId);
+    const failedPublicationKeys: string[] = [];
+    progressStore.getDb().function('fail_durable_publication', (key) => {
+      failedPublicationKeys.push(String(key));
+      throw new Error('synthetic durable publication failure');
+    });
+    progressStore.getDb().exec(`
+      CREATE TRIGGER fail_durable_publication
+      BEFORE INSERT ON meta
+      WHEN NEW.key IN ('${runtimeMetaKey}', '${containmentKey}')
+      BEGIN
+        SELECT fail_durable_publication(NEW.key);
+      END
+    `);
+
+    expect(abortRegistry.abort([decision.jobId])).toMatchObject({
+      aborted: [],
+      refused: [
+        {
+          jobId: decision.jobId,
+          reason: expect.stringContaining('durable containment hold persistence failed'),
+        },
+      ],
+    });
+    expect(failedPublicationKeys).toContain(containmentKey);
+    expect(failedPublicationKeys).not.toContain(runtimeMetaKey);
+    expect(readDurableCliContainmentStatus(progressStore.getDb(), decision.jobId)).toEqual({ kind: 'missing' });
+
+    progressStore.getDb().exec('DROP TRIGGER fail_durable_publication');
+    // Abandonment refuses while a cleanup attempt is settling; its named exit is repeating the abort.
+    let abandonment = abortRegistry.abort([decision.jobId]);
+    await vi.waitFor(() => {
+      abandonment = abortRegistry.abort([decision.jobId]);
+      expect(abandonment.abandoned).toHaveLength(1);
+    });
+    expect(abandonment).toEqual({
+      aborted: [],
+      notFound: [],
+      abandoned: [
+        {
+          jobId: decision.jobId,
+          reason: 'job ownership was released without proof of process absence',
+          nextStep: 'Inspect the recorded process because it may still be live.',
+        },
+      ],
+    });
+    expect(readDurableCliContainmentStatus(progressStore.getDb(), decision.jobId)).toMatchObject({
+      kind: 'valid',
+      status: { disposition: { kind: 'operator-abandoned', processAbsenceProven: false } },
+    });
+    expect(clearInterval).toHaveBeenCalledWith(retryHandle);
+
+    resolveExit(exitRecord);
+    await waitForTerminalEvent(service, decision.jobId);
+  });
+
+  it('keeps the abort hold when deleting the durable containment row fails', async () => {
+    const base = createRealRuntime('prod');
+    const retryHandle = {};
+    let retryCleanup!: () => void;
+    let processAbsent = false;
+    const clearInterval = vi.fn();
+    const exitRecord = { exitCode: 0, signal: null, endTime: new Date(1).toISOString() } as const;
+    let resolveExit!: (record: typeof exitRecord) => void;
+    const exit = new Promise<typeof exitRecord>((resolve) => {
+      resolveExit = resolve;
+    });
+    const runtimeRecord = {
+      transport: 'durable-cli' as const,
+      pid: 91_002,
+      stdoutPath: join(mockState.tmpRoot, 'failed-containment-delete-stdout'),
+      stderrPath: join(mockState.tmpRoot, 'failed-containment-delete-stderr'),
+      startTime: new Date(0).toISOString(),
+    };
+    runtime = {
+      ...base,
+      env: { ...base.env, platform: () => 'darwin' },
+      time: {
+        ...base.time,
+        setInterval: (callback) => {
+          retryCleanup = callback;
+          return retryHandle;
+        },
+        clearInterval,
+      },
+      process: {
+        ...base.process,
+        kill: vi.fn(() => true),
+        readProcessIncarnation: () => null,
+        observeLiveness: () => (processAbsent ? 'absent' : 'unknown'),
+        durable: {
+          launch: async (options) => {
+            const processSubject = {
+              pid: runtimeRecord.pid,
+              incarnation: testIncarnation('failed-containment-delete-wrapper'),
+              processGroupId: runtimeRecord.pid,
+              childRoot: {
+                pid: runtimeRecord.pid + 1,
+                incarnation: testIncarnation('failed-containment-delete-child'),
+              },
+            };
+            options.onSpawned?.({
+              runtimeRecord,
+              leaderIncarnation: processSubject.incarnation,
+              childRoot: processSubject.childRoot,
+            });
+            return {
+              disposition: 'launched',
+              launchHandle: 'failed-containment-delete' as never,
+              pid: runtimeRecord.pid,
+              stdoutPath: runtimeRecord.stdoutPath,
+              stderrPath: runtimeRecord.stderrPath,
+              runtimeRecord,
+              processSubject,
+            };
+          },
+          waitForExit: () => exit,
+        },
+      },
+    };
+    launchCoordinator = new LaunchCoordinator({ runtime });
+    const provider: Provider = {
+      name: 'codex',
+      execute: (_request, providerRuntime) =>
+        streamProviderEvents(async (emit) => {
+          if (providerRuntime.transport !== 'standalone') throw new Error('expected standalone runtime');
+          const result = await providerRuntime.runCli({ command: 'fixture', args: [] });
+          emit(providerTerminalEvent({ content: result.stdout, outcome: { kind: 'completed' }, durationMs: 0 }));
+        }),
+    };
+    mockState.getNewProvider.mockReturnValue(provider);
+    const service = createService(ctx);
+    const { abortRegistry, progressStore } = getInternals(service);
+
+    const decision = await service.start('codex', { prompt: 'hello' }, ctx);
+    if (decision.status !== 'running') throw new Error('expected running launch');
+    trackJob(decision.jobId);
+    await vi.waitFor(() => {
+      expect(progressStore.readRuntimeProjection(decision.jobId)).toMatchObject({ transport: 'durable-cli' });
+    });
+    expect(abortRegistry.abort([decision.jobId]).refused).toHaveLength(1);
+    const abortHolds = (abortRegistry as unknown as { readonly holds: Map<string, unknown> }).holds;
+    await vi.waitFor(() => {
+      expect(readDurableCliContainmentStatus(progressStore.getDb(), decision.jobId)).toMatchObject({
+        kind: 'valid',
+        status: { disposition: { kind: 'held' } },
+      });
+      expect(abortHolds.has(decision.jobId)).toBe(true);
+      expect(abortRegistry.has(decision.jobId)).toBe(true);
+    });
+    const cleanupHandles = (
+      launchCoordinator as unknown as { readonly cleanupHandles: Map<symbol, DurableProcessCleanup> }
+    ).cleanupHandles;
+    expect(cleanupHandles.size).toBe(1);
+    const retainedCleanup = [...cleanupHandles.values()][0];
+    if (retainedCleanup === undefined) throw new Error('Expected retained durable cleanup ownership');
+    await retainedCleanup();
+
+    let deletionAttempts = 0;
+    progressStore.getDb().function('fail_containment_delete', () => {
+      deletionAttempts += 1;
+      throw new Error('synthetic containment delete failure');
+    });
+    progressStore.getDb().exec(`
+      CREATE TRIGGER fail_containment_delete
+      BEFORE DELETE ON meta
+      WHEN OLD.key = '${durableCliContainmentStatusKey(decision.jobId)}'
+      BEGIN
+        SELECT fail_containment_delete();
+      END
+    `);
+
+    processAbsent = true;
+    retryCleanup();
+    await retainedCleanup();
+
+    expect(deletionAttempts).toBe(1);
+    expect(abortHolds.has(decision.jobId)).toBe(true);
+    expect(readDurableCliContainmentStatus(progressStore.getDb(), decision.jobId)).toMatchObject({
+      kind: 'valid',
+      status: { disposition: { kind: 'held' } },
+    });
+    expect(clearInterval).not.toHaveBeenCalled();
+    expect(progressStore.readStatus(decision.jobId)?.phase).toBe('running');
+
+    progressStore.getDb().exec('DROP TRIGGER fail_containment_delete');
+    expect(abortRegistry.abort([decision.jobId])).toEqual({
+      aborted: [],
+      notFound: [],
+      abandoned: [
+        {
+          jobId: decision.jobId,
+          reason: 'job ownership was released without proof of process absence',
+          nextStep: 'Inspect the recorded process because it may still be live.',
+        },
+      ],
+    });
+    expect(abortHolds.has(decision.jobId)).toBe(false);
+    expect(abortRegistry.has(decision.jobId)).toBe(true);
+    expect(clearInterval).toHaveBeenCalledWith(retryHandle);
+    resolveExit(exitRecord);
+    await waitForTerminalEvent(service, decision.jobId);
   });
 
   it('records provider artifact handle events through the launch session API before continuity checkpoints', async () => {

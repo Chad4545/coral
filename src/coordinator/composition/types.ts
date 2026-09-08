@@ -1,3 +1,4 @@
+import type { TerminateAllDisposition } from '../live/admission.js';
 import type { IncomingMessage, Server, ServerResponse } from 'node:http';
 import type { BackendInfo } from '../../infra/backend-discovery.js';
 import type { ProviderRegistry } from '../../providers/registry.js';
@@ -32,6 +33,7 @@ import type { HealthSnapshot } from '../../transport/server-ports.js';
 import type { KbDaemonSupervisor } from '../live/kb-daemon-supervisor.js';
 import type { ProviderScope } from '../../infra/provider-scope.js';
 import type { StoreFormatDescription } from '../../store/format-fingerprint.js';
+import type { ProcessExitRemainder, ProcessExitRemainderAcceptance } from '../shutdown-settlement.js';
 
 type CoordinatorBootSnapshot = {
   version?: string;
@@ -75,7 +77,7 @@ export type CoordinatorCoreOptions = {
   cleanupStaleJobsFn?: (currentBundleHash: string) => void | Promise<void>;
   markJobsAsErrorFn?: (message: string) => void | Promise<void>;
   createStoreServicesFromDbFn?: (storeDb: Database) => CoordinatorStoreServices;
-  terminateAllFn?: () => void;
+  terminateAllFn?: (signal: AbortSignal) => TerminateAllDisposition | Promise<TerminateAllDisposition>;
   registerBuiltInProvidersFn?: RegisterBuiltInProvidersFn;
   recoverPersistedDiscussFn?: RecoverPersistedDiscussFn;
   providerHostManager?: ProviderHostManager;
@@ -110,8 +112,9 @@ export type CoordinatorCoreOptions = {
    */
   getConsumerStuck: () => NonNullable<NonNullable<HealthSnapshot['diagnostics']>['consumerStuck']>;
   getTextProjectionState?: () => HealthSnapshot['textProjectionState'];
-  disposeLifecycleReactor?: () => void;
+  disposeLifecycleReactor?: () => void | Promise<void>;
   onStopped?: () => void;
+  acceptProcessExitRemainder?: (remainder: ProcessExitRemainder) => ProcessExitRemainderAcceptance;
   onFatalShutdownError?: (error: unknown) => void;
   discussRegistry?: DiscussContextRegistry;
   /**

@@ -1,6 +1,7 @@
 import { currentCoralStoreFormat } from '#src/store-format.js';
 import { applyBundledStoreSchema, type Database } from '#src/store/db.js';
 import {
+  acquireProviderOperationMutationAdmission,
   attributeUnreadableProviderOperations,
   completeExecutingProviderOperationAttachment,
   compareAndSwapProviderOperation,
@@ -16,6 +17,8 @@ import {
   retireSupersededProviderOperation,
   readProviderOperationsDue,
   observeProviderOperationRecord,
+  ProviderOperationMutationAdmission,
+  providerOperationMutationAdmission,
   subscribeProviderOperationMutations,
 } from '#src/store/provider-operation-journal.js';
 import {
@@ -82,6 +85,299 @@ describe('provider operation journal', () => {
     discardUnreadableProviderOperationWithRecoveryAuthority(db, key, revision, {
       claim: () => ({ kind: 'claimed' as const, settle: () => true }),
     });
+
+  it('closes only one set and joins mutations admitted before its fence', async () => {
+    const admission = new ProviderOperationMutationAdmission();
+    const target = providerOperationRecord('prepare-pending');
+    const unrelated = providerOperationRecord('prepare-pending', {
+      operation: {
+        ...target.operation,
+        proxyInstanceId: '00000000-0000-4000-8000-000000000030',
+        buildSetId: '00000000-0000-4000-8000-000000000040',
+      },
+      locator: {
+        ...target.locator,
+        proxy: {
+          ...target.locator.proxy,
+          instanceId: '00000000-0000-4000-8000-000000000030',
+        },
+      },
+    });
+    let settleTarget!: () => void;
+    const targetMaySettle = new Promise<void>((resolve) => {
+      settleTarget = resolve;
+    });
+    const mutation = admission.run('provider-operation:prepare', () => targetMaySettle, target.operation);
+    await Promise.resolve();
+
+    const fence = admission.closeSet(target.operation);
+    expect(fence).toMatchObject({
+      kind: 'holding',
+      pendingMutations: ['provider-operation:prepare'],
+      exit: 'admitted-provider-operation-mutation-settlement',
+    });
+    expect(() => admission.runSync('late-target', () => undefined, target.operation)).toThrow(
+      'Provider operation mutation admission is closed for this proxy set.',
+    );
+    expect(admission.runSync('unrelated-set', () => 'admitted', unrelated.operation)).toBe('admitted');
+    if (fence.kind !== 'holding') throw new Error('active exact-set mutation was not retained by the fence');
+
+    let drained = false;
+    void fence.retryAfter.then(() => {
+      drained = true;
+    });
+    await Promise.resolve();
+    expect(drained).toBe(false);
+
+    settleTarget();
+    await mutation;
+    await fence.retryAfter;
+    expect(fence.isHeld()).toBe(true);
+    expect(() => admission.runSync('still-fenced', () => undefined, target.operation)).toThrow(
+      'Provider operation mutation admission is closed for this proxy set.',
+    );
+
+    const successorFence = admission.closeSet(target.operation);
+    fence.release();
+    expect(fence.isHeld()).toBe(false);
+    expect(successorFence.isHeld()).toBe(true);
+    expect(() => admission.runSync('successor-fenced', () => undefined, target.operation)).toThrow(
+      'Provider operation mutation admission is closed for this proxy set.',
+    );
+    successorFence.release();
+    expect(admission.runSync('released-target', () => 'admitted', target.operation)).toBe('admitted');
+  });
+
+  it('inherits an admitted parent set across an unscoped nested mutation after the fence closes', async () => {
+    const admission = new ProviderOperationMutationAdmission();
+    const target = providerOperationRecord('prepare-pending');
+    let startNested!: () => void;
+    let finishNested!: () => void;
+    let markNestedStarted!: () => void;
+    const nestedMayStart = new Promise<void>((resolve) => {
+      startNested = resolve;
+    });
+    const nestedMayFinish = new Promise<void>((resolve) => {
+      finishNested = resolve;
+    });
+    const nestedStarted = new Promise<void>((resolve) => {
+      markNestedStarted = resolve;
+    });
+    let journalMutationRan = false;
+    const outer = admission.run(
+      'provider-event:outer',
+      async () => {
+        await nestedMayStart;
+        await admission.run('provider-event-transaction', async () => {
+          admission.runSync('provider-operation-update', () => {
+            journalMutationRan = true;
+          });
+          markNestedStarted();
+          await nestedMayFinish;
+        });
+      },
+      target.operation,
+    );
+    await Promise.resolve();
+
+    const fence = admission.closeSet(target.operation);
+    if (fence.kind !== 'holding') throw new Error('scoped parent was not retained by the fence');
+    startNested();
+    await nestedStarted;
+    expect(journalMutationRan).toBe(true);
+
+    let drained = false;
+    void fence.retryAfter.then(() => {
+      drained = true;
+    });
+    await Promise.resolve();
+    expect(drained).toBe(false);
+
+    finishNested();
+    await outer;
+    await fence.retryAfter;
+    fence.release();
+  });
+
+  it('rejects a delayed descendant after its admitted parent drains from a set fence', async () => {
+    const admission = new ProviderOperationMutationAdmission();
+    const target = providerOperationRecord('prepare-pending');
+    let finishParent!: () => void;
+    let startDescendant!: () => void;
+    const parentMayFinish = new Promise<void>((resolve) => {
+      finishParent = resolve;
+    });
+    const descendantMayStart = new Promise<void>((resolve) => {
+      startDescendant = resolve;
+    });
+    let descendant!: Promise<void>;
+    let journalMutationRan = false;
+    const parent = admission.run(
+      'provider-event:parent',
+      async () => {
+        descendant = descendantMayStart.then(() => {
+          admission.runSync(
+            'provider-operation:delayed-descendant',
+            () => {
+              journalMutationRan = true;
+            },
+            target.operation,
+          );
+        });
+        await parentMayFinish;
+      },
+      target.operation,
+    );
+    await Promise.resolve();
+
+    const fence = admission.closeSet(target.operation);
+    if (fence.kind !== 'holding') throw new Error('scoped parent was not retained by the fence');
+    finishParent();
+    await parent;
+    await fence.retryAfter;
+
+    startDescendant();
+    await expect(descendant).rejects.toThrow('Provider operation mutation admission is closed for this proxy set.');
+    expect(journalMutationRan).toBe(false);
+    fence.release();
+  });
+
+  it('retains a set-fence scope through global admission close and retires it with the lease', async () => {
+    const admission = new ProviderOperationMutationAdmission();
+    const target = providerOperationRecord('prepare-pending');
+    const fence = admission.closeSet(target.operation);
+    const close = admission.close();
+
+    expect(close).toMatchObject({
+      kind: 'holding',
+      pendingMutations: ['provider-operation-mutation-set-fence'],
+      exit: 'admitted-provider-operation-mutation-settlement',
+    });
+    expect(() => admission.closeSet(target.operation)).toThrow('Provider operation mutation admission is closed.');
+    expect(
+      await fence.run('fenced-release', () =>
+        admission.runSync('fenced-release-journal-mutation', () => 'admitted', target.operation),
+      ),
+    ).toBe('admitted');
+    if (close.kind !== 'holding') throw new Error('set fence was not retained by global admission close');
+
+    fence.release();
+    await close.retryAfter;
+    await expect(fence.run('stale-fenced-release', () => undefined)).rejects.toThrow(
+      'Provider operation mutation set fence is no longer held.',
+    );
+  });
+
+  it('retains a detached nested poll admitted while its parent is draining', async () => {
+    const db = createDb();
+    const admission = providerOperationMutationAdmission(db);
+    let releaseParent!: () => void;
+    let releaseSuccessor!: () => void;
+    let markSuccessorStarted!: () => void;
+    const parentMayFinish = new Promise<void>((resolve) => {
+      releaseParent = resolve;
+    });
+    const successorMayFinish = new Promise<void>((resolve) => {
+      releaseSuccessor = resolve;
+    });
+    const successorStarted = new Promise<void>((resolve) => {
+      markSuccessorStarted = resolve;
+    });
+    let successor!: Promise<void>;
+
+    try {
+      const parent = admission.run('provider-operation-due-poll', async () => {
+        try {
+          await parentMayFinish;
+        } finally {
+          successor = admission.run('provider-operation-due-poll', async () => {
+            markSuccessorStarted();
+            await successorMayFinish;
+          });
+        }
+      });
+      await Promise.resolve();
+
+      const stopping = admission.close();
+      expect(stopping).toMatchObject({ kind: 'holding' });
+      if (stopping.kind !== 'holding') throw new Error('active poll was not retained by admission closure');
+
+      releaseParent();
+      await parent;
+      await successorStarted;
+      let drainSettled = false;
+      void stopping.retryAfter.then(() => {
+        drainSettled = true;
+      });
+      await Promise.resolve();
+      expect(drainSettled).toBe(false);
+
+      releaseSuccessor();
+      await successor;
+      await stopping.retryAfter;
+      expect(admission.close()).toEqual({ kind: 'drained' });
+    } finally {
+      db.close();
+    }
+  });
+
+  it('transfers drained database admission to a successor without reopening the predecessor', async () => {
+    const db = createDb();
+    const predecessorAcquisition = acquireProviderOperationMutationAdmission(db, 'coordinator-one');
+    expect(predecessorAcquisition.kind).toBe('acquired');
+    if (predecessorAcquisition.kind !== 'acquired') throw new Error('predecessor admission was not acquired');
+    const predecessor = predecessorAcquisition.admission;
+    const sameOwnerAcquisition = acquireProviderOperationMutationAdmission(db, 'coordinator-one');
+    expect(sameOwnerAcquisition).toMatchObject({ kind: 'acquired', owner: 'coordinator-one' });
+    if (sameOwnerAcquisition.kind !== 'acquired') throw new Error('same owner did not retain admission');
+    expect(sameOwnerAcquisition.admission).toBe(predecessor);
+    expect(acquireProviderOperationMutationAdmission(db, 'coordinator-two')).toMatchObject({
+      kind: 'holding',
+      predecessorOwner: 'coordinator-one',
+      successorOwner: 'coordinator-two',
+      exit: 'predecessor-provider-operation-mutation-admission-release',
+    });
+    let releaseMutation!: () => void;
+    const mutationMayFinish = new Promise<void>((resolve) => {
+      releaseMutation = resolve;
+    });
+    const mutation = predecessor.run('predecessor-mutation', () => mutationMayFinish);
+
+    try {
+      await Promise.resolve();
+      const stopping = predecessor.close();
+      expect(stopping).toMatchObject({ kind: 'holding' });
+
+      const prematureSuccessor = acquireProviderOperationMutationAdmission(db, 'coordinator-two');
+      expect(prematureSuccessor).toMatchObject({
+        kind: 'holding',
+        predecessorOwner: 'coordinator-one',
+        successorOwner: 'coordinator-two',
+        exit: 'admitted-provider-operation-mutation-settlement',
+      });
+
+      releaseMutation();
+      await mutation;
+      if (stopping.kind === 'holding') await stopping.retryAfter;
+
+      const successorAcquisition = acquireProviderOperationMutationAdmission(db, 'coordinator-two');
+      expect(successorAcquisition.kind).toBe('acquired');
+      if (successorAcquisition.kind !== 'acquired') throw new Error('successor admission was not acquired');
+      expect(providerOperationMutationAdmission(db)).toBe(successorAcquisition.admission);
+      expect(() => predecessor.runSync('stale-predecessor', () => undefined)).toThrow(
+        'Provider operation mutation admission is closed.',
+      );
+
+      const record = providerOperationRecord('prepare-pending');
+      insertProviderOperation(db, record);
+      expect(readProviderOperation(db, record.operation)).toEqual(record);
+    } finally {
+      releaseMutation();
+      await mutation;
+      db.close();
+    }
+  });
+
   it('assigns the durable local handoff only to generic job recovery', () => {
     for (const phase of PHASES) {
       expect(providerOperationJobRecoveryOwner(providerOperationRecord(phase))).toBe(

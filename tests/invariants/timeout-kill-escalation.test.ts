@@ -31,6 +31,10 @@ import { join, relative } from 'node:path';
 import { describe, expect, it } from 'vitest';
 import ts from 'typescript';
 
+import type { ProcessLiveness } from '#src/infra/node-process.js';
+import type { ChildProcessLike } from '#src/infra/port-types.js';
+import { gracefulKill } from '#src/infra/process-supervision.js';
+
 import { codeTextOnly } from '../helpers/ts-code-text.js';
 
 const REPO_ROOT = join(__dirname, '..', '..');
@@ -46,8 +50,12 @@ const CONTAINMENT_HELPER_FILE = 'src/infra/process-containment.ts';
 // deleting teardown entirely would also make that scan pass. Keep every owner
 // explicit so an ownership change cannot silently narrow the escalation guarantee.
 const RECORDED_CONTAINMENT_OWNER_FILES = [
+  'src/coordinator/live/durable-transport.ts',
+  'src/coordinator/live/provider-proxy/spawn-undo.ts',
   'src/provider-proxy/enforcement.ts',
+  'src/provider-proxy/role-main.ts',
   'src/coordinator/live/provider-hosts/drain.ts',
+  'src/coordinator/services/recovery/actions.ts',
   'src/coordinator/services/recovery/interrupted-performer.ts',
   'src/coordinator/services/provider-proxy-set/index.ts',
   'src/coordinator/services/provider-proxy-set/inheritance.ts',
@@ -99,7 +107,69 @@ function callsReapRecordedContainment(source: string): boolean {
   return /reapRecordedContainment\s*\(/u.test(codeTextOnly(source));
 }
 
+function gracefulKillObserverIsRequired(source: string): boolean {
+  const sourceFile = ts.createSourceFile(PRIMITIVE_FILE, source, ts.ScriptTarget.Latest, true, ts.ScriptKind.TS);
+  const declaration = sourceFile.statements.find(
+    (statement): statement is ts.FunctionDeclaration =>
+      ts.isFunctionDeclaration(statement) && statement.name?.text === 'gracefulKill',
+  );
+  const observer = declaration?.parameters[2];
+  return observer !== undefined && observer.questionToken === undefined && observer.initializer === undefined;
+}
+
+function gracefulKillSignals(observeLiveness: (pid: number) => ProcessLiveness): NodeJS.Signals[] {
+  let escalation: (() => void) | undefined;
+  const signals: NodeJS.Signals[] = [];
+  const child = {
+    pid: 4_242,
+    exitCode: null,
+    signalCode: null,
+    stdin: null,
+    stdout: null,
+    stderr: null,
+    kill: (signal?: NodeJS.Signals) => {
+      if (signal !== undefined) signals.push(signal);
+      return true;
+    },
+    on: () => child,
+  } as unknown as ChildProcessLike;
+  const runtime = {
+    time: {
+      setTimeout: (callback: () => void) => {
+        escalation = callback;
+        return { unref: () => undefined } as unknown as NodeJS.Timeout;
+      },
+      clearTimeout: () => undefined,
+    },
+  };
+
+  gracefulKill(child, runtime, observeLiveness);
+  escalation?.();
+  return signals;
+}
+
 describe('process kills escalate SIGTERM→SIGKILL', () => {
+  it('requires every gracefulKill caller to supply a liveness observer', () => {
+    const source = readFileSync(join(REPO_ROOT, PRIMITIVE_FILE), 'utf-8');
+    expect(gracefulKillObserverIsRequired(source)).toBe(true);
+  });
+
+  it('the sanctioned child helper refuses escalation after observed absence', () => {
+    expect(gracefulKillSignals(() => 'absent')).toEqual(['SIGTERM']);
+  });
+
+  it('the sanctioned child helper refuses escalation after an unknown observation', () => {
+    expect(gracefulKillSignals(() => 'unknown')).toEqual(['SIGTERM']);
+  });
+
+  it('the sanctioned child helper refuses escalation when observation throws', () => {
+    expect(
+      gracefulKillSignals(() => {
+        throw new Error('observation failed');
+      }),
+    ).toEqual(['SIGTERM']);
+  });
+
   it('no module calls the bare safeKill primitive outside its home or the documented allowlist', () => {
     const violations: string[] = [];
     for (const filePath of listSourceFiles(SRC_ROOT)) {
@@ -109,9 +179,7 @@ describe('process kills escalate SIGTERM→SIGKILL', () => {
         violations.push(canonical);
       }
     }
-    // To resolve a violation: use `gracefulKill(child, runtime)` (SIGTERM then
-    // SIGKILL after a grace period). Only add to ALLOWLIST if the child is not a
-    // live process awaiting graceful shutdown, with the reason recorded there.
+    // A live child awaiting shutdown must use graceful escalation unless an allowlist records why it cannot.
     expect(violations).toEqual([]);
   });
 
@@ -133,13 +201,6 @@ describe('process kills escalate SIGTERM→SIGKILL', () => {
 // Migrating one to a sanctioned helper removes its entry.
 const HAND_ROLLED_ESCALATION_ALLOWLIST = new Map<string, string>([
   [
-    'src/coordinator/live/provider-proxy/spawn-undo.ts',
-    // `buildGuardianSpawnUndo`'s own comment: a shorter fixed grace (`gracefulKillByPid`'s, built for a plain
-    // child with nothing of its own left to do) would force-kill the guardian mid-reap and strand the very
-    // containment it was just asked to hold, so it spends the full teardown-reserve budget instead.
-    'deliberately not gracefulKillByPid — a plain-child grace period would force-kill the guardian mid-reap of its own containment',
-  ],
-  [
     'src/coordinator/handoff.ts',
     // Handoff targets a separately discovered incumbent, not a child or recorded containment. Each signal
     // requires a fresh pid/start-time check and its own capability, policy, cooldown, and audit handling.
@@ -152,13 +213,6 @@ const HAND_ROLLED_ESCALATION_ALLOWLIST = new Map<string, string>([
   [
     'src/providers/claude/appserver/print-controller.ts',
     'pre-existing Claude appserver child-shutdown escalation (shutdown()), not yet migrated to gracefulKill',
-  ],
-  [
-    'src/provider-proxy/role-main.ts',
-    // Guardian-construction unwind must synchronously confirm both a detached proxy group and an ordinary,
-    // non-detached reaper pid absent on its monotonic clock. `reapRecordedContainment` cannot represent the
-    // latter without falsely claiming it is a process-group leader; `gracefulKill` does not confirm absence.
-    'guardian-construction unwind confirms an ordinary non-detached child pid that neither sanctioned helper can represent without losing absence confirmation',
   ],
 ]);
 
@@ -299,13 +353,11 @@ function signalParametersByFunction(
   return signalParameters;
 }
 
-/** Every literal signal a module routes to the real `.kill()` primitive, by walking its AST and following
- *  local parameter flow. Comments and unrelated strings are structurally invisible to this walk. */
-function handRolledEscalationSignals(source: string): Set<KillSignal> {
+/** Static template bodies must be scanned as source because executable wrappers may not remain AST strings. */
+function collectHandRolledEscalationSignals(source: string, signals: Set<KillSignal>): void {
   const sourceFile = ts.createSourceFile('scan.ts', source, ts.ScriptTarget.Latest, true, ts.ScriptKind.TS);
   const functions = localFunctions(sourceFile);
   const signalParameters = signalParametersByFunction(functions);
-  const signals = new Set<KillSignal>();
   const visit = (node: ts.Node): void => {
     if (ts.isCallExpression(node)) {
       const directSignal = isKillPrimitiveCall(node) ? literalSignal(signalArgument(node)) : null;
@@ -319,15 +371,121 @@ function handRolledEscalationSignals(source: string): Set<KillSignal> {
         }
       }
     }
+    if (ts.isNoSubstitutionTemplateLiteral(node) && node.text.trim().length > 0) {
+      collectHandRolledEscalationSignals(node.text, signals);
+    }
     ts.forEachChild(node, visit);
   };
   visit(sourceFile);
+}
+
+function handRolledEscalationSignals(source: string): Set<KillSignal> {
+  const signals = new Set<KillSignal>();
+  collectHandRolledEscalationSignals(source, signals);
   return signals;
 }
 
 function hasHandRolledEscalation(source: string): boolean {
   const signals = handRolledEscalationSignals(source);
   return signals.has('SIGTERM') && signals.has('SIGKILL');
+}
+
+function forEachCallInNode(node: ts.Node, inspect: (call: ts.CallExpression) => void): void {
+  const visit = (child: ts.Node): void => {
+    if (child !== node && ts.isFunctionLike(child)) return;
+    if (ts.isCallExpression(child)) inspect(child);
+    ts.forEachChild(child, visit);
+  };
+  visit(node);
+}
+
+function signalsInNode(
+  node: ts.Node,
+  signalParameters: ReadonlyMap<string, ReadonlySet<number>>,
+): ReadonlySet<KillSignal> {
+  const signals = new Set<KillSignal>();
+  forEachCallInNode(node, (call) => {
+    const directSignal = isKillPrimitiveCall(call) ? literalSignal(signalArgument(call)) : null;
+    if (directSignal !== null) signals.add(directSignal);
+
+    const calleeName = localCalleeName(call);
+    if (calleeName === null) return;
+    for (const index of signalParameters.get(calleeName) ?? []) {
+      const signal = literalSignal(call.arguments[index]);
+      if (signal !== null) signals.add(signal);
+    }
+  });
+  return signals;
+}
+
+function containsTimedWait(node: ts.Node): boolean {
+  let found = false;
+  forEachCallInNode(node, (call) => {
+    const callee = call.expression;
+    const name = ts.isPropertyAccessExpression(callee)
+      ? callee.name.text
+      : ts.isIdentifier(callee)
+        ? callee.text
+        : null;
+    if (name === 'sleep' || name === 'setTimeout' || name === 'setInterval') found = true;
+  });
+  return found;
+}
+
+function containsAbruptCompletion(node: ts.Node): boolean {
+  let found = false;
+  const visit = (child: ts.Node): void => {
+    if (child !== node && ts.isFunctionLike(child)) return;
+    if (ts.isReturnStatement(child) || ts.isThrowStatement(child)) {
+      found = true;
+      return;
+    }
+    ts.forEachChild(child, visit);
+  };
+  visit(node);
+  return found;
+}
+
+function hasTimedSingleSignalTeardown(source: string): boolean {
+  const sourceFile = ts.createSourceFile('scan.ts', source, ts.ScriptTarget.Latest, true, ts.ScriptKind.TS);
+  const functions = localFunctions(sourceFile);
+  const signalParameters = signalParametersByFunction(functions);
+  let violation = false;
+
+  const inspectFunction = (localFunction: LocalFunction): void => {
+    const functionSignals = signalsInNode(localFunction, signalParameters);
+    if (!functionSignals.has('SIGTERM') || functionSignals.has('SIGKILL')) return;
+
+    const visit = (node: ts.Node): void => {
+      if (violation) return;
+      if (ts.isBlock(node)) {
+        let termDelivered = false;
+        for (const statement of node.statements) {
+          const statementSignals = signalsInNode(statement, signalParameters);
+          if (statementSignals.has('SIGTERM')) termDelivered = true;
+          if (statementSignals.has('SIGKILL') || containsAbruptCompletion(statement)) {
+            termDelivered = false;
+            continue;
+          }
+          if (termDelivered && containsTimedWait(statement)) {
+            violation = true;
+            return;
+          }
+        }
+      }
+      ts.forEachChild(node, visit);
+    };
+    if (localFunction.body !== undefined) visit(localFunction.body);
+  };
+
+  const visit = (node: ts.Node): void => {
+    if (ts.isFunctionDeclaration(node) || ts.isFunctionExpression(node) || ts.isArrowFunction(node)) {
+      inspectFunction(node);
+    }
+    ts.forEachChild(node, visit);
+  };
+  visit(sourceFile);
+  return violation;
 }
 
 describe('process kills do not hand-roll a SIGTERM→SIGKILL escalation outside the sanctioned helpers', () => {
@@ -368,6 +526,29 @@ describe('process kills do not hand-roll a SIGTERM→SIGKILL escalation outside 
     expect(handRolledEscalationSignals(mutation)).toEqual(new Set<KillSignal>(['SIGTERM', 'SIGKILL']));
   });
 
+  it('detects an escalation hidden in a static executable template mutation', () => {
+    const mutation = [
+      'const wrapper = String.raw`',
+      "  process.kill(pid, 'SIGTERM');",
+      "  process.kill(pid, 'SIGKILL');",
+      '`;',
+    ].join('\n');
+
+    expect(handRolledEscalationSignals(mutation)).toEqual(new Set<KillSignal>(['SIGTERM', 'SIGKILL']));
+  });
+
+  it('detects a teardown that waits after SIGTERM and then gives up without escalation', () => {
+    const mutation = `
+      async function reap(pid: number, runtime: Runtime): Promise<void> {
+        runtime.process.kill(pid, 'SIGTERM');
+        await runtime.time.sleep(100);
+        throw new Error('still alive');
+      }
+    `;
+
+    expect(hasTimedSingleSignalTeardown(mutation)).toBe(true);
+  });
+
   it('no module combines a literal SIGTERM kill with a literal SIGKILL kill outside gracefulKill, reapRecordedContainment, or the documented allowlist', () => {
     const violations: string[] = [];
     for (const filePath of listSourceFiles(SRC_ROOT)) {
@@ -383,9 +564,7 @@ describe('process kills do not hand-roll a SIGTERM→SIGKILL escalation outside 
         violations.push(canonical);
       }
     }
-    // To resolve a violation: route the escalation through `gracefulKill(child, runtime)` or
-    // `reapRecordedContainment(...)`. Only add to HAND_ROLLED_ESCALATION_ALLOWLIST for a documented, deliberate
-    // reason a sanctioned helper cannot be used yet — never merely to silence this.
+    // Hand-rolled escalation requires an allowlisted reason a sanctioned helper cannot be used.
     expect(violations).toEqual([]);
   });
 
@@ -398,5 +577,15 @@ describe('process kills do not hand-roll a SIGTERM→SIGKILL escalation outside 
       }
     }
     expect(stale).toEqual([]);
+  });
+
+  it('no module waits after a lone literal SIGTERM teardown outside the sanctioned helpers', () => {
+    const violations: string[] = [];
+    for (const filePath of listSourceFiles(SRC_ROOT)) {
+      const canonical = canonicalSrcPath(filePath);
+      if (canonical === PRIMITIVE_FILE || canonical === CONTAINMENT_HELPER_FILE) continue;
+      if (hasTimedSingleSignalTeardown(readFileSync(filePath, 'utf-8'))) violations.push(canonical);
+    }
+    expect(violations).toEqual([]);
   });
 });

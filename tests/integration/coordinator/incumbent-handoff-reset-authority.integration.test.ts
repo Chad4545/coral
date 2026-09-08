@@ -253,7 +253,7 @@ describe('incumbent handoff reset authority', () => {
         shutdownToken,
         incarnation,
       },
-      { storage: runtime.storage, env: runtime.env, paths: runtime.paths },
+      { storage: runtime.storage, env: runtime.env, paths: runtime.paths, process: runtime.process },
     );
 
     const incumbent = await startScriptedIncumbent(runtime.paths.coral.coordinator.socketPath, async (request) => {
@@ -312,7 +312,7 @@ describe('incumbent handoff reset authority', () => {
         kbDaemonSupervisor: createMockKbDaemonSupervisor(),
         cleanupStaleJobsFn: () => {},
         markJobsAsErrorFn: () => {},
-        terminateAllFn: () => {},
+        terminateAllFn: () => ({ kind: 'all-observed-absent' }),
         registerBuiltInProvidersFn: () => {},
         getConsumerStuck: () => {
           throw new Error('getConsumerStuck must not run before store services exist');

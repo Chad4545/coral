@@ -6,12 +6,34 @@ import { bindProviderRunner, type ProviderDurableSpawner } from '#src/providers/
 const NO_CLI_RESULT = { stdout: '', stderr: '', code: 0, aborted: false };
 
 describe('bindProviderRunner', () => {
-  it('forwards onDurableProcessIdentity to the spawner, and the spawner call reaches the caller', async () => {
+  it('forwards the durable identity callback and exact job identity to the spawner', async () => {
     let capturedOptionsHadCallback = false;
+    let capturedJobId: string | undefined;
+    const identity = {
+      pid: 4242,
+      incarnation: testIncarnation(1_000),
+      processGroupId: 4242,
+      childRoot: { pid: 4243, incarnation: testIncarnation(1_001) },
+    };
+    const status = {
+      kind: 'held' as const,
+      reason: 'containment observation unavailable',
+      retryIntervalMs: 500,
+      abandonment: 'abort-job' as const,
+    };
+    const control = {
+      retry: vi.fn(),
+      abandon: vi.fn(() => ({
+        kind: 'abandoned' as const,
+        reason: 'job ownership was released without proof of process absence',
+        nextStep: 'Inspect the recorded process because it may still be live.',
+      })),
+    };
     const spawner: ProviderDurableSpawner = {
       spawnDurableJob: (options) => {
         capturedOptionsHadCallback = typeof options.onDurableProcessIdentity === 'function';
-        options.onDurableProcessIdentity?.({ pid: 4242, incarnation: testIncarnation(1_000) });
+        capturedJobId = options.jobId;
+        options.onDurableProcessIdentity?.(identity, status, control);
         return Promise.resolve(NO_CLI_RESULT);
       },
     };
@@ -25,14 +47,13 @@ describe('bindProviderRunner', () => {
       '/tmp/job-dir',
       undefined,
       onDurableProcessIdentity,
+      'job-visible-hold',
     );
     await runCli({ command: 'codex', args: [] });
 
     expect(capturedOptionsHadCallback).toBe(true);
-    expect(onDurableProcessIdentity).toHaveBeenCalledExactlyOnceWith({
-      pid: 4242,
-      incarnation: testIncarnation(1_000),
-    });
+    expect(capturedJobId).toBe('job-visible-hold');
+    expect(onDurableProcessIdentity).toHaveBeenCalledExactlyOnceWith(identity, status, control);
   });
 
   it('passes no onDurableProcessIdentity through when the caller supplies none', async () => {

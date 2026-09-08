@@ -10,6 +10,7 @@ import {
   createProductionServerEsbuildOptions,
   PLACEHOLDER_STORE_FORMAT_FINGERPRINT,
 } from './server-esbuild-options.mjs';
+import { CURRENT_STRICT_BUNDLE_MANIFEST_FILE } from '../src/infra/bundle-manifest-address.ts';
 
 const repoRoot = fileURLToPath(new URL('..', import.meta.url));
 const buildDir = resolve(repoRoot, process.argv[2] ?? 'clients/build');
@@ -17,7 +18,9 @@ const expectedBuildFiles = new Set([
   'coral-backend.cjs',
   'coral-cli.cjs',
   'coral-claude-appserver.cjs',
+  'coral-durable-wrapper.cjs',
   'manifest.json',
+  CURRENT_STRICT_BUNDLE_MANIFEST_FILE,
 ]);
 if (!existsSync(buildDir)) {
   throw new Error(`Kiwi build contract is missing ${buildDir}; run \`npm run build\` before this verifier.`);
@@ -29,7 +32,7 @@ const unexpectedBuildFiles = buildFiles.filter(
 );
 if (missingBuildFiles.length > 0 || unexpectedBuildFiles.length > 0) {
   throw new Error(
-    `Kiwi build contract expected the four bundle files and optional build receipt, with no WASM staged beside them; got: ${buildFiles.sort().join(', ')}`,
+    `Kiwi build contract expected the lifecycle bundle files and optional build receipt, with no WASM staged beside them; got: ${buildFiles.sort().join(', ')}`,
   );
 }
 

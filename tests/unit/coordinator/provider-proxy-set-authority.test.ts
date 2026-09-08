@@ -5,7 +5,7 @@ import { mkdtempSync, readFileSync, rmSync, statSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
-import { afterEach, describe, expect, it } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
 
 import { buildGuardianSpawnUndo } from '#src/coordinator/live/provider-proxy/spawn-undo.js';
 import {
@@ -193,12 +193,7 @@ function authorityWithProxyClient(proxyClient: ControlClient): ReturnType<typeof
 describe('createProviderProxySetAuthority: stopAndReap budget', () => {
   it('confirms a teardown against a stubborn target that spends the full SIGTERM+SIGKILL escalation', async () => {
     const time = new VirtualTime();
-    // The minimum time a legitimate hard reap takes when the target does not die on the first signal: SIGTERM
-    // grace, then SIGKILL grace, then the disappearance confirmation window — the exact floor
-    // `guardian.stop-and-reap.v1`'s `budgetMs: 'caller-deadline'` exists to protect, and exclusive of any
-    // per-syscall overhead. A budget below this floor cannot ever succeed against a stubborn process, so this
-    // is deliberately the value under test rather than an arbitrary number that merely exceeds the bug's
-    // 5s budget.
+    // The test budget must cover TERM grace, KILL grace, and disappearance confirmation.
     const stubbornReapFloorMs = SIGTERM_GRACE_MS + SIGKILL_GRACE_MS + CONTAINMENT_DISAPPEARANCE_CONFIRM_MS;
     expect(stubbornReapFloorMs).toBe(11_000);
     expect(stubbornReapFloorMs).toBeGreaterThan(PROXY_CONTROL_RPC_TIMEOUT_MS);
@@ -212,7 +207,7 @@ describe('createProviderProxySetAuthority: stopAndReap budget', () => {
     const pending = authority.stopAndReap(new AbortController().signal);
     time.tick(stubbornReapFloorMs);
 
-    await expect(pending).resolves.toEqual({ disappearanceReceipt: 'guardian:gone;reaper:gone' });
+    await expect(pending).resolves.toEqual({ disappearanceReceipt: 'gone' });
   });
 
   it('still reports unconfirmed when the caller signal aborts before the reap answers', async () => {
@@ -295,14 +290,74 @@ describe('createProviderProxySetAuthority: RPC response validation', () => {
 
     await expect(controls.list()).rejects.toThrow(/Work directory must be absolute and normalized/u);
   });
+
+  it('falls back to the legacy inventory address only when the current method is absent', async () => {
+    const methods: string[] = [];
+    const failure = {
+      kind: 'json-rpc-error' as const,
+      jsonRpcCode: -32_601,
+      protocolCode: 'method_not_found' as const,
+      admissionReason: null,
+      heartbeatRefusal: null,
+    };
+    const proxyClient: ControlClient = {
+      exchange: (method) => {
+        methods.push(method);
+        if (method.endsWith('.v2')) {
+          const error = new ControlClientError('control_call_failed', 'method not found', 'remote-response', failure);
+          return Promise.resolve(
+            controlExchangeForTest({ kind: 'response', response: { kind: 'refusal', failure, error } }),
+          );
+        }
+        return Promise.resolve(
+          controlExchangeForTest({
+            kind: 'response',
+            response: {
+              kind: 'result',
+              value: method.includes('.list.') ? { hosts: [] } : { state: 'stale' },
+            },
+          }),
+        );
+      },
+      faulted: new Promise<never>(() => undefined),
+      onFault: () => () => undefined,
+      close: () => {},
+    };
+    const controls = authorityWithProxyClient(proxyClient).providerHosts;
+    if (controls === undefined) throw new Error('provider-host controls were not composed');
+
+    await expect(controls.list()).resolves.toEqual([]);
+    await expect(
+      controls.inspect({ provider: 'codex', fingerprint: 'a'.repeat(64), instanceId: 'host', leaseMode: 'shared' }),
+    ).resolves.toBeNull();
+    await expect(
+      controls.terminalEviction({
+        provider: 'codex',
+        fingerprint: 'a'.repeat(64),
+        instanceId: 'host',
+        leaseMode: 'shared',
+      }),
+    ).resolves.toBeNull();
+    await expect(
+      controls.evict({ provider: 'codex', fingerprint: 'a'.repeat(64), instanceId: 'host', leaseMode: 'shared' }),
+    ).rejects.toThrow('method not found');
+    expect(methods).toEqual([
+      'provider-host.list.v2',
+      'provider-host.list.v1',
+      'provider-host.inspect.v2',
+      'provider-host.inspect.v1',
+      'provider-host.terminal-eviction.v2',
+      'provider-host.evict.v2',
+    ]);
+  });
 });
 
-describe('createProviderProxySetAuthority: stopAndReap providerRoots', () => {
-  it('names this coordinator’s own recorded provider roots, not an empty claim the guardian would refuse', async () => {
+describe('createProviderProxySetAuthority: commitContainment', () => {
+  it('sends guardian.containment-commit.v1 alone, naming no providerRoots and never touching the reaper client', async () => {
     const calls: unknown[] = [];
-    const client: ControlClient = {
-      exchange: (_method, params) => {
-        calls.push(params);
+    const guardianClient: ControlClient = {
+      exchange: (method, params) => {
+        calls.push({ method, params });
         return Promise.resolve(
           controlExchangeForTest({
             kind: 'response',
@@ -314,45 +369,192 @@ describe('createProviderProxySetAuthority: stopAndReap providerRoots', () => {
       onFault: () => () => undefined,
       close: () => {},
     };
-    const root = { pid: 9_001, incarnation: testIncarnation(700) };
-    const authority = authorityWithGuardianClient(client, [root]);
+    const deps: ProviderProxySetAuthorityDependencies = {
+      proxyInstanceId: PROXY_IDENTITY.proxyInstanceId,
+      guardianClient,
+      proxyClient: unreachableClient(),
+      reaperClient: unreachableClient(),
+      guardianIdentity: GUARDIAN_IDENTITY,
+      reaperIdentity: REAPER_IDENTITY,
+      proxyIdentityFields: PROXY_IDENTITY,
+      heartbeats: inactiveHeartbeats(),
+      coordinatorIdentity: COORDINATOR_IDENTITY,
+      handoffCapsulePath: '/dev/null/unused-handoff-capsule.json',
+      runtime: unusedRuntimePorts(),
+      operationRegistry: { operationsFor: () => [], providerRootsFor: () => [] },
+    };
+    const authority = createProviderProxySetAuthority(deps);
+
+    const outcome = await authority.commitContainment(new AbortController().signal);
+
+    expect(calls).toEqual([
+      {
+        method: 'guardian.containment-commit.v1',
+        params: { guardian: GUARDIAN_IDENTITY, reaper: REAPER_IDENTITY, proxy: PROXY_IDENTITY },
+      },
+    ]);
+    expect(outcome).toEqual({ kind: 'containment-absent', disappearanceReceipt: 'gone' });
+  });
+
+  it('reports outcome-unknown for an older guardian’s already-in-progress refusal', async () => {
+    const remoteFailure: ControlClientRemoteFailure = {
+      kind: 'json-rpc-error',
+      jsonRpcCode: -32000,
+      protocolCode: 'invalid_state',
+      admissionReason: 'invalid-state',
+      heartbeatRefusal: null,
+    };
+    const guardianClient: ControlClient = {
+      exchange: () =>
+        Promise.resolve(
+          controlExchangeForTest({
+            kind: 'response',
+            response: {
+              kind: 'refusal',
+              failure: remoteFailure,
+              error: new ControlClientError(
+                'control_call_failed',
+                'A containment commit is already in progress.',
+                'remote-response',
+                remoteFailure,
+              ),
+            },
+          }),
+        ),
+      faulted: new Promise<never>(() => undefined),
+      onFault: () => () => undefined,
+      close: () => {},
+    };
+    const authority = authorityWithGuardianClient(guardianClient);
+
+    const outcome = await authority.commitContainment(new AbortController().signal);
+
+    expect(outcome.kind).toBe('outcome-unknown');
+  });
+
+  it('reports not-sent for a structured pre-latch refusal', async () => {
+    const remoteFailure: ControlClientRemoteFailure = {
+      kind: 'json-rpc-error',
+      jsonRpcCode: -32000,
+      protocolCode: 'identity_mismatch',
+      admissionReason: null,
+      heartbeatRefusal: null,
+    };
+    const guardianClient: ControlClient = {
+      exchange: () =>
+        Promise.resolve(
+          controlExchangeForTest({
+            kind: 'response',
+            response: {
+              kind: 'refusal',
+              failure: remoteFailure,
+              error: new ControlClientError(
+                'control_call_failed',
+                'Teardown named a different reaper than this one.',
+                'remote-response',
+                remoteFailure,
+              ),
+            },
+          }),
+        ),
+      faulted: new Promise<never>(() => undefined),
+      onFault: () => () => undefined,
+      close: () => {},
+    };
+    const authority = authorityWithGuardianClient(guardianClient);
+
+    const outcome = await authority.commitContainment(new AbortController().signal);
+
+    expect(outcome.kind).toBe('not-sent');
+  });
+
+  it('reports outcome-unknown when the guardian says teardown latched but absence remains unconfirmed', async () => {
+    const guardianClient: ControlClient = {
+      exchange: () =>
+        Promise.resolve(
+          controlExchangeForTest({
+            kind: 'response',
+            response: {
+              kind: 'result',
+              value: {
+                state: 'teardown-latched-absence-unconfirmed',
+                reason: 'Recorded containment remained present at the exit deadline.',
+              },
+            },
+          }),
+        ),
+      faulted: new Promise<never>(() => undefined),
+      onFault: () => () => undefined,
+      close: () => {},
+    };
+    const authority = authorityWithGuardianClient(guardianClient);
+
+    const outcome = await authority.commitContainment(new AbortController().signal);
+
+    expect(outcome).toEqual({
+      kind: 'outcome-unknown',
+      error: 'Recorded containment remained present at the exit deadline.',
+    });
+  });
+
+  it('reports outcome-unknown when the response is lost after the request may have reached the guardian', async () => {
+    const guardianClient: ControlClient = {
+      exchange: () =>
+        Promise.resolve(
+          controlExchangeForTest({
+            kind: 'no-response',
+            cause: 'connection-closed-after-write',
+            error: new ControlClientError('control_client_closed', 'closed after write', 'closed'),
+          }),
+        ),
+      faulted: new Promise<never>(() => undefined),
+      onFault: () => () => undefined,
+      close: () => {},
+    };
+    const authority = authorityWithGuardianClient(guardianClient);
+
+    const outcome = await authority.commitContainment(new AbortController().signal);
+
+    expect(outcome.kind).toBe('outcome-unknown');
+  });
+
+  it('reports outcome-unknown, not not-sent, when the caller deadline races an in-flight exchange', async () => {
+    const time = new VirtualTime();
+    const guardianClient = fakeControlClient(time, PROXY_TEARDOWN_RESERVE_MS - 1, {
+      state: 'containment-absent',
+      disappearanceReceipt: 'gone',
+    });
+    const authority = authorityWithGuardianClient(guardianClient);
+    const deadline = new AbortController();
+
+    const pending = authority.commitContainment(deadline.signal);
+    deadline.abort();
+    const outcome = await pending;
+
+    // A lost race cannot prove the request never reached the guardian — it is a lost response, not a proven
+    // non-latch, and must not be treated as one.
+    expect(outcome.kind).toBe('outcome-unknown');
+  });
+
+  it('collapses both unconfirmed outcomes into stopAndReap’s coarse contract identically', async () => {
+    const guardianClient: ControlClient = {
+      exchange: () =>
+        Promise.resolve(
+          controlExchangeForTest({
+            kind: 'no-response',
+            cause: 'timeout',
+            error: new ControlClientError('control_client_connect_failed', 'no reply', 'timeout'),
+          }),
+        ),
+      faulted: new Promise<never>(() => undefined),
+      onFault: () => () => undefined,
+      close: () => {},
+    };
+    const authority = authorityWithGuardianClient(guardianClient);
 
     const result = await authority.stopAndReap(new AbortController().signal);
 
-    // Hardcoding `providerRoots: []` here is exactly the defect: both enforcers refuse a teardown that
-    // disagrees with what they actually recorded, so an empty claim against a set with a real staged root
-    // always fails — this asserts the actual wire params carried the registry's own roots instead.
-    expect(calls).toEqual([
-      expect.objectContaining({ providerRoots: [root], guardian: GUARDIAN_IDENTITY }),
-      expect.objectContaining({ providerRoots: [root], reaper: REAPER_IDENTITY }),
-    ]);
-    expect(result).toEqual({ disappearanceReceipt: 'guardian:gone;reaper:gone' });
-  });
-
-  it('names an empty set when this coordinator holds no live operations against the proxy', async () => {
-    const calls: unknown[] = [];
-    const client: ControlClient = {
-      exchange: (_method, params) => {
-        calls.push(params);
-        return Promise.resolve(
-          controlExchangeForTest({
-            kind: 'response',
-            response: { kind: 'result', value: { state: 'containment-absent', disappearanceReceipt: 'gone' } },
-          }),
-        );
-      },
-      faulted: new Promise<never>(() => undefined),
-      onFault: () => () => undefined,
-      close: () => {},
-    };
-    const authority = authorityWithGuardianClient(client, []);
-
-    await authority.stopAndReap(new AbortController().signal);
-
-    expect(calls).toEqual([
-      expect.objectContaining({ providerRoots: [], guardian: GUARDIAN_IDENTITY }),
-      expect.objectContaining({ providerRoots: [], reaper: REAPER_IDENTITY }),
-    ]);
+    expect(result).toHaveProperty('unconfirmed');
   });
 });
 
@@ -786,8 +988,19 @@ describe('createProviderProxySetAuthority: continuous recovery', () => {
 });
 
 function fakeSpawnedGuardian(pid: number, seed: number): SpawnedRoleProcess {
+  const child: ChildProcessLike = {
+    pid,
+    exitCode: null,
+    signalCode: null,
+    stdin: null,
+    stdout: null,
+    stderr: null,
+    on: () => child,
+    kill: () => true,
+  };
   return {
-    child: {} as unknown as ChildProcessLike,
+    kind: 'spawned',
+    child,
     pid,
     incarnation: testIncarnation(seed),
     // Never settles — these tests exercise the undo path, not the spawn-error race `spawnFailed` exists for.
@@ -803,32 +1016,54 @@ type SignalCall = { pid: number; signal: NodeJS.Signals | 0 };
  * partial mock this replaces went unnoticed.
  */
 function guardianUndoRuntime(
-  time: VirtualTime,
   isAlive: () => boolean,
   killCalls: SignalCall[],
   observe?: () => ProcessLiveness,
+  onKill?: (signal: NodeJS.Signals | 0) => void,
+  identityMatches = true,
 ): Runtime {
+  let monotonicNow = 0n;
   return {
-    time,
+    time: {
+      now: () => {
+        throw new Error('guardian spawn undo must not read wall-clock time');
+      },
+      monotonicNow: () => monotonicNow,
+      sleep: async (milliseconds: number) => {
+        monotonicNow += BigInt(milliseconds);
+      },
+    },
     process: {
       kill: (pid: number, signal: NodeJS.Signals | 0) => {
         killCalls.push({ pid, signal });
+        onKill?.(signal);
         return true;
       },
       observeLiveness: () => observe?.() ?? (isAlive() ? 'alive' : 'absent'),
+      observeRecordedProcessAsync: async () => {
+        const liveness = observe?.() ?? (isAlive() ? 'alive' : 'absent');
+        return liveness === 'alive' && !identityMatches ? 'absent' : liveness;
+      },
     },
   } as unknown as Runtime;
 }
 
 describe('buildGuardianSpawnUndo', () => {
   it("signals the guardian's process group, not its bare pid", async () => {
-    const time = new VirtualTime();
     const killCalls: SignalCall[] = [];
-    const runtime = guardianUndoRuntime(time, () => false, killCalls);
+    let alive = true;
+    const runtime = guardianUndoRuntime(
+      () => alive,
+      killCalls,
+      undefined,
+      (signal) => {
+        if (signal === 'SIGTERM') alive = false;
+      },
+    );
     const spawned = fakeSpawnedGuardian(4_242, 1_000);
 
     const undo = buildGuardianSpawnUndo(runtime, spawned, 'linux', () => spawned.incarnation);
-    await undo();
+    await expect(undo()).resolves.toBeUndefined();
 
     // detached:true makes the guardian its own process-group leader (and it spawns the reaper into that
     // group before this coordinator holds control on either), so undo must reap the whole group — the
@@ -836,85 +1071,123 @@ describe('buildGuardianSpawnUndo', () => {
     expect(killCalls).toEqual([{ pid: -spawned.pid, signal: 'SIGTERM' }]);
   });
 
-  it('waits out the teardown reserve for a group still reaping rather than force-killing it mid-reap', async () => {
-    const time = new VirtualTime();
+  it('escalates a group that remains alive through the SIGTERM grace', async () => {
     const killCalls: SignalCall[] = [];
-    // Alive while the guardian drives its own enforcer's stopAndReap, gone before the reserve runs out.
-    const disappearsAt = time.now() + PROXY_TEARDOWN_RESERVE_MS / 2;
-    const runtime = guardianUndoRuntime(time, () => time.now() < disappearsAt, killCalls);
+    let alive = true;
+    const runtime = guardianUndoRuntime(
+      () => alive,
+      killCalls,
+      undefined,
+      (signal) => {
+        if (signal === 'SIGKILL') alive = false;
+      },
+    );
     const spawned = fakeSpawnedGuardian(4_242, 1_000);
 
-    const pending = buildGuardianSpawnUndo(runtime, spawned, 'linux', () => spawned.incarnation)();
-    time.tick(PROXY_TEARDOWN_RESERVE_MS);
-    await pending;
+    await expect(
+      buildGuardianSpawnUndo(runtime, spawned, 'linux', () => spawned.incarnation)(),
+    ).resolves.toBeUndefined();
 
-    expect(killCalls).toEqual([{ pid: -spawned.pid, signal: 'SIGTERM' }]);
-  });
-
-  it('escalates to SIGKILL on the group once the teardown reserve is spent', async () => {
-    const time = new VirtualTime();
-    const killCalls: SignalCall[] = [];
-    const runtime = guardianUndoRuntime(time, () => true, killCalls);
-    const spawned = fakeSpawnedGuardian(4_242, 1_000);
-
-    const pending = buildGuardianSpawnUndo(runtime, spawned, 'linux', () => spawned.incarnation)();
-    time.tick(PROXY_TEARDOWN_RESERVE_MS);
-    await pending;
-
-    // The same group, again: a guardian that spent its whole reserve without disappearing is not going to,
-    // and leaving it holding the proxy containment is the one outcome this undo exists to rule out.
     expect(killCalls).toEqual([
       { pid: -spawned.pid, signal: 'SIGTERM' },
       { pid: -spawned.pid, signal: 'SIGKILL' },
     ]);
   });
 
-  // On darwin an incarnation is wall-clock at one-second resolution, so a match is not proof the pid is still
-  // the process this acquisition spawned. Refusing costs the guardian's orphan deadline — it never received
-  // control, so it ends itself — and signalling a matching-but-different pid costs an unrelated process.
-  // Escalation needs observed life. The group may have exited during the TERM grace and had its id reused, so
-  // an unanswerable probe is not permission to SIGKILL a bare number.
-  it("does not escalate to SIGKILL when the group's liveness cannot be observed", async () => {
-    const time = new VirtualTime();
+  it('reports a hold after SIGKILL when the group remains alive', async () => {
+    const killCalls: SignalCall[] = [];
+    const runtime = guardianUndoRuntime(() => true, killCalls);
+    const spawned = fakeSpawnedGuardian(4_242, 1_000);
+
+    await expect(buildGuardianSpawnUndo(runtime, spawned, 'linux', () => spawned.incarnation)()).rejects.toThrow(
+      'guardian process-group cleanup is holding because absence could not be confirmed',
+    );
+
+    expect(killCalls).toEqual([
+      { pid: -spawned.pid, signal: 'SIGTERM' },
+      { pid: -spawned.pid, signal: 'SIGKILL' },
+    ]);
+  });
+
+  it('reports a hold without signalling when group liveness is unknown', async () => {
     const killCalls: SignalCall[] = [];
     const runtime = guardianUndoRuntime(
-      time,
       () => true,
       killCalls,
       () => 'unknown',
     );
     const spawned = fakeSpawnedGuardian(4_242, 1_000);
 
-    const pending = buildGuardianSpawnUndo(runtime, spawned, 'linux', () => spawned.incarnation)();
-    time.tick(PROXY_TEARDOWN_RESERVE_MS);
-    await pending;
-
-    expect(killCalls).toEqual([{ pid: -spawned.pid, signal: 'SIGTERM' }]);
-  });
-
-  it('declines to signal on a platform whose incarnation cannot authorize one', async () => {
-    const time = new VirtualTime();
-    const killCalls: SignalCall[] = [];
-    const runtime = guardianUndoRuntime(time, () => true, killCalls);
-    const spawned = fakeSpawnedGuardian(4_242, 1_000);
-
-    await buildGuardianSpawnUndo(runtime, spawned, 'darwin', () => spawned.incarnation)();
+    await expect(buildGuardianSpawnUndo(runtime, spawned, 'linux', () => spawned.incarnation)()).rejects.toThrow(
+      'guardian process-group cleanup is holding because identity observation did not authorize a signal',
+    );
 
     expect(killCalls).toEqual([]);
   });
 
-  it('refuses to signal once the recorded incarnation no longer matches (recycled pid)', async () => {
-    const time = new VirtualTime();
+  it("signals the owned guardian's process group on Darwin without an incarnation capability gate", async () => {
     const killCalls: SignalCall[] = [];
-    const runtime = guardianUndoRuntime(time, () => true, killCalls);
+    let alive = true;
+    const runtime = guardianUndoRuntime(
+      () => alive,
+      killCalls,
+      undefined,
+      (signal) => {
+        if (signal === 'SIGTERM') alive = false;
+      },
+    );
     const spawned = fakeSpawnedGuardian(4_242, 1_000);
-    // A different incarnation than what this acquisition recorded at spawn time: pid 4242 now names some
-    // other process, and signalling it would kill a stranger.
-    const readProcessIncarnation = (): ProcessIncarnation => testIncarnation(9_999);
+
+    await expect(buildGuardianSpawnUndo(runtime, spawned, 'darwin', () => null)()).resolves.toBeUndefined();
+
+    expect(killCalls).toEqual([{ pid: -spawned.pid, signal: 'SIGTERM' }]);
+  });
+
+  it("ignores a changed incarnation re-read for the owned guardian's process group", async () => {
+    const killCalls: SignalCall[] = [];
+    let alive = true;
+    const runtime = guardianUndoRuntime(
+      () => alive,
+      killCalls,
+      undefined,
+      (signal) => {
+        if (signal === 'SIGTERM') alive = false;
+      },
+      false,
+    );
+    const spawned = fakeSpawnedGuardian(4_242, 1_000);
+    const readProcessIncarnation = vi.fn<() => ProcessIncarnation>(() => testIncarnation(9_999));
 
     const undo = buildGuardianSpawnUndo(runtime, spawned, 'linux', readProcessIncarnation);
-    await undo();
+    await expect(undo()).resolves.toBeUndefined();
 
+    expect(readProcessIncarnation).not.toHaveBeenCalled();
+    expect(killCalls).toEqual([{ pid: -spawned.pid, signal: 'SIGTERM' }]);
+  });
+
+  it("refuses the recovered proxy's process group on Darwin", async () => {
+    const killCalls: SignalCall[] = [];
+    const runtime = guardianUndoRuntime(() => true, killCalls);
+    const spawned = fakeSpawnedGuardian(4_242, 1_000);
+    const undo = buildGuardianSpawnUndo(runtime, spawned, 'darwin', () => spawned.incarnation);
+    undo.bindProxyIdentity({ pid: 5_252, incarnation: testIncarnation(2_000), processGroupId: 5_252 });
+
+    await expect(undo()).rejects.toThrow(
+      'proxy process-group cleanup is holding because this platform cannot bind a signal to its recorded incarnation',
+    );
+    expect(killCalls).toEqual([]);
+  });
+
+  it("refuses the recovered proxy's process group after an incarnation mismatch", async () => {
+    const killCalls: SignalCall[] = [];
+    const runtime = guardianUndoRuntime(() => true, killCalls, undefined, undefined, false);
+    const spawned = fakeSpawnedGuardian(4_242, 1_000);
+    const undo = buildGuardianSpawnUndo(runtime, spawned, 'linux', () => testIncarnation(9_999));
+    undo.bindProxyIdentity({ pid: 5_252, incarnation: testIncarnation(2_000), processGroupId: 5_252 });
+
+    await expect(undo()).rejects.toThrow(
+      'proxy process-group cleanup is holding because the recorded group became unattributable',
+    );
     expect(killCalls).toEqual([]);
   });
 });

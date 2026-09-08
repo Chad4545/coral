@@ -1,12 +1,23 @@
 import { testIncarnation } from '#tests/helpers/process-incarnation.js';
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
 
 import {
   acquireProviderProxySet,
   type AcquisitionUndo,
   type ProviderProxyAcquisitionSteps,
 } from '#src/coordinator/live/provider-proxy/index.js';
+import {
+  closeProviderProxyAcquisitionSession,
+  handOverProviderProxyAcquisitionControlSession,
+  providerProxyAcquisitionSessionDescriptor,
+  providerProxyControlSessionOwner,
+  retryProviderProxyAcquisitionPublication,
+} from '#src/coordinator/live/provider-proxy/control-session.js';
 import type { ProviderProxyOperationAuthority } from '#src/coordinator/live/provider-proxy/operation-route.js';
+import type { PublicationReceipt } from '#src/coordinator/live/provider-proxy/set-publication.js';
+import { PROXY_CONTROL_RPC_TIMEOUT_MS, providerProxyDisappearanceReceipt } from '#src/provider-proxy/protocol.js';
+import { providerProxySetAddress } from '#src/coordinator/services/provider-proxy-set/identity.js';
+import { createPublicationUnknownAcquisitionSessionFixture } from '#tests/helpers/provider-proxy-acquisition-session.js';
 
 const SET: ProviderProxyOperationAuthority = {
   proxyInstanceId: 'p1',
@@ -15,11 +26,12 @@ const SET: ProviderProxyOperationAuthority = {
     adoptionWindowMs: Number.MAX_SAFE_INTEGER,
     heartbeatHoldBound: {
       spanMs: Number.MAX_SAFE_INTEGER,
-      materialSchedulerLatenessMs: Number.MAX_SAFE_INTEGER,
+      materialSchedulerLatenessMs: Math.floor(Number.MAX_SAFE_INTEGER / 4),
     },
   },
   registerSuccessionOperation: async () => ({ kind: 'registered' as const }),
   stopAndReap: async () => ({ disappearanceReceipt: 'gone' }),
+  commitContainment: async () => ({ kind: 'containment-absent', disappearanceReceipt: 'gone' }),
   stopHeartbeats: () => {},
   initiateControlClose: async () => {},
   setIdentity: {
@@ -41,6 +53,12 @@ const SET: ProviderProxyOperationAuthority = {
     canonicalEndpoint: '/tmp/proxy.sock',
   },
 };
+const acceptHoldForTest = () => ({
+  kind: 'accepted' as const,
+  owner: 'durable-provider-proxy-acquisition-hold-store' as const,
+});
+const immediateRetryTime = { sleep: async () => undefined };
+const PUBLICATION_RECEIPT = { kind: 'provider-proxy-set-published' } as PublicationReceipt;
 
 type Recorded = { readonly log: string[]; readonly steps: ProviderProxyAcquisitionSteps };
 
@@ -70,7 +88,12 @@ function steps(options: { failAt?: 'capsules' | 'spawn' | 'control'; failUndo?: 
       establishControl: async () => {
         log.push('control');
         if (options.failAt === 'control') throw new Error('containment ACK never arrived');
-        return { set: SET, undo: undo('control') };
+        return {
+          kind: 'established',
+          set: SET as never,
+          publicationReceipt: PUBLICATION_RECEIPT,
+          undo: undo('control'),
+        };
       },
     },
   };
@@ -78,13 +101,36 @@ function steps(options: { failAt?: 'capsules' | 'spawn' | 'control'; failUndo?: 
 
 const live = (): AbortSignal => new AbortController().signal;
 
+function publicationUnknownHandoff() {
+  const fixture = createPublicationUnknownAcquisitionSessionFixture(
+    providerProxyControlSessionOwner.controlEstablishment,
+  );
+  return {
+    handoff: handOverProviderProxyAcquisitionControlSession(
+      fixture.session,
+      providerProxyControlSessionOwner.acquisition,
+      {
+        kind: 'publication-unknown',
+        role: 'guardian',
+        reason: 'publication response was lost',
+      },
+    ),
+    ...fixture,
+  };
+}
+
 describe('provider proxy set acquisition', () => {
   it('publishes the set only after every step has passed', async () => {
     const recorded = steps();
 
-    const result = await acquireProviderProxySet({ steps: recorded.steps, deadlineSignal: live() });
+    const result = await acquireProviderProxySet({
+      steps: recorded.steps,
+      time: immediateRetryTime,
+      acceptHold: acceptHoldForTest,
+      deadlineSignal: live(),
+    });
 
-    expect(result).toEqual({ kind: 'acquired', set: SET });
+    expect(result).toEqual({ kind: 'acquired', set: SET, publicationReceipt: PUBLICATION_RECEIPT });
     expect(recorded.log).toEqual(['capsules', 'spawn', 'control']);
   });
 
@@ -95,7 +141,12 @@ describe('provider proxy set acquisition', () => {
   ])('unwinds exactly what the %s cut had created', async (failAt, cut, expectedUndo) => {
     const recorded = steps({ failAt });
 
-    const result = await acquireProviderProxySet({ steps: recorded.steps, deadlineSignal: live() });
+    const result = await acquireProviderProxySet({
+      steps: recorded.steps,
+      time: immediateRetryTime,
+      acceptHold: acceptHoldForTest,
+      deadlineSignal: live(),
+    });
 
     expect(result).toMatchObject({ kind: 'provider_proxy_acquisition_failed', cut, strandedArtifacts: [] });
     // Newest first: closing a control before removing the capsule that authorised it keeps the window in
@@ -109,6 +160,8 @@ describe('provider proxy set acquisition', () => {
 
     const result = await acquireProviderProxySet({
       steps: recorded.steps,
+      time: immediateRetryTime,
+      acceptHold: acceptHoldForTest,
       deadlineSignal: live(),
       onCleanupFailure: (label) => cleanupFailures.push(label),
     });
@@ -119,10 +172,215 @@ describe('provider proxy set acquisition', () => {
     expect(cleanupFailures).toEqual(['guardian']);
   });
 
+  it('publishes a pre-identity guardian spawn hold with the acquisition-abandonment exit', async () => {
+    const recorded = steps();
+    const recoverySubject = { kind: 'spawned-process-group' as const, processGroupId: 101 };
+    const recoveryCapability = {
+      retry: vi.fn(async () => ({ kind: 'held' as const, reason: 'spawned_process_group_alive' })),
+    };
+    const operatorExit = {
+      kind: 'abandon-provider-proxy-acquisition' as const,
+      abandon: vi.fn(() => ({
+        kind: 'operator-abandoned' as const,
+        recoverySubject,
+        processAbsenceProven: false as const,
+        successor: { owner: 'operator-command' as const, acceptance: 'accepted' as const },
+      })),
+    };
+    const acquisitionSteps: ProviderProxyAcquisitionSteps = {
+      ...recorded.steps,
+      spawnGuardian: async () => ({
+        kind: 'provider_proxy_role_spawn_held',
+        reason: 'guardian incarnation unavailable',
+        setAddress: {
+          buildSetId: SET.setIdentity.buildSetId,
+          hostFingerprint: SET.setIdentity.hostFingerprint,
+          proxyInstanceId: SET.setIdentity.proxyInstanceId,
+        },
+        recoverySubject,
+        operatorExit,
+        recoveryCapability,
+      }),
+    };
+    const acceptHold = vi.fn(acceptHoldForTest);
+
+    const result = await acquireProviderProxySet({
+      steps: acquisitionSteps,
+      time: immediateRetryTime,
+      acceptHold,
+      deadlineSignal: live(),
+    });
+
+    expect(result).toMatchObject({
+      kind: 'provider_proxy_acquisition_held',
+      cut: 'guardian spawn',
+      recoverySubject,
+      operatorExit: { kind: 'abandon-provider-proxy-acquisition' },
+      recoveryCapability,
+    });
+    expect(acceptHold).toHaveBeenCalledWith(expect.objectContaining({ recoverySubject, recoveryCapability }));
+    expect(recorded.log).toContain('undo:capsules');
+  });
+
+  it('retains recovery capability until a held guardian retry confirms absence', async () => {
+    const log: string[] = [];
+    let guardianAbsent = false;
+    const guardianIdentity = {
+      pid: 101,
+      incarnation: testIncarnation(101),
+      processGroupId: 101,
+    };
+    const acquisitionSteps: ProviderProxyAcquisitionSteps = {
+      createCapsules: async () => ({
+        label: 'capsules',
+        run: () => {
+          log.push('undo:capsules');
+        },
+      }),
+      spawnGuardian: async () => ({
+        kind: 'guardian-containment',
+        label: 'guardian',
+        setAddress: {
+          buildSetId: SET.setIdentity.buildSetId,
+          hostFingerprint: SET.setIdentity.hostFingerprint,
+          proxyInstanceId: SET.setIdentity.proxyInstanceId,
+        },
+        guardianIdentity,
+        captureRecoveryProof: () => {
+          const subject = {
+            guardianIdentity,
+            reaper: { kind: 'possible-unidentified' as const },
+            constructionContainmentSettled: false,
+            proxy: { kind: 'possible-unidentified' as const },
+          };
+          return {
+            subject,
+            absenceEvidence: () =>
+              ({
+                recoverySubject: subject,
+                disappearanceReceipt: providerProxyDisappearanceReceipt(guardianIdentity, []),
+              }) as never,
+          };
+        },
+        run: () => {
+          log.push('undo:guardian');
+          if (!guardianAbsent) throw new Error('guardian absence is unobservable');
+        },
+      }),
+      establishControl: async (registerUndo) => {
+        registerUndo({
+          kind: 'recovery-capability',
+          label: 'handoff capsule',
+          run: () => {
+            log.push('undo:handoff capsule');
+          },
+        });
+        throw new Error('publication refused');
+      },
+    };
+
+    const acceptHold = vi
+      .fn()
+      .mockReturnValueOnce({
+        kind: 'held' as const,
+        owner: 'provider-host-acquisition' as const,
+        reason: 'durable store temporarily unavailable',
+        waitingFor: 'store-repair' as const,
+        exit: 'provider-proxy-set-operator-disposition-store-retry' as const,
+      })
+      .mockReturnValue({
+        kind: 'accepted' as const,
+        owner: 'durable-provider-proxy-acquisition-hold-store' as const,
+      });
+    const cleanupFailures: string[] = [];
+    const retryDelay = vi.fn(async () => undefined);
+    const result = await acquireProviderProxySet({
+      steps: acquisitionSteps,
+      time: { sleep: retryDelay },
+      deadlineSignal: live(),
+      acceptHold,
+      onCleanupFailure: (label) => cleanupFailures.push(label),
+    });
+
+    expect(result).toMatchObject({
+      kind: 'provider_proxy_acquisition_held',
+      guardianIdentity,
+      strandedArtifacts: ['guardian'],
+    });
+    expect(log).toEqual(['undo:guardian', 'undo:capsules']);
+    expect(acceptHold).toHaveBeenCalledTimes(2);
+    expect(retryDelay).toHaveBeenCalledWith(1_000);
+    expect(acceptHold).toHaveBeenCalledWith(
+      expect.objectContaining({
+        setAddress: providerProxySetAddress(SET.setIdentity),
+        recoverySubject: expect.objectContaining({ proxy: { kind: 'possible-unidentified' } }),
+      }),
+    );
+    expect(cleanupFailures).toContain('durable acquisition hold');
+    if (result.kind !== 'provider_proxy_acquisition_held') throw new Error(`expected hold, received ${result.kind}`);
+    if (!('guardianIdentity' in result)) throw new Error('expected an identity-bound guardian hold');
+    guardianAbsent = true;
+    await expect(result.recoveryCapability.retry(live())).resolves.toMatchObject({
+      kind: 'absence-confirmed',
+      evidence: {
+        recoverySubject: result.recoverySubject,
+        disappearanceReceipt: providerProxyDisappearanceReceipt(result.guardianIdentity, []),
+      },
+      strandedArtifacts: [],
+    });
+    expect(log).toEqual(['undo:guardian', 'undo:capsules', 'undo:guardian', 'undo:handoff capsule']);
+  });
+
+  it('hands over the live control-session owner without unwinding a publication-unknown set', async () => {
+    const recorded = steps();
+    const publicationUnknown = publicationUnknownHandoff();
+    recorded.steps.establishControl = async () => publicationUnknown.handoff;
+
+    const result = await acquireProviderProxySet({
+      steps: recorded.steps,
+      time: immediateRetryTime,
+      acceptHold: acceptHoldForTest,
+      deadlineSignal: live(),
+    });
+
+    if (result.kind !== 'handed-over') throw new Error(`expected handoff, received ${result.kind}`);
+    expect(result.incident).toEqual({
+      kind: 'publication-unknown',
+      role: 'guardian',
+      reason: 'publication response was lost',
+    });
+    expect(providerProxyAcquisitionSessionDescriptor(result.session)).toEqual({
+      setIdentity: publicationUnknown.setIdentity,
+      capsulePath: '/capsules/publication-unknown.handoff.v3.json',
+      capsuleBinding: publicationUnknown.capsuleBinding,
+    });
+    await expect(retryProviderProxyAcquisitionPublication(result.session)).resolves.toMatchObject({
+      kind: 'publication-unknown',
+      role: 'guardian',
+    });
+    expect(publicationUnknown.guardianExchange.mock.calls).toContainEqual([
+      'guardian.acquisition-publish.v1',
+      {
+        guardian: publicationUnknown.guardianIdentity,
+        reaper: publicationUnknown.reaperIdentity,
+        proxy: publicationUnknown.proxyIdentity,
+      },
+      PROXY_CONTROL_RPC_TIMEOUT_MS,
+    ]);
+    expect(publicationUnknown.proxyExchange).not.toHaveBeenCalled();
+    expect(recorded.log).toEqual(['capsules', 'spawn']);
+    closeProviderProxyAcquisitionSession(result.session, 'test complete');
+  });
+
   it('does not begin a step once the acquisition deadline has elapsed', async () => {
     const recorded = steps();
 
-    const result = await acquireProviderProxySet({ steps: recorded.steps, deadlineSignal: AbortSignal.abort() });
+    const result = await acquireProviderProxySet({
+      steps: recorded.steps,
+      time: immediateRetryTime,
+      acceptHold: acceptHoldForTest,
+      deadlineSignal: AbortSignal.abort(),
+    });
 
     expect(result).toMatchObject({ cut: 'capsule creation', reason: 'the acquisition deadline elapsed' });
     // Nothing was created, so there is nothing to unwind — and nothing was spawned that could outlive this.
@@ -134,6 +392,9 @@ describe('provider proxy set acquisition', () => {
     const originalSpawn = recorded.steps.spawnGuardian;
     recorded.steps.spawnGuardian = async () => {
       const undo = await originalSpawn();
+      if (undo.kind === 'provider_proxy_role_spawn_held') {
+        throw new Error('expected an identity-bound guardian undo');
+      }
       // Simulates a control-close RPC that never returns — exactly what would otherwise hold the caller's
       // single-flight slot open forever.
       return { label: undo.label, run: () => new Promise<void>(() => {}) };
@@ -142,6 +403,8 @@ describe('provider proxy set acquisition', () => {
 
     const result = await acquireProviderProxySet({
       steps: recorded.steps,
+      time: immediateRetryTime,
+      acceptHold: acceptHoldForTest,
       deadlineSignal: AbortSignal.timeout(50),
       onCleanupFailure: (label) => cleanupFailures.push(label),
     });
@@ -153,24 +416,57 @@ describe('provider proxy set acquisition', () => {
     expect(recorded.log).toContain('undo:capsules');
   });
 
-  it('refuses to publish a set whose deadline elapsed while the last handshake was in flight', async () => {
+  it('keeps an already-published set when the deadline elapses after control establishment returns', async () => {
     const recorded = steps();
     const deadline = new AbortController();
     const original = recorded.steps.establishControl;
     const racing: ProviderProxyAcquisitionSteps = {
       ...recorded.steps,
-      establishControl: async () => {
-        const result = await original();
+      establishControl: async (registerUndo, assertPublicationMayBegin) => {
+        const result = await original(registerUndo, assertPublicationMayBegin);
         deadline.abort();
         return result;
       },
     };
 
-    const result = await acquireProviderProxySet({ steps: racing, deadlineSignal: deadline.signal });
+    const result = await acquireProviderProxySet({
+      steps: racing,
+      time: immediateRetryTime,
+      acceptHold: acceptHoldForTest,
+      deadlineSignal: deadline.signal,
+    });
 
-    // The caller has already given up, so publishing here would hand out a set nobody is holding — and it
-    // would reap itself on a deadline nobody is watching.
-    expect(result).toMatchObject({ kind: 'provider_proxy_acquisition_failed', cut: 'readiness publication' });
+    expect(result).toEqual({ kind: 'acquired', set: SET, publicationReceipt: PUBLICATION_RECEIPT });
+    expect(recorded.log.filter((entry) => entry.startsWith('undo:'))).toEqual([]);
+  });
+
+  it('refuses to begin publication after the acquisition deadline has elapsed', async () => {
+    const recorded = steps();
+    const deadline = new AbortController();
+    recorded.steps.establishControl = async (registerUndo, assertPublicationMayBegin) => {
+      registerUndo({
+        label: 'control',
+        run: () => {
+          recorded.log.push('undo:control');
+        },
+      });
+      deadline.abort();
+      assertPublicationMayBegin();
+      throw new Error('publication began after its gate');
+    };
+
+    const result = await acquireProviderProxySet({
+      steps: recorded.steps,
+      time: immediateRetryTime,
+      acceptHold: acceptHoldForTest,
+      deadlineSignal: deadline.signal,
+    });
+
+    expect(result).toMatchObject({
+      kind: 'provider_proxy_acquisition_failed',
+      cut: 'readiness publication',
+      reason: 'the acquisition deadline elapsed before the set was published',
+    });
     expect(recorded.log.filter((entry) => entry.startsWith('undo:'))).toEqual([
       'undo:control',
       'undo:guardian',

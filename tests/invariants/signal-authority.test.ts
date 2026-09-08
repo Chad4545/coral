@@ -1,33 +1,10 @@
-// Signal-authority invariant — a signal aimed at a *number* must first establish that the number still names
-// the process it was recorded for.
-//
-// A pid is not an identity: the OS recycles it. `child.kill('SIGTERM')` is therefore out of scope here, and
-// deliberately so — the handle names one child, and Node refuses to signal through it once that child has been
-// reaped. `process.kill(pid, sig)` has no such protection. Whatever the number meant when it was written down,
-// nothing revalidates it at the moment of the call, and the failure is silent: SIGKILL to a stranger.
-//
-// This is not hypothetical and it is not rare. `incarnationMayAuthorizeSignal` exists because a macOS
-// incarnation is wall-clock at one-second resolution and cannot carry this weight at all.
-// A rule enforced by reading is a rule enforced at whatever rate people read.
-//
-// The scan is intentionally coarse — file-level, not call-level. Every file that signals a bare pid must
-// either consult `incarnationMayAuthorizeSignal`, or carry an entry below saying what makes its number safe.
-// Coarse is the right grain: an exemption is a claim about a subsystem's evidence, and it should be written
-// down where a reader of that subsystem will meet it.
-//
-// Signal 0 is not a signal. `kill(pid, 0)` and `kill(-pid, 0)` are liveness probes; the worst a recycled pid
-// does there is answer a question wrongly, which every caller already treats as inconclusive.
-//
-// One limitation, stated because a scan that hides its blind spots is worse than none: a signal delivered
-// through a *helper* is attributed to the helper's file, not the caller's. `gracefulKillByPid` lives in
-// `infra/process-supervision.ts`, so its callers (`live/durable-transport.ts`,
-// `services/recovery/actions.ts`) are invisible here. Guarding one call inside an allowlisted file and
-// deleting its entry would therefore pass while its siblings stay unguarded. Until every pid signal goes
-// through one identity-bearing helper, the ALLOWLIST names modules, and
-// `docs/todo/durable-cli-signal-authority.md` names the behavioural paths.
+// Every non-probe signal to a numeric target must refresh its exact identity in the enclosing signalling
+// function, or derive the number from a branded live-child authority after refusing a collected child.
+// Authority cannot cross function boundaries. Child-handle signalling carries its own authority, while
+// signal-zero probes carry no delivery authority.
 
 import { readFileSync, readdirSync } from 'node:fs';
-import { join, relative } from 'node:path';
+import { join, posix, relative } from 'node:path';
 import { describe, expect, it } from 'vitest';
 import ts from 'typescript';
 
@@ -35,6 +12,7 @@ import { bindWithHandoff, HandoffEscalationError, type HandoffOptions } from '..
 import type { Runtime } from '../../src/runtime/ports.js';
 import type { IncumbentIdentity } from '../../src/transport/ipc/handoff.js';
 import { codeTextOnly } from '../helpers/ts-code-text.js';
+import { isFunctionScope } from '../helpers/ts-function-scope.js';
 import { testIncarnation } from '../helpers/process-incarnation.js';
 
 const REPO_ROOT = join(__dirname, '..', '..');
@@ -42,54 +20,16 @@ const SRC_ROOT = 'src';
 
 const AUTHORITY_OWNER_FILE = 'src/infra/node-process.ts';
 
-/**
- * Files that signal a bare pid without consulting the rule, each with what stands in for it.
- *
- * An entry is a claim, and a claim that stops being true is worse than no claim — so keep them specific
- * enough to be falsified. "It is probably fine" is not an entry.
- */
-const ALLOWLIST = new Map<string, string>([
+const EXACT_CALL_ALLOWLIST = new Map<string, string>([
   [
-    'src/runtime/real.ts',
-    // The port itself. It forwards a signal it is handed and holds no record to check one against; the
-    // authority belongs to whoever produced the number.
+    'src/runtime/real.ts:process.kill(pid)',
     'the process port that forwards kill(); it has no recorded identity of its own to check',
   ],
+  ['src/cli/run.ts:process.kill(process.pid)', 'signals its own pid to re-raise a handoff signal'],
+  ['src/cli/commands/backend.ts:process.kill(process.pid)', 'signals its own pid to re-raise a continuation signal'],
   [
-    'src/cli/run.ts',
-    // `kill(process.pid, …)` — the caller's own pid, re-raising a signal on itself so the shell sees the
-    // real cause of death. A process cannot be a stranger to itself.
-    'signals its own pid to re-raise a handoff signal',
-  ],
-  ['src/cli/commands/backend.ts', 'signals its own pid to re-raise a continuation signal'],
-  [
-    'src/infra/process-containment.ts',
-    // The known gap, deliberately open rather than hidden: closing it here breaks coordinator-local provider
-    // host teardown, which has no reclaimer. Both the reasoning and the shape of the real fix are in
-    // docs/todo/darwin-signal-authority.md, and this entry is what keeps that document from being the only
-    // place it is recorded.
-    'deliberately open on darwin — see docs/todo/darwin-signal-authority.md',
-  ],
-  [
-    'src/coordinator/live/durable-transport.ts',
-    // Signals a durable child's pid after an idle timeout measured in minutes. The identity IS recorded
-    // (`durable_cli_process.v1` carries an incarnation) and is not consulted.
-    'UNGUARDED, tracked in docs/todo/durable-cli-signal-authority.md',
-  ],
-  ['src/jobs/reconcile/registry.ts', 'UNGUARDED, tracked in docs/todo/durable-cli-signal-authority.md'],
-  ['src/coordinator/services/recovery/service.ts', 'UNGUARDED, tracked in docs/todo/durable-cli-signal-authority.md'],
-  [
-    'src/infra/process-supervision.ts',
-    'UNGUARDED (gracefulKillByPid), tracked in docs/todo/durable-cli-signal-authority.md',
-  ],
-  [
-    'src/runtime/exec-builder.ts',
-    // Signals the child it is at that moment awaiting, on timeout or maxBuffer, through an injected `kill`.
-    // The exposure is real but a different size: the window is the single event-loop
-    // turn between the child exiting and its 'close' reaching the `resolved` guard, not a pid recovered from
-    // a record written before a restart. Recorded rather than waved through, and it is the site that proved
-    // the scan's own blind spot.
-    'signals a child it currently holds and awaits; one-turn exit/close race, tracked with the others',
+    'src/runtime/durable-cli-wrapper.ts:process.kill(-process.pid)',
+    'signals the process group led by its own live process',
   ],
 ]);
 
@@ -115,35 +55,20 @@ function canonicalSrcPath(filePath: string): string {
   return relative(REPO_ROOT, filePath).replace(/\\/gu, '/');
 }
 
-/**
- * Whether a file signals a pid rather than a held child.
- *
- * Read from the AST rather than a regex, because the distinction that matters is the call's *arity and
- * argument shape*: `kill(sig)` is a handle, `kill(pid, sig)` is a number, and `kill(pid, 0)` is a question.
- * Text cannot separate those without reimplementing the parser.
- *
- * Both call shapes count, and the second is why: an earlier version matched only `something.kill(pid, sig)`
- * and was blind to `kill(-child.pid, signal)` where `kill` is an *injected function* — which is exactly what
- * `runtime/exec-builder.ts` does. The scan reported a complete enumeration while missing a real signal path,
- * which is worse than not scanning, because the empty result was read as proof.
- */
-function signalsABarePid(source: string, fileName: string): boolean {
+/** The scan must distinguish handle calls, numeric delivery calls, and signal-zero probes from the AST. */
+function barePidSignalCalls(source: string, fileName: string): readonly ts.CallExpression[] {
   const parsed = ts.createSourceFile(fileName, source, ts.ScriptTarget.Latest, true);
-  let found = false;
+  const found: ts.CallExpression[] = [];
 
   const namesKill = (callee: ts.Expression): boolean =>
     (ts.isPropertyAccessExpression(callee) && callee.name.text === 'kill') ||
     (ts.isIdentifier(callee) && callee.text === 'kill');
 
   const visit = (node: ts.Node): void => {
-    if (found) return;
     if (ts.isCallExpression(node) && namesKill(node.expression) && node.arguments.length >= 2) {
       const signal = node.arguments[1];
       const isProbe = signal !== undefined && ts.isNumericLiteral(signal) && signal.text === '0';
-      if (!isProbe) {
-        found = true;
-        return;
-      }
+      if (!isProbe) found.push(node);
     }
     ts.forEachChild(node, visit);
   };
@@ -152,64 +77,512 @@ function signalsABarePid(source: string, fileName: string): boolean {
   return found;
 }
 
-function consultsSignalAuthority(source: string): boolean {
-  return /(^|[^.\w$])incarnationMayAuthorizeSignal\s*\(/u.test(codeTextOnly(source));
+function exactCallKey(call: ts.CallExpression, source: ts.SourceFile): string | null {
+  const firstArgument = call.arguments[0];
+  if (
+    ts.isPropertyAccessExpression(call.expression) &&
+    call.expression.expression.getText(source) === 'process' &&
+    call.expression.name.text === 'kill' &&
+    firstArgument !== undefined
+  ) {
+    return `${canonicalSrcPath(source.fileName)}:process.kill(${firstArgument.getText(source)})`;
+  }
+  return null;
+}
+
+function enclosingSignallingFunction(call: ts.CallExpression): ts.FunctionLikeDeclaration | null {
+  let scope: ts.Node | undefined = call;
+  while (scope !== undefined && !isFunctionScope(scope)) scope = scope.parent;
+  return scope !== undefined && isFunctionScope(scope) ? scope : null;
+}
+
+function signallingFunctionName(scope: ts.FunctionLikeDeclaration, source: ts.SourceFile): string {
+  if ('name' in scope && scope.name !== undefined) return scope.name.getText(source);
+  const parent = scope.parent;
+  if (ts.isVariableDeclaration(parent) || ts.isPropertyAssignment(parent)) return parent.name.getText(source);
+  return '<anonymous-signalling-function>';
+}
+
+type LiveChildAuthoritySource = Readonly<{
+  name: string;
+  declaredAt: number;
+  mayBeUndefined: boolean;
+}>;
+
+type LiveChildAuthorityImports = Readonly<{
+  mintNames: ReadonlySet<string>;
+  typeNames: ReadonlySet<string>;
+}>;
+
+function importsLiveChildAuthorityFromCanonicalModule(source: ts.SourceFile): LiveChildAuthorityImports {
+  const mintNames = new Set<string>();
+  const typeNames = new Set<string>();
+  const root = REPO_ROOT.replace(/\\/gu, '/');
+  const sourceName = source.fileName.replace(/\\/gu, '/');
+  const canonicalSourceName = sourceName.startsWith(`${root}/`) ? sourceName.slice(root.length + 1) : sourceName;
+
+  if (canonicalSourceName === 'src/infra/process-supervision.ts') {
+    mintNames.add('liveChildAuthority');
+    typeNames.add('LiveChildAuthority');
+  }
+
+  for (const statement of source.statements) {
+    if (
+      !ts.isImportDeclaration(statement) ||
+      !ts.isStringLiteral(statement.moduleSpecifier) ||
+      statement.importClause?.namedBindings === undefined ||
+      !ts.isNamedImports(statement.importClause.namedBindings)
+    ) {
+      continue;
+    }
+    const specifier = statement.moduleSpecifier.text;
+    const canonicalModule =
+      specifier === '#src/infra/process-supervision.js' ||
+      (specifier.startsWith('.') &&
+        posix.normalize(posix.join(posix.dirname(canonicalSourceName), specifier)) ===
+          'src/infra/process-supervision.js');
+    if (!canonicalModule) continue;
+
+    for (const element of statement.importClause.namedBindings.elements) {
+      const importedName = (element.propertyName ?? element.name).text;
+      if (importedName === 'liveChildAuthority') mintNames.add(element.name.text);
+      if (importedName === 'LiveChildAuthority') typeNames.add(element.name.text);
+    }
+  }
+  return { mintNames, typeNames };
+}
+
+function typeUsesImportedLiveChildAuthority(type: ts.TypeNode, importedNames: ReadonlySet<string>): boolean {
+  let found = false;
+  const visit = (node: ts.Node): void => {
+    if (ts.isTypeReferenceNode(node) && ts.isIdentifier(node.typeName) && importedNames.has(node.typeName.text)) {
+      found = true;
+      return;
+    }
+    ts.forEachChild(node, visit);
+  };
+  visit(type);
+  return found;
+}
+
+function unwrappedExpression(expression: ts.Expression): ts.Expression {
+  let current = expression;
+  while (
+    ts.isParenthesizedExpression(current) ||
+    ts.isAsExpression(current) ||
+    ts.isTypeAssertionExpression(current) ||
+    ts.isNonNullExpression(current)
+  ) {
+    current = current.expression;
+  }
+  return current;
+}
+
+function dominatingStatements(call: ts.CallExpression, scope: ts.FunctionLikeDeclaration): readonly ts.Statement[] {
+  const statements: ts.Statement[] = [];
+  let current: ts.Node = call;
+  while (current !== scope && current.parent !== undefined) {
+    const parent = current.parent;
+    if (ts.isBlock(parent)) {
+      const containingStatement = parent.statements.find(
+        (statement) => statement.pos <= current.pos && statement.end >= current.end,
+      );
+      if (containingStatement !== undefined) {
+        const index = parent.statements.indexOf(containingStatement);
+        statements.push(...parent.statements.slice(0, index));
+      }
+    }
+    current = parent;
+  }
+  return statements.sort((left, right) => left.pos - right.pos);
+}
+
+function liveChildAuthoritySources(
+  scope: ts.FunctionLikeDeclaration,
+  statements: readonly ts.Statement[],
+  imports: LiveChildAuthorityImports,
+): readonly LiveChildAuthoritySource[] {
+  const sources: LiveChildAuthoritySource[] = [];
+  for (const parameter of scope.parameters) {
+    if (
+      ts.isIdentifier(parameter.name) &&
+      parameter.type !== undefined &&
+      typeUsesImportedLiveChildAuthority(parameter.type, imports.typeNames)
+    ) {
+      sources.push({ name: parameter.name.text, declaredAt: parameter.pos, mayBeUndefined: false });
+    }
+  }
+  for (const statement of statements) {
+    if (!ts.isVariableStatement(statement)) continue;
+    for (const declaration of statement.declarationList.declarations) {
+      const initializer = declaration.initializer;
+      if (
+        !ts.isIdentifier(declaration.name) ||
+        initializer === undefined ||
+        !ts.isCallExpression(initializer) ||
+        !ts.isIdentifier(initializer.expression) ||
+        !imports.mintNames.has(initializer.expression.text)
+      ) {
+        continue;
+      }
+      sources.push({ name: declaration.name.text, declaredAt: declaration.pos, mayBeUndefined: true });
+    }
+  }
+  return sources;
+}
+
+function callsHasExited(expression: ts.Expression, authorityName: string): boolean {
+  const candidate = unwrappedExpression(expression);
+  return (
+    ts.isCallExpression(candidate) &&
+    candidate.arguments.length === 0 &&
+    ts.isPropertyAccessExpression(candidate.expression) &&
+    ts.isIdentifier(candidate.expression.expression) &&
+    candidate.expression.expression.text === authorityName &&
+    candidate.expression.name.text === 'hasExited'
+  );
+}
+
+function checksUndefined(expression: ts.Expression, authorityName: string): boolean {
+  const candidate = unwrappedExpression(expression);
+  if (!ts.isBinaryExpression(candidate)) return false;
+  if (
+    candidate.operatorToken.kind !== ts.SyntaxKind.EqualsEqualsEqualsToken &&
+    candidate.operatorToken.kind !== ts.SyntaxKind.EqualsEqualsToken
+  ) {
+    return false;
+  }
+  const isAuthority = (operand: ts.Expression): boolean => {
+    const unwrapped = unwrappedExpression(operand);
+    return ts.isIdentifier(unwrapped) && unwrapped.text === authorityName;
+  };
+  const isMissing = (operand: ts.Expression): boolean => {
+    const unwrapped = unwrappedExpression(operand);
+    return (
+      (ts.isIdentifier(unwrapped) && unwrapped.text === 'undefined') || unwrapped.kind === ts.SyntaxKind.NullKeyword
+    );
+  };
+  return (
+    (isAuthority(candidate.left) && isMissing(candidate.right)) ||
+    (isMissing(candidate.left) && isAuthority(candidate.right))
+  );
+}
+
+function refusesCollectedChild(condition: ts.Expression, authority: LiveChildAuthoritySource): boolean {
+  const candidate = unwrappedExpression(condition);
+  if (!authority.mayBeUndefined) return callsHasExited(candidate, authority.name);
+  if (!ts.isBinaryExpression(candidate) || candidate.operatorToken.kind !== ts.SyntaxKind.BarBarToken) return false;
+  return (
+    (checksUndefined(candidate.left, authority.name) && callsHasExited(candidate.right, authority.name)) ||
+    (callsHasExited(candidate.left, authority.name) && checksUndefined(candidate.right, authority.name))
+  );
+}
+
+function statementReturns(statement: ts.Statement): boolean {
+  if (ts.isReturnStatement(statement)) return true;
+  if (!ts.isBlock(statement)) return false;
+  const lastStatement = statement.statements.at(-1);
+  return lastStatement !== undefined && ts.isReturnStatement(lastStatement);
+}
+
+function signalTargetsAuthority(call: ts.CallExpression, authorityName: string): boolean {
+  const firstArgument = call.arguments[0];
+  if (firstArgument === undefined) return false;
+  let target = unwrappedExpression(firstArgument);
+  if (ts.isPrefixUnaryExpression(target) && target.operator === ts.SyntaxKind.MinusToken) {
+    target = unwrappedExpression(target.operand);
+  }
+  return (
+    ts.isPropertyAccessExpression(target) &&
+    ts.isIdentifier(target.expression) &&
+    target.expression.text === authorityName &&
+    target.name.text === 'pid'
+  );
+}
+
+function liveChildAuthorityGuardsSignal(
+  scope: ts.FunctionLikeDeclaration,
+  call: ts.CallExpression,
+  source: ts.SourceFile,
+): boolean {
+  const statements = dominatingStatements(call, scope);
+  const imports = importsLiveChildAuthorityFromCanonicalModule(source);
+  for (const authority of liveChildAuthoritySources(scope, statements, imports)) {
+    if (!signalTargetsAuthority(call, authority.name)) continue;
+    const guard = statements.at(-1);
+    const guarded =
+      guard !== undefined &&
+      ts.isIfStatement(guard) &&
+      guard.pos > authority.declaredAt &&
+      statementReturns(guard.thenStatement) &&
+      refusesCollectedChild(guard.expression, authority);
+    if (guarded) return true;
+  }
+  return false;
+}
+
+function establishesSignalAuthority(
+  scope: ts.FunctionLikeDeclaration,
+  call: ts.CallExpression,
+  source: ts.SourceFile,
+): boolean {
+  const text = codeTextOnly(scope.getText(source));
+  // Only exact identity evidence may authorize signalling through a branded capability or inline guard.
+  if (/verifySignalTarget\s*\(/u.test(text) || /\bHandoffSignalCapability\b/u.test(text)) return true;
+  if (liveChildAuthorityGuardsSignal(scope, call, source)) return true;
+  // The refusal must end the `if` it opens: a tail that could run past `{`, `}` or `;` would be satisfied
+  // by any later brace in the scanned text, which is how a module-wide scan read a guard that was not there.
+  const refusesInsufficientPlatformAuthority =
+    /if\s*\([\s\S]*?!\s*(?:incarnationMayAuthorizeSignal|identityMayAuthorizeSignal)\s*\([^)]*\)[^{};]*?\)\s*(?:\{|return\b)/u.test(
+      text,
+    );
+  const refreshesExactIdentity =
+    /readProcessIncarnation\s*\(/u.test(text) ||
+    /readIncarnation\s*\(/u.test(text) ||
+    /observeRecordedTarget\s*\(/u.test(text);
+  return refusesInsufficientPlatformAuthority && refreshesExactIdentity;
+}
+
+function unguardedSignallingFunctions(source: string, fileName: string): readonly string[] {
+  const parsed = ts.createSourceFile(fileName, source, ts.ScriptTarget.Latest, true);
+  const violations = new Set<string>();
+  for (const call of barePidSignalCalls(source, fileName)) {
+    if (EXACT_CALL_ALLOWLIST.has(exactCallKey(call, parsed) ?? '')) continue;
+    const scope = enclosingSignallingFunction(call);
+    if (scope === null || !establishesSignalAuthority(scope, call, parsed)) {
+      violations.add(scope === null ? '<module-scope>' : signallingFunctionName(scope, parsed));
+    }
+  }
+  return [...violations];
 }
 
 describe('a signal aimed at a pid establishes that the pid is still its recorded process', () => {
-  it('no module signals a bare pid without consulting the platform rule or a written exemption', () => {
+  it('no module signals a bare pid without refusing on insufficient platform authority or a written exemption', () => {
     const violations: string[] = [];
     for (const filePath of listSourceFiles(SRC_ROOT)) {
       const canonical = canonicalSrcPath(filePath);
-      if (canonical === AUTHORITY_OWNER_FILE || ALLOWLIST.has(canonical)) continue;
+      if (canonical === AUTHORITY_OWNER_FILE) continue;
       const source = readFileSync(filePath, 'utf-8');
-      if (signalsABarePid(source, canonical) && !consultsSignalAuthority(source)) violations.push(canonical);
+      for (const scope of unguardedSignallingFunctions(source, canonical)) violations.push(`${canonical}::${scope}`);
     }
-    // To resolve: consult `incarnationMayAuthorizeSignal(platform)` before signalling and compare the recorded
-    // incarnation against a fresh probe — or add an ALLOWLIST entry stating what else proves the pid.
+    // Numeric signal authority requires a fresh matching incarnation or an explicit allowlist proof.
     expect(violations.sort()).toEqual([]);
   });
 
   it('every exemption still signals a bare pid (stale entries are removed)', () => {
-    const stale: string[] = [];
-    for (const canonical of ALLOWLIST.keys()) {
+    const staleCalls: string[] = [];
+    for (const key of EXACT_CALL_ALLOWLIST.keys()) {
+      const separator = key.indexOf(':');
+      const canonical = key.slice(0, separator);
       const source = readFileSync(join(REPO_ROOT, canonical), 'utf-8');
-      if (!signalsABarePid(source, canonical)) stale.push(canonical);
+      const parsed = ts.createSourceFile(canonical, source, ts.ScriptTarget.Latest, true);
+      const keys = barePidSignalCalls(source, canonical).map((call) => exactCallKey(call, parsed));
+      if (!keys.includes(key)) staleCalls.push(key);
     }
-    expect(stale.sort()).toEqual([]);
+    expect(staleCalls.sort()).toEqual([]);
   });
 
-  // The scan answers "did the file consult the rule", never "did it obey the answer", and never "did it ask
-  // about the platform it is actually running on". A guard-shaped statement reading
-  // `incarnationMayAuthorizeSignal('linux')` satisfies the first two and is a constant `true` — the whole
-  // refusal deleted, in a form that still greps as present. That mutation survived the first version of this
-  // test, so the argument is checked here rather than only the shape.
-  it('the two gated signal paths refuse, and ask about the running platform rather than a constant', () => {
-    for (const canonical of ['src/coordinator/live/provider-proxy/spawn-undo.ts', 'src/provider-proxy/role-main.ts']) {
-      const raw = readFileSync(join(REPO_ROOT, canonical), 'utf-8');
-      expect(
-        /if\s*\(\s*!\s*incarnationMayAuthorizeSignal\s*\([^)]*\)\s*\)\s*return/u.test(codeTextOnly(raw)),
-        `${canonical} must refuse, not merely ask`,
-      ).toBe(true);
+  it('does not let a guarded sibling hide an unguarded signalling function', () => {
+    const fixture = `
+      function guarded(runtime: Runtime, pid: number, incarnation: ProcessIncarnation, platform: NodeJS.Platform) {
+        if (!incarnationMayAuthorizeSignal(platform)) return;
+        if (runtime.process.readProcessIncarnation(pid, platform) !== incarnation) return;
+        runtime.process.kill(pid, 'SIGTERM');
+      }
+      function unguarded(runtime: Runtime, pid: number) {
+        runtime.process.kill(pid, 'SIGKILL');
+      }
+    `;
 
-      const parsed = ts.createSourceFile(canonical, raw, ts.ScriptTarget.Latest, true);
-      const constantArguments: string[] = [];
-      const visit = (node: ts.Node): void => {
-        if (
-          ts.isCallExpression(node) &&
-          ts.isIdentifier(node.expression) &&
-          node.expression.text === 'incarnationMayAuthorizeSignal'
-        ) {
-          for (const argument of node.arguments) {
-            if (ts.isStringLiteralLike(argument)) constantArguments.push(argument.getText(parsed));
-          }
-        }
-        ts.forEachChild(node, visit);
-      };
-      visit(parsed);
+    expect(unguardedSignallingFunctions(fixture, 'negative-control.ts')).toEqual(['unguarded']);
+  });
 
-      expect(constantArguments, `${canonical} must ask about the platform it is running on`).toEqual([]);
+  it('rejects a platform guard that never refreshes the recorded identity', () => {
+    const fixture = `
+      function staleAuthority(runtime: Runtime, pid: number, platform: NodeJS.Platform) {
+        if (!incarnationMayAuthorizeSignal(platform)) return;
+        runtime.process.kill(pid, 'SIGTERM');
+      }
+    `;
+
+    expect(unguardedSignallingFunctions(fixture, 'negative-control.ts')).toEqual(['staleAuthority']);
+  });
+
+  it('accepts a branded live-child authority only when its collection guard dominates its pid signal', () => {
+    const fixture = `
+      import { liveChildAuthority } from './infra/process-supervision.js';
+      import { type LiveChildAuthority as ChildAuthority } from '#src/infra/process-supervision.js';
+
+      function guarded(child: ChildProcessLike, kill: ProcessPort['kill']) {
+        const authority = liveChildAuthority(child);
+        if (authority === undefined || authority.hasExited()) return;
+        kill(-authority.pid, 'SIGTERM');
+      }
+      function guardedParameter(authority: ChildAuthority, kill: ProcessPort['kill']) {
+        if (authority.hasExited()) return;
+        kill(-authority.pid, 'SIGKILL');
+      }
+    `;
+
+    expect(unguardedSignallingFunctions(fixture, 'src/positive-control.ts')).toEqual([]);
+  });
+
+  it('rejects a brand that does not synchronously guard its own pid and an unbranded predicate', () => {
+    const fixture = `
+      import { liveChildAuthority, type LiveChildAuthority } from './infra/process-supervision.js';
+
+      function unguardedBrand(child: ChildProcessLike, kill: ProcessPort['kill']) {
+        const authority = liveChildAuthority(child);
+        if (authority === undefined) return;
+        kill(-authority.pid, 'SIGTERM');
+      }
+      async function staleAcrossAwait(authority: LiveChildAuthority, kill: ProcessPort['kill']) {
+        if (authority.hasExited()) return;
+        await Promise.resolve();
+        kill(-authority.pid, 'SIGTERM');
+      }
+      function wrongSubject(authority: LiveChildAuthority, pid: number, kill: ProcessPort['kill']) {
+        if (authority.hasExited()) return;
+        kill(pid, 'SIGTERM');
+      }
+      function unbranded(pid: number, kill: ProcessPort['kill']) {
+        const authority = { pid, hasExited: () => false };
+        if (authority.hasExited()) return;
+        kill(-authority.pid, 'SIGKILL');
+      }
+    `;
+
+    expect(unguardedSignallingFunctions(fixture, 'src/negative-control.ts')).toEqual([
+      'unguardedBrand',
+      'staleAcrossAwait',
+      'wrongSubject',
+      'unbranded',
+    ]);
+  });
+
+  it('rejects local functions and types that counterfeit live-child authority names', () => {
+    const fixture = `
+      function liveChildAuthority(child: ChildProcessLike) {
+        return { pid: child.pid, hasExited: () => false };
+      }
+      type LiveChildAuthority = Readonly<{ pid: number; hasExited(): boolean }>;
+
+      function counterfeitMint(child: ChildProcessLike, kill: ProcessPort['kill']) {
+        const authority = liveChildAuthority(child);
+        if (authority === undefined || authority.hasExited()) return;
+        kill(-authority.pid, 'SIGTERM');
+      }
+      function counterfeitType(authority: LiveChildAuthority, kill: ProcessPort['kill']) {
+        if (authority.hasExited()) return;
+        kill(-authority.pid, 'SIGKILL');
+      }
+    `;
+
+    expect(unguardedSignallingFunctions(fixture, 'src/counterfeit-control.ts')).toEqual([
+      'counterfeitMint',
+      'counterfeitType',
+    ]);
+  });
+
+  it('the backend recorded-role signal has platform authority and a fresh matching incarnation', () => {
+    const canonical = 'src/cli/commands/backend.ts';
+    const raw = readFileSync(join(REPO_ROOT, canonical), 'utf-8');
+    const parsed = ts.createSourceFile(canonical, raw, ts.ScriptTarget.Latest, true);
+    const recordedPidCalls = barePidSignalCalls(raw, canonical).filter(
+      (call) => !EXACT_CALL_ALLOWLIST.has(exactCallKey(call, parsed) ?? ''),
+    );
+
+    expect(recordedPidCalls).toHaveLength(1);
+    const call = recordedPidCalls[0];
+    if (call === undefined) throw new Error('Expected the provider-role signal call');
+    let scope: ts.Node = call;
+    while (scope.parent !== undefined && !ts.isFunctionLike(scope)) scope = scope.parent;
+    const guardedSource = codeTextOnly(scope.getText(parsed));
+
+    expect(guardedSource).toMatch(
+      /if\s*\(\s*!\s*incarnationMayAuthorizeSignal\s*\(\s*platform\s*\)\s*\)\s*(?:\{\s*)?return\b/u,
+    );
+    expect(guardedSource).toMatch(
+      /observedIncarnation\s*=\s*runtime\.process\.readProcessIncarnation\s*\(\s*roleIdentity\.pid\s*,\s*platform\s*\)/u,
+    );
+    expect(guardedSource).toMatch(/observedIncarnation\s*!==\s*roleIdentity\.incarnation/u);
+  });
+
+  // A recovered numeric path must refuse before entering containment when its running platform cannot bind
+  // a signal to the recorded incarnation. Branded own-child cleanup is a separate authority path.
+  it('the recovered proxy signal path terminates on insufficient running-platform authority', () => {
+    const canonical = 'src/coordinator/live/provider-proxy/spawn-undo.ts';
+    const raw = readFileSync(join(REPO_ROOT, canonical), 'utf-8');
+    const parsed = ts.createSourceFile(canonical, raw, ts.ScriptTarget.Latest, true);
+    const recoveredCalls: ts.CallExpression[] = [];
+    const visit = (node: ts.Node): void => {
+      if (
+        ts.isCallExpression(node) &&
+        ts.isIdentifier(node.expression) &&
+        node.expression.text === 'reapRecordedContainment' &&
+        node.arguments[0]?.getText(parsed) === 'retainedProxyIdentity'
+      ) {
+        recoveredCalls.push(node);
+      }
+      ts.forEachChild(node, visit);
+    };
+    visit(parsed);
+
+    expect(recoveredCalls).toHaveLength(1);
+    const recoveredCall = recoveredCalls[0];
+    if (recoveredCall === undefined) throw new Error('Expected the recovered proxy containment call');
+
+    let callStatement: ts.Statement | undefined;
+    let branchBlock: ts.Block | undefined;
+    let current: ts.Node = recoveredCall;
+    while (current.parent !== undefined) {
+      if (ts.isStatement(current) && ts.isBlock(current.parent)) {
+        callStatement = current;
+        branchBlock = current.parent;
+        break;
+      }
+      current = current.parent;
     }
+    const recoveredBranch = branchBlock?.parent;
+    if (
+      branchBlock === undefined ||
+      callStatement === undefined ||
+      recoveredBranch === undefined ||
+      !ts.isIfStatement(recoveredBranch)
+    ) {
+      throw new Error('Expected recovered proxy delivery inside its identity branch');
+    }
+    expect(recoveredBranch.thenStatement).toBe(branchBlock);
+    expect(codeTextOnly(recoveredBranch.expression.getText(parsed))).toMatch(/^retainedProxyIdentity\s*!==\s*null$/u);
+
+    const callIndex = branchBlock.statements.indexOf(callStatement);
+    const refusal = branchBlock.statements[callIndex - 1];
+    expect(refusal && ts.isIfStatement(refusal)).toBe(true);
+    if (refusal === undefined || !ts.isIfStatement(refusal)) {
+      throw new Error('Expected an immediate platform refusal before recovered proxy delivery');
+    }
+    expect(codeTextOnly(refusal.expression.getText(parsed))).toMatch(
+      /^!\s*incarnationMayAuthorizeSignal\s*\(\s*platform\s*\)$/u,
+    );
+    const refusalTail = ts.isBlock(refusal.thenStatement)
+      ? refusal.thenStatement.statements.at(-1)
+      : refusal.thenStatement;
+    expect(
+      refusalTail !== undefined && (ts.isReturnStatement(refusalTail) || ts.isThrowStatement(refusalTail)),
+      `${canonical} must terminate the recovered path when platform authority is insufficient`,
+    ).toBe(true);
+
+    const environment = recoveredCall.arguments[3];
+    expect(environment && ts.isObjectLiteralExpression(environment)).toBe(true);
+    if (environment === undefined || !ts.isObjectLiteralExpression(environment)) {
+      throw new Error('Expected the recovered proxy containment environment');
+    }
+    const passesThrough = (name: string): boolean =>
+      environment.properties.some(
+        (property) => ts.isShorthandPropertyAssignment(property) && property.name.text === name,
+      );
+    expect(passesThrough('platform')).toBe(true);
+    expect(passesThrough('readProcessIncarnation')).toBe(true);
   });
 
   it.each([
@@ -237,6 +610,7 @@ describe('a signal aimed at a pid establishes that the pid is still its recorded
       const runtime: Pick<Runtime, 'time' | 'process' | 'env'> = {
         time: {
           now: () => now,
+          monotonicNow: () => BigInt(now),
           sleep: async (ms) => {
             now += ms;
           },

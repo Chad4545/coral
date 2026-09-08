@@ -1,7 +1,7 @@
 import { z } from 'zod';
 
 import { BUILD_FLAVOR_ENV_KEY } from '../../../infra/build-flavor.js';
-import { probeProcessIncarnation, type ProcessIncarnation } from '../../../infra/node-process.js';
+import type { ProcessIncarnation } from '../../../infra/node-process.js';
 import { PROVIDER_SERVER_INITIALIZE_TIMEOUT_MS } from '../../../providers/app-server-transport.js';
 import {
   providerGuardianBootstrapCapsulePath,
@@ -23,12 +23,17 @@ import {
 import type { ProviderProxyOperationSnapshot } from '../../services/operation-registry.js';
 import {
   runtimeControlTimer,
+  requireSpawnedRole,
   spawnRoleProcess,
   type RoleConnectRetryOptions,
   type RoleSpawnPorts,
   type SpawnedRoleProcess,
 } from '../../../provider-proxy/role-spawn.js';
-import { currentHandoffCapsulePath } from '../../../provider-proxy/handoff-capsule.js';
+import {
+  currentHandoffCapsulePath,
+  handoffCapsuleV3Schema,
+  readHandoffCapsuleFile,
+} from '../../../provider-proxy/handoff-capsule.js';
 import { DETACHED_CONTAINMENT_KIND } from '../../../provider-proxy/guardian.js';
 import type { ControlClient, ProviderEventHandler } from '../../../provider-proxy/control-client.js';
 import {
@@ -37,17 +42,22 @@ import {
 } from '../../../provider-proxy/orphan-deadline.js';
 import {
   PROXY_CONTROL_RPC_TIMEOUT_MS,
+  guardianAcquisitionAbortParamsSchema,
+  guardianAcquisitionAbortResultSchema,
   guardianIdentitySchema,
   proxyIdentitySchema,
   reaperIdentitySchema,
   type CoordinatorIdentity,
+  type GuardianIdentity,
+  type ProxyIdentity,
+  type ReaperIdentity,
   controlEpochSchema,
   guardianOpenParamsSchema,
   heartbeatChallengeSchema,
   proxyControlOpenParamsSchema,
   reaperOpenParamsSchema,
 } from '../../../provider-proxy/protocol.js';
-import type { AcquisitionUndo, ProviderProxyAcquisitionSteps } from './index.js';
+import type { AcquisitionUndo, ProviderProxyAcquisitionSteps, ProviderProxyRoleSpawnHeld } from './index.js';
 import { createProviderProxyAuthorityHeartbeatAssembly } from './heartbeat.js';
 import {
   establishRoleControl,
@@ -56,10 +66,21 @@ import {
   ESTABLISH_CONTROL_RETRY_INTERVAL_MS,
 } from './role-control.js';
 import { createProviderProxySetAuthority } from './set-authority.js';
-import { buildGuardianSpawnUndo } from './spawn-undo.js';
-import { createProviderProxyOperationAuthority, type ProviderProxyOperationAuthority } from './operation-route.js';
+import {
+  buildGuardianSpawnUndo,
+  preIdentityRoleSpawnAbsenceEvidence,
+  type GuardianSpawnUndo,
+  type PreIdentityRoleSpawnRecoverySubject,
+} from './spawn-undo.js';
 import type { ProviderProxySetIdentity } from '../../services/provider-proxy-set/identity.js';
 import { createProviderProxyAuthorityFaultLatch } from '../../services/provider-proxy-authority-fault.js';
+import {
+  createOwnedProviderProxyAcquisitionControlSession,
+  establishProviderProxyAcquisitionSession,
+  handOverProviderProxyAcquisitionControlSession,
+  providerProxyControlSessionOwner,
+  retryProviderProxyAcquisitionPublication,
+} from './control-session.js';
 
 /**
  * The production implementation of `ProviderProxyAcquisitionSteps`: mints one guardian/reaper/proxy set's
@@ -157,6 +178,7 @@ export function createProviderProxyAcquisitionSteps(
 
   let minted: MintedSet | null = null;
   let guardianSpawn: SpawnedRoleProcess | null = null;
+  let guardianSpawnUndo: GuardianSpawnUndo | null = null;
 
   return {
     async createCapsules(): Promise<AcquisitionUndo> {
@@ -261,51 +283,133 @@ export function createProviderProxyAcquisitionSteps(
       };
     },
 
-    async spawnGuardian(): Promise<AcquisitionUndo> {
+    async spawnGuardian(): Promise<AcquisitionUndo | ProviderProxyRoleSpawnHeld> {
       if (minted === null) {
         throw new Error('createCapsules must run before spawnGuardian.');
       }
       const setMinted = minted;
       const platform = runtime.env.platform() as NodeJS.Platform;
-      const readProcessIncarnation = options.readProcessIncarnation ?? probeProcessIncarnation;
+      const readProcessIncarnation = options.readProcessIncarnation ?? runtime.process.readProcessIncarnation;
       const spawnPorts: RoleSpawnPorts = {
         process: runtime.process,
         runtime,
         platform,
         readProcessIncarnation,
       };
-      const spawned = spawnRoleProcess('guardian', setMinted.guardianCapsulePath, spawnPorts, {
-        pluginRoot: options.pluginRoot,
-        detached: true,
-        envAdditions: {
-          [BUILD_FLAVOR_ENV_KEY]: flavor,
-          [CORAL_PROVIDER_PROXY_ORPHAN_TIMEOUT_MS_ENV]: String(deadlineConfiguration.orphanTimeoutMs),
-        },
-      });
+      const spawned = await requireSpawnedRole(
+        spawnRoleProcess('guardian', setMinted.guardianCapsulePath, spawnPorts, {
+          pluginRoot: options.pluginRoot,
+          detached: true,
+          envAdditions: {
+            [BUILD_FLAVOR_ENV_KEY]: flavor,
+            [CORAL_PROVIDER_PROXY_ORPHAN_TIMEOUT_MS_ENV]: String(deadlineConfiguration.orphanTimeoutMs),
+          },
+        }),
+      );
+      if (spawned.kind === 'held') {
+        if (spawned.subject.kind === 'process') {
+          throw new Error('A detached guardian spawn cannot retain a leader-only cleanup subject.');
+        }
+        const recoverySubject: PreIdentityRoleSpawnRecoverySubject =
+          spawned.subject.processGroupId === null
+            ? { kind: 'unattributable-process-group' }
+            : { kind: 'spawned-process-group', processGroupId: spawned.subject.processGroupId };
+        const operatorExit = {
+          kind: 'abandon-provider-proxy-acquisition' as const,
+          abandon: () => {
+            const abandonment = spawned.operatorExit.abandon();
+            const subjectMatches =
+              abandonment.subject.kind === 'unattributable-process-group' &&
+              abandonment.subject.processGroupId ===
+                (recoverySubject.kind === 'spawned-process-group' ? recoverySubject.processGroupId : null);
+            if (
+              !subjectMatches ||
+              abandonment.processAbsenceProven ||
+              abandonment.successor.owner !== 'operator-command' ||
+              abandonment.successor.acceptance !== 'accepted'
+            ) {
+              throw new Error('Role spawn operator exit did not accept the exact acquisition cleanup subject.');
+            }
+            return {
+              kind: 'operator-abandoned' as const,
+              recoverySubject,
+              processAbsenceProven: false as const,
+              successor: abandonment.successor,
+            };
+          },
+        };
+        let retry = spawned.retry;
+        return {
+          kind: 'provider_proxy_role_spawn_held',
+          reason: spawned.error.message,
+          setAddress: { buildSetId, hostFingerprint, proxyInstanceId: setMinted.proxyInstanceId },
+          recoverySubject,
+          operatorExit,
+          recoveryCapability: {
+            retry: async (signal) => {
+              const cleanup = await retry(signal);
+              if (cleanup.kind !== 'observed-absent') {
+                retry = cleanup.retry;
+                return { kind: 'held', reason: `${cleanup.subject.kind}:${cleanup.observation}` };
+              }
+              if (recoverySubject.kind !== 'spawned-process-group') {
+                return { kind: 'held', reason: 'spawned process-group attribution remains unavailable' };
+              }
+              if (!('processGroupEvidence' in cleanup.evidence)) {
+                throw new Error('Detached guardian cleanup returned leader-only absence evidence.');
+              }
+              return {
+                kind: 'absence-confirmed',
+                evidence: preIdentityRoleSpawnAbsenceEvidence(cleanup.evidence.processGroupEvidence),
+                strandedArtifacts: [],
+              };
+            },
+          },
+        };
+      }
       guardianSpawn = spawned;
+      guardianSpawnUndo = buildGuardianSpawnUndo(runtime, spawned, platform, readProcessIncarnation);
+      guardianSpawnUndo.retainPossibleProxy();
       return {
+        kind: 'guardian-containment',
         label: 'guardian',
-        run: buildGuardianSpawnUndo(runtime, spawned, platform, readProcessIncarnation),
+        run: guardianSpawnUndo,
+        setAddress: {
+          buildSetId,
+          hostFingerprint,
+          proxyInstanceId: setMinted.proxyInstanceId,
+        },
+        guardianIdentity: guardianSpawnUndo.guardianIdentity,
+        captureRecoveryProof: guardianSpawnUndo.captureRecoveryProof,
       };
     },
 
-    async establishControl(): Promise<Readonly<{ set: ProviderProxyOperationAuthority; undo: AcquisitionUndo }>> {
-      if (minted === null || guardianSpawn === null) {
+    async establishControl(registerUndo: (undo: AcquisitionUndo) => void, assertPublicationMayBegin: () => void) {
+      if (minted === null || guardianSpawn === null || guardianSpawnUndo === null) {
         throw new Error('createCapsules and spawnGuardian must run before establishControl.');
       }
       const setMinted = minted;
       const spawnedGuardian = guardianSpawn;
+      const spawnUndo = guardianSpawnUndo;
       const timer = runtimeControlTimer(runtime);
       const retry: RoleConnectRetryOptions = {
         connectTimeoutMs: ESTABLISH_CONTROL_CONNECT_TIMEOUT_MS,
         retryIntervalMs: ESTABLISH_CONTROL_RETRY_INTERVAL_MS,
         overallDeadlineMs: ESTABLISH_CONTROL_READY_DEADLINE_MS,
-        now: () => runtime.time.now(),
+        monotonicNow: () => runtime.time.monotonicNow(),
         sleep: (ms: number) => runtime.time.sleep(ms),
       };
       const opened: ControlClient[] = [];
       const faults = createProviderProxyAuthorityFaultLatch();
       const heartbeatAssembly = createProviderProxyAuthorityHeartbeatAssembly(runtime, faults);
+      // An acquisition abort must name every role identity bound to the set it concerns.
+      let acquisitionAbortIdentities: Readonly<{
+        client: ControlClient;
+        guardian: GuardianIdentity;
+        reaper: ReaperIdentity;
+        proxy: ProxyIdentity;
+      }> | null = null;
+      let guardianTeardownClient: ControlClient | null = null;
 
       try {
         // The proxy is reached first: only it can report its own pid, incarnation, and process-group id, and
@@ -331,6 +435,7 @@ export function createProviderProxyAcquisitionSteps(
           },
           ...(options.onProviderEvent === undefined ? {} : { onProviderEvent: options.onProviderEvent() }),
         });
+        spawnUndo.bindProxyIdentity(proxySession.opened.proxy);
         heartbeatAssembly.startRole('proxy', {
           client: proxySession.client,
           controlEpoch: proxySession.opened.controlEpoch,
@@ -406,6 +511,13 @@ export function createProviderProxyAcquisitionSteps(
             containmentKind: DETACHED_CONTAINMENT_KIND,
           },
         });
+        spawnUndo.bindControl({
+          client: guardianSession.client,
+          guardian: guardianSession.opened.guardian,
+          reaper: reaperSession.opened.reaper,
+          proxy: proxySession.opened.proxy,
+        });
+        guardianTeardownClient = guardianSession.client;
         heartbeatAssembly.startRole('reaper', {
           client: reaperSession.client,
           controlEpoch: reaperSession.opened.controlEpoch,
@@ -419,6 +531,12 @@ export function createProviderProxyAcquisitionSteps(
           reaper: reaperSession.client,
         };
         const heartbeats = heartbeatAssembly.complete();
+        acquisitionAbortIdentities = {
+          client: guardianSession.client,
+          guardian: guardianSession.opened.guardian,
+          reaper: reaperSession.opened.reaper,
+          proxy: proxySession.opened.proxy,
+        };
 
         const handoffCapsulePath = currentHandoffCapsulePath(
           { generation, flavor, buildSetId, hostFingerprint, proxyInstanceId: setMinted.proxyInstanceId },
@@ -437,15 +555,20 @@ export function createProviderProxyAcquisitionSteps(
           handoffCapsulePath,
           runtime,
           operationRegistry: options.operationRegistry,
+          registerAcquisitionUndo: registerUndo,
           ...(options.onProviderEvent === undefined ? {} : { onProviderEvent: options.onProviderEvent }),
         });
         const installation = await base.installRecoveryCredential(new AbortController().signal);
         if (installation.kind !== 'installed') {
           throw new Error(`provider_proxy_recovery_credential_${installation.kind}`);
         }
-        // The set-level identity `operation.prepare.v1`'s coordinator meta commit needs (W2.3): fixed for
-        // this set's whole lifetime, built from the exact same verified fields `base`'s identity checks just
-        // confirmed rather than re-derived, so the two can never disagree.
+        const capsuleBinding = handoffCapsuleV3Schema.parse(
+          readHandoffCapsuleFile(handoffCapsulePath, {
+            storage: runtime.storage,
+            uid: process.getuid?.() ?? 0,
+          }),
+        );
+
         const setIdentity: ProviderProxySetIdentity = {
           buildSetId,
           hostFingerprint,
@@ -464,15 +587,39 @@ export function createProviderProxyAcquisitionSteps(
           proxyProcessGroupId: proxyIdentity.processGroupId,
           canonicalEndpoint: setMinted.proxyEndpoint,
         };
-        const set = createProviderProxyOperationAuthority({
-          base,
-          setIdentity,
-          clients,
-          faults,
-          mutationRpcTimeoutMs: PROXY_OPERATION_ACTIVATION_RPC_TIMEOUT_MS,
-        });
+        const session = createOwnedProviderProxyAcquisitionControlSession(
+          providerProxyControlSessionOwner.controlEstablishment,
+          {
+            base,
+            setIdentity,
+            clients,
+            heartbeats,
+            faults,
+            guardianIdentity: guardianSession.opened.guardian,
+            reaperIdentity: reaperSession.opened.reaper,
+            proxyIdentity: proxySession.opened.proxy,
+            capsulePath: handoffCapsulePath,
+            capsuleBinding,
+            mutationRpcTimeoutMs: PROXY_OPERATION_ACTIVATION_RPC_TIMEOUT_MS,
+          },
+        );
+
+        // No claim authority exists until every publication stage confirms.
+        assertPublicationMayBegin();
+        const publication = await retryProviderProxyAcquisitionPublication(session);
+        if (publication.kind === 'publication-unknown') {
+          return handOverProviderProxyAcquisitionControlSession(
+            session,
+            providerProxyControlSessionOwner.acquisition,
+            publication,
+          );
+        }
+        if (publication.kind === 'not-attempted') {
+          throw new Error(`provider_proxy_acquisition_publication_refused:${publication.role}:${publication.reason}`);
+        }
+        const established = establishProviderProxyAcquisitionSession(session, publication.receipt);
         return {
-          set,
+          ...established,
           undo: {
             label: 'control',
             run: () => {
@@ -480,14 +627,32 @@ export function createProviderProxyAcquisitionSteps(
               heartbeats.guardian.stop();
               heartbeats.reaper.stop();
               proxySession.client.close();
-              guardianSession.client.close();
               reaperSession.client.close();
             },
           },
         };
       } catch (error: unknown) {
+        if (acquisitionAbortIdentities !== null) {
+          // Acquisition abort is best-effort and cannot reverse publication; definitive cleanup remains with
+          // the guardian teardown owner.
+          const { client, guardian, reaper, proxy } = acquisitionAbortIdentities;
+          try {
+            const abortExchange = await client.exchange(
+              'guardian.acquisition-abort.v1',
+              guardianAcquisitionAbortParamsSchema.parse({ guardian, reaper, proxy }),
+              PROXY_CONTROL_RPC_TIMEOUT_MS,
+            );
+            if (abortExchange.kind === 'response' && abortExchange.response.kind === 'result') {
+              guardianAcquisitionAbortResultSchema.parse(abortExchange.response.value);
+            }
+          } catch {
+            // Definitive cleanup remains with the guardian teardown owner when the abort is not heard.
+          }
+        }
         heartbeatAssembly.stop();
-        for (const client of opened) client.close();
+        for (const client of opened) {
+          if (client !== guardianTeardownClient) client.close();
+        }
         throw error;
       }
     },

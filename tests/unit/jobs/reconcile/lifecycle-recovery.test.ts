@@ -32,7 +32,11 @@ import { createTestJobJournalDeps } from '#tests/helpers/job-journal-deps.js';
 import { createEventBodyCodec } from '#src/store/event-body-codec.js';
 import { openTestStoreDb } from '#tests/helpers/store-db.js';
 import { permissiveProviderLookupPort } from '#tests/helpers/append-context.js';
+import { readDurableCliContainmentStatus, writeDurableCliProcessRuntimeMeta } from '#src/jobs/runtime-meta-store.js';
+import { testIncarnation } from '#tests/helpers/process-incarnation.js';
+import { encodeHistoricalDurableCliProcessRuntimeMeta } from '#tests/helpers/historical-durable-cli-runtime-meta.js';
 import type {
+  LifecycleShutdownDisposition,
   RecoverPersistedDiscussFn,
   RunStartupRecoveryFn,
   StartupRecoveryInputs,
@@ -55,6 +59,7 @@ import { createFailedWorkflowDescendantReleaser } from '#src/coordinator/service
 import type { AtomicFailedWorkflowDescendantReleaser } from '#src/workflow/recover.js';
 import type { WorkflowPlan } from '#src/workflow/plan.js';
 import { awaitRecoveryCursorBarrier } from '#src/coordinator/index.js';
+import type { TerminateAllDisposition } from '#src/coordinator/live/admission.js';
 
 let runtime: ReturnType<typeof createRealRuntime>;
 
@@ -112,6 +117,8 @@ async function loadModules() {
     sessionLifecycleReactorModule,
     sessionsEventsModule,
     providerCapabilityModule,
+    recoveryQuarantineModule,
+    recoverySourceRegistryModule,
   ] = await Promise.all([
     import('#src/jobs/store.js'),
     import('#src/sessions/shell.js'),
@@ -142,6 +149,8 @@ async function loadModules() {
     import('#src/sessions/lifecycle-reactor.js'),
     import('#src/sessions/events.js'),
     import('#src/providers/capability.js'),
+    import('#src/recovery/quarantine.js'),
+    import('#src/recovery/source-registry.js'),
   ]);
 
   return {
@@ -174,6 +183,8 @@ async function loadModules() {
     sessionLifecycleReactorModule,
     sessionsEventsModule,
     providerCapabilityModule,
+    recoveryQuarantineModule,
+    recoverySourceRegistryModule,
   };
 }
 
@@ -328,7 +339,7 @@ function createFakeExecutionAndRecoveryService(overrides: Record<string, unknown
     completeRecoveredJob: vi.fn(),
     finalizeInterruptedAppServerJob: vi.fn(async () => {}),
     finalizeInterruptedDurableJob: vi.fn(async () => {}),
-    interruptAppServerJob: vi.fn(async () => {}),
+    interruptAppServerJob: vi.fn(async () => ({ kind: 'acknowledged' as const })),
     ...overrides,
   };
 }
@@ -642,15 +653,28 @@ function stubRuntimeRecord(
     stdoutPath?: string;
     stderrPath?: string;
     startTime?: string;
+    recordContainment?: boolean;
   },
 ): void {
+  const pid = overrides.pid ?? process.pid;
   progressStore.appendRuntimeStarted(overrides.jobId, {
     transport: 'durable-cli',
-    pid: overrides.pid ?? process.pid,
+    pid,
     stdoutPath: overrides.stdoutPath ?? join(progressStore.jobDir(overrides.jobId), 'stdout'),
     stderrPath: overrides.stderrPath ?? join(progressStore.jobDir(overrides.jobId), 'stderr'),
     startTime: overrides.startTime ?? new Date().toISOString(),
   });
+  if (overrides.recordContainment) {
+    const incarnation =
+      runtime.process.readProcessIncarnation(pid, runtime.env.platform() as NodeJS.Platform) ?? testIncarnation(pid);
+    writeDurableCliProcessRuntimeMeta(progressStore.getDb(), {
+      jobId: overrides.jobId,
+      pid,
+      incarnation,
+      processGroupId: pid,
+      childRoot: { pid, incarnation },
+    });
+  }
 }
 
 function stubAppServerRuntime(
@@ -720,6 +744,7 @@ function createLifecycleHarness(
     writeBackendInfoFn?: () => void;
     cleanupStaleJobsFn?: (currentBundleHash: string, signal: AbortSignal) => void | Promise<void>;
     markJobsAsErrorFn?: (message: string, signal: AbortSignal) => void | Promise<void>;
+    terminateAllFn?: (signal: AbortSignal) => TerminateAllDisposition | Promise<TerminateAllDisposition>;
     registerRuntimeComponentFn?: (component: RuntimeComponent) => void;
     interruptedAppServerReason?: 'restart' | 'handoff';
     runtime?: ReturnType<typeof createRealRuntime>;
@@ -767,6 +792,7 @@ function createLifecycleHarness(
         bundleHash: '1111111111111111',
         cliBundleHash: '2222222222222222',
         claudeAppserverBundleHash: '3333333333333333',
+        durableWrapperBundleHash: '4444444444444444',
         flavor: 'prod',
         instanceId: `lifecycle-${Math.random()}`,
         token: 'test-token',
@@ -810,7 +836,7 @@ function createLifecycleHarness(
       removeBackendInfoIfOwnerFn: () => {},
       cleanupStaleJobsFn: options.cleanupStaleJobsFn ?? (() => {}),
       markJobsAsErrorFn: options.markJobsAsErrorFn ?? (() => {}),
-      terminateAllFn: () => {},
+      terminateAllFn: options.terminateAllFn ?? (() => ({ kind: 'all-observed-absent' })),
       kbDaemonSupervisor,
       handoffQuiescePorts: () => [],
       createKbHealthComponentFn: () => createKbDaemonHealthComponent(kbDaemonSupervisor),
@@ -916,19 +942,49 @@ function createActualRecoveryService(
 }
 
 async function stopLifecycleController(controller: {
-  shutdown: (reason: string) => Promise<void>;
-  waitForShutdown: () => Promise<void>;
-}): Promise<void> {
+  shutdown: (reason: string) => Promise<LifecycleShutdownDisposition>;
+  waitForShutdown: () => Promise<LifecycleShutdownDisposition>;
+}): Promise<LifecycleShutdownDisposition | null> {
+  let disposition: LifecycleShutdownDisposition | null = null;
   try {
-    await controller.shutdown('test');
+    disposition = await controller.shutdown('test');
   } catch {
     /* best effort */
   }
-  try {
-    await controller.waitForShutdown();
-  } catch {
-    /* best effort */
+
+  if (disposition === null) {
+    try {
+      disposition = await controller.waitForShutdown();
+    } catch {
+      return null;
+    }
   }
+
+  if (disposition.disposition === 'held' && disposition.recovery.automaticRetry.status === 'scheduled') {
+    try {
+      await vi.waitFor(
+        async () => {
+          disposition = await controller.waitForShutdown();
+          if (disposition.disposition === 'held' && disposition.recovery.automaticRetry.status === 'scheduled') {
+            throw new Error('automatic cleanup is still scheduled');
+          }
+        },
+        { timeout: 5_000 },
+      );
+    } catch (error: unknown) {
+      throw new Error('Automatic lifecycle cleanup did not reach finalized or waiting-for-operator within 5s.', {
+        cause: error,
+      });
+    }
+  }
+
+  if (disposition.disposition === 'held') {
+    const { automaticRetry, retainedOwnership } = disposition.recovery;
+    throw new Error(
+      `Test lifecycle cleanup held: status=${automaticRetry.status}; attempts=${automaticRetry.attemptsStarted}/${automaticRetry.attemptLimit}; reason=${disposition.reason}; exit=${disposition.recovery.exit}; cleanupObligations=${JSON.stringify(retainedOwnership.cleanupObligations)}; operatorActions=${JSON.stringify(retainedOwnership.operatorActions)}`,
+    );
+  }
+  return disposition;
 }
 
 /**
@@ -1211,6 +1267,11 @@ describe('lifecycle recovery', () => {
       expect(resumeLoop).toHaveBeenCalledTimes(1);
       expect(resumeLoop.mock.calls[0]?.[1]).toBe('p3-valid-discussion');
     } finally {
+      progressStore
+        .getDb()
+        .prepare('DELETE FROM projection_discuss WHERE discuss_id = ?')
+        .run('p3-malformed-discussion');
+      registry.contexts.clear();
       await stopLifecycleController(controller);
     }
   });
@@ -1740,6 +1801,90 @@ describe('lifecycle recovery', () => {
     }
   });
 
+  it('keeps a running job nonterminal when shutdown cannot prove its containment absent', async () => {
+    const modules = await loadModules();
+    const pluginRoot = createPluginRoot('plugin-unresolved-shutdown');
+    const projectRoot = createProjectRoot('project-unresolved-shutdown');
+    const namespace = modules.pathsModule.pluginRootNamespace(pluginRoot);
+    const eventBus = new modules.eventBusModule.TypedEventBus();
+    const progressStore = new modules.progressStoreModule.JobStore(namespace, runtime, createEventBodyCodec(), {
+      db: openTestStoreDb(runtime, ':memory:'),
+      eventBus,
+      providers: permissiveProviderLookupPort,
+    });
+    const jobId = 'unresolved-shutdown-job';
+    stubLaunchRecord(progressStore, {
+      jobId,
+      sessionId: `${jobId}-session`,
+      provider: 'codex',
+      projectRoot,
+      backendNamespace: namespace,
+    });
+    const markJobsAsErrorFn = vi.fn(async (message: string, signal: AbortSignal) => {
+      await modules.lifecycleModule.markJobsAsError(
+        progressStore,
+        message,
+        runtime.time.now(),
+        signal,
+        createTestJobJournalDeps(progressStore, runtime).coordinatorCommit,
+      );
+    });
+    let containmentAbsent = false;
+    const { controller } = createLifecycleHarness(modules, {
+      pluginRoot,
+      progressStore,
+      eventBus,
+      runStartupRecoveryFn: async () => [],
+      markJobsAsErrorFn,
+      terminateAllFn: () =>
+        containmentAbsent
+          ? { kind: 'all-observed-absent' }
+          : {
+              kind: 'unresolved-at-deadline',
+              processes: [{ kind: 'target-alive', pid: 4_242, stage: 'after-sigkill' }],
+              pendingLaunches: 0,
+              retainedLaunches: [],
+              cleanupHandles: 1,
+              retainedProcesses: [],
+              cleanupFailures: 0,
+              owner: 'launch-coordinator',
+            },
+    });
+
+    try {
+      await controller.start();
+      await expect(controller.shutdown('test')).resolves.toMatchObject({
+        disposition: 'held',
+        recovery: {
+          retainedOwnership: {
+            cleanupObligations: expect.arrayContaining([
+              'child termination',
+              'crashed job terminalization',
+              'provider control and IPC authority release',
+            ]),
+          },
+        },
+      });
+
+      expect(markJobsAsErrorFn).not.toHaveBeenCalled();
+      expect(progressStore.readStatus(jobId)?.phase).toBe('launching');
+      expect(
+        progressStore
+          .getDb()
+          .prepare(
+            `SELECT COUNT(*) AS count
+               FROM recovery_quarantine
+              WHERE boundary_id = 'crashed-job-terminalization'
+                AND subject_key = ?`,
+          )
+          .get(jobId),
+      ).toEqual({ count: 0 });
+    } finally {
+      containmentAbsent = true;
+      await stopLifecycleController(controller);
+    }
+  });
+
   it('AC13 crash terminalization quarantines one job while its sibling settles and lifecycle reaches running', async () => {
     const modules = await loadModules();
     const pluginRoot = createPluginRoot('plugin-ac13-crash-terminalization');
@@ -2252,7 +2397,7 @@ describe('lifecycle recovery', () => {
     }
   });
 
-  it('2. running durable-cli job with a live PID is adopted before the launch fence lifts', async () => {
+  it('2. a durable-cli job whose child survives its wrapper is adopted before the launch fence lifts', async () => {
     const modules = await loadModules();
     const pluginRoot = createPluginRoot('plugin-running');
     const namespace = modules.pathsModule.pluginRootNamespace(pluginRoot);
@@ -2274,18 +2419,33 @@ describe('lifecycle recovery', () => {
       projectRoot,
     });
     const adoptSpy = vi.spyOn(service, 'adoptRunningJob');
+    const finalizeSpy = vi.spyOn(service, 'finalizeInterruptedDurableJob');
+    const jobId = '00000000-0000-4000-8000-000000000701';
+    const wrapperPid = 999_990;
+    const childIncarnation = runtime.process.readProcessIncarnation(
+      process.pid,
+      runtime.env.platform() as NodeJS.Platform,
+    );
+    if (childIncarnation === null) return;
 
     stubLaunchRecord(progressStore, {
-      jobId: 'running-live',
+      jobId,
       sessionId: 'session-running-live',
       provider: 'codex',
       projectRoot,
       backendNamespace: namespace,
     });
     stubRuntimeRecord(progressStore, {
-      jobId: 'running-live',
-      pid: process.pid,
+      jobId,
+      pid: wrapperPid,
       startTime: '2026-04-12T00:00:00.000Z',
+    });
+    writeDurableCliProcessRuntimeMeta(progressStore.getDb(), {
+      jobId,
+      pid: wrapperPid,
+      incarnation: testIncarnation(wrapperPid),
+      processGroupId: wrapperPid,
+      childRoot: { pid: process.pid, incarnation: childIncarnation },
     });
 
     const { controller, runtimeState } = createLifecycleHarness(modules, {
@@ -2300,10 +2460,11 @@ describe('lifecycle recovery', () => {
     try {
       await controller.start();
       expect(adoptSpy).toHaveBeenCalledWith(
-        expect.objectContaining({ launchRecord: expect.objectContaining({ jobId: 'running-live' }) }),
-        expect.objectContaining({ pid: process.pid }),
+        expect.objectContaining({ launchRecord: expect.objectContaining({ jobId }) }),
+        expect.objectContaining({ pid: wrapperPid }),
       );
-      expect(launchCoordinator.getActiveJobIds()).toContain('running-live');
+      expect(finalizeSpy).not.toHaveBeenCalled();
+      expect(launchCoordinator.getActiveJobIds()).toContain(jobId);
       const adoptOrder = adoptSpy.mock.invocationCallOrder[0];
       const fenceOffOrder = runtimeState.setLaunchFenceActive.mock.invocationCallOrder.find(
         (_call: number, index: number) => runtimeState.setLaunchFenceActive.mock.calls[index]?.[0] === false,
@@ -2311,6 +2472,116 @@ describe('lifecycle recovery', () => {
       expect(adoptOrder).toBeDefined();
       expect(fenceOffOrder).toBeDefined();
       expect(adoptOrder ?? Number.POSITIVE_INFINITY).toBeLessThan(fenceOffOrder ?? Number.POSITIVE_INFINITY);
+    } finally {
+      await stopLifecycleController(controller);
+    }
+  });
+
+  it('quarantines predecessor containment evidence and lets jobs abort abandon it without signalling', async () => {
+    const { createCoordinatorControl } = await import('#src/coordinator/composition/job-control.js');
+    const modules = await loadModules();
+    const pluginRoot = createPluginRoot('plugin-v1-containment-hold');
+    const namespace = modules.pathsModule.pluginRootNamespace(pluginRoot);
+    const projectRoot = createProjectRoot('project-v1-containment-hold');
+    const eventBus = new modules.eventBusModule.TypedEventBus();
+    const progressStore = new modules.progressStoreModule.JobStore(namespace, runtime, createEventBodyCodec(), {
+      db: openTestStoreDb(runtime, ':memory:'),
+      eventBus,
+      providers: permissiveProviderLookupPort,
+    });
+    const launchCoordinator = createLaunchCoordinator(modules);
+    const providerRegistry = createRecoveryProviderRegistry(modules);
+    const service = createActualRecoveryService(modules, {
+      progressStore,
+      eventBus,
+      launchCoordinator,
+      providerRegistry,
+      pluginRoot,
+      projectRoot,
+    });
+    const adoptSpy = vi.spyOn(service, 'adoptRunningJob');
+    const killSpy = vi.spyOn(runtime.process, 'kill');
+    const jobId = '00000000-0000-4000-8000-000000000703';
+    const wrapperPid = 999_991;
+
+    stubLaunchRecord(progressStore, {
+      jobId,
+      sessionId: 'session-v1-containment-hold',
+      provider: 'codex',
+      projectRoot,
+      backendNamespace: namespace,
+    });
+    stubRuntimeRecord(progressStore, {
+      jobId,
+      pid: wrapperPid,
+      startTime: '2026-04-12T00:00:00.000Z',
+    });
+    progressStore
+      .getDb()
+      .prepare<[string, string]>('INSERT INTO meta (key, value) VALUES (?, ?)')
+      .run(
+        `durable_cli_process.v1:${jobId}`,
+        encodeHistoricalDurableCliProcessRuntimeMeta({
+          version: 1,
+          jobId,
+          pid: wrapperPid,
+          incarnation: testIncarnation(wrapperPid),
+        }),
+      );
+
+    const { controller } = createLifecycleHarness(modules, {
+      pluginRoot,
+      progressStore,
+      eventBus,
+      launchCoordinator,
+      providerRegistry,
+      servicesByProjectRoot: new Map([[projectRoot, service]]),
+    });
+
+    try {
+      await controller.start();
+      expect(adoptSpy).not.toHaveBeenCalled();
+      expect(readDurableCliContainmentStatus(progressStore.getDb(), jobId)).toMatchObject({
+        kind: 'valid',
+        status: {
+          evidence: { kind: 'predecessor', record: { version: 1, pid: wrapperPid } },
+          disposition: { kind: 'held', abandonment: 'abort-job' },
+        },
+      });
+      expect(
+        progressStore
+          .readJobEvents(jobId)
+          .some((event) => event.type === 'progress' && event.message.includes('cannot authorize a signal')),
+      ).toBe(true);
+
+      const control = createCoordinatorControl({
+        world: { idleTimer: { requestDrain() {} } } as never,
+        listExecutionServices: () => [service] as never,
+        getLifecycleController: () => controller,
+        getProgressStore: () => progressStore,
+        internalJobAbortRegistry: { abort: (jobIds: string[]) => ({ aborted: [], notFound: jobIds }) } as never,
+      });
+      expect(control.abortJobs([jobId])).toEqual({
+        aborted: [],
+        notFound: [],
+        abandoned: [
+          {
+            jobId,
+            reason: 'recovery ownership was released without proof of recorded containment absence',
+            nextStep:
+              `Run coral-cli jobs detail ${jobId}; the recorded containment may still be live and is no longer ` +
+              'owned by recovery.',
+          },
+        ],
+      });
+
+      await vi.waitFor(() => {
+        expect(progressStore.readStatus(jobId)).toMatchObject({
+          phase: 'aborted',
+          result: { outcome: { kind: 'aborted', reason: 'user_abort' } },
+        });
+      });
+      expect(killSpy).not.toHaveBeenCalled();
     } finally {
       await stopLifecycleController(controller);
     }
@@ -2339,7 +2610,8 @@ describe('lifecycle recovery', () => {
       pluginRoot,
       projectRoot,
     });
-    const jobId = 'running-adopted-abort';
+    const jobId = '00000000-0000-4000-8000-000000000702';
+    const finalizeInterruptedDurableJob = vi.spyOn(service, 'finalizeInterruptedDurableJob');
     // Real PID adoption/kill semantics require an actual child process here.
     const child = spawn(process.execPath, ['-e', 'setInterval(() => {}, 1000);'], { stdio: 'ignore' });
     await new Promise<void>((resolve, reject) => {
@@ -2361,6 +2633,7 @@ describe('lifecycle recovery', () => {
       jobId,
       pid: child.pid,
       startTime: '2026-04-12T00:00:00.000Z',
+      recordContainment: true,
     });
 
     const { controller } = createLifecycleHarness(modules, {
@@ -2384,7 +2657,20 @@ describe('lifecycle recovery', () => {
         } as never,
       });
 
-      expect(control.abortJobs([jobId])).toEqual({ aborted: [jobId], notFound: [] });
+      expect(control.abortJobs([jobId])).toEqual({
+        aborted: [],
+        notFound: [],
+        held: [
+          {
+            jobId,
+            reason:
+              'identity-safe SIGTERM/SIGKILL reaping is in progress until recorded containment absence is confirmed',
+            nextStep:
+              `Run coral-cli jobs detail ${jobId}; if cleanup remains held, run coral-cli abort jobs ${jobId} ` +
+              'again to explicitly abandon ownership.',
+          },
+        ],
+      });
 
       await vi.waitFor(
         () => {
@@ -2394,6 +2680,12 @@ describe('lifecycle recovery', () => {
           });
         },
         { timeout: 4_000 },
+      );
+      expect(finalizeInterruptedDurableJob).toHaveBeenCalledWith(
+        expect.anything(),
+        expect.anything(),
+        expect.objectContaining({ cancelled: true }),
+        expect.anything(),
       );
     } finally {
       child.kill('SIGKILL');
@@ -2462,7 +2754,11 @@ describe('lifecycle recovery', () => {
       providers: permissiveProviderLookupPort,
     });
     const fakeService = createFakeExecutionAndRecoveryService();
-    const jobId = `foreign-${phase}-${durableRuntime ? 'durable' : appServerRuntime ? 'app' : 'none'}`;
+    const jobId = durableRuntime
+      ? livePid
+        ? '00000000-0000-4000-8000-000000000709'
+        : '00000000-0000-4000-8000-000000000707'
+      : `foreign-${phase}-${appServerRuntime ? 'app' : 'none'}`;
     const foreignNamespace = 'foreign-namespace';
 
     stubLaunchRecord(progressStore, {
@@ -2479,6 +2775,7 @@ describe('lifecycle recovery', () => {
       stubRuntimeRecord(progressStore, {
         jobId,
         pid: livePid ? process.pid : 999_991,
+        recordContainment: true,
       });
     }
     if (appServerRuntime) {
@@ -2650,17 +2947,19 @@ describe('lifecycle recovery', () => {
       providers: permissiveProviderLookupPort,
     });
     const fakeService = createFakeExecutionAndRecoveryService();
+    const jobId = '00000000-0000-4000-8000-000000000711';
 
     stubLaunchRecord(progressStore, {
-      jobId: 'dead-running',
+      jobId,
       sessionId: 'dead-running-session',
       provider: 'codex',
       projectRoot,
       backendNamespace: namespace,
     });
     stubRuntimeRecord(progressStore, {
-      jobId: 'dead-running',
+      jobId,
       pid: 999_999,
+      recordContainment: true,
     });
 
     const { controller } = createLifecycleHarness(modules, {
@@ -2673,7 +2972,7 @@ describe('lifecycle recovery', () => {
     try {
       await controller.start();
       expect(fakeService.finalizeInterruptedDurableJob).toHaveBeenCalledWith(
-        expect.objectContaining({ launchRecord: expect.objectContaining({ jobId: 'dead-running' }) }),
+        expect.objectContaining({ launchRecord: expect.objectContaining({ jobId }) }),
         expect.objectContaining({ transport: 'durable-cli', pid: 999_999 }),
         expect.objectContaining({ exit: null, terminal: null, cancelled: false }),
         expect.objectContaining({ signal: expect.any(AbortSignal), onCommitStart: expect.any(Function) }),
@@ -2696,7 +2995,7 @@ describe('lifecycle recovery', () => {
       eventBus,
       providers: permissiveProviderLookupPort,
     });
-    const jobId = 'dead-finalizer-blocked-job';
+    const jobId = '00000000-0000-4000-8000-000000000712';
     const fakeService = createFakeExecutionAndRecoveryService({
       finalizeInterruptedDurableJob: vi.fn(async () => {
         throw new Error('exact session CAS went stale');
@@ -2710,7 +3009,7 @@ describe('lifecycle recovery', () => {
       projectRoot,
       backendNamespace: namespace,
     });
-    stubRuntimeRecord(progressStore, { jobId, pid: 999_998 });
+    stubRuntimeRecord(progressStore, { jobId, pid: 999_998, recordContainment: true });
 
     const { controller, runtimeState } = createLifecycleHarness(modules, {
       pluginRoot,
@@ -3225,6 +3524,7 @@ describe('lifecycle recovery', () => {
       bundleHash: 'test-bundle',
       cliBundleHash: 'test-cli-bundle',
       claudeAppserverBundleHash: 'test-claude-bundle',
+      durableWrapperBundleHash: 'test-durable-wrapper-bundle',
       flavor: 'prod' as const,
       instanceId: 'raw-source-recovery',
       token: 'test-token',
@@ -3547,7 +3847,8 @@ describe('lifecycle recovery', () => {
         eventBus,
         providers: permissiveProviderLookupPort,
       });
-      const jobId = `${recoveryKind}-registration-throws-job`;
+      const jobId =
+        recoveryKind === 'running' ? '00000000-0000-4000-8000-000000000704' : `${recoveryKind}-registration-throws-job`;
       const sessionId = `${jobId}-session`;
       const captureError = `${recoveryKind} authority capture rejected`;
       const fakeService = createFakeExecutionAndRecoveryService({
@@ -3567,7 +3868,7 @@ describe('lifecycle recovery', () => {
       if (recoveryKind === 'queued') {
         appendQueuedEvent(progressStore, jobId, sessionId, namespace, projectRoot);
       } else {
-        stubRuntimeRecord(progressStore, { jobId, pid: process.pid });
+        stubRuntimeRecord(progressStore, { jobId, pid: process.pid, recordContainment: true });
       }
 
       const { controller, runtimeState } = createLifecycleHarness(modules, {
@@ -3627,7 +3928,8 @@ describe('lifecycle recovery', () => {
         pluginRoot,
         projectRoot,
       });
-      const jobId = `${recoveryKind}-adoption-throws-job`;
+      const jobId =
+        recoveryKind === 'running' ? '00000000-0000-4000-8000-000000000705' : `${recoveryKind}-adoption-throws-job`;
       const sessionId = `${jobId}-session`;
       const adoptionError = `${recoveryKind} namespace rebind failed`;
 
@@ -3641,7 +3943,7 @@ describe('lifecycle recovery', () => {
       if (recoveryKind === 'queued') {
         appendQueuedEvent(progressStore, jobId, sessionId, namespace, projectRoot);
       } else {
-        stubRuntimeRecord(progressStore, { jobId, pid: process.pid });
+        stubRuntimeRecord(progressStore, { jobId, pid: process.pid, recordContainment: true });
       }
       vi.spyOn(progressStore, 'rebindNamespace').mockImplementationOnce(() => {
         throw new Error(adoptionError);
@@ -3704,7 +4006,8 @@ describe('lifecycle recovery', () => {
         pluginRoot,
         projectRoot,
       });
-      const jobId = `${recoveryKind}-unreadable-record-job`;
+      const jobId =
+        recoveryKind === 'running' ? '00000000-0000-4000-8000-000000000706' : `${recoveryKind}-unreadable-record-job`;
       const sessionId = `${jobId}-session`;
 
       stubLaunchRecord(progressStore, {
@@ -3717,7 +4020,7 @@ describe('lifecycle recovery', () => {
       if (recoveryKind === 'queued') {
         appendQueuedEvent(progressStore, jobId, sessionId, namespace, projectRoot);
       } else {
-        stubRuntimeRecord(progressStore, { jobId, pid: process.pid });
+        stubRuntimeRecord(progressStore, { jobId, pid: process.pid, recordContainment: true });
       }
       // What a build that cannot read a newer durable shape actually throws. The provider's session
       // outlives this coordinator, so adoption must be deferred rather than spent.
@@ -3889,139 +4192,248 @@ describe('lifecycle recovery', () => {
       { reason: 'subject-mismatch', provider: 'codex' },
     ].flatMap((failure) =>
       (['durable-alive', 'durable-absent', 'durable-unknown', 'app-server-not-addressable'] as const).map(
-        (carrier) => ({ failure, carrier }),
+        (carrier) => ({
+          failure,
+          carrier,
+          expectedDisposition: carrier === 'durable-absent' ? ('settled' as const) : ('quarantined' as const),
+        }),
       ),
     ),
-  )('14d-f. settles $failure.reason with $carrier through ordinary binding-failure recovery', async (fixture) => {
-    const modules = await loadModules();
-    const suffix = `${fixture.failure.reason}-${fixture.carrier}`;
-    const pluginRoot = createPluginRoot(`plugin-repairable-binding-${suffix}`);
-    const namespace = modules.pathsModule.pluginRootNamespace(pluginRoot);
-    const projectRoot = createProjectRoot(`project-repairable-binding-${suffix}`);
-    const eventBus = new modules.eventBusModule.TypedEventBus();
-    const progressStore = new modules.progressStoreModule.JobStore(namespace, runtime, createEventBodyCodec(), {
-      db: openTestStoreDb(runtime, ':memory:'),
-      eventBus,
-      providers: permissiveProviderLookupPort,
-    });
-    const jobId = `repairable-binding-${suffix}`;
-    const sessionId = `${jobId}-session`;
-    const pid = 73_700;
-    const observeLiveness = vi
-      .spyOn(runtime.process, 'observeLiveness')
-      .mockReturnValue(
-        fixture.carrier === 'durable-alive' ? 'alive' : fixture.carrier === 'durable-absent' ? 'absent' : 'unknown',
+  )(
+    '14d-f. leaves $failure.reason with $carrier $expectedDisposition through binding-failure recovery',
+    async (fixture) => {
+      const modules = await loadModules();
+      const suffix = `${fixture.failure.reason}-${fixture.carrier}`;
+      const pluginRoot = createPluginRoot(`plugin-repairable-binding-${suffix}`);
+      const namespace = modules.pathsModule.pluginRootNamespace(pluginRoot);
+      const projectRoot = createProjectRoot(`project-repairable-binding-${suffix}`);
+      const eventBus = new modules.eventBusModule.TypedEventBus();
+      const progressStore = new modules.progressStoreModule.JobStore(namespace, runtime, createEventBodyCodec(), {
+        db: openTestStoreDb(runtime, ':memory:'),
+        eventBus,
+        providers: permissiveProviderLookupPort,
+      });
+      const jobId = '00000000-0000-4000-8000-000000000014';
+      const sessionId = `${jobId}-session`;
+      const pid = 73_700;
+      let monotonicMs = 0n;
+      const monotonicNow = vi.spyOn(runtime.time, 'monotonicNow').mockImplementation(() => {
+        monotonicMs += 25n;
+        return monotonicMs;
+      });
+      const sleep = vi.spyOn(runtime.time, 'sleep').mockResolvedValue();
+      const observeLiveness = vi
+        .spyOn(runtime.process, 'observeLiveness')
+        .mockReturnValue(
+          fixture.carrier === 'durable-alive' ? 'alive' : fixture.carrier === 'durable-absent' ? 'absent' : 'unknown',
+        );
+      const kill = vi.spyOn(runtime.process, 'kill');
+      const captureProviderRecoveryAuthority = vi.fn(
+        async (_launchRecord: JobLaunch) =>
+          ({
+            ok: false,
+            failure: fixture.failure,
+          }) as never,
       );
-    const kill = vi.spyOn(runtime.process, 'kill');
-    const fakeService = createFakeExecutionAndRecoveryService({
-      captureProviderRecoveryAuthority: vi.fn(async () => ({
-        ok: false,
-        failure: fixture.failure,
-      })),
-    });
+      const fakeService = createFakeExecutionAndRecoveryService({
+        captureProviderRecoveryAuthority,
+      });
 
-    stubLaunchRecord(progressStore, {
-      jobId,
-      sessionId,
-      provider: 'codex',
-      projectRoot,
-      backendNamespace: namespace,
-    });
-    if (fixture.carrier === 'app-server-not-addressable') {
-      stubAppServerRuntime(progressStore, jobId, 'codex');
-    } else {
-      stubRuntimeRecord(progressStore, { jobId, pid });
-    }
-    const runtimeProjection = progressStore.readRuntimeProjection(jobId);
-    const interruptAppServerJob = fakeService.interruptAppServerJob;
-
-    const servicesByProjectRoot = new Map([[projectRoot, fakeService]]);
-    let healthyJobId: string | null = null;
-    let healthyService: ReturnType<typeof createFakeExecutionAndRecoveryService> | null = null;
-    if (fixture.failure.reason === 'profile-unavailable' && fixture.carrier === 'durable-alive') {
-      healthyJobId = 'repairable-binding-healthy-sibling';
-      const healthySessionId = `${healthyJobId}-session`;
-      const healthyProjectRoot = createProjectRoot('project-repairable-binding-healthy-sibling');
-      healthyService = createFakeExecutionAndRecoveryService();
-      servicesByProjectRoot.set(healthyProjectRoot, healthyService);
       stubLaunchRecord(progressStore, {
-        jobId: healthyJobId,
-        sessionId: healthySessionId,
+        jobId,
+        sessionId,
         provider: 'codex',
-        projectRoot: healthyProjectRoot,
+        projectRoot,
         backendNamespace: namespace,
       });
-      appendQueuedEvent(progressStore, healthyJobId, healthySessionId, namespace, healthyProjectRoot);
-    }
-
-    const { controller, runtimeState } = createLifecycleHarness(modules, {
-      pluginRoot,
-      progressStore,
-      eventBus,
-      servicesByProjectRoot,
-      runtime,
-    });
-
-    try {
-      await controller.start();
-      expect(runtimeState.getLifecycle()).toBe('running');
-      expect(runtimeState.getLaunchFenceActive()).toBe(false);
-      expect(progressStore.readStatus(jobId)).toMatchObject({
-        phase: 'error',
-        result: { outcome: { kind: 'job_fault', fault: { kind: 'provider_binding', reason: fixture.failure.reason } } },
-      });
-      expect(progressStore.readRuntimeProjection(jobId)).toEqual(runtimeProjection);
-      expect(
-        new modules.sessionManagerModule.SessionManager(
-          projectRoot,
-          runtime,
-          undefined,
-          undefined,
-          progressStore.getDb(),
-          permissiveProviderLookupPort,
-        ).get('codex', sessionId)?.activeJobId,
-      ).toBeUndefined();
-      expect(
-        progressStore
-          .getDb()
-          .prepare("SELECT COUNT(*) AS count FROM events WHERE stream_id = ? AND type = 'job.terminal.recorded'")
-          .get(jobId),
-      ).toEqual({ count: 1 });
-      expect(
-        progressStore
-          .getDb()
-          .prepare("SELECT COUNT(*) AS count FROM events WHERE stream_id = ? AND type = 'session.claim.released'")
-          .get(sessionId),
-      ).toEqual({ count: 1 });
       if (fixture.carrier === 'app-server-not-addressable') {
-        expect(observeLiveness).not.toHaveBeenCalledWith(pid);
+        stubAppServerRuntime(progressStore, jobId, 'codex');
       } else {
-        expect(observeLiveness).toHaveBeenCalledWith(pid);
+        stubRuntimeRecord(progressStore, { jobId, pid });
+        const incarnation = testIncarnation(`repairable-binding-${suffix}`);
+        writeDurableCliProcessRuntimeMeta(progressStore.getDb(), {
+          jobId,
+          pid,
+          incarnation,
+          processGroupId: pid,
+          childRoot: { pid: pid + 1, incarnation },
+        });
+        vi.spyOn(runtime.process, 'readProcessIncarnation').mockReturnValue(
+          fixture.carrier === 'durable-absent' ? null : incarnation,
+        );
+        vi.spyOn(runtime.process, 'observeRecordedProcessAsync').mockImplementation(async () =>
+          fixture.carrier === 'durable-alive' ? 'alive' : fixture.carrier === 'durable-absent' ? 'absent' : 'unknown',
+        );
+        vi.spyOn(runtime.process, 'observeProcessIdentities').mockImplementation(async (owners) =>
+          owners.map((owner) => ({
+            owner,
+            evidence:
+              fixture.carrier === 'durable-absent'
+                ? { kind: 'pid-absent' as const }
+                : fixture.carrier === 'durable-unknown'
+                  ? { kind: 'unobservable' as const, cause: 'probe-failed' as const }
+                  : { kind: 'incarnation' as const, incarnation },
+          })),
+        );
       }
-      if (fixture.carrier === 'durable-alive') {
-        expect(kill).toHaveBeenCalledWith(pid, 'SIGTERM');
-      } else {
-        expect(kill).not.toHaveBeenCalled();
+      const runtimeProjection = progressStore.readRuntimeProjection(jobId);
+      const interruptAppServerJob = fakeService.interruptAppServerJob;
+
+      const servicesByProjectRoot = new Map([[projectRoot, fakeService]]);
+      let healthyJobId: string | null = null;
+      let healthyService: ReturnType<typeof createFakeExecutionAndRecoveryService> | null = null;
+      if (fixture.failure.reason === 'profile-unavailable' && fixture.carrier === 'durable-alive') {
+        healthyJobId = 'repairable-binding-healthy-sibling';
+        const healthySessionId = `${healthyJobId}-session`;
+        const healthyProjectRoot = createProjectRoot('project-repairable-binding-healthy-sibling');
+        healthyService = createFakeExecutionAndRecoveryService();
+        servicesByProjectRoot.set(healthyProjectRoot, healthyService);
+        stubLaunchRecord(progressStore, {
+          jobId: healthyJobId,
+          sessionId: healthySessionId,
+          provider: 'codex',
+          projectRoot: healthyProjectRoot,
+          backendNamespace: namespace,
+        });
+        appendQueuedEvent(progressStore, healthyJobId, healthySessionId, namespace, healthyProjectRoot);
       }
-      expect(interruptAppServerJob).not.toHaveBeenCalled();
-      const quarantineRows = progressStore
-        .getDb()
-        .prepare(
-          `SELECT error_message, disposition_detail
-             FROM recovery_quarantine
-            WHERE boundary_id = 'coordinator-job-recovery'
-              AND subject_key = ?`,
-        )
-        .all(jobId) as Array<{ error_message: string; disposition_detail: string }>;
-      expect(quarantineRows).toHaveLength(0);
-      if (healthyJobId !== null && healthyService !== null) {
-        expect(healthyService.recoverQueuedJob).toHaveBeenCalledTimes(1);
-        expect(progressStore.readStatus(healthyJobId)?.phase).not.toBe('error');
+
+      const { controller, runtimeState } = createLifecycleHarness(modules, {
+        pluginRoot,
+        progressStore,
+        eventBus,
+        servicesByProjectRoot,
+        runtime,
+      });
+
+      try {
+        await controller.start();
+        expect(runtimeState.getLifecycle()).toBe('running');
+        expect(runtimeState.getLaunchFenceActive()).toBe(false);
+        const settled = fixture.expectedDisposition === 'settled';
+        expect(progressStore.readStatus(jobId)).toMatchObject(
+          settled
+            ? {
+                phase: 'error',
+                result: {
+                  outcome: { kind: 'job_fault', fault: { kind: 'provider_binding', reason: fixture.failure.reason } },
+                },
+              }
+            : { phase: 'running' },
+        );
+        expect(progressStore.readRuntimeProjection(jobId)).toEqual(runtimeProjection);
+        expect(
+          new modules.sessionManagerModule.SessionManager(
+            projectRoot,
+            runtime,
+            undefined,
+            undefined,
+            progressStore.getDb(),
+            permissiveProviderLookupPort,
+          ).get('codex', sessionId)?.activeJobId,
+        ).toBe(settled ? undefined : jobId);
+        expect(
+          progressStore
+            .getDb()
+            .prepare("SELECT COUNT(*) AS count FROM events WHERE stream_id = ? AND type = 'job.terminal.recorded'")
+            .get(jobId),
+        ).toEqual({ count: settled ? 1 : 0 });
+        expect(
+          progressStore
+            .getDb()
+            .prepare("SELECT COUNT(*) AS count FROM events WHERE stream_id = ? AND type = 'session.claim.released'")
+            .get(sessionId),
+        ).toEqual({ count: settled ? 1 : 0 });
+        if (fixture.carrier === 'app-server-not-addressable' || fixture.carrier === 'durable-unknown') {
+          expect(observeLiveness).not.toHaveBeenCalledWith(-pid);
+        } else {
+          expect(observeLiveness).toHaveBeenCalledWith(-pid);
+        }
+        if (fixture.carrier === 'durable-alive') {
+          expect(kill).toHaveBeenCalledWith(-pid, 'SIGTERM');
+          expect(kill).toHaveBeenCalledWith(pid + 1, 'SIGTERM');
+        } else {
+          expect(kill).not.toHaveBeenCalled();
+        }
+        expect(interruptAppServerJob).not.toHaveBeenCalled();
+        const quarantineRows = progressStore
+          .getDb()
+          .prepare(
+            `SELECT error_message, disposition_detail
+               FROM recovery_quarantine
+              WHERE boundary_id = 'coordinator-job-recovery'
+                AND subject_key = ?`,
+          )
+          .all(jobId) as Array<{ error_message: string; disposition_detail: string }>;
+        expect(quarantineRows).toHaveLength(settled ? 0 : 1);
+        if (!settled) {
+          expect(controller.getRecoveryRegistry()?.has(jobId)).toBe(true);
+          expect(quarantineRows[0]?.disposition_detail).toContain(
+            fixture.carrier === 'durable-alive'
+              ? 'remained present at the exit deadline'
+              : fixture.carrier === 'durable-unknown'
+                ? 'could not be observed'
+                : 'has no locally observable durable process identity',
+          );
+        }
+        if (healthyJobId !== null && healthyService !== null) {
+          expect(healthyService.recoverQueuedJob).toHaveBeenCalledTimes(1);
+          expect(progressStore.readStatus(healthyJobId)?.phase).not.toBe('error');
+        }
+
+        if (fixture.failure.reason === 'profile-unavailable' && fixture.carrier === 'durable-alive') {
+          captureProviderRecoveryAuthority.mockImplementation(
+            async (repairedLaunchRecord: JobLaunch) =>
+              ({
+                ok: true,
+                authority: {
+                  launchRecord: repairedLaunchRecord,
+                  session: { sessionId: repairedLaunchRecord.sessionId },
+                  boundProvider: { name: repairedLaunchRecord.provider },
+                },
+              }) as never,
+          );
+          const quarantine = new modules.recoveryQuarantineModule.RecoveryQuarantineStore(
+            progressStore.getDb(),
+            runtime.time,
+          );
+          const retained = quarantine.list().find((entry) => entry.subject.key === jobId);
+          if (retained === undefined) throw new Error(`expected retained quarantine for ${jobId}`);
+          const sources = modules.recoverySourceRegistryModule.createRecoverySourceRegistry();
+          sources.register('coordinator-job-recovery', (subject, signal, quarantinePort) =>
+            modules.recoveryCoordinatorModule.createCoordinatorJobRecoveryRetryPlan(
+              progressStore.getDb(),
+              subject,
+              signal,
+              quarantinePort,
+            ),
+          );
+          const retry = modules.recoverySourceRegistryModule.createRecoveryQuarantineRetryService({
+            instanceId: 'recovery-hold-exit-test',
+            ids: { uuid: () => 'recovery-hold-exit-token' },
+            quarantine,
+            sources,
+          });
+
+          await expect(
+            retry.clear({
+              boundary: retained.boundary,
+              key: retained.subject.key,
+              revision: retained.subject.revision.kind === 'fingerprint' ? retained.subject.revision.value : null,
+            }),
+          ).resolves.toMatchObject({ disposition: 'continuation' });
+          expect(fakeService.adoptRunningJob).not.toHaveBeenCalled();
+          expect(quarantine.read('coordinator-job-recovery', jobId)).toMatchObject({ state: 'continuation' });
+        }
+      } finally {
+        monotonicNow.mockRestore();
+        sleep.mockRestore();
+        observeLiveness.mockRestore();
+        kill.mockRestore();
+        await stopLifecycleController(controller);
       }
-    } finally {
-      await stopLifecycleController(controller);
-    }
-  });
+    },
+  );
 
   it('15. current-namespace live durable jobs stay running after startup recovery', async () => {
     const modules = await loadModules();
@@ -4045,16 +4457,18 @@ describe('lifecycle recovery', () => {
       projectRoot,
     });
 
+    const jobId = '00000000-0000-4000-8000-000000000707';
     stubLaunchRecord(progressStore, {
-      jobId: 'still-running',
+      jobId,
       sessionId: 'still-running-session',
       provider: 'codex',
       projectRoot,
       backendNamespace: namespace,
     });
     stubRuntimeRecord(progressStore, {
-      jobId: 'still-running',
+      jobId,
       pid: process.pid,
+      recordContainment: true,
     });
 
     const { controller } = createLifecycleHarness(modules, {
@@ -4068,7 +4482,7 @@ describe('lifecycle recovery', () => {
 
     try {
       await controller.start();
-      expect(progressStore.readStatus('still-running')).toMatchObject({ phase: 'running' });
+      expect(progressStore.readStatus(jobId)).toMatchObject({ phase: 'running' });
     } finally {
       await stopLifecycleController(controller);
     }
@@ -4134,17 +4548,19 @@ describe('lifecycle recovery', () => {
       providers: permissiveProviderLookupPort,
     });
     const fakeService = createFakeExecutionAndRecoveryService();
+    const jobId = '00000000-0000-4000-8000-000000000717';
 
     stubLaunchRecord(progressStore, {
-      jobId: 'foreign-history',
+      jobId,
       sessionId: 'foreign-history-session',
       provider: 'codex',
       projectRoot,
       backendNamespace: 'foreign-history-namespace',
     });
     stubRuntimeRecord(progressStore, {
-      jobId: 'foreign-history',
+      jobId,
       pid: 999_992,
+      recordContainment: true,
     });
 
     const { controller } = createLifecycleHarness(modules, {
@@ -4156,7 +4572,7 @@ describe('lifecycle recovery', () => {
 
     try {
       await controller.start();
-      const history = progressStore.readJobEvents('foreign-history');
+      const history = progressStore.readJobEvents(jobId);
       expect(history).not.toContainEqual(
         expect.objectContaining({
           type: 'terminal',
@@ -4165,7 +4581,7 @@ describe('lifecycle recovery', () => {
       );
       expect(fakeService.finalizeInterruptedDurableJob).toHaveBeenCalledWith(
         expect.objectContaining({
-          launchRecord: expect.objectContaining({ jobId: 'foreign-history' }),
+          launchRecord: expect.objectContaining({ jobId }),
         }),
         expect.objectContaining({ transport: 'durable-cli', pid: 999_992 }),
         expect.objectContaining({ exit: null, terminal: null, cancelled: false }),
@@ -4354,17 +4770,19 @@ describe('lifecycle recovery', () => {
       providers: permissiveProviderLookupPort,
     });
     const fakeService = createFakeExecutionAndRecoveryService();
+    const jobId = '00000000-0000-4000-8000-000000000722';
 
     stubLaunchRecord(progressStore, {
-      jobId: 'foreign-no-adopt',
+      jobId,
       sessionId: 'foreign-no-adopt-session',
       provider: 'codex',
       projectRoot,
       backendNamespace: 'foreign-no-adopt-namespace',
     });
     stubRuntimeRecord(progressStore, {
-      jobId: 'foreign-no-adopt',
+      jobId,
       pid: 999_993,
+      recordContainment: true,
     });
 
     const { controller } = createLifecycleHarness(modules, {
@@ -4379,7 +4797,7 @@ describe('lifecycle recovery', () => {
       expect(fakeService.adoptRunningJob).not.toHaveBeenCalled();
       expect(fakeService.finalizeInterruptedDurableJob).toHaveBeenCalledWith(
         expect.objectContaining({
-          launchRecord: expect.objectContaining({ jobId: 'foreign-no-adopt' }),
+          launchRecord: expect.objectContaining({ jobId }),
         }),
         expect.objectContaining({ transport: 'durable-cli', pid: 999_993 }),
         expect.objectContaining({ exit: null, terminal: null, cancelled: false }),

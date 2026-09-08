@@ -10,10 +10,12 @@ import {
   type ControlClient,
   type ControlExchange,
 } from '#src/provider-proxy/control-client.js';
-import type {
-  ControlEndpointOptions,
-  ControlMethod,
-  createControlEndpoint as createControlEndpointType,
+import {
+  type ActiveControlAuthorization,
+  type ControlEndpoint,
+  type ControlEndpointOptions,
+  type ControlMethod,
+  type createControlEndpoint as createControlEndpointType,
 } from '#src/provider-proxy/control-endpoint.js';
 import type { EnforcementScheduler } from '#src/provider-proxy/enforcement.js';
 import { createGuardian, type GuardianContainmentIdentity } from '#src/provider-proxy/guardian.js';
@@ -21,13 +23,15 @@ import {
   guardianHandoffRedeemParamsSchema,
   guardianReaperHandoffInstallParamsSchema,
 } from '#src/provider-proxy/handoff-capsule.js';
+import { createControlHolderAuthority, type ControlHolderAuthority } from '#src/provider-proxy/holder-lifecycle.js';
 import type { EnforcerDeadlineStateMachine } from '#src/provider-proxy/orphan-deadline.js';
 import {
+  enforcementHoldStatusSchema,
   guardianOperationActivateParamsSchema,
   guardianRegisterProviderRootParamsSchema,
 } from '#src/provider-proxy/protocol.js';
 
-const endpointHarness = vi.hoisted(() => ({ options: undefined as unknown }));
+const endpointHarness = vi.hoisted(() => ({ options: undefined as unknown, activeAuthorizationCurrent: true }));
 
 vi.mock('#src/provider-proxy/control-endpoint.js', async (importOriginal) => {
   const actual = await importOriginal<{ createControlEndpoint: typeof createControlEndpointType }>();
@@ -38,6 +42,9 @@ vi.mock('#src/provider-proxy/control-endpoint.js', async (importOriginal) => {
       return {
         listen: async (): Promise<void> => {},
         close: async (): Promise<void> => {},
+        activeControlAuthorizationIsCurrent: (
+          ..._args: Parameters<ControlEndpoint['activeControlAuthorizationIsCurrent']>
+        ) => endpointHarness.activeAuthorizationCurrent,
         pushOnTenancy: async (): Promise<never> => {
           throw new Error('unused tenancy push');
         },
@@ -62,6 +69,7 @@ const cleanups: Array<() => Promise<void>> = [];
 afterEach(async () => {
   for (const cleanup of cleanups.splice(0).reverse()) await cleanup();
   endpointHarness.options = undefined;
+  endpointHarness.activeAuthorizationCurrent = true;
   vi.restoreAllMocks();
 });
 
@@ -78,12 +86,15 @@ function deadlinesFor<Scope extends symbol>(clock: MonotonicClock<Scope>): Enfor
     latchTeardown: () => {},
     markContainmentAbsent: () => {},
     markExited: () => {},
+    renewHolderCheck: () => {},
     bounds: () => ({
       lastRoundTripEvidenceAt: clock.now(),
       eofAt: null,
       controlLossAt: clock.now(),
       adoptionDeadline: clock.shiftMilliseconds(clock.now(), 60_000),
       exitDeadline: clock.shiftMilliseconds(clock.now(), 74_000),
+      holderCheckAt: clock.shiftMilliseconds(clock.now(), 60_000),
+      holderCheckAccelerated: false,
     }),
     state: () => 'accepting-control' as const,
   };
@@ -95,7 +106,12 @@ function letGuardianIngressYield(schema: z.ZodTypeAny, request: unknown): void {
 
 type GuardianHarness = ReturnType<typeof createGuardianHarness>;
 
-function createGuardianHarness() {
+function createGuardianHarness(
+  holderAuthority: ControlHolderAuthority = createControlHolderAuthority(),
+  containmentFailure?: Readonly<{ latchTeardown: () => void; observeLiveness: () => never }>,
+  enforcementHoldStatus?: () => z.infer<typeof enforcementHoldStatusSchema> | null,
+  abandonUnattributable: () => boolean = () => false,
+) {
   const clock = createMonotonicClock(Symbol('guardian-outbound'), { readMilliseconds: () => 0n });
   const shared = {
     generation: 'gen2' as const,
@@ -146,6 +162,10 @@ function createGuardianHarness() {
       value = { state: 'containment-recorded', reaper: reaperIdentity };
     } else if (method === 'reaper.record-redemption.v1') {
       value = { state: 'redemption-recorded' };
+    } else if (method === 'reaper.acquisition-publish.v1') {
+      value = { state: 'acquisition-published' };
+    } else if (method === 'reaper.containment-prepare.v1') {
+      value = { state: 'containment-prepared', token: 'prepare-token', providerRoots: [] };
     } else {
       value = { state: 'root-recorded' };
     }
@@ -173,10 +193,20 @@ function createGuardianHarness() {
       proxyGuardianAuthSecret: PAIR_SECRET,
     },
     clock,
-    deadlines: deadlinesFor(clock),
+    deadlines: {
+      ...deadlinesFor(clock),
+      ...(containmentFailure === undefined ? {} : { latchTeardown: containmentFailure.latchTeardown }),
+    },
     containmentEnvironment: {
       clock,
-      process: { kill: () => true, observeLiveness: () => 'alive' as const },
+      process: {
+        kill: () => true,
+        observeLiveness: containmentFailure?.observeLiveness ?? (() => 'alive' as const),
+        observeRecordedProcessAsync: async () => {
+          if (containmentFailure === undefined) return 'alive';
+          return containmentFailure.observeLiveness();
+        },
+      },
       platform: 'linux',
       maxRecordedRoots: 128,
       readProcessIncarnation: () => CONTAINMENT.incarnation,
@@ -190,6 +220,10 @@ function createGuardianHarness() {
     reaperChannel,
     self: { pid: 5_102, incarnation: testIncarnation(902) },
     reaperSelf: { pid: reaperIdentity.pid, incarnation: reaperIdentity.incarnation },
+    holderAuthority,
+    observeHolder: () => Promise.resolve('unknown' as const),
+    ...(enforcementHoldStatus === undefined ? {} : { enforcementHoldStatus }),
+    abandonUnattributable,
     onOutcome: () => {},
     onProgressViolation: () => {},
   });
@@ -201,6 +235,13 @@ function createGuardianHarness() {
     if (found === undefined) throw new Error(`Guardian method ${name} was not registered.`);
     return found;
   };
+  // This harness may cast only because it stubs endpoint provenance.
+  const activeAuthorization = {} as ActiveControlAuthorization;
+  const call = (name: string, params: unknown): Promise<unknown> | unknown => {
+    const entry = method(name);
+    if (entry.authority === 'active') return entry.handle(params, activeAuthorization);
+    return entry.handle(params);
+  };
   const operation = () => ({
     jobId: randomUUID(),
     operationId: randomUUID(),
@@ -208,7 +249,30 @@ function createGuardianHarness() {
     buildSetId: shared.buildSetId,
   });
 
-  return { guardian, method, reaperExchange, mintReceipt, coordinatorIdentity, proxyIdentity, operation };
+  const guardianIdentity = {
+    guardianInstanceId: shared.guardianInstanceId,
+    pid: 5_102,
+    incarnation: testIncarnation(902),
+    generation: shared.generation,
+    flavor: shared.flavor,
+    buildSetId: shared.buildSetId,
+    hostFingerprint: FINGERPRINT,
+    canonicalControlEndpoint: '/guardian.sock',
+  };
+
+  return {
+    guardian,
+    method,
+    call,
+    reaperExchange,
+    mintReceipt,
+    coordinatorIdentity,
+    guardianIdentity,
+    reaperIdentity,
+    proxyIdentity,
+    abandonUnattributable,
+    operation,
+  };
 }
 
 async function armGuardian(harness: GuardianHarness): Promise<void> {
@@ -221,12 +285,135 @@ function refuseReceiverConsultation(harness: GuardianHarness): void {
 }
 
 describe('guardian outbound schemas', () => {
+  it('leaves acquisition publication bounded only by the caller deadline', () => {
+    createGuardianHarness();
+
+    expect(
+      (endpointHarness.options as ControlEndpointOptions).role.methods.get('guardian.acquisition-publish.v1')?.budgetMs,
+    ).toBe('caller-deadline');
+  });
+
+  it('returns holder identity and disposition from one status snapshot', async () => {
+    const statusIdentity = {
+      controlEpoch: 7,
+      holder: { instanceId: randomUUID(), pid: 4_007, incarnation: testIncarnation('status-holder') },
+    };
+    const holderAuthority: ControlHolderAuthority = {
+      install: () => {},
+      current: () => {
+        throw new Error('holder status performed a separate current-holder read');
+      },
+      phase: () => 'published',
+      publish: () => {},
+      recordObservation: () => {},
+      status: () => ({
+        identity: statusIdentity,
+        disposition: 'alive',
+        transitionSequence: 9,
+        changedAtMs: 12_000,
+      }),
+    };
+    const enforcementHold = enforcementHoldStatusSchema.parse({
+      kind: 'recorded-group-unattributable',
+      attempts: 2,
+      roleIdentity: { role: 'guardian', pid: 5_102, incarnation: testIncarnation(902) },
+      retry: { state: 'scheduled', nextProbeAtMs: 14_000 },
+    });
+    const harness = createGuardianHarness(holderAuthority, undefined, () => enforcementHold);
+    const grantId = randomUUID();
+    const secret = 'f'.repeat(64);
+    await harness.call(
+      'guardian.handoff-install.v1',
+      guardianReaperHandoffInstallParamsSchema.parse({
+        grantId,
+        secretSha256: createHash('sha256').update(secret, 'utf8').digest('hex'),
+        successor: harness.coordinatorIdentity,
+        operations: [],
+        orphanTimeoutMs: 30_000,
+        teardownReserveMs: 14_000,
+      }),
+    );
+
+    const result = await harness.call('guardian.holder-status.v1', {
+      grantId,
+      secret,
+      generation: harness.guardianIdentity.generation,
+      flavor: harness.guardianIdentity.flavor,
+      buildSetId: harness.guardianIdentity.buildSetId,
+      hostFingerprint: harness.guardianIdentity.hostFingerprint,
+      guardianInstanceId: harness.guardianIdentity.guardianInstanceId,
+      reaperInstanceId: harness.reaperIdentity.reaperInstanceId,
+      proxyInstanceId: harness.proxyIdentity.proxyInstanceId,
+    });
+
+    expect(result).toEqual({
+      disposition: 'alive',
+      phase: 'published',
+      holder: statusIdentity.holder,
+      controlEpoch: statusIdentity.controlEpoch,
+      transitionSequence: 9,
+      changedAtMs: 12_000,
+      enforcementHold,
+    });
+  });
+
+  it('authenticates exact-role abandonment with the installed capsule grant', async () => {
+    const abandonUnattributable = vi.fn(() => true);
+    const harness = createGuardianHarness(createControlHolderAuthority(), undefined, undefined, abandonUnattributable);
+    const grantId = randomUUID();
+    const secret = 'f'.repeat(64);
+    await harness.call(
+      'guardian.handoff-install.v1',
+      guardianReaperHandoffInstallParamsSchema.parse({
+        grantId,
+        secretSha256: createHash('sha256').update(secret, 'utf8').digest('hex'),
+        successor: harness.coordinatorIdentity,
+        operations: [],
+        orphanTimeoutMs: 30_000,
+        teardownReserveMs: 14_000,
+      }),
+    );
+    const credential = {
+      grantId,
+      secret,
+      generation: harness.guardianIdentity.generation,
+      flavor: harness.guardianIdentity.flavor,
+      buildSetId: harness.guardianIdentity.buildSetId,
+      hostFingerprint: harness.guardianIdentity.hostFingerprint,
+      guardianInstanceId: harness.guardianIdentity.guardianInstanceId,
+      reaperInstanceId: harness.reaperIdentity.reaperInstanceId,
+      proxyInstanceId: harness.proxyIdentity.proxyInstanceId,
+    };
+    const method = harness.method('guardian.abandon-unattributable.v1');
+    expect(method.authority).toBe('operator');
+
+    expect(() =>
+      harness.call('guardian.abandon-unattributable.v1', {
+        credential,
+        roleIdentity: { role: 'guardian', pid: 9_999, incarnation: harness.guardianIdentity.incarnation },
+      }),
+    ).toThrow(/different guardian/u);
+    expect(abandonUnattributable).not.toHaveBeenCalled();
+
+    expect(
+      harness.call('guardian.abandon-unattributable.v1', {
+        credential,
+        roleIdentity: {
+          role: 'guardian',
+          pid: harness.guardianIdentity.pid,
+          incarnation: harness.guardianIdentity.incarnation,
+        },
+      }),
+    ).toEqual({ state: 'unattributable-containment-abandoned' });
+    expect(abandonUnattributable).toHaveBeenCalledOnce();
+  });
+
   it('replays one stable activation receipt for the exact membership tuple', async () => {
     const harness = createGuardianHarness();
     await armGuardian(harness);
     const operation = harness.operation();
     const reservation = randomUUID();
-    const staged = (await harness.method('guardian.register-provider-root.v1').handle({
+    const staged = (await harness.call('guardian.register-provider-root.v1', {
       proxy: harness.proxyIdentity,
       operation,
       reservation,
@@ -242,12 +429,118 @@ describe('guardian outbound schemas', () => {
       jointContainmentReceipt: staged.jointContainmentReceipt,
     };
 
-    const first = await harness.method('guardian.operation-activate.v1').handle(activation);
-    const replay = await harness.method('guardian.operation-activate.v1').handle(activation);
+    const first = await harness.call('guardian.operation-activate.v1', activation);
+    const replay = await harness.call('guardian.operation-activate.v1', activation);
 
     expect(replay).toEqual(first);
     expect(harness.mintReceipt).toHaveBeenCalledOnce();
     expect(harness.reaperExchange).toHaveBeenCalledOnce();
+  });
+
+  it('does not latch activation after active control changes during reaper confirmation', async () => {
+    const harness = createGuardianHarness();
+    await armGuardian(harness);
+    const operation = harness.operation();
+    const reservation = randomUUID();
+    const staged = (await harness.call('guardian.register-provider-root.v1', {
+      proxy: harness.proxyIdentity,
+      operation,
+      reservation,
+      providerPid: ROOT.pid,
+      providerIncarnation: ROOT.incarnation,
+    })) as { jointContainmentReceipt: string };
+    const activation = {
+      operation,
+      reservation,
+      providerRoot: ROOT,
+      jointContainmentReceipt: staged.jointContainmentReceipt,
+    };
+    harness.mintReceipt.mockClear();
+    harness.reaperExchange.mockImplementationOnce(async () => {
+      endpointHarness.activeAuthorizationCurrent = false;
+      return controlExchangeForTest({
+        kind: 'response',
+        response: { kind: 'result', value: { state: 'root-recorded' } },
+      });
+    });
+
+    await expect(harness.call('guardian.operation-activate.v1', activation)).rejects.toMatchObject({
+      code: 'unauthorized_control',
+    });
+    expect(harness.mintReceipt).not.toHaveBeenCalled();
+
+    endpointHarness.activeAuthorizationCurrent = true;
+    await expect(harness.call('guardian.operation-activate.v1', activation)).resolves.toMatchObject({
+      state: 'activation-authorized',
+      jointActivationReceipt: expect.any(String),
+    });
+    expect(harness.mintReceipt).toHaveBeenCalledOnce();
+  });
+
+  it('replays the enforcer hold when teardown latches but absence is not confirmed', async () => {
+    const latchTeardown = vi.fn();
+    const holderAuthority = createControlHolderAuthority();
+    const harness = createGuardianHarness(holderAuthority, {
+      latchTeardown,
+      observeLiveness: () => {
+        throw new Error('absence could not be observed');
+      },
+    });
+    holderAuthority.install({
+      controlEpoch: 1,
+      holder: {
+        instanceId: harness.coordinatorIdentity.instanceId,
+        pid: harness.coordinatorIdentity.pid,
+        incarnation: harness.coordinatorIdentity.incarnation,
+      },
+    });
+    await armGuardian(harness);
+
+    const request = {
+      guardian: harness.guardianIdentity,
+      reaper: harness.reaperIdentity,
+      proxy: harness.proxyIdentity,
+    };
+    const result = await harness.call('guardian.containment-commit.v1', request);
+    const replay = await harness.call('guardian.containment-commit.v1', request);
+
+    expect(latchTeardown).toHaveBeenCalledOnce();
+    expect(result).toEqual({
+      state: 'teardown-latched-absence-unconfirmed',
+      reason: 'absence could not be observed',
+    });
+    expect(replay).toEqual(result);
+    expect(harness.reaperExchange).toHaveBeenCalledOnce();
+  });
+
+  it('throws a pre-latch containment-prepare failure without latching teardown', async () => {
+    const latchTeardown = vi.fn();
+    const holderAuthority = createControlHolderAuthority();
+    const harness = createGuardianHarness(holderAuthority, {
+      latchTeardown,
+      observeLiveness: () => {
+        throw new Error('teardown must not run');
+      },
+    });
+    holderAuthority.install({
+      controlEpoch: 1,
+      holder: {
+        instanceId: harness.coordinatorIdentity.instanceId,
+        pid: harness.coordinatorIdentity.pid,
+        incarnation: harness.coordinatorIdentity.incarnation,
+      },
+    });
+    await armGuardian(harness);
+    harness.reaperExchange.mockRejectedValueOnce(new Error('prepare refused'));
+
+    await expect(
+      harness.call('guardian.containment-commit.v1', {
+        guardian: harness.guardianIdentity,
+        reaper: harness.reaperIdentity,
+        proxy: harness.proxyIdentity,
+      }),
+    ).rejects.toThrow('prepare refused');
+    expect(latchTeardown).not.toHaveBeenCalled();
   });
 
   it('lets the paired proxy release membership idempotently', async () => {
@@ -255,7 +548,7 @@ describe('guardian outbound schemas', () => {
     await armGuardian(harness);
     const operation = harness.operation();
     const reservation = randomUUID();
-    await harness.method('guardian.register-provider-root.v1').handle({
+    await harness.call('guardian.register-provider-root.v1', {
       proxy: harness.proxyIdentity,
       operation,
       reservation,
@@ -265,10 +558,10 @@ describe('guardian outbound schemas', () => {
     const release = { proxy: harness.proxyIdentity, operation, reservation };
 
     expect(harness.method('guardian.operation-release.v1').authority).toBe('pairing');
-    expect(harness.method('guardian.operation-release.v1').handle(release)).toEqual({
+    expect(harness.call('guardian.operation-release.v1', release)).toEqual({
       state: 'membership-released',
     });
-    expect(harness.method('guardian.operation-release.v1').handle(release)).toEqual({
+    expect(harness.call('guardian.operation-release.v1', release)).toEqual({
       state: 'membership-absent',
     });
   });
@@ -301,7 +594,7 @@ describe('guardian outbound schemas', () => {
     };
     letGuardianIngressYield(guardianRegisterProviderRootParamsSchema, request);
 
-    await expect(harness.method('guardian.register-provider-root.v1').handle(request)).rejects.toMatchObject({
+    await expect(harness.call('guardian.register-provider-root.v1', request)).rejects.toMatchObject({
       issues: [expect.objectContaining({ code: 'invalid_type', path: ['providerRoot', 'pid'] })],
     });
     expect(harness.reaperExchange).not.toHaveBeenCalled();
@@ -312,7 +605,7 @@ describe('guardian outbound schemas', () => {
     await armGuardian(harness);
     const operation = harness.operation();
     const reservation = randomUUID();
-    const staged = (await harness.method('guardian.register-provider-root.v1').handle({
+    const staged = (await harness.call('guardian.register-provider-root.v1', {
       proxy: harness.proxyIdentity,
       operation,
       reservation,
@@ -329,7 +622,7 @@ describe('guardian outbound schemas', () => {
     };
     letGuardianIngressYield(guardianOperationActivateParamsSchema, request);
 
-    await expect(harness.method('guardian.operation-activate.v1').handle(request)).rejects.toMatchObject({
+    await expect(harness.call('guardian.operation-activate.v1', request)).rejects.toMatchObject({
       issues: [expect.objectContaining({ code: 'unrecognized_keys', keys: ['unexpected'], path: ['providerRoot'] })],
     });
     expect(harness.reaperExchange).not.toHaveBeenCalled();
@@ -339,7 +632,8 @@ describe('guardian outbound schemas', () => {
     const harness = createGuardianHarness();
     const grantId = randomUUID();
     const secret = 'f'.repeat(64);
-    await harness.method('guardian.handoff-install.v1').handle(
+    await harness.call(
+      'guardian.handoff-install.v1',
       guardianReaperHandoffInstallParamsSchema.parse({
         grantId,
         secretSha256: createHash('sha256').update(secret, 'utf8').digest('hex'),
@@ -357,7 +651,7 @@ describe('guardian outbound schemas', () => {
     };
     letGuardianIngressYield(guardianHandoffRedeemParamsSchema, request);
 
-    await expect(harness.method('guardian.handoff-redeem.v1').handle(request)).rejects.toMatchObject({
+    await expect(harness.call('guardian.handoff-redeem.v1', request)).rejects.toMatchObject({
       issues: [expect.objectContaining({ code: 'unrecognized_keys', keys: ['unexpected'], path: ['successor'] })],
     });
     expect(harness.reaperExchange).not.toHaveBeenCalled();
@@ -375,7 +669,7 @@ describe('guardian outbound schemas', () => {
     );
 
     await expect(
-      harness.method('guardian.register-provider-root.v1').handle({
+      harness.call('guardian.register-provider-root.v1', {
         proxy: harness.proxyIdentity,
         operation: harness.operation(),
         reservation: randomUUID(),
@@ -387,6 +681,113 @@ describe('guardian outbound schemas', () => {
     });
     expect(harness.reaperExchange).toHaveBeenCalledOnce();
     expect(harness.guardian.enforcer()?.recordedRoots()).toEqual([]);
+    expect(harness.mintReceipt).not.toHaveBeenCalled();
+  });
+
+  it(
+    "answers acquisition-publication-unknown, never a refusal, when reaper.acquisition-publish.v1's own " +
+      "reply cannot be confirmed — the reaper's handler publishes before it replies, so a refusal here would " +
+      'read as proof of the one thing that did not happen',
+    async () => {
+      const harness = createGuardianHarness();
+      const publishRequest = {
+        guardian: harness.guardianIdentity,
+        reaper: harness.reaperIdentity,
+        proxy: harness.proxyIdentity,
+      };
+      harness.reaperExchange.mockResolvedValueOnce(
+        controlExchangeForTest({
+          kind: 'response',
+          response: { kind: 'result', value: { state: 'acquisition-published', unexpected: true } },
+        }),
+      );
+
+      const unconfirmed = (await harness.call('guardian.acquisition-publish.v1', publishRequest)) as {
+        state: string;
+        reason: string;
+      };
+
+      expect(unconfirmed.state).toBe('acquisition-publication-unknown');
+      expect(unconfirmed.reason).toEqual(expect.any(String));
+      expect(harness.mintReceipt).not.toHaveBeenCalled();
+
+      // An unconfirmed attempt must not prevent a later idempotent publication.
+      const published = (await harness.call('guardian.acquisition-publish.v1', publishRequest)) as {
+        state: string;
+        certificate: string;
+      };
+      expect(published.state).toBe('acquisition-published');
+      expect(published.certificate).toEqual(expect.any(String));
+    },
+  );
+
+  it('keeps the guardian provisional when active control is revoked during reaper publication', async () => {
+    const holderAuthority = createControlHolderAuthority();
+    const harness = createGuardianHarness(holderAuthority);
+    const publishRequest = {
+      guardian: harness.guardianIdentity,
+      reaper: harness.reaperIdentity,
+      proxy: harness.proxyIdentity,
+    };
+    harness.reaperExchange.mockImplementationOnce(async () => {
+      endpointHarness.activeAuthorizationCurrent = false;
+      return controlExchangeForTest({
+        kind: 'response',
+        response: { kind: 'result', value: { state: 'acquisition-published' } },
+      });
+    });
+
+    await expect(harness.call('guardian.acquisition-publish.v1', publishRequest)).resolves.toMatchObject({
+      state: 'acquisition-publication-unknown',
+    });
+    expect(holderAuthority.phase()).toBe('acquisition-provisional');
+    expect(harness.mintReceipt).not.toHaveBeenCalled();
+    expect(await harness.call('guardian.acquisition-abort.v1', publishRequest)).toEqual({
+      state: 'acquisition-aborted',
+    });
+  });
+
+  it('answers acquisition-publication-not-attempted when transport evidence proves the reaper request never left', async () => {
+    const harness = createGuardianHarness();
+    const publishRequest = {
+      guardian: harness.guardianIdentity,
+      reaper: harness.reaperIdentity,
+      proxy: harness.proxyIdentity,
+    };
+    harness.reaperExchange.mockResolvedValueOnce(
+      controlExchangeForTest({
+        kind: 'not-sent',
+        cause: 'connection-already-closed',
+        error: new Error('reaper channel unavailable'),
+      }),
+    );
+
+    const notAttempted = (await harness.call('guardian.acquisition-publish.v1', publishRequest)) as {
+      state: string;
+      reason: string;
+    };
+
+    expect(notAttempted.state).toBe('acquisition-publication-not-attempted');
+    expect(notAttempted.reason).toEqual(expect.any(String));
+    expect(harness.mintReceipt).not.toHaveBeenCalled();
+  });
+
+  it('keeps an exchange rejection unknown because it carries no transport-owned delivery disposition', async () => {
+    const harness = createGuardianHarness();
+    const publishRequest = {
+      guardian: harness.guardianIdentity,
+      reaper: harness.reaperIdentity,
+      proxy: harness.proxyIdentity,
+    };
+    harness.reaperExchange.mockRejectedValueOnce(new Error('reaper channel unavailable'));
+
+    const unconfirmed = (await harness.call('guardian.acquisition-publish.v1', publishRequest)) as {
+      state: string;
+      reason: string;
+    };
+
+    expect(unconfirmed.state).toBe('acquisition-publication-unknown');
+    expect(unconfirmed.reason).toEqual(expect.any(String));
     expect(harness.mintReceipt).not.toHaveBeenCalled();
   });
 });

@@ -16,12 +16,15 @@ import { join } from 'node:path';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 
 import * as auditLogModule from '#src/infra/audit-log.js';
+import { CURRENT_STRICT_BUNDLE_MANIFEST_FILE } from '#src/infra/bundle-manifest-address.js';
 import type { StorageBigIntStat, StorageEntryKind } from '#src/infra/port-types.js';
 import type { StrictBundleManifest } from '#src/infra/bundle-manifest.js';
 import { createForeignTargetValidator } from '#src/infra/handoff-target.js';
 import type { Runtime } from '#src/runtime/ports.js';
 import { createRealRuntime } from '#src/runtime/real.js';
 import {
+  ACTIVE_STORE_SELECTION_VERSION,
+  ACTIVE_STORE_TRANSITION_VERSION,
   encodeActiveStoreSelection,
   encodeActiveStoreTransition,
   readActiveStoreSelection,
@@ -47,6 +50,7 @@ const roots: string[] = [];
 const backendBundle = 'backend fixture';
 const cliBundle = 'cli fixture';
 const claudeAppserverBundle = 'claude appserver fixture';
+const durableWrapperBundle = 'durable wrapper fixture';
 
 function bundleHash(contents: string): string {
   return createHash('sha256').update(contents).digest('hex').slice(0, 16);
@@ -59,6 +63,7 @@ function manifest(version: string, buildSetId: string): StrictBundleManifest {
     bundleHash: bundleHash(backendBundle),
     cliBundleHash: bundleHash(cliBundle),
     claudeAppserverBundleHash: bundleHash(claudeAppserverBundle),
+    durableWrapperBundleHash: bundleHash(durableWrapperBundle),
     flavor: 'prod',
     storeFormatFingerprint: currentCoralStoreFormat().fingerprint,
   };
@@ -70,13 +75,14 @@ function createBundle(root: string, expected: StrictBundleManifest): string {
   writeFileSync(join(bundleDir, 'coral-backend.cjs'), backendBundle);
   writeFileSync(join(bundleDir, 'coral-cli.cjs'), cliBundle);
   writeFileSync(join(bundleDir, 'coral-claude-appserver.cjs'), claudeAppserverBundle);
-  writeFileSync(join(bundleDir, 'manifest.json'), JSON.stringify(expected));
+  writeFileSync(join(bundleDir, 'coral-durable-wrapper.cjs'), durableWrapperBundle);
+  writeFileSync(join(bundleDir, CURRENT_STRICT_BUNDLE_MANIFEST_FILE), JSON.stringify(expected));
   return bundleDir;
 }
 
 function selection(expected: StrictBundleManifest, bundleDir: string): ActiveStoreSelection {
   return {
-    version: 1,
+    version: ACTIVE_STORE_SELECTION_VERSION,
     manifest: expected,
     bundleDir,
     activeStoreFingerprint: expected.storeFormatFingerprint,
@@ -136,7 +142,7 @@ function stubAudit(): ReturnType<typeof vi.spyOn> {
 
 function supersededTransition(currentSelection: ActiveStoreSelection): ActiveStoreTransition {
   return {
-    version: 1,
+    version: ACTIVE_STORE_TRANSITION_VERSION,
     transitionId: '323e4567-e89b-42d3-a456-426614174000',
     kind: 'selection-recovery',
     evidence: {
@@ -210,7 +216,9 @@ describe('active-store-selection locking', () => {
     runtime.storage.writeAtomicDurableSync = vi.fn((path, bytes, options) => {
       expect(existsSync(boundary.adoptionLock)).toBe(true);
       expect(existsSync(resetLock)).toBe(false);
-      events.push(path === paths.transitionFile ? 'transition' : 'selection');
+      events.push(
+        path === paths.transitionFile ? 'transition' : path === paths.selectionV1File ? 'selection-v1' : 'selection',
+      );
       return durableWrite(path, bytes, options);
     });
     const db = fakeDatabase();
@@ -239,16 +247,18 @@ describe('active-store-selection locking', () => {
     });
 
     expect(result).toEqual({ kind: 'opened', db });
-    expect(events).toEqual(['transition', 'selection', 'classify', 'open']);
+    expect(events).toEqual(['transition', 'selection-v1', 'selection', 'classify', 'open']);
     expect(existsSync(boundary.adoptionLock)).toBe(false);
     expect(existsSync(resetLock)).toBe(false);
     expect(statSync(paths.coordinationRoot).mode & 0o777).toBe(0o700);
+    expect(statSync(paths.selectionV1File).mode & 0o777).toBe(0o600);
     expect(statSync(paths.selectionFile).mode & 0o777).toBe(0o600);
+    expect(existsSync(paths.transitionV1File)).toBe(false);
     expect(existsSync(paths.transitionFile)).toBe(false);
   });
 
-  it('should leave the store untouched when either required durable publication fails', async () => {
-    for (const failedRecord of ['transitionFile', 'selectionFile'] as const) {
+  it('should leave the store untouched when any required durable publication fails', async () => {
+    for (const failedRecord of ['transitionFile', 'selectionV1File', 'selectionFile'] as const) {
       const { runtime, currentSelection, authority } = harness();
       const paths = resolveActiveStoreRecordPaths(runtime);
       const { classifyStore, openStore } = stubStoreOpen();
@@ -284,7 +294,7 @@ describe('active-store-selection locking', () => {
       expect(classifyStore).not.toHaveBeenCalled();
       expect(openStore).not.toHaveBeenCalled();
       expect(existsSync(runtime.paths.coral.store.dbFile)).toBe(false);
-      if (failedRecord === 'selectionFile') {
+      if (failedRecord === 'selectionV1File' || failedRecord === 'selectionFile') {
         expect(readActiveStoreTransition(runtime).kind).toBe('valid');
       }
     }
@@ -324,7 +334,7 @@ describe('active-store-selection locking', () => {
   it('should resume a transition even when the selection already names the current build', async () => {
     const { runtime, currentSelection, authority } = harness();
     const transition: ActiveStoreTransition = {
-      version: 1,
+      version: ACTIVE_STORE_TRANSITION_VERSION,
       transitionId: '323e4567-e89b-42d3-a456-426614174000',
       kind: 'selection-recovery',
       evidence: {
@@ -429,6 +439,57 @@ describe('active-store-selection locking', () => {
       expect(readdirSync(retainedTransitionRoot(runtime))).toHaveLength(1);
     },
   );
+
+  it('should transfer a v1-only transition to quarantine before clearing its rollback authority', async () => {
+    const { runtime, currentSelection, authority } = harness();
+    const paths = resolveActiveStoreRecordPaths(runtime);
+    publish(runtime, 'selectionFile', encodeActiveStoreSelection(currentSelection));
+    const legacy = supersededTransition(currentSelection);
+    const currentManifestV1 = {
+      version: legacy.currentManifest.version,
+      buildSetId: legacy.currentManifest.buildSetId,
+      bundleHash: legacy.currentManifest.bundleHash,
+      cliBundleHash: legacy.currentManifest.cliBundleHash,
+      claudeAppserverBundleHash: legacy.currentManifest.claudeAppserverBundleHash,
+      flavor: legacy.currentManifest.flavor,
+      storeFormatFingerprint: legacy.currentManifest.storeFormatFingerprint,
+    };
+    mkdirSync(paths.coordinationRoot, { recursive: true, mode: 0o700 });
+    const legacyBytes = `${JSON.stringify({ ...legacy, version: 1, currentManifest: currentManifestV1 })}\n`;
+    writeFileSync(paths.transitionV1File, legacyBytes, { mode: 0o600 });
+    const unlink = runtime.storage.unlinkSync.bind(runtime.storage);
+    runtime.storage.unlinkSync = vi.fn((path) => {
+      if (path === paths.transitionV1File) {
+        expect(readdirSync(retainedTransitionRoot(runtime))).toHaveLength(1);
+      }
+      unlink(path);
+    });
+    const db = fakeDatabase();
+    stubStoreOpen({ kind: 'fresh' }, db);
+    const recordAudit = stubAudit();
+
+    const result = await coordinateActiveStoreSelection(runtime, authority, {
+      storeFormat: currentCoralStoreFormat(),
+      currentSelection,
+      dependencies: {
+        kind: 'operator',
+        validateSelectedTarget: () => {
+          throw new Error('validator should not run');
+        },
+      },
+    });
+
+    expect(result).toEqual({ kind: 'opened', db });
+    expect(existsSync(paths.transitionV1File)).toBe(false);
+    const retainedFiles = readdirSync(retainedTransitionRoot(runtime));
+    expect(retainedFiles).toHaveLength(1);
+    expect(readFileSync(join(retainedTransitionRoot(runtime), retainedFiles[0]), 'utf8')).toBe(legacyBytes);
+    expect(recordAudit).toHaveBeenCalledWith(
+      'active-store-transition-superseded',
+      expect.objectContaining({ failureCode: 'transition_current_build_mismatch' }),
+      'warn',
+    );
+  });
 
   it('should hard-refuse a transition rejection outside the supersede allowlist', async () => {
     const { runtime, currentSelection, authority } = harness();
@@ -805,20 +866,23 @@ describe('active-store-selection locking', () => {
   it('should refuse via the documented code when a freshly created coordination directory is unsafe', async () => {
     const { runtime, currentSelection, authority } = harness();
     const paths = resolveActiveStoreRecordPaths(runtime);
+    const mkdirSync = runtime.storage.mkdirSync.bind(runtime.storage);
+    let coordinationRootCreated = false;
+    runtime.storage.mkdirSync = (path, options) => {
+      mkdirSync(path, options);
+      if (path === paths.coordinationRoot) coordinationRootCreated = true;
+    };
     const lstatSync = runtime.storage.lstatSync.bind(runtime.storage);
-    let coordinationRootLstatCalls = 0;
     function poisonCreatedCoordinationRoot(path: string): StorageEntryKind;
     function poisonCreatedCoordinationRoot(path: string, options: { bigint: true }): StorageBigIntStat;
     function poisonCreatedCoordinationRoot(
       path: string,
       options?: { bigint: true },
     ): StorageEntryKind | StorageBigIntStat {
-      if (path === paths.coordinationRoot) {
-        coordinationRootLstatCalls += 1;
-        if (coordinationRootLstatCalls === 3) {
-          const real = options?.bigint === true ? lstatSync(path, options) : lstatSync(path);
-          return { ...real, isDirectory: () => true, isSymbolicLink: () => true };
-        }
+      if (path === paths.coordinationRoot && coordinationRootCreated) {
+        coordinationRootCreated = false;
+        const real = options?.bigint === true ? lstatSync(path, options) : lstatSync(path);
+        return { ...real, isDirectory: () => true, isSymbolicLink: () => true };
       }
       return options?.bigint === true ? lstatSync(path, options) : lstatSync(path);
     }
@@ -847,16 +911,23 @@ describe('active-store-selection locking', () => {
     const paths = resolveActiveStoreRecordPaths(runtime);
     mkdirSync(paths.coordinationRoot, { recursive: true, mode: 0o700 });
     chmodSync(paths.coordinationRoot, 0o700);
+    const lstatSync = runtime.storage.lstatSync.bind(runtime.storage);
+    let transitionPublicationReady = false;
+    function armTransitionPublicationRecheck(path: string): StorageEntryKind;
+    function armTransitionPublicationRecheck(path: string, options: { bigint: true }): StorageBigIntStat;
+    function armTransitionPublicationRecheck(
+      path: string,
+      options?: { bigint: true },
+    ): StorageEntryKind | StorageBigIntStat {
+      if (path === paths.selectionFile) transitionPublicationReady = true;
+      return options?.bigint === true ? lstatSync(path, options) : lstatSync(path);
+    }
+    runtime.storage.lstatSync = armTransitionPublicationRecheck;
     const realpathSync = runtime.storage.realpathSync.bind(runtime.storage);
-    let coordinationRootRealpathCalls = 0;
     runtime.storage.realpathSync = (path) => {
-      if (path === paths.coordinationRoot) {
-        coordinationRootRealpathCalls += 1;
-        // Calls 1-2 are the read-side checks, which see the genuinely canonical directory. Call 3 is
-        // `ensureActiveStoreCoordinationDirectory`'s own recheck, which this poisons.
-        if (coordinationRootRealpathCalls === 3) {
-          return `${path}-mismatch`;
-        }
+      if (path === paths.coordinationRoot && transitionPublicationReady) {
+        transitionPublicationReady = false;
+        return `${path}-mismatch`;
       }
       return realpathSync(path);
     };

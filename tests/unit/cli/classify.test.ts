@@ -163,4 +163,55 @@ describe('command class coverage', () => {
       { path: 'backend provider-host evict', commandClass: 'mutate' },
     ]);
   });
+
+  it('classifies shutdown-recovery status as a direct read and abandonment as a mutation', () => {
+    const entries = collectCommandCoverage(buildProgram())
+      .filter(
+        (entry) => entry.path === 'backend shutdown-recovery' || entry.path.startsWith('backend shutdown-recovery '),
+      )
+      .map((entry) => ({
+        path: entry.path,
+        isLeaf: entry.isLeaf,
+        kind: entry.resolution.kind,
+        commandClass: entry.resolution.kind === 'class' ? entry.resolution.commandClass : null,
+      }));
+
+    expect(entries).toEqual([
+      {
+        path: 'backend shutdown-recovery',
+        isLeaf: false,
+        kind: 'container',
+        commandClass: null,
+      },
+      {
+        path: 'backend shutdown-recovery status',
+        isLeaf: true,
+        kind: 'class',
+        commandClass: 'directRead',
+      },
+      {
+        path: 'backend shutdown-recovery abandon',
+        isLeaf: true,
+        kind: 'class',
+        commandClass: 'mutate',
+      },
+    ]);
+  });
+
+  it('classifies provider-proxy role actions as mutation leaves', () => {
+    const entries = collectCommandCoverage(buildProgram())
+      .filter((entry) => entry.path.startsWith('backend provider-proxy-set '))
+      .map((entry) => ({
+        path: entry.path,
+        isLeaf: entry.isLeaf,
+        commandClass: entry.resolution.kind === 'class' ? entry.resolution.commandClass : null,
+      }));
+
+    expect(entries).toEqual([
+      { path: 'backend provider-proxy-set terminate-role', isLeaf: true, commandClass: 'mutate' },
+      { path: 'backend provider-proxy-set retry-role-reap', isLeaf: true, commandClass: 'mutate' },
+      { path: 'backend provider-proxy-set contain', isLeaf: true, commandClass: 'mutate' },
+      { path: 'backend provider-proxy-set abandon', isLeaf: true, commandClass: 'mutate' },
+    ]);
+  });
 });

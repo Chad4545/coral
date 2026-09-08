@@ -119,8 +119,18 @@ function providerHostManager(): ProviderHostManager {
       throw new Error('provider host was not expected');
     },
     attachSession: async () => null,
-    drainForHandoff: async () => undefined,
-    shutdown: async () => undefined,
+    drainForHandoff: async () => ({
+      kind: 'provider-hosts-quiesced',
+      liveProxySets: [],
+      acquisitionCleanupHolds: [],
+      closingHosts: [],
+    }),
+    shutdown: async () => ({
+      kind: 'provider-hosts-quiesced',
+      liveProxySets: [],
+      acquisitionCleanupHolds: [],
+      closingHosts: [],
+    }),
     routeAppServerOperation: () => null,
   };
 }

@@ -24,8 +24,12 @@ import {
   providerHostEvictResponseSchema,
   providerHostInspectResponseSchema,
   providerHostListResponseSchema,
+  providerProxySetContainBooleanRpcSpec,
+  providerProxySetContainBooleanResponseSchema,
+  providerProxySetContainRpcSpec,
   providerProxySetContainResponseSchema,
   unreadableProviderOperationDiscardResultSchema,
+  type ProviderProxySetContainBooleanRequest,
   type ProviderProxySetContainRequest,
   type ProviderHostSelectorRequest,
 } from './rpc/catalog.js';
@@ -47,6 +51,7 @@ function decodePathSegment(segment: string): string | null {
 
 export type CatalogRequestExecution =
   | { kind: 'unary'; body: unknown; statusCode?: number }
+  | { kind: 'unsupported-method'; body: unknown; statusCode: 404 }
   | { kind: 'subscription'; notifications: AsyncIterable<unknown> };
 
 const BACKEND_RECOVERING_MESSAGE = 'recovering — retry after 500ms';
@@ -70,6 +75,10 @@ function jobScopeMismatchResult(jobs: readonly string[]): ToolDomainResult {
 
 function unary(body: unknown, statusCode?: number): CatalogRequestExecution {
   return statusCode === undefined ? { kind: 'unary', body } : { kind: 'unary', body, statusCode };
+}
+
+function unsupportedMethod(message: string): CatalogRequestExecution {
+  return { kind: 'unsupported-method', body: { code: 'unsupported_method', message }, statusCode: 404 };
 }
 
 function unaryHttp(response: { statusCode: number; body: unknown }): CatalogRequestExecution {
@@ -382,14 +391,27 @@ type ProviderHostAdministrationErrorCode =
   | 'provider_host_inventory_unavailable'
   | 'provider_host_not_found'
   | 'provider_host_ambiguous'
+  | 'provider_host_eviction_requires_exact_ref'
   | 'provider_host_identity_integrity'
+  | 'provider_host_operator_abandoned'
+  | 'provider_host_shutdown_held'
   | 'provider_host_stale';
+
+type ProviderHostEvictionAbandonmentView = Readonly<{
+  kind: 'operator-abandoned';
+  subject: Readonly<Record<string, unknown>>;
+  processAbsenceProven: false;
+  successor: Readonly<{ owner: 'operator-command'; acceptance: 'accepted' }>;
+}>;
 
 const PROVIDER_HOST_ADMINISTRATION_ERROR_CODES = new Set<ProviderHostAdministrationErrorCode>([
   'provider_host_inventory_unavailable',
   'provider_host_not_found',
   'provider_host_ambiguous',
+  'provider_host_eviction_requires_exact_ref',
   'provider_host_identity_integrity',
+  'provider_host_operator_abandoned',
+  'provider_host_shutdown_held',
   'provider_host_stale',
 ]);
 
@@ -400,9 +422,25 @@ function isProviderHostAdministrationErrorCode(code: unknown): code is ProviderH
   );
 }
 
+function isProviderHostEvictionAbandonmentView(value: unknown): value is ProviderHostEvictionAbandonmentView {
+  return (
+    isRecord(value) &&
+    value.kind === 'operator-abandoned' &&
+    isRecord(value.subject) &&
+    value.processAbsenceProven === false &&
+    isRecord(value.successor) &&
+    value.successor.owner === 'operator-command' &&
+    value.successor.acceptance === 'accepted'
+  );
+}
+
 function providerHostAdministrationDetail(error: Record<string, unknown>): {
   ownerIds: string[];
   hostRefs: string[];
+  observation: 'alive' | 'unobservable' | null;
+  successorOwner: string | null;
+  operatorExit: string | null;
+  abandonment: ProviderHostEvictionAbandonmentView | null;
 } {
   const ownerIds = Array.isArray(error.ownerIds)
     ? error.ownerIds.filter((value): value is string => typeof value === 'string')
@@ -416,13 +454,24 @@ function providerHostAdministrationDetail(error: Record<string, unknown>): {
         }
       })
     : [];
-  return { ownerIds, hostRefs };
+  const hold = isRecord(error.hold) ? error.hold : null;
+  const observation = hold?.observation === 'alive' || hold?.observation === 'unobservable' ? hold.observation : null;
+  const successorOwner = typeof hold?.successorOwner === 'string' ? hold.successorOwner : null;
+  const operatorExit = typeof hold?.operatorExit === 'string' ? hold.operatorExit : null;
+  const abandonment = isProviderHostEvictionAbandonmentView(error.abandonment) ? error.abandonment : null;
+  return { ownerIds, hostRefs, observation, successorOwner, operatorExit, abandonment };
 }
 
 function providerHostAdministrationCopy(
   code: ProviderHostAdministrationErrorCode,
   ownerIds: readonly string[],
   hostRefs: readonly string[],
+  hold: Readonly<{
+    observation: 'alive' | 'unobservable' | null;
+    successorOwner: string | null;
+    operatorExit: string | null;
+    abandonment: ProviderHostEvictionAbandonmentView | null;
+  }>,
 ): { message: string; remediation: string } {
   switch (code) {
     case 'provider_host_inventory_unavailable':
@@ -433,7 +482,7 @@ function providerHostAdministrationCopy(
       };
     case 'provider_host_not_found':
       return {
-        message: 'No live, retained-blocked, or reclamation-failed provider host matches the selector.',
+        message: 'No live, retained-blocked, shutdown-held, or reclamation-failed provider host matches the selector.',
         remediation: 'Rerun `coral-cli backend provider-host list`, then use a currently listed reference.',
       };
     case 'provider_host_ambiguous':
@@ -442,12 +491,37 @@ function providerHostAdministrationCopy(
         remediation:
           'For one listed reference, run `coral-cli backend provider-host inspect <ref>` and verify it, then run `coral-cli backend provider-host evict <ref>`; never choose a match by position.',
       };
+    case 'provider_host_eviction_requires_exact_ref':
+      return {
+        message: 'Provider-host eviction requires an exact host reference.',
+        remediation:
+          'Run `coral-cli backend provider-host list`, inspect the intended host, then run `coral-cli backend provider-host evict <ref>` with its exact reference.',
+      };
     case 'provider_host_identity_integrity':
       return {
         message: `The exact provider-host identity matched multiple owners: ${hostRefs.join(', ')}.`,
         remediation:
           'Do not evict: preserve the complete error output, then run `coral-cli backend status` to capture coordinator state before escalating the integrity failure.',
       };
+    case 'provider_host_operator_abandoned': {
+      const hostRef = hostRefs[0] ?? '<ref>';
+      const subject = hold.abandonment === null ? 'unknown' : JSON.stringify(hold.abandonment.subject);
+      const successorOwner = hold.abandonment?.successor.owner ?? 'none';
+      return {
+        message: `Provider-host cleanup was terminally abandoned without proof that its process exited: ${hostRef}; subject=${subject}; processAbsenceProven=false; successorOwner=${successorOwner}.`,
+        remediation: `Inspect the recorded process because it may still be live. Retry \`coral-cli backend provider-host evict ${hostRef}\` to recover this retained terminal disposition for the owner process's lifetime; the retry does not prove that the abandoned process exited.`,
+      };
+    }
+    case 'provider_host_shutdown_held': {
+      const hostRef = hostRefs[0] ?? '<ref>';
+      const observation = hold.observation ?? 'unobservable';
+      const successorOwner = hold.successorOwner ?? 'none';
+      const operatorExit = hold.operatorExit ?? 'retry-provider-shutdown';
+      return {
+        message: `The provider host remains shutdown-held: ${hostRef}; observation=${observation}; successorOwner=${successorOwner}; operatorExit=${operatorExit}.`,
+        remediation: `Run \`coral-cli backend provider-host evict ${hostRef}\` to execute the reported ${operatorExit} exit; Coral will report eviction only after no hold remains.`,
+      };
+    }
     case 'provider_host_stale':
       return {
         message: `The selected provider host changed before the owner could revalidate it: ${hostRefs.join(', ')}.`,
@@ -459,8 +533,14 @@ function providerHostAdministrationCopy(
 function providerHostAdministrationFailure(error: unknown): CatalogRequestExecution | null {
   if (!isRecord(error) || !isProviderHostAdministrationErrorCode(error.code)) return null;
 
-  const { ownerIds, hostRefs } = providerHostAdministrationDetail(error);
-  const { message, remediation } = providerHostAdministrationCopy(error.code, ownerIds, hostRefs);
+  const { ownerIds, hostRefs, observation, successorOwner, operatorExit, abandonment } =
+    providerHostAdministrationDetail(error);
+  const { message, remediation } = providerHostAdministrationCopy(error.code, ownerIds, hostRefs, {
+    observation,
+    successorOwner,
+    operatorExit,
+    abandonment,
+  });
   const statusCode =
     error.code === 'provider_host_not_found' ? 404 : error.code === 'provider_host_inventory_unavailable' ? 503 : 409;
   return unary(
@@ -468,7 +548,12 @@ function providerHostAdministrationFailure(error: unknown): CatalogRequestExecut
       code: error.code,
       message,
       remediation,
-      detail: { ownerIds, hostRefs },
+      detail: {
+        ownerIds,
+        hostRefs,
+        ...(error.code === 'provider_host_shutdown_held' ? { observation, successorOwner, operatorExit } : {}),
+        ...(error.code === 'provider_host_operator_abandoned' ? { abandonment } : {}),
+      },
     },
     statusCode,
   );
@@ -573,7 +658,9 @@ function dispatchCatalogRequest(context: AuthorizedCatalogRequest): Promise<Cata
 function executeCoordinatorCatalogRequest(context: AuthorizedCatalogRequest): Promise<CatalogRequestExecution> {
   const route = context.spec.name;
   if (route.startsWith('coordinator.provider_host.')) return executeProviderHostCatalogRequest(context);
-  if (route === 'coordinator.provider_proxy_set.contain') return executeProviderProxySetContainCatalogRequest(context);
+  if (route === providerProxySetContainRpcSpec.name || route === providerProxySetContainBooleanRpcSpec.name) {
+    return executeProviderProxySetContainCatalogRequest(context);
+  }
 
   switch (route) {
     case 'coordinator.recovery_quarantine.clear':
@@ -590,12 +677,23 @@ function executeCoordinatorCatalogRequest(context: AuthorizedCatalogRequest): Pr
 }
 
 async function executeProviderProxySetContainCatalogRequest({
+  spec,
   request,
   rpcPorts,
   abortSignal,
 }: AuthorizedCatalogRequest): Promise<CatalogRequestExecution> {
   if (rpcPorts.providerProxySets === undefined) {
     throw new Error('provider_proxy_set_operator_exit_unavailable');
+  }
+  if (spec.name === providerProxySetContainBooleanRpcSpec.name) {
+    const result = await rpcPorts.providerProxySets.containBoolean(
+      request as ProviderProxySetContainBooleanRequest,
+      abortSignal,
+    );
+    if (result.kind === 'unsupported-contract') {
+      return unsupportedMethod('The legacy containment contract cannot represent this provider-proxy set state.');
+    }
+    return unary(providerProxySetContainBooleanResponseSchema.parse(result));
   }
   return unary(
     providerProxySetContainResponseSchema.parse(

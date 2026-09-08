@@ -5,23 +5,26 @@ import { backendLog } from '../infra/backend-log.js';
 import type { StrictBundleIdentityResult } from '../infra/bundle-manifest.js';
 import { createMonotonicClock, type MonotonicClock } from '../infra/monotonic-clock.js';
 import {
-  incarnationMayAuthorizeSignal,
-  probeProcessIncarnation,
+  snapshotProcessIncarnationProbeSubjects,
+  terminateProcessIncarnationProbes,
+  type AsyncRecordedProcessObserver,
   type ProcessIncarnation,
-  type ProcessLiveness,
+  type ProcessIncarnationProbeHold,
+  type ProcessIncarnationProbeSubject,
 } from '../infra/node-process.js';
 import { providerProxyBootstrapCapsulePath, providerReaperBootstrapCapsulePath } from '../infra/path/index.js';
 import {
-  CONTAINMENT_DISAPPEARANCE_CONFIRM_MS,
-  SIGKILL_GRACE_MS,
-  SIGTERM_GRACE_MS,
-} from '../infra/process-constants.js';
-import {
-  ABSENCE_POLL_MS,
+  reapRecordedContainment,
   type ProcessContainmentEnvironment,
   type RecordedContainmentIdentity,
   type RecordedProcessIdentity,
 } from '../infra/process-containment.js';
+import { gracefulKillByPid, type GracefulKillByPidOutcome } from '../infra/process-supervision.js';
+import {
+  SettlementGate,
+  type HeldSettlementDisposition,
+  type SettledSettlementDisposition,
+} from '../obligation/settlement.js';
 import { createRealRuntime } from '../runtime/real.js';
 import type { Runtime } from '../runtime/ports.js';
 import {
@@ -31,14 +34,18 @@ import {
 } from './bootstrap-capsule.js';
 import {
   MAX_PROXY_RECORDED_PROVIDER_ROOTS,
+  mintLocalSignalTeardownAuthorization,
   type EnforcementOutcome,
   type EnforcementScheduler,
+  type LocalSignalTeardownDisposition,
 } from './enforcement.js';
 import { DETACHED_CONTAINMENT_KIND, createGuardian, type Guardian } from './guardian.js';
+import { createControlHolderAuthority, type ControlHolderAuthority } from './holder-lifecycle.js';
 import type { ProviderOperationKey } from './ledger.js';
 import {
   createEnforcerDeadlineStateMachine,
   CORAL_PROVIDER_PROXY_ORPHAN_TIMEOUT_MS_ENV,
+  PROXY_TEARDOWN_RESERVE_MS,
   resolveProviderProxyDeadlineConfiguration,
   type EnforcerDeadlineStateMachine,
   type ProviderProxyDeadlineConfiguration,
@@ -47,14 +54,17 @@ import type { OperationStageHandle } from './operation-supervisor.js';
 import type { ControlClient, ControlExchange } from './control-client.js';
 import {
   guardianRegisterProviderRootParamsSchema,
+  GUARDIAN_CONSTRUCTION_CONTAINMENT_SETTLED_EXIT_CODE,
   guardianProxyOperationReleaseParamsSchema,
   guardianProxyOperationReleaseResultSchema,
   jointContainmentReceiptSchema,
   providerRootSchema,
+  ProxyControlProtocolError,
   reservationSchema,
   PROXY_CONTROL_RPC_TIMEOUT_MS,
   controlPairParamsSchema,
   controlPairResultSchema,
+  enforcementHoldStatusSchema,
   type JointContainmentReceipt,
   type ProxyIdentity,
   type ProxyPreparedAppServerOperation,
@@ -65,8 +75,11 @@ import { createProxyAppServerHostAuthority } from './provider-root-authority.js'
 import { createSemanticOperationRuntime, type SemanticOperationStageHandle } from './semantic-operation-runner.js';
 import {
   connectRoleControlWithRetry,
+  requireSpawnedRole,
   runtimeControlTimer,
   spawnRoleProcess,
+  type HeldRoleSpawn,
+  type RoleSpawnCleanupSubject,
   type RoleSpawnPorts,
   type SpawnedRoleProcess,
 } from './role-spawn.js';
@@ -111,8 +124,8 @@ export type ProviderRoleMainPorts = Readonly<{
   baseDir?: string;
   /** Injected for tests; defaults to the real embedded-vs-adjacent-manifest strict identity check. */
   resolveStrictIdentity?(): StrictBundleIdentityResult;
-  /** Injected for tests; defaults to the real per-platform `/proc` or `ps` probe. */
   readProcessIncarnation?(pid: number, platform: NodeJS.Platform): ProcessIncarnation | null;
+  observeRecordedProcessAsync?: AsyncRecordedProcessObserver;
   /** Injected for tests; defaults to the real `process.exit`. Called once a guardian or reaper's enforcement
    *  outcome has settled and its own control has closed — its only reason to keep running was bounding one
    *  containment, and there is nothing left to bound once teardown is done. */
@@ -145,9 +158,14 @@ function buildContainmentEnvironment<Scope extends symbol>(
   return {
     maxRecordedRoots: MAX_PROXY_RECORDED_PROVIDER_ROOTS,
     clock,
-    process: { kill: ports.runtime.process.kill, observeLiveness: ports.runtime.process.observeLiveness },
+    process: {
+      kill: ports.runtime.process.kill,
+      observeLiveness: ports.runtime.process.observeLiveness,
+      observeRecordedProcessAsync:
+        ports.observeRecordedProcessAsync ?? ports.runtime.process.observeRecordedProcessAsync,
+    },
     platform: ports.runtime.env.platform() as NodeJS.Platform,
-    ...(ports.readProcessIncarnation === undefined ? {} : { readProcessIncarnation: ports.readProcessIncarnation }),
+    readProcessIncarnation: ports.readProcessIncarnation ?? ports.runtime.process.readProcessIncarnation,
   };
 }
 
@@ -155,8 +173,18 @@ function buildDeadlines<Scope extends symbol>(
   clock: MonotonicClock<Scope>,
   configuration: ProviderProxyDeadlineConfiguration,
   ports: ProviderRoleMainPorts,
+  holderAuthority: ControlHolderAuthority,
 ): EnforcerDeadlineStateMachine<Scope> {
-  return createEnforcerDeadlineStateMachine(clock, configuration, { mintChallenge: () => ports.runtime.ids.uuid() });
+  return createEnforcerDeadlineStateMachine(
+    clock,
+    configuration,
+    { mintChallenge: () => ports.runtime.ids.uuid() },
+    holderAuthority,
+  );
+}
+
+function buildHolderObserver(ports: ProviderRoleMainPorts): AsyncRecordedProcessObserver {
+  return ports.observeRecordedProcessAsync ?? ports.runtime.process.observeRecordedProcessAsync;
 }
 
 function buildSpawnPorts(ports: ProviderRoleMainPorts): RoleSpawnPorts {
@@ -164,17 +192,17 @@ function buildSpawnPorts(ports: ProviderRoleMainPorts): RoleSpawnPorts {
     process: ports.runtime.process,
     runtime: ports.runtime,
     platform: ports.runtime.env.platform() as NodeJS.Platform,
-    ...(ports.readProcessIncarnation === undefined ? {} : { readProcessIncarnation: ports.readProcessIncarnation }),
+    readProcessIncarnation: ports.readProcessIncarnation ?? ports.runtime.process.readProcessIncarnation,
   };
 }
 
-/** How the deferred close-and-exit below schedules itself; real callers source it from the runtime's own
- *  timer port, tests supply a synchronous stand-in so the assertion does not have to race a real timer. */
-type RoleOutcomeScheduler = (callback: () => void) => void;
+/** Close-and-exit deferral and hold retries must use the injected scheduler. */
+type RoleOutcomeScheduler = (callback: () => void, delayMs: number) => void;
 
 function realRoleOutcomeScheduler(ports: ProviderRoleMainPorts): RoleOutcomeScheduler {
-  return (callback) => {
-    ports.runtime.time.setTimeout(callback, 0);
+  return (callback, delayMs) => {
+    const handle = ports.runtime.time.setTimeout(callback, delayMs);
+    handle.unref?.();
   };
 }
 
@@ -183,7 +211,7 @@ function realRoleOutcomeScheduler(ports: ProviderRoleMainPorts): RoleOutcomeSche
 function readSelfIdentity(ports: ProviderRoleMainPorts): Readonly<{ pid: number; incarnation: ProcessIncarnation }> {
   const pid = ports.runtime.env.pid();
   const platform = ports.runtime.env.platform() as NodeJS.Platform;
-  const read = ports.readProcessIncarnation ?? probeProcessIncarnation;
+  const read = ports.readProcessIncarnation ?? ports.runtime.process.readProcessIncarnation;
   const incarnation = read(pid, platform);
   if (incarnation === null) {
     throw new Error(`Could not read this process's own incarnation (pid ${pid}).`);
@@ -219,26 +247,24 @@ function proxyCapsulePathFrom(capsule: GuardianBootstrapCapsule, baseDir: string
 
 export type GuardianRoleHandle = Readonly<{
   role: 'guardian';
-  guardian: Guardian<symbol>;
+  guardian: Guardian;
   reaperSpawn: SpawnedRoleProcess;
   proxySpawn: SpawnedRoleProcess;
   close(): Promise<void>;
-  /** What a SIGTERM asks for: give up and reap the proxy containment this guardian's enforcer was armed on,
-   *  rather than merely disarm and disappear — the same close-and-exit path a cooperative
-   *  `guardian.stop-and-reap.v1` RPC takes, reached here directly instead of over the wire. Falls back to a
-   *  plain close on the (unreachable in production) window before any containment was ever recorded, since
-   *  there is nothing yet to reap. */
-  giveUp(): Promise<EnforcementOutcome>;
+  /** Ordinary teardown must not authorize abandonment of an unattributable hold. */
+  giveUp(): Promise<LocalSignalTeardownDisposition>;
 }>;
+
+export type ReaperSignalTeardownDisposition =
+  | LocalSignalTeardownDisposition
+  | Readonly<{ kind: 'closed-without-containment' }>;
 
 export type ReaperRoleHandle = Readonly<{
   role: 'reaper';
-  reaper: Reaper<symbol>;
+  reaper: Reaper;
   close(): Promise<void>;
-  /** The reaper's own half of `GuardianRoleHandle.giveUp`: reaps the same containment its enforcer was
-   *  independently armed on, so a SIGTERM reaching this process (it shares the guardian's process group)
-   *  enforces rather than merely disarms even if the guardian did not survive to do so itself. */
-  giveUp(): Promise<EnforcementOutcome>;
+  /** Ordinary teardown must not authorize abandonment of an unattributable hold. */
+  giveUp(): Promise<ReaperSignalTeardownDisposition>;
 }>;
 
 export type ProxyRoleHandle = Readonly<{
@@ -249,199 +275,458 @@ export type ProxyRoleHandle = Readonly<{
 
 export type ProviderRoleHandle = GuardianRoleHandle | ReaperRoleHandle | ProxyRoleHandle;
 
-/** Whether `identity` still names the exact process it was recorded from. A readable-but-different start
- *  time means a different process now holds this pid; an unreadable one means it is already gone, or was
- *  never reachable. Either way, a mismatch means there is nothing this identity still names — signalling the
- *  bare pid would risk hitting whatever now holds it. */
-function isStillTheRecordedProcess<Scope extends symbol>(
-  identity: RecordedProcessIdentity,
-  environment: ProcessContainmentEnvironment<Scope>,
-): boolean {
-  // Where an incarnation cannot authorize a signal, a match is not evidence and this answers no. It is the
-  // conservative direction: the caller declines to reap, and the role it declined to reap is a role that
-  // never received control, so its own orphan deadline ends it. A few tens of seconds of an orphaned group
-  // is the whole cost; SIGKILL to whatever else now holds the pid is not recoverable at all.
-  if (!incarnationMayAuthorizeSignal(environment.platform)) return false;
-  const read = environment.readProcessIncarnation ?? probeProcessIncarnation;
-  try {
-    return read(identity.pid, environment.platform) === identity.incarnation;
-  } catch {
-    return false;
-  }
+type GuardianConstructionProxyProcessGroupSubject = Readonly<{
+  kind: 'proxy-process-group';
+  identity: RecordedContainmentIdentity;
+}>;
+
+type GuardianConstructionReaperProcessSubject = Readonly<{
+  kind: 'reaper-process';
+  identity: RecordedProcessIdentity;
+}>;
+
+type GuardianConstructionOperatorSubject =
+  | GuardianConstructionProxyProcessGroupSubject
+  | GuardianConstructionReaperProcessSubject;
+
+type GuardianConstructionOperatorExit<Subject extends GuardianConstructionOperatorSubject> = Readonly<{
+  kind: 'abandon-guardian-construction-cleanup';
+  subject: Subject;
+  abandon(): Readonly<{
+    kind: 'operator-abandoned';
+    subject: Subject;
+    processAbsenceProven: false;
+    successor: Readonly<{ owner: 'operator-command'; acceptance: 'accepted' }>;
+  }>;
+}>;
+
+type GuardianConstructionCleanupObligation =
+  | Readonly<{
+      kind: 'proxy-process-group';
+      identity: RecordedContainmentIdentity;
+      operatorExit: GuardianConstructionOperatorExit<GuardianConstructionProxyProcessGroupSubject>;
+      reason: string;
+    }>
+  | Readonly<{
+      kind: 'reaper-process';
+      identity: RecordedProcessIdentity;
+      operatorExit: GuardianConstructionOperatorExit<GuardianConstructionReaperProcessSubject>;
+      reason: string;
+    }>
+  | Readonly<{
+      kind: 'failed-role-spawn';
+      subject: RoleSpawnCleanupSubject;
+      operatorExit: HeldRoleSpawn['operatorExit'];
+      settled: Promise<void>;
+      reason: string;
+    }>;
+
+function guardianConstructionOperatorExit<Subject extends GuardianConstructionOperatorSubject>(
+  subject: Subject,
+): GuardianConstructionOperatorExit<Subject> {
+  return {
+    kind: 'abandon-guardian-construction-cleanup',
+    subject,
+    abandon: () => ({
+      kind: 'operator-abandoned',
+      subject,
+      processAbsenceProven: false,
+      successor: { owner: 'operator-command', acceptance: 'accepted' },
+    }),
+  };
 }
 
-/**
- * Deliberate exception to the shared escalation helpers: guardian-construction unwind must handle both a
- * detached proxy group and an ordinary, non-detached reaper pid. `reapRecordedContainment` cannot represent
- * the latter without falsely claiming it is a process-group leader, while `gracefulKill` does not confirm
- * absence. This keeps the required monotonic disappear-then-confirm discipline for both target shapes, so a
- * target that flickers dead-then-alive across one lucky poll is not mistaken for reaped. The exception is
- * documented and kept live by `timeout-kill-escalation.test.ts`.
- */
-async function signalAndConfirmAbsence<Scope extends symbol>(
-  target: number,
-  signal: NodeJS.Signals,
-  graceMs: number,
-  clock: MonotonicClock<Scope>,
-  environment: ProcessContainmentEnvironment<Scope>,
-): Promise<ProcessLiveness> {
-  environment.process.kill(target, signal);
-  const waitDeadline = clock.shiftMilliseconds(clock.now(), graceMs);
-  while (environment.process.observeLiveness(target) === 'alive' && clock.compare(clock.now(), waitDeadline) < 0) {
-    await clock.sleep(ABSENCE_POLL_MS);
-  }
-  const afterGrace = environment.process.observeLiveness(target);
-  if (afterGrace !== 'absent') return afterGrace;
+export type GuardianConstructionCleanupDisposition =
+  | Readonly<{ kind: 'settled' }>
+  | Readonly<{
+      kind: 'holding';
+      pending: readonly [GuardianConstructionCleanupObligation, ...GuardianConstructionCleanupObligation[]];
+      reason: string;
+      retry(): Promise<GuardianConstructionCleanupDisposition>;
+    }>;
 
-  const confirmDeadline = clock.shiftMilliseconds(clock.now(), CONTAINMENT_DISAPPEARANCE_CONFIRM_MS);
-  while (clock.compare(clock.now(), confirmDeadline) < 0) {
-    const observed = environment.process.observeLiveness(target);
-    if (observed !== 'absent') return observed;
-    const remainingMs = clock.millisecondsBetween(clock.now(), confirmDeadline);
-    await clock.sleep(Math.max(0, Math.min(ABSENCE_POLL_MS, remainingMs)));
-  }
-  return environment.process.observeLiveness(target);
+function guardianConstructionCleanupHoldDetail(
+  disposition: Extract<GuardianConstructionCleanupDisposition, { kind: 'holding' }>,
+): string {
+  return disposition.pending
+    .map((obligation) => {
+      switch (obligation.kind) {
+        case 'proxy-process-group':
+          return (
+            `proxy-process-group pgid=${obligation.identity.processGroupId} pid=${obligation.identity.pid} ` +
+            `incarnation=${obligation.identity.incarnation} reason=${obligation.reason}`
+          );
+        case 'reaper-process':
+          return (
+            `reaper-process pid=${obligation.identity.pid} incarnation=${obligation.identity.incarnation} ` +
+            `reason=${obligation.reason}`
+          );
+        case 'failed-role-spawn':
+          return obligation.subject.kind === 'process'
+            ? `failed-role-spawn process pid=${obligation.subject.pid ?? 'unavailable'} reason=${obligation.reason}`
+            : `failed-role-spawn process-group pgid=${obligation.subject.processGroupId ?? 'unavailable'} reason=${obligation.reason}`;
+      }
+    })
+    .join('; ');
 }
 
-async function reapUnheldTarget<Scope extends symbol>(
-  target: number,
-  targetLabel: string,
-  clock: MonotonicClock<Scope>,
-  environment: ProcessContainmentEnvironment<Scope>,
-): Promise<void> {
-  const afterTerm = await signalAndConfirmAbsence(target, 'SIGTERM', SIGTERM_GRACE_MS, clock, environment);
-  if (afterTerm === 'absent') return;
-  // Escalation needs observed life. `unknown` is not permission to send SIGKILL — the target may have exited
-  // during the grace and had its id reused, and this path signals a bare number.
-  //
-  // Unpinned, and worth saying so: guardian-construction unwind is private and reachable only by driving a
-  // real guardian to fail mid-construction, so mutating this branch away leaves the suite green. The identical
-  // rule at `spawn-undo.ts` and `process-containment.ts` is pinned; this one rides on their being the same
-  // rule, which is weaker than a test and stronger than nothing.
-  if (afterTerm === 'unknown') {
-    throw new Error(`Could not observe ${targetLabel} after SIGTERM; refusing to escalate to SIGKILL.`);
-  }
-  if ((await signalAndConfirmAbsence(target, 'SIGKILL', SIGKILL_GRACE_MS, clock, environment)) === 'absent') return;
-  throw new Error(`Could not confirm ${targetLabel} exited after SIGTERM and SIGKILL.`);
+function combineGuardianConstructionCleanup(
+  dispositions: readonly GuardianConstructionCleanupDisposition[],
+): GuardianConstructionCleanupDisposition {
+  const holding = dispositions.filter(
+    (disposition): disposition is Extract<GuardianConstructionCleanupDisposition, { kind: 'holding' }> =>
+      disposition.kind === 'holding',
+  );
+  const [first, ...rest] = holding;
+  if (first === undefined) return { kind: 'settled' };
+  const pending: [GuardianConstructionCleanupObligation, ...GuardianConstructionCleanupObligation[]] = [
+    ...first.pending,
+    ...rest.flatMap((disposition) => disposition.pending),
+  ];
+  return {
+    kind: 'holding',
+    pending,
+    reason: pending.map((obligation) => `${obligation.kind}: ${obligation.reason}`).join(', '),
+    retry: async () => combineGuardianConstructionCleanup(await Promise.all(holding.map(({ retry }) => retry()))),
+  };
 }
 
-/**
- * Best-effort cleanup for a detached role process (the proxy: spawned with `detached: true`) this attempt
- * itself spawned but can no longer hold, because a later cut in the same construction failed. A detached
- * spawn is its own process-group leader by that OS guarantee — the identical fact
- * `guardian.recordContainment`'s own `processGroupId: proxySpawn.pid` call already relies on — so this takes
- * a full `RecordedContainmentIdentity` and asserts that shape rather than trusting a bare pid plus an
- * easily-mistyped "signal the group" flag.
- *
- * Not a call to `reapRecordedContainment` itself: that function observes whether its target is already
- * absent *before* ever signalling it — correct for a containment that may be reaped long after it was
- * recorded, but wrong here, where the target is a process this very construction attempt spawned moments ago
- * and is expected to still be alive. Skipping straight to "already absent" on an unrelated liveness-probe gap
- * would silently abandon a real cleanup. This reuses that function's
- * monotonic-clock, confirm-after-signal discipline directly instead of its observe-first entry point.
- */
+function holdFailedRoleSpawn(spawn: HeldRoleSpawn): GuardianConstructionCleanupDisposition {
+  const holding = (retry: HeldRoleSpawn['retry'], reason: string): GuardianConstructionCleanupDisposition => ({
+    kind: 'holding',
+    pending: [
+      {
+        kind: 'failed-role-spawn',
+        subject: spawn.subject,
+        operatorExit: spawn.operatorExit,
+        settled: spawn.settled,
+        reason,
+      },
+    ],
+    reason,
+    retry: async () => {
+      const cleanup = await retry();
+      if (cleanup.kind === 'observed-absent') return { kind: 'settled' };
+      return {
+        ...holding(cleanup.retry, `${cleanup.subject.kind}:${cleanup.observation}`),
+        pending: [
+          {
+            kind: 'failed-role-spawn',
+            subject: cleanup.subject,
+            operatorExit: cleanup.operatorExit,
+            settled: spawn.settled,
+            reason: `${cleanup.subject.kind}:${cleanup.observation}`,
+          },
+        ],
+      };
+    },
+  });
+  return holding(spawn.retry, spawn.error.message);
+}
+
+/** A vanished or reused leader cannot prove that its detached process group is absent. */
 async function reapUnheldProcessGroup<Scope extends symbol>(
   containment: RecordedContainmentIdentity,
   clock: MonotonicClock<Scope>,
   environment: ProcessContainmentEnvironment<Scope>,
-): Promise<void> {
+): Promise<GuardianConstructionCleanupDisposition> {
   if (containment.processGroupId !== containment.pid) {
     throw new Error(
       `Recorded containment pid=${containment.pid} is not its own process-group leader (processGroupId=${containment.processGroupId}).`,
     );
   }
-  if (!isStillTheRecordedProcess(containment, environment)) return;
-  await reapUnheldTarget(
-    -containment.processGroupId,
-    `process group ${containment.processGroupId}`,
-    clock,
-    environment,
+  const subject = { kind: 'proxy-process-group', identity: containment } as const;
+  const operatorExit = guardianConstructionOperatorExit(subject);
+  const holding = (reason: string): GuardianConstructionCleanupDisposition => ({
+    kind: 'holding',
+    pending: [{ ...subject, operatorExit, reason }],
+    reason,
+    retry,
+  });
+  async function retry(): Promise<GuardianConstructionCleanupDisposition> {
+    try {
+      const outcome = await reapRecordedContainment(
+        containment,
+        [],
+        clock.shiftMilliseconds(clock.now(), PROXY_TEARDOWN_RESERVE_MS),
+        environment,
+      );
+      if (outcome.kind === 'containment-absent') return { kind: 'settled' };
+      if (outcome.kind === 'recorded-group-unattributable') {
+        return holding('the recorded proxy group became unattributable');
+      }
+      if (outcome.kind === 'identity-unobservable') {
+        return holding(
+          outcome.signalDelivered
+            ? 'process identity became unobservable after a recorded proxy-group signal was delivered'
+            : 'process identity could not be observed before recorded proxy-group signal authorization',
+        );
+      }
+      return holding('signal authorization could not be established for the recorded proxy group');
+    } catch (error: unknown) {
+      return holding(error instanceof Error ? error.message : String(error));
+    }
+  }
+  return retry();
+}
+
+function gracefulKillFailureDetail(outcome: Exclude<GracefulKillByPidOutcome, { kind: 'observed-absent' }>): string {
+  switch (outcome.kind) {
+    case 'signal-refused':
+      return outcome.reason;
+    case 'signal-delivered-escalation-unavailable':
+      return `${outcome.signal}:${outcome.reason}`;
+    case 'signal-failed':
+      return `${outcome.signal}:${outcome.reason}`;
+    case 'target-unobservable':
+    case 'target-alive':
+      return `${outcome.kind}:${outcome.stage}`;
+  }
+}
+
+/** An undetached reaper remains a pid target and must not be promoted to a process-group identity. */
+async function reapUnheldOrdinaryProcess(
+  identity: RecordedProcessIdentity,
+  ports: ProviderRoleMainPorts,
+): Promise<GuardianConstructionCleanupDisposition> {
+  const subject = { kind: 'reaper-process', identity } as const;
+  const operatorExit = guardianConstructionOperatorExit(subject);
+  const holding = (reason: string): GuardianConstructionCleanupDisposition => ({
+    kind: 'holding',
+    pending: [{ ...subject, operatorExit, reason }],
+    reason,
+    retry,
+  });
+  async function retry(): Promise<GuardianConstructionCleanupDisposition> {
+    try {
+      const readProcessIncarnation = ports.readProcessIncarnation ?? ports.runtime.process.readProcessIncarnation;
+      const runtime: Runtime = {
+        ...ports.runtime,
+        process: { ...ports.runtime.process, readProcessIncarnation },
+      };
+      const disposition = gracefulKillByPid(runtime, identity.pid, identity.incarnation);
+      const outcome = disposition.kind === 'escalation-scheduled' ? await disposition.settlement : disposition;
+      if (outcome.kind === 'observed-absent') return { kind: 'settled' };
+      if (outcome.kind === 'signal-refused' && outcome.reason === 'expected-incarnation-mismatch') {
+        return { kind: 'settled' };
+      }
+      return holding(`Could not confirm pid=${identity.pid} exited (${gracefulKillFailureDetail(outcome)}).`);
+    } catch (error: unknown) {
+      return holding(error instanceof Error ? error.message : String(error));
+    }
+  }
+  return retry();
+}
+
+/** A non-zero exit must not be read as confirmed containment absence. */
+const ROLE_ENFORCEMENT_FAILURE_EXIT_CODE = 1;
+const ROLE_UNATTRIBUTABLE_REAP_MAX_ATTEMPTS = 5;
+const ROLE_UNATTRIBUTABLE_REAP_BASE_DELAY_MS = 1_000;
+const ROLE_UNATTRIBUTABLE_REAP_MAX_DELAY_MS = 30_000;
+
+type RoleEnforcementHoldStatus = z.infer<typeof enforcementHoldStatusSchema>;
+
+export class GuardianConstructionCleanupHeldError extends Error {
+  readonly hold: Extract<GuardianConstructionCleanupDisposition, { kind: 'holding' }>;
+
+  constructor(originalFailure: unknown, hold: Extract<GuardianConstructionCleanupDisposition, { kind: 'holding' }>) {
+    super(
+      `Guardian construction failed while spawned process cleanup remains held: ${guardianConstructionCleanupHoldDetail(hold)}`,
+      { cause: originalFailure },
+    );
+    this.name = 'GuardianConstructionCleanupHeldError';
+    this.hold = hold;
+    Object.setPrototypeOf(this, GuardianConstructionCleanupHeldError.prototype);
+  }
+}
+
+const settledGuardianConstructionFailures = new WeakSet<object>();
+
+function markGuardianConstructionCleanupSettled(error: unknown): unknown {
+  const failure =
+    (typeof error === 'object' && error !== null) || typeof error === 'function'
+      ? error
+      : new Error('Guardian construction failed after spawned process cleanup settled.', { cause: error });
+  settledGuardianConstructionFailures.add(failure);
+  return failure;
+}
+
+function isGuardianConstructionCleanupSettled(error: unknown): boolean {
+  return (
+    ((typeof error === 'object' && error !== null) || typeof error === 'function') &&
+    settledGuardianConstructionFailures.has(error)
   );
 }
 
-/**
- * Best-effort cleanup for an ordinary (non-detached) role process (the reaper) this attempt itself spawned
- * but can no longer hold. Signalled by its own pid, never a group: an undetached child shares its parent's
- * process group rather than establishing one of its own, so it never had a group to target.
- */
-async function reapUnheldOrdinaryProcess<Scope extends symbol>(
-  identity: RecordedProcessIdentity,
-  clock: MonotonicClock<Scope>,
-  environment: ProcessContainmentEnvironment<Scope>,
-): Promise<void> {
-  if (!isStillTheRecordedProcess(identity, environment)) return;
-  await reapUnheldTarget(identity.pid, `pid=${identity.pid}`, clock, environment);
+function acceptGuardianConstructionOperatorExit(
+  disposition: Extract<GuardianConstructionCleanupDisposition, { kind: 'holding' }>,
+): boolean {
+  const subjectMatches = (obligation: GuardianConstructionCleanupObligation, subject: unknown): boolean => {
+    if (typeof subject !== 'object' || subject === null || !('kind' in subject)) return false;
+    if (obligation.kind === 'failed-role-spawn') {
+      if (obligation.subject.kind !== subject.kind) return false;
+      return obligation.subject.kind === 'process'
+        ? 'pid' in subject && obligation.subject.pid === subject.pid
+        : 'processGroupId' in subject && obligation.subject.processGroupId === subject.processGroupId;
+    }
+    if (obligation.kind !== subject.kind || !('identity' in subject)) return false;
+    const identity = subject.identity;
+    if (typeof identity !== 'object' || identity === null || !('pid' in identity) || !('incarnation' in identity)) {
+      return false;
+    }
+    if (obligation.identity.pid !== identity.pid || obligation.identity.incarnation !== identity.incarnation) {
+      return false;
+    }
+    return obligation.kind === 'reaper-process'
+      ? true
+      : 'processGroupId' in identity && obligation.identity.processGroupId === identity.processGroupId;
+  };
+  if (!disposition.pending.every((obligation) => subjectMatches(obligation, obligation.operatorExit.subject))) {
+    return false;
+  }
+  const abandonments = disposition.pending.map(({ operatorExit }) => operatorExit.abandon());
+  return disposition.pending.every((obligation, index) => {
+    const abandonment = abandonments[index];
+    if (
+      abandonment === undefined ||
+      abandonment.kind !== 'operator-abandoned' ||
+      abandonment.processAbsenceProven !== false ||
+      abandonment.successor.owner !== 'operator-command' ||
+      abandonment.successor.acceptance !== 'accepted'
+    ) {
+      return false;
+    }
+    return subjectMatches(obligation, abandonment.subject);
+  });
 }
-
-/** A wake later than the model's enforcement bound, or a reap that failed outright — exit code for the
- *  latter, distinct from the `0` a confirmed `containment-absent` exits with. */
-const ROLE_ENFORCEMENT_FAILURE_EXIT_CODE = 1;
 
 export type RoleEnforcementOutcomeHandlers = Readonly<{
   onOutcome(outcome: EnforcementOutcome): void;
   onProgressViolation(observedWakeLatencyMs: number): void;
+  enforcementHoldStatus(): RoleEnforcementHoldStatus | null;
+  abandonUnattributable(): boolean;
 }>;
 
 export type RoleEnforcementOutcomeOptions<Scope extends symbol> = Readonly<{
   role: 'guardian' | 'reaper';
+  roleIdentity: Readonly<{ pid: number; incarnation: ProcessIncarnation }>;
   deadlines: Pick<EnforcerDeadlineStateMachine<Scope>, 'markExited'>;
   /** Closes this role's own control (and, for the guardian, its reaper pairing channel too). */
   close(): Promise<void>;
   exitProcess(code: number): void;
+  grantWasInstalled(): boolean;
+  now(): number;
+  retryUnattributable(): Promise<EnforcementOutcome> | null;
   schedule: RoleOutcomeScheduler;
 }>;
 
+function unattributableRetryDelayMs(attempts: number): number {
+  return Math.min(ROLE_UNATTRIBUTABLE_REAP_BASE_DELAY_MS * 2 ** (attempts - 1), ROLE_UNATTRIBUTABLE_REAP_MAX_DELAY_MS);
+}
+
 /**
- * How a guardian or reaper role reacts once its own enforcer's teardown settles. A role process's only
- * reason to keep running is bounding one containment, so once that is truly done — `containment-absent` —
- * there is nothing left to hold and the process must exit; without this, the deadline model's `exited` state
- * is unreachable in production and the process leaks forever. A `reap-failed` outcome exits too, since this
- * role has no retry of its own to fall back on, but it never claims the `exited` state the model reserves
- * for a confirmed reap.
- *
- * The close-and-exit is deferred past the current synchronous continuation, not run inline: `onOutcome` is
- * invoked from *inside* `enforcement.ts`'s own `settle()`, which runs before a caller's own in-flight
- * `*.stop-and-reap.v1` RPC handler ever resumes from its `await` — closing sockets here synchronously would
- * destroy that caller's connection before its own response reaches the wire. Deferring lets every microtask
- * already queued, including that response's `write()`, run first.
+ * Outcomes without confirmed absence must keep the role alive unless explicit operator authority abandons the hold.
+ * Only confirmed absence may mark the deadline model exited. Close-and-exit must remain deferred so an
+ * in-flight control response can reach its caller before the role closes its sockets.
  */
 export function buildEnforcementOutcomeHandlers<Scope extends symbol>(
   options: RoleEnforcementOutcomeOptions<Scope>,
 ): RoleEnforcementOutcomeHandlers {
+  let enforcementHoldStatus: RoleEnforcementHoldStatus | null = null;
+  let unattributableAbandoned = false;
+
+  const closeAndExit = (exitCode: number): void => {
+    void options
+      .close()
+      .catch((error: unknown) => backendLog.error(`${options.role}: close on exit failed`, error))
+      .finally(() => options.exitProcess(exitCode));
+  };
+
+  const handleOutcome = (outcome: EnforcementOutcome): void => {
+    if (outcome.kind !== 'containment-absent') {
+      if (unattributableAbandoned) return;
+      if (outcome.kind === 'reap-failed') {
+        backendLog.error(`${options.role}: containment reap failed`, outcome.reason);
+      }
+      const reportedOutcome =
+        outcome.kind === 'reap-failed'
+          ? ({ kind: outcome.kind, reason: 'process-containment-reap-failed' } as const)
+          : ({ kind: outcome.kind } as const);
+      const attempts = (enforcementHoldStatus?.attempts ?? 0) + 1;
+      if (attempts >= ROLE_UNATTRIBUTABLE_REAP_MAX_ATTEMPTS && options.grantWasInstalled()) {
+        enforcementHoldStatus = enforcementHoldStatusSchema.parse({
+          ...reportedOutcome,
+          attempts,
+          roleIdentity: { role: options.role, ...options.roleIdentity },
+          retry: { state: 'operator-action-required' },
+        });
+        return;
+      }
+      const delayMs = unattributableRetryDelayMs(attempts);
+      enforcementHoldStatus = enforcementHoldStatusSchema.parse({
+        ...reportedOutcome,
+        attempts,
+        roleIdentity: { role: options.role, ...options.roleIdentity },
+        retry: { state: 'scheduled', nextProbeAtMs: options.now() + delayMs },
+      });
+      options.schedule(() => {
+        if (
+          unattributableAbandoned ||
+          enforcementHoldStatus?.attempts !== attempts ||
+          enforcementHoldStatus.retry.state !== 'scheduled'
+        ) {
+          return;
+        }
+        enforcementHoldStatus = enforcementHoldStatusSchema.parse({
+          ...enforcementHoldStatus,
+          retry: { state: 'in-progress' },
+        });
+        void options.retryUnattributable();
+      }, delayMs);
+      return;
+    }
+
+    enforcementHoldStatus = null;
+    options.deadlines.markExited();
+    closeAndExit(
+      options.role === 'guardian' && !options.grantWasInstalled()
+        ? GUARDIAN_CONSTRUCTION_CONTAINMENT_SETTLED_EXIT_CODE
+        : 0,
+    );
+  };
+
   return {
     onOutcome: (outcome) => {
-      options.schedule(() => {
-        if (outcome.kind === 'containment-absent') {
-          options.deadlines.markExited();
-        } else {
-          backendLog.error(`${options.role}: containment reap failed`, outcome.reason);
-        }
-        void options
-          .close()
-          .catch((error: unknown) => backendLog.error(`${options.role}: close on exit failed`, error))
-          .finally(() =>
-            options.exitProcess(outcome.kind === 'containment-absent' ? 0 : ROLE_ENFORCEMENT_FAILURE_EXIT_CODE),
-          );
-      });
+      options.schedule(() => handleOutcome(outcome), 0);
     },
     onProgressViolation: (observedWakeLatencyMs) => {
-      // A late wake is a detected progress-premise failure the plan requires be reported, not an execution
-      // that silently counts as satisfying the enforcement guarantee — teardown still proceeds regardless.
+      // A late wake is diagnostic and does not itself authorize teardown.
       backendLog.warn(`${options.role}: enforcement wake exceeded the modelled bound by ${observedWakeLatencyMs}ms`);
+    },
+    enforcementHoldStatus: () => enforcementHoldStatus,
+    abandonUnattributable: () => {
+      if (enforcementHoldStatus === null || unattributableAbandoned) return false;
+      if (enforcementHoldStatus.kind !== 'recorded-group-unattributable') {
+        throw new ProxyControlProtocolError(
+          'invalid_state',
+          `This ${options.role} has a failed containment reap, not an unattributable recorded group. Retry the reap without relinquishing containment ownership.`,
+        );
+      }
+      if (enforcementHoldStatus.retry.state === 'in-progress') {
+        throw new ProxyControlProtocolError(
+          'invalid_state',
+          `This ${options.role} cannot abandon its unattributable hold while a retry is in-progress and may already have sent a process signal. Retry the abandonment after the containment retry settles.`,
+        );
+      }
+      unattributableAbandoned = true;
+      enforcementHoldStatus = null;
+      options.schedule(() => closeAndExit(ROLE_ENFORCEMENT_FAILURE_EXIT_CODE), 0);
+      return true;
     },
   };
 }
 
-/**
- * Unwinds a guardian construction attempt that failed partway through, using only what was actually created
- * by the point of failure. Ordered in fixed phases, not merely by reverse creation order, because the two
- * differ once every phase exists: stop scheduled work first (closing the guardian also disarms its
- * enforcer), then close every opened control, then identity-check and reap every process this attempt
- * started, newest first. A control left open while its process is being signalled could observe a partial,
- * contradictory state; a live enforcement tick firing mid-unwind could reap concurrently with this function.
- * Every phase runs regardless of an earlier one failing — failures are reported, not left to abandon the
- * rest — because a cleanup that gave up on its first error is exactly how a set stays half-abandoned.
- */
+/** Every created process remains owned until absence is confirmed or a retry capability retains it. */
 async function unwindGuardianConstruction(
   ports: ProviderRoleMainPorts,
   partial: Readonly<{
@@ -449,9 +734,11 @@ async function unwindGuardianConstruction(
     reaperChannel: Pick<ControlClient, 'close'> | null;
     reaperSpawn: SpawnedRoleProcess | null;
     proxySpawn: SpawnedRoleProcess | null;
+    failedRoleSpawn: HeldRoleSpawn | null;
   }>,
-): Promise<void> {
+): Promise<GuardianConstructionCleanupDisposition> {
   const stranded: string[] = [];
+  let proxyCleanup: GuardianConstructionCleanupDisposition = { kind: 'settled' };
   const attempt = async (label: string, run: () => Promise<void> | void): Promise<void> => {
     try {
       await run();
@@ -461,9 +748,6 @@ async function unwindGuardianConstruction(
     }
   };
 
-  // Phase 1: stop scheduled work and close every opened control. `close` (once the guardian exists) already
-  // disarms its enforcer before closing the reaper channel and its own endpoint, in that order; before the
-  // guardian exists there is only the reaper channel to close, and nothing yet scheduled to disarm.
   if (partial.close !== null) {
     await attempt('close the guardian control', partial.close);
   } else if (partial.reaperChannel !== null) {
@@ -471,35 +755,45 @@ async function unwindGuardianConstruction(
     await attempt('close the reaper control channel', () => reaperChannel.close());
   }
 
-  // Phase 2: identity-check and reap every process this attempt started, newest first. Its own scoped clock,
-  // matching the pattern every role's own construction (`startProviderGuardianRole`, `startProviderReaperRole`,
-  // `startProviderProxyRole`) already uses to mint one on demand rather than share another subsystem's.
   const clock = createMonotonicClock(guardianConstructionUnwindClockScope);
   const environment = buildContainmentEnvironment(clock, ports);
+  let reaperCleanup: GuardianConstructionCleanupDisposition = { kind: 'settled' };
+  const failedRoleSpawnCleanup =
+    partial.failedRoleSpawn === null ? { kind: 'settled' as const } : holdFailedRoleSpawn(partial.failedRoleSpawn);
   if (partial.proxySpawn !== null) {
     const proxySpawn = partial.proxySpawn;
-    await attempt('reap the proxy process group', () =>
-      reapUnheldProcessGroup(
-        {
-          pid: proxySpawn.pid,
-          incarnation: proxySpawn.incarnation,
-          processGroupId: proxySpawn.pid,
-        },
-        clock,
-        environment,
-      ),
+    proxyCleanup = await reapUnheldProcessGroup(
+      {
+        pid: proxySpawn.pid,
+        incarnation: proxySpawn.incarnation,
+        processGroupId: proxySpawn.pid,
+      },
+      clock,
+      environment,
     );
+    if (proxyCleanup.kind === 'holding') {
+      const detail = guardianConstructionCleanupHoldDetail(proxyCleanup);
+      stranded.push(`reap the proxy process group (${detail})`);
+      backendLog.error(`guardian construction cleanup could not reap the proxy process group: ${detail}`);
+    }
   }
   if (partial.reaperSpawn !== null) {
     const reaperSpawn = partial.reaperSpawn;
-    await attempt('reap the reaper process', () => reapUnheldOrdinaryProcess(reaperSpawn, clock, environment));
+    reaperCleanup = await reapUnheldOrdinaryProcess(
+      { pid: reaperSpawn.pid, incarnation: reaperSpawn.incarnation },
+      ports,
+    );
+    if (reaperCleanup.kind === 'holding') {
+      const detail = guardianConstructionCleanupHoldDetail(reaperCleanup);
+      stranded.push(`reap the reaper process (${detail})`);
+      backendLog.error(`guardian construction cleanup could not reap the reaper process: ${detail}`);
+    }
   }
 
-  // Phase 3: capsules and endpoints are removed by the coordinator's own acquisition steps once it observes
-  // this rejection; this attempt owns no capsule path of its own to remove.
   if (stranded.length > 0) {
     backendLog.error(`guardian construction failed and could not clean up: ${stranded.join(', ')}`);
   }
+  return combineGuardianConstructionCleanup([proxyCleanup, reaperCleanup, failedRoleSpawnCleanup]);
 }
 
 /**
@@ -535,7 +829,9 @@ export async function startProviderGuardianRole(
   const capsule = consumeProviderBootstrapCapsule(capsulePath, 'guardian', buildCapsuleEnv(ports));
   const clock = createMonotonicClock(guardianRoleClockScope);
   const deadlineConfiguration = resolveProviderProxyDeadlineConfiguration(ports.runtime.env);
-  const deadlines = buildDeadlines(clock, deadlineConfiguration, ports);
+  // Guardian deadlines and enforcement must share one holder authority.
+  const holderAuthority = createControlHolderAuthority({ wallClockNow: ports.runtime.time.now });
+  const deadlines = buildDeadlines(clock, deadlineConfiguration, ports, holderAuthority);
   const containmentEnvironment = buildContainmentEnvironment(clock, ports);
   const timer = runtimeControlTimer(ports.runtime);
   const spawnPorts = buildSpawnPorts(ports);
@@ -545,24 +841,32 @@ export async function startProviderGuardianRole(
   };
   const exitProcess = ports.exitProcess ?? ((code: number): void => process.exit(code));
   const schedule = realRoleOutcomeScheduler(ports);
-
+  const self = readSelfIdentity(ports);
   let reaperSpawn: SpawnedRoleProcess | null = null;
   let reaperChannel: ControlClient | null = null;
   let close: (() => Promise<void>) | null = null;
   let proxySpawn: SpawnedRoleProcess | null = null;
+  let failedRoleSpawn: HeldRoleSpawn | null = null;
 
   try {
-    reaperSpawn = spawnRoleProcess('reaper', reaperCapsulePathFrom(capsule, ports.baseDir), spawnPorts, {
-      pluginRoot: ports.pluginRoot,
-      detached: false,
-      envAdditions: roleEnv,
-    });
+    const reaperDisposition = await requireSpawnedRole(
+      spawnRoleProcess('reaper', reaperCapsulePathFrom(capsule, ports.baseDir), spawnPorts, {
+        pluginRoot: ports.pluginRoot,
+        detached: false,
+        envAdditions: roleEnv,
+      }),
+    );
+    if (reaperDisposition.kind === 'held') {
+      failedRoleSpawn = reaperDisposition;
+      throw reaperDisposition.error;
+    }
+    reaperSpawn = reaperDisposition;
 
     const reaperConnected = connectRoleControlWithRetry(capsule.reaperControlEndpoint, timer, {
       connectTimeoutMs: ROLE_CONNECT_TIMEOUT_MS,
       retryIntervalMs: ROLE_SPAWN_READY_RETRY_INTERVAL_MS,
       overallDeadlineMs: ROLE_SPAWN_READY_DEADLINE_MS,
-      now: () => ports.runtime.time.now(),
+      monotonicNow: () => ports.runtime.time.monotonicNow(),
       sleep: (ms) => ports.runtime.time.sleep(ms),
     });
     reaperChannel = await raceReadinessAgainstSpawnFailure(reaperConnected, reaperSpawn.spawnFailed);
@@ -580,21 +884,23 @@ export async function startProviderGuardianRole(
     // Forward-referenced by `close` below (assigned into `createGuardian`'s own `onOutcome` before the
     // guardian it closes exists), then assigned exactly once — `let` is load-bearing here, not a style choice.
     // eslint-disable-next-line prefer-const
-    let guardianRef!: Guardian<symbol>;
+    let guardianRef!: Guardian;
     close = async (): Promise<void> => {
       pairedReaperChannel.close();
       await guardianRef.close();
     };
-    // Captured once `close` holds its real value, so `giveUp` below closes over a function rather than the
-    // `(() => Promise<void>) | null` type `close` itself carries for the rest of this attempt.
-    const closeGuardian = close;
-    const { onOutcome, onProgressViolation } = buildEnforcementOutcomeHandlers({
-      role: 'guardian',
-      deadlines,
-      close,
-      exitProcess,
-      schedule,
-    });
+    const { onOutcome, onProgressViolation, enforcementHoldStatus, abandonUnattributable } =
+      buildEnforcementOutcomeHandlers({
+        role: 'guardian',
+        roleIdentity: self,
+        deadlines,
+        close,
+        exitProcess,
+        grantWasInstalled: () => holderAuthority.phase() === 'published',
+        now: ports.runtime.time.now,
+        retryUnattributable: () => guardianRef.enforcer()?.retryUnattributable() ?? null,
+        schedule,
+      });
     guardianRef = createGuardian({
       capsule,
       clock,
@@ -604,8 +910,12 @@ export async function startProviderGuardianRole(
       timer,
       mintReceipt: () => ports.runtime.ids.uuid(),
       reaperChannel: pairedReaperChannel,
-      self: readSelfIdentity(ports),
+      self,
       reaperSelf: { pid: reaperSpawn.pid, incarnation: reaperSpawn.incarnation },
+      holderAuthority,
+      observeHolder: buildHolderObserver(ports),
+      enforcementHoldStatus,
+      abandonUnattributable,
       onOutcome,
       onProgressViolation,
     });
@@ -614,11 +924,18 @@ export async function startProviderGuardianRole(
     await guardian.listen();
     ports.onGuardianListening?.();
 
-    proxySpawn = spawnRoleProcess('proxy', proxyCapsulePathFrom(capsule, ports.baseDir), spawnPorts, {
-      pluginRoot: ports.pluginRoot,
-      detached: true,
-      envAdditions: roleEnv,
-    });
+    const proxyDisposition = await requireSpawnedRole(
+      spawnRoleProcess('proxy', proxyCapsulePathFrom(capsule, ports.baseDir), spawnPorts, {
+        pluginRoot: ports.pluginRoot,
+        detached: true,
+        envAdditions: roleEnv,
+      }),
+    );
+    if (proxyDisposition.kind === 'held') {
+      failedRoleSpawn = proxyDisposition;
+      throw proxyDisposition.error;
+    }
+    proxySpawn = proxyDisposition;
 
     const containmentRecorded = guardian.recordContainment({
       pid: proxySpawn.pid,
@@ -627,6 +944,10 @@ export async function startProviderGuardianRole(
       containmentKind: DETACHED_CONTAINMENT_KIND,
     });
     await raceReadinessAgainstSpawnFailure(containmentRecorded, proxySpawn.spawnFailed);
+    const enforcer = guardian.enforcer();
+    if (enforcer === null) {
+      throw new Error('Guardian containment recording completed without an armed enforcer.');
+    }
 
     return {
       role: 'guardian',
@@ -634,21 +955,21 @@ export async function startProviderGuardianRole(
       reaperSpawn,
       proxySpawn,
       close,
-      giveUp: async (): Promise<EnforcementOutcome> => {
-        const armed = guardian.enforcer();
-        if (armed === null) {
-          // Unreachable once this handle exists — `recordContainment` above always succeeds before this
-          // function returns — but a null enforcer still has nothing to reap, so the plain close it would
-          // otherwise have gotten on SIGTERM is the correct fallback rather than a thrown assertion.
-          await closeGuardian();
-          return { kind: 'reap-failed', reason: 'no containment was recorded to reap' };
-        }
-        return armed.stopAndReap(deadlines.bounds().exitDeadline);
+      giveUp: async (): Promise<LocalSignalTeardownDisposition> => {
+        // Local signal authority must be minted only while handling that signal.
+        return enforcer.giveUp(mintLocalSignalTeardownAuthorization());
       },
     };
   } catch (error: unknown) {
-    await unwindGuardianConstruction(ports, { close, reaperChannel, reaperSpawn, proxySpawn });
-    throw error;
+    const cleanup = await unwindGuardianConstruction(ports, {
+      close,
+      reaperChannel,
+      reaperSpawn,
+      proxySpawn,
+      failedRoleSpawn,
+    });
+    if (cleanup.kind === 'holding') throw new GuardianConstructionCleanupHeldError(error, cleanup);
+    throw markGuardianConstructionCleanupSettled(error);
   }
 }
 
@@ -660,21 +981,33 @@ export async function startProviderReaperRole(
 ): Promise<ReaperRoleHandle> {
   const capsule = consumeProviderBootstrapCapsule(capsulePath, 'reaper', buildCapsuleEnv(ports));
   const clock = createMonotonicClock(reaperRoleClockScope);
-  const deadlines = buildDeadlines(clock, resolveProviderProxyDeadlineConfiguration(ports.runtime.env), ports);
+  // Reaper deadlines and enforcement must share one holder authority.
+  const holderAuthority = createControlHolderAuthority({ wallClockNow: ports.runtime.time.now });
+  const deadlines = buildDeadlines(
+    clock,
+    resolveProviderProxyDeadlineConfiguration(ports.runtime.env),
+    ports,
+    holderAuthority,
+  );
   const exitProcess = ports.exitProcess ?? ((code: number): void => process.exit(code));
-
+  const self = readSelfIdentity(ports);
   // Forward-referenced by `close` below (assigned into `createReaper`'s own `onOutcome` before the reaper it
   // closes exists), then assigned exactly once — `let` is load-bearing here, not a style choice.
   // eslint-disable-next-line prefer-const
-  let reaperRef!: Reaper<symbol>;
+  let reaperRef!: Reaper;
   const close = (): Promise<void> => reaperRef.close();
-  const { onOutcome, onProgressViolation } = buildEnforcementOutcomeHandlers({
-    role: 'reaper',
-    deadlines,
-    close,
-    exitProcess,
-    schedule: realRoleOutcomeScheduler(ports),
-  });
+  const { onOutcome, onProgressViolation, enforcementHoldStatus, abandonUnattributable } =
+    buildEnforcementOutcomeHandlers({
+      role: 'reaper',
+      roleIdentity: self,
+      deadlines,
+      close,
+      exitProcess,
+      grantWasInstalled: () => holderAuthority.phase() === 'published',
+      now: ports.runtime.time.now,
+      retryUnattributable: () => reaperRef.enforcer()?.retryUnattributable() ?? null,
+      schedule: realRoleOutcomeScheduler(ports),
+    });
 
   reaperRef = createReaper({
     capsule,
@@ -684,7 +1017,11 @@ export async function startProviderReaperRole(
     scheduler: buildScheduler(ports.runtime),
     timer: runtimeControlTimer(ports.runtime),
     mintReceipt: () => ports.runtime.ids.uuid(),
-    self: readSelfIdentity(ports),
+    self,
+    holderAuthority,
+    observeHolder: buildHolderObserver(ports),
+    enforcementHoldStatus,
+    abandonUnattributable,
     onOutcome,
     onProgressViolation,
   });
@@ -694,15 +1031,16 @@ export async function startProviderReaperRole(
     role: 'reaper',
     reaper: reaperRef,
     close,
-    giveUp: async (): Promise<EnforcementOutcome> => {
+    giveUp: async (): Promise<ReaperSignalTeardownDisposition> => {
       const armed = reaperRef.enforcer();
       if (armed === null) {
-        // The guardian has not yet forwarded a containment to reap — nothing armed, nothing to enforce, so
-        // the plain close this process would otherwise have gotten on SIGTERM is the correct fallback.
-        await close();
-        return { kind: 'reap-failed', reason: 'no containment was recorded to reap' };
+        await close()
+          .catch((error: unknown) => backendLog.error('reaper: close on exit failed', error))
+          .finally(() => exitProcess(0));
+        return { kind: 'closed-without-containment' };
       }
-      return armed.stopAndReap(deadlines.bounds().exitDeadline);
+      // Local signal authority must be minted only while handling that signal.
+      return armed.giveUp(mintLocalSignalTeardownAuthorization());
     },
   };
 }
@@ -860,7 +1198,7 @@ export async function startProviderProxyRole(
     connectTimeoutMs: ROLE_CONNECT_TIMEOUT_MS,
     retryIntervalMs: ROLE_SPAWN_READY_RETRY_INTERVAL_MS,
     overallDeadlineMs: ROLE_SPAWN_READY_DEADLINE_MS,
-    now: () => ports.runtime.time.now(),
+    monotonicNow: () => ports.runtime.time.monotonicNow(),
     sleep: (ms) => ports.runtime.time.sleep(ms),
   });
   const pairingResult = requireRolePeerResult(
@@ -969,7 +1307,112 @@ export async function startProviderProxyRole(
   };
 }
 
-export type ProviderRoleMainOptions = Readonly<{ pluginRoot: string }>;
+export type ProviderRoleMainOptions = Readonly<{ pluginRoot: string; runtime?: Runtime }>;
+
+type RoleProbeSettlementDisposition = SettledSettlementDisposition | RoleProbeHeldSettlementDisposition;
+
+interface RoleProbeHeldSettlementDisposition extends HeldSettlementDisposition<
+  'process-incarnation-probes-unsettled',
+  'process-incarnation-probe-settlement',
+  never,
+  readonly ProcessIncarnationProbeHold[],
+  RoleProbeSettlementDisposition
+> {
+  retry(): Promise<RoleProbeSettlementDisposition>;
+}
+
+const roleProbeSettlementGate = new SettlementGate<
+  never,
+  'process-incarnation-probes-unsettled',
+  'process-incarnation-probe-settlement',
+  never,
+  readonly ProcessIncarnationProbeHold[],
+  never,
+  RoleProbeSettlementDisposition
+>();
+
+async function settleRoleShutdownProbes(): Promise<RoleProbeSettlementDisposition> {
+  const disposition = await terminateProcessIncarnationProbes();
+  if (disposition.disposition === 'settled') return roleProbeSettlementGate.settled();
+  return roleProbeSettlementGate.held({
+    reason: 'process-incarnation-probes-unsettled',
+    exit: 'process-incarnation-probe-settlement',
+    retryAfter: disposition.untilSettled,
+    deferredFailures: [],
+    retainedAuthority: disposition.unsettled,
+    retry: settleRoleShutdownProbes,
+  });
+}
+
+function createRoleShutdownProbeGate(
+  role: 'guardian' | 'reaper' | 'proxy',
+  exitProcess: (code: number) => void,
+): Readonly<{ requestCleanup(): void; requestExit(code: number): void; dispose(): void }> {
+  let requestedExitCode: number | null = null;
+  let cleanupInFlight = false;
+  let exited = false;
+  let disposed = false;
+
+  const cleanupFailed = (error: unknown, cleanupSubjects: readonly ProcessIncarnationProbeSubject[]): void => {
+    const subjects = cleanupSubjects
+      .map((subject) => ('key' in subject ? `key=${subject.key}` : `pid=${subject.pid}`))
+      .join('; ');
+    if (disposed) return;
+    cleanupInFlight = false;
+    backendLog.error(
+      `${role}: process-incarnation probe cleanup failed; shutdown remains held; registered subjects: ${subjects || 'none'}`,
+      error,
+    );
+  };
+
+  const acceptDisposition = (disposition: RoleProbeSettlementDisposition): void => {
+    if (disposed) return;
+    if (disposition.disposition === 'held') {
+      const holds = disposition.retainedAuthority
+        .map((hold) =>
+          'key' in hold
+            ? `key=${hold.key} reason=${hold.reason} exit=${hold.exit}`
+            : `pid=${hold.pid ?? 'unavailable'} reason=${hold.reason} exit=${hold.exit}`,
+        )
+        .join('; ');
+      backendLog.error(`${role}: shutdown remains held by unsettled process-incarnation probes: ${holds}`);
+      void disposition.retryAfter.then(
+        () => {
+          const cleanupSubjects = snapshotProcessIncarnationProbeSubjects();
+          void disposition.retry().then(acceptDisposition, (error: unknown) => cleanupFailed(error, cleanupSubjects));
+        },
+        (error: unknown) => cleanupFailed(error, snapshotProcessIncarnationProbeSubjects()),
+      );
+      return;
+    }
+    cleanupInFlight = false;
+    if (requestedExitCode !== null) {
+      exited = true;
+      exitProcess(requestedExitCode);
+    }
+  };
+
+  const requestCleanup = (): void => {
+    if (cleanupInFlight || exited || disposed) return;
+    cleanupInFlight = true;
+    const cleanupSubjects = snapshotProcessIncarnationProbeSubjects();
+    void settleRoleShutdownProbes().then(acceptDisposition, (error: unknown) => cleanupFailed(error, cleanupSubjects));
+  };
+
+  return {
+    requestCleanup,
+    requestExit: (code): void => {
+      requestedExitCode ??= code;
+      requestCleanup();
+    },
+    dispose: (): void => {
+      disposed = true;
+      requestedExitCode = null;
+    },
+  };
+}
+
+let activeRoleShutdownDispose: (() => void) | null = null;
 
 /**
  * The `bootstrap.ts` dispatch target: composes the real runtime and runs whichever role `argv` named,
@@ -980,58 +1423,144 @@ export type ProviderRoleMainOptions = Readonly<{ pluginRoot: string }>;
 export async function runProviderRoleMain(mode: ProviderRoleArgv, options: ProviderRoleMainOptions): Promise<number> {
   if (mode.role === 'none') return 0;
 
-  // Every role logs to stderr (`backendLog`), and `role-spawn.ts` spawns roles through the short-lived-child
-  // path — piped, not redirected to a file. If this role's parent (the coordinator spawning the guardian, or
-  // the guardian spawning the reaper/proxy) exits first, the read end of that pipe closes, and this
-  // process's next stderr write raises EPIPE. A `Writable` stream's `'error'` with no listener is an
-  // uncaught exception, which would kill the very enforcer that exists to bound coordinator loss — so the
-  // guard is installed before anything else in this role can log. `stdout` is guarded for the same reason,
-  // though no role writes to it today.
-  process.stdout.on('error', () => {});
-  process.stderr.on('error', () => {});
+  // Stream error guards must be installed before logging; only EPIPE from a closed output pipe may be ignored.
+  const guardParentPipe = (error: Error): void => {
+    if ((error as NodeJS.ErrnoException).code === 'EPIPE') return;
+    throw error;
+  };
+  process.stdout.on('error', guardParentPipe);
+  process.stderr.on('error', guardParentPipe);
 
-  const runtime = createRealRuntime(resolveBuildFlavor(process.env));
-  const ports: ProviderRoleMainPorts = { runtime, pluginRoot: options.pluginRoot };
+  const runtime = options.runtime ?? createRealRuntime(resolveBuildFlavor(process.env));
+  activeRoleShutdownDispose?.();
+  let removeRoleSignalHandlers = (): void => undefined;
+  let disposeRoleLifecycle = (): void => undefined;
+  let processExitRequested = false;
+  const probeGate = createRoleShutdownProbeGate(mode.role, (code) => {
+    if (processExitRequested) return;
+    processExitRequested = true;
+    disposeRoleLifecycle();
+    process.exit(code);
+  });
+  disposeRoleLifecycle = () => {
+    probeGate.dispose();
+    removeRoleSignalHandlers();
+    if (activeRoleShutdownDispose === disposeRoleLifecycle) activeRoleShutdownDispose = null;
+  };
+  activeRoleShutdownDispose = disposeRoleLifecycle;
+  const ports: ProviderRoleMainPorts = {
+    runtime,
+    pluginRoot: options.pluginRoot,
+    exitProcess: probeGate.requestExit,
+  };
 
-  const handle: ProviderRoleHandle =
-    mode.role === 'guardian'
-      ? await startProviderGuardianRole(mode.capsulePath, ports)
-      : mode.role === 'reaper'
-        ? await startProviderReaperRole(mode.capsulePath, ports)
-        : await startProviderProxyRole(mode.capsulePath, ports);
+  let handle: ProviderRoleHandle;
+  if (mode.role === 'guardian') {
+    try {
+      handle = await startProviderGuardianRole(mode.capsulePath, ports);
+    } catch (error: unknown) {
+      let constructionExitCode = GUARDIAN_CONSTRUCTION_CONTAINMENT_SETTLED_EXIT_CODE;
+      if (error instanceof GuardianConstructionCleanupHeldError) {
+        backendLog.error('guardian: construction failed and spawned process cleanup remains held', error);
+        let disposition: GuardianConstructionCleanupDisposition = error.hold;
+        let operatorExitAccepted = false;
+        let releaseOperatorSignal!: () => void;
+        const operatorSignal = new Promise<void>((resolve) => {
+          releaseOperatorSignal = resolve;
+        });
+        const abandonConstruction = (): void => {
+          if (operatorExitAccepted) return;
+          if (disposition.kind !== 'holding' || !acceptGuardianConstructionOperatorExit(disposition)) return;
+          operatorExitAccepted = true;
+          releaseOperatorSignal();
+        };
+        process.on('SIGTERM', abandonConstruction);
+        process.on('SIGINT', abandonConstruction);
+        try {
+          while (disposition.kind === 'holding' && !operatorExitAccepted) {
+            await Promise.race([runtime.time.sleep(ROLE_UNATTRIBUTABLE_REAP_BASE_DELAY_MS), operatorSignal]);
+            if (operatorExitAccepted) break;
+            const heldBeforeRetry: Extract<GuardianConstructionCleanupDisposition, { kind: 'holding' }> = disposition;
+            try {
+              disposition = await heldBeforeRetry.retry();
+              if (disposition.kind === 'holding') {
+                backendLog.error(
+                  `guardian: construction cleanup retry remains held: ${guardianConstructionCleanupHoldDetail(disposition)}`,
+                );
+              }
+            } catch (retryError: unknown) {
+              backendLog.error(
+                `guardian: construction cleanup retry failed; shutdown remains held: ${guardianConstructionCleanupHoldDetail(heldBeforeRetry)}`,
+                retryError,
+              );
+            }
+          }
+        } finally {
+          process.removeListener('SIGTERM', abandonConstruction);
+          process.removeListener('SIGINT', abandonConstruction);
+        }
+        if (operatorExitAccepted) {
+          constructionExitCode = 0;
+          probeGate.requestExit(0);
+        }
+      } else {
+        if (!isGuardianConstructionCleanupSettled(error)) {
+          disposeRoleLifecycle();
+          throw error;
+        }
+        backendLog.error('guardian: construction failed after spawned process cleanup settled', error);
+      }
+      if (constructionExitCode !== 0) disposeRoleLifecycle();
+      return constructionExitCode;
+    }
+  } else if (mode.role === 'reaper') {
+    try {
+      handle = await startProviderReaperRole(mode.capsulePath, ports);
+    } catch (error: unknown) {
+      disposeRoleLifecycle();
+      throw error;
+    }
+  } else {
+    try {
+      handle = await startProviderProxyRole(mode.capsulePath, ports);
+    } catch (error: unknown) {
+      disposeRoleLifecycle();
+      throw error;
+    }
+  }
 
-  const exitProcess = ports.exitProcess ?? ((code: number): void => process.exit(code));
   let proxyShutdownStarted = false;
 
   const shutdown = (): void => {
-    // SIGTERM/SIGINT here means give up entirely — `buildGuardianSpawnUndo`'s acquisition-cleanup path is
-    // the production sender — never a negotiated handoff (that goes through `*.stop-and-reap.v1` over
-    // control, or a clean `initiateControlClose`). A guardian or reaper holds a proxy containment its own
-    // enforcer was armed on; `close()` alone only disarms it, and the proxy is a separate detached
-    // process-group leader outside this signal's own reach, so leaving it merely disarmed strands it
-    // forever. `giveUp()` reaps it first, through the same close-and-exit path a cooperative RPC teardown
-    // takes, and its own outcome handler is what exits this process afterwards.
-    //
-    // The proxy holds no containment of its own, so it has no enforcement outcome to exit on — `close()` now
-    // drains every kernel it runs, but nothing else ever calls `exitProcess` for this role. Installing this
-    // handler overrides SIGTERM's own default terminate, so without an explicit exit here this process would
-    // sit alive with no way to end itself once `close()` resolves.
+    probeGate.requestCleanup();
     if (handle.role === 'proxy') {
       if (proxyShutdownStarted) return;
       proxyShutdownStarted = true;
       void handle.close().then(
-        () => exitProcess(0),
+        () => probeGate.requestExit(0),
         (error: unknown) => {
           backendLog.error('proxy: close on shutdown failed', error);
-          exitProcess(ROLE_ENFORCEMENT_FAILURE_EXIT_CODE);
+          probeGate.requestExit(ROLE_ENFORCEMENT_FAILURE_EXIT_CODE);
         },
       );
       return;
     }
-    void handle.giveUp();
+    const role = handle.role;
+    void handle
+      .giveUp()
+      .catch((error: unknown) =>
+        backendLog.error(
+          `${role}: give-up on shutdown failed; containment remains held; SIGTERM or SIGINT retries teardown`,
+          error,
+        ),
+      );
   };
   process.on('SIGTERM', shutdown);
   process.on('SIGINT', shutdown);
+  removeRoleSignalHandlers = () => {
+    process.removeListener('SIGTERM', shutdown);
+    process.removeListener('SIGINT', shutdown);
+  };
 
   return 0;
 }

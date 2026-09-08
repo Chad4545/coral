@@ -1,8 +1,9 @@
 import { z } from 'zod';
 
-import { nonEmptyStringSchema, readNonEmptyString } from '../infra/identifiers.js';
+import { readNonEmptyString } from '../infra/identifiers.js';
+import { persistedNonEmptyStringSchema } from '../infra/persisted-scalar-contracts.js';
 
-export const continuityRefSchema = nonEmptyStringSchema;
+export const continuityRefSchema = persistedNonEmptyStringSchema;
 
 export const providerContinuityBlobSchema = z.record(z.string(), z.unknown());
 

@@ -31,6 +31,7 @@ import {
 import { readFile as readFileAsync } from 'node:fs/promises';
 import { homedir as osHomedir, tmpdir as osTmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
+import { fileURLToPath } from 'node:url';
 import { DatabaseSync } from 'node:sqlite';
 import { composeCoralPaths } from '../infra/path/index.js';
 import { resolveProjectSource } from '../infra/project-source.js';
@@ -46,6 +47,11 @@ import type {
 } from '../infra/port-types.js';
 import type {
   DurableExecutionTransport,
+  DurableCliProcessSubject,
+  DurableLaunchHeld,
+  DurableLaunchHandle,
+  DurableLaunchRetryDisposition,
+  DurableLaunchSignalAuthority,
   IdPort,
   ProcessPort,
   Runtime,
@@ -61,20 +67,35 @@ import {
   MAX_BUFFER,
 } from '../infra/process-constants.js';
 import { composeChildEnv, parsePassthrough, resolveEnvBudgetBytes } from '../infra/env-sanitize.js';
-import { isDurableCliRuntime, type DurableCliRuntimeRecord, type DurableProcessExit } from './durable-runtime.js';
+import type { DurableCliRuntimeRecord, DurableProcessExit } from './durable-runtime.js';
 import { buildExecPromise } from './exec-builder.js';
 import { createRealTimePort } from '../infra/time.js';
 import {
+  createAsyncRecordedProcessObserver,
   observeProcessLiveness,
   parseLinuxProcessIncarnation,
   probeProcessIncarnation,
+  probeProcessIncarnationAsync,
+  isProcessIncarnation,
+  type ProcessIncarnation,
+  type ProcessIncarnationProbeTerminator,
 } from '../infra/node-process.js';
-import type { RecordedProcessIdentity } from '../infra/process-containment.js';
+import { observeRecordedContainment, type RecordedProcessIdentity } from '../infra/process-containment.js';
+import {
+  gracefulKill,
+  liveChildAuthority,
+  type GracefulKillDisposition,
+  type GracefulKillPendingDisposition,
+} from '../infra/process-supervision.js';
+
+declare const __BUNDLE_DIR__: string | undefined;
 
 const DURABLE_POLL_INTERVAL_MS = 100;
 const DURABLE_POLL_TIMEOUT_MS = 5_000;
 const DURABLE_EXIT_GRACE_MS = 5_000;
 const ENV_RECORD_FILE = 'env.json';
+const LAUNCH_PAYLOAD_FILE = 'launch.v1.json';
+const DURABLE_WRAPPER_BUNDLE_FILE = 'coral-durable-wrapper.cjs';
 
 type ProcessIdentityObservationEnvironment = Readonly<{
   platform: string;
@@ -191,60 +212,37 @@ function openSqliteDatabaseSync(path: string, options?: { readOnly?: boolean }):
   };
 }
 
-const WRAPPER_SCRIPT = `
-const { spawn } = require('child_process');
-const { openSync, closeSync, readFileSync } = require('fs');
-const { join } = require('path');
-
-const jobDir = process.argv[1];
-const command = process.argv[2];
-const args = JSON.parse(process.argv[3]);
-const env = JSON.parse(readFileSync(join(jobDir, 'env.json'), 'utf8'));
-const cwd = process.argv[4] || undefined;
-const prompt = process.argv[5] || '';
-
-const stdoutPath = join(jobDir, 'stdout');
-const stderrPath = join(jobDir, 'stderr');
-
-const stdoutFd = openSync(stdoutPath, 'w', 0o600);
-const stderrFd = openSync(stderrPath, 'w', 0o600);
-
-function shouldUseWindowsCommandShell(value) {
-  if (process.platform !== 'win32') return false;
-  const normalized = value.trim().toLowerCase();
-  return normalized.endsWith('.cmd') || normalized.endsWith('.bat');
+function durableWrapperEntrypoint(): string {
+  if (typeof __BUNDLE_DIR__ === 'string') {
+    return join(__BUNDLE_DIR__, DURABLE_WRAPPER_BUNDLE_FILE);
+  }
+  return fileURLToPath(new URL('../../dist/runtime/durable-cli-wrapper.js', import.meta.url));
 }
 
-const child = spawn(command, args, {
-  stdio: ['pipe', stdoutFd, stderrFd],
-  cwd,
-  env,
-  shell: shouldUseWindowsCommandShell(command),
-});
-
-const runtimeRecord = {
-  transport: 'durable-cli',
-  pid: child.pid,
-  stdoutPath,
-  stderrPath,
-  startTime: new Date().toISOString(),
-};
-process.stdout.write(JSON.stringify({ type: 'runtime', runtimeRecord }) + '\\n');
-
-if (prompt) child.stdin.write(prompt);
-child.stdin.end();
-
-function writeExit(code, signal, exitCode) {
-  try { closeSync(stdoutFd); } catch {}
-  try { closeSync(stderrFd); } catch {}
-  const exitRecord = { exitCode: code, signal: signal || null, endTime: new Date().toISOString() };
-  process.stdout.write(JSON.stringify({ type: 'exit', exitRecord }) + '\\n');
-  process.exit(exitCode);
+export async function waitForRecordedDurableExit(
+  processSubject: DurableCliProcessSubject,
+  pid: number,
+  platform: NodeJS.Platform,
+  time: Pick<TimePort, 'monotonicNow' | 'sleep'>,
+): Promise<never> {
+  let exitedAt = null as bigint | null;
+  while (true) {
+    const observation = observeRecordedContainment(processSubject, {
+      process: { observeLiveness: observeProcessLiveness },
+      platform,
+      readProcessIncarnation: probeProcessIncarnation,
+    });
+    if (observation.kind === 'absent') {
+      exitedAt ??= time.monotonicNow();
+      if (time.monotonicNow() - exitedAt >= BigInt(DURABLE_EXIT_GRACE_MS)) {
+        throw new Error(`Durable process ${pid} exited before the wrapper reported completion`);
+      }
+    } else {
+      exitedAt = null;
+    }
+    await time.sleep(DURABLE_POLL_INTERVAL_MS);
+  }
 }
-
-child.on('close', (code, signal) => writeExit(code, signal, 0));
-child.on('error', () => writeExit(null, null, 1));
-`.trim();
 
 type CapturedEnvState = {
   fullEnv: Readonly<Record<string, string>>;
@@ -259,6 +257,8 @@ type DurableControlMessage =
   | {
       type: 'runtime';
       runtimeRecord: DurableCliRuntimeRecord;
+      leaderIncarnation: ProcessIncarnation | null;
+      childRoot: RecordedProcessIdentity | null;
     }
   | {
       type: 'exit';
@@ -418,77 +418,273 @@ export function createRealRuntime(flavor: BuildFlavor, opts?: CreateRealRuntimeO
     return options.env ?? buildSpawnEnv();
   };
 
-  const durableExitPromises = new Map<number, Promise<DurableProcessExit>>();
+  const durableExitRegistrations = new Map<
+    DurableLaunchHandle,
+    Readonly<{
+      pid: number;
+      processSubject: DurableCliProcessSubject;
+      exitPromise: Promise<DurableProcessExit>;
+    }>
+  >();
   const durable: DurableExecutionTransport = {
     launch: async (options) => {
+      if (capturedEnv.platform === 'win32') {
+        throw new Error(
+          'Durable CLI launch is unsupported on Windows because Coral cannot observe or terminate a POSIX process group there.',
+        );
+      }
       const envPath = `${options.jobDir}/${ENV_RECORD_FILE}`;
+      const launchPayloadPath = `${options.jobDir}/${LAUNCH_PAYLOAD_FILE}`;
+      const startTime = new Date(time.now()).toISOString();
       storage.writeAtomicSync(envPath, JSON.stringify(options.env ?? buildSpawnEnv(options.envAdditions)), {
         mode: 0o600,
       });
-
-      const wrapper = spawnChild(
-        process.execPath,
-        [
-          '-e',
-          WRAPPER_SCRIPT,
-          options.jobDir,
-          options.command,
-          JSON.stringify(options.args),
-          options.cwd ?? '',
-          options.prompt ?? '',
-        ],
-        {
-          detached: true,
-          stdio: ['ignore', 'pipe', 'pipe'],
-          env: buildSpawnEnv(),
-        },
+      storage.writeAtomicSync(
+        launchPayloadPath,
+        JSON.stringify({
+          version: 1,
+          command: options.command,
+          args: options.args,
+          cwd: options.cwd ?? null,
+          prompt: options.prompt ?? '',
+          startTime,
+        }),
+        { mode: 0o600 },
       );
-      wrapper.unref();
 
-      const { runtimeRecord, exitPromise } = await waitForDurableRuntime({
+      const wrapper = spawnChild(process.execPath, [durableWrapperEntrypoint(), launchPayloadPath], {
+        detached: true,
+        stdio: ['ignore', 'pipe', 'pipe', 'ipc'],
+        env: buildSpawnEnv(),
+      });
+      let wrapperUnreferenced = false;
+      const unrefWrapper = (): void => {
+        if (wrapperUnreferenced) return;
+        wrapperUnreferenced = true;
+        wrapper.unref();
+        wrapper.channel?.unref();
+      };
+
+      let wrapperClosed = false;
+      const wrapperSettlement = new Promise<void>((resolve) => {
+        wrapper.on('close', () => {
+          wrapperClosed = true;
+          resolve();
+        });
+      });
+      let wrapperTermination: GracefulKillPendingDisposition | null = null;
+      const requestWrapperTermination = (): GracefulKillDisposition => {
+        if (wrapperTermination !== null) return wrapperTermination;
+        const disposition = gracefulKill(wrapper as unknown as ChildProcessLike, { time }, observeProcessLiveness);
+        if ('settlement' in disposition) {
+          wrapperTermination = disposition;
+          void disposition.settlement.then(() => {
+            if (wrapperTermination === disposition) wrapperTermination = null;
+          });
+        }
+        return disposition;
+      };
+
+      const holdLaunchFailure = (
+        reason: string,
+        retryAfter = time.sleep(DURABLE_POLL_INTERVAL_MS),
+      ): DurableLaunchHeld => {
+        const retry = async (): Promise<DurableLaunchRetryDisposition> => {
+          const termination = requestWrapperTermination();
+          if (wrapperClosed) return { disposition: 'settled' };
+          if (wrapper.pid !== undefined) {
+            try {
+              if (observeProcessLiveness(wrapper.pid) === 'absent') return { disposition: 'settled' };
+            } catch {
+              // Unknown liveness retains the close-backed launch obligation.
+            }
+          }
+          return holdLaunchFailure(
+            reason,
+            'settlement' in termination
+              ? termination.settlement.then(() => undefined)
+              : time.sleep(DURABLE_POLL_INTERVAL_MS),
+          );
+        };
+        return {
+          disposition: 'held',
+          owner: 'launch-caller',
+          pid: wrapper.pid ?? null,
+          reason,
+          retryAfter: Promise.race([wrapperSettlement, retryAfter]),
+          retry,
+        };
+      };
+
+      let ownershipAccepted = false;
+      const resolveLaunchFailure = async (reason: string): Promise<DurableLaunchHeld> => {
+        let disposition = holdLaunchFailure(reason);
+        if (ownershipAccepted) return disposition;
+        while (true) {
+          await disposition.retryAfter;
+          const retry = await disposition.retry();
+          if (retry.disposition === 'settled') throw new Error(reason);
+          disposition = retry;
+        }
+      };
+
+      try {
+        const ownershipAcceptance = options.onWrapperSpawned?.({
+          pid: wrapper.pid ?? null,
+          settled: wrapperSettlement,
+          requestTermination: requestWrapperTermination,
+        });
+        if (options.onWrapperSpawned !== undefined && ownershipAcceptance?.kind !== 'accepted') {
+          return resolveLaunchFailure('Durable wrapper ownership was not accepted.');
+        }
+        if (ownershipAcceptance?.kind === 'accepted') {
+          ownershipAccepted = true;
+          unrefWrapper();
+        }
+      } catch (error: unknown) {
+        return resolveLaunchFailure(`Durable wrapper ownership was refused: ${errorMessage(error)}`);
+      }
+
+      const wrapperAuthority = liveChildAuthority(wrapper as unknown as ChildProcessLike);
+      const signalAuthority: DurableLaunchSignalAuthority | undefined =
+        wrapperAuthority === undefined
+          ? undefined
+          : Object.freeze({
+              ...wrapperAuthority,
+              requestTermination: requestWrapperTermination,
+            });
+
+      let initiallyObservedLeaderIncarnation: ProcessIncarnation | null = null;
+      if (wrapper.pid !== undefined) {
+        try {
+          initiallyObservedLeaderIncarnation = probeProcessIncarnation(wrapper.pid, capturedEnv.platform);
+        } catch {
+          initiallyObservedLeaderIncarnation = null;
+        }
+      }
+      if (wrapper.pid === undefined || initiallyObservedLeaderIncarnation === null) {
+        return resolveLaunchFailure(
+          'Durable launch could not establish the wrapper process identity before provider spawn. Retry the job; if this persists, verify process inspection permissions.',
+        );
+      }
+      const provisionalRuntimeRecord: DurableCliRuntimeRecord = {
+        transport: 'durable-cli',
+        pid: wrapper.pid,
+        stdoutPath: `${options.jobDir}/stdout`,
+        stderrPath: `${options.jobDir}/stderr`,
+        startTime,
+      };
+      const readiness = waitForDurableRuntime({
         time,
         wrapper,
       });
-      durableExitPromises.set(runtimeRecord.pid, exitPromise);
+      try {
+        options.onWrapperIdentified?.({
+          runtimeRecord: provisionalRuntimeRecord,
+          pid: wrapper.pid,
+          leaderIncarnation: initiallyObservedLeaderIncarnation,
+          ...(signalAuthority === undefined ? {} : { signalAuthority }),
+        });
+        await new Promise<void>((resolve, reject) => {
+          wrapper.send('runtime-start-published', (error) => {
+            if (error) reject(error);
+            else resolve();
+          });
+        });
+      } catch (error: unknown) {
+        void readiness.catch(() => {});
+        return resolveLaunchFailure(errorMessage(error));
+      }
+
+      let ready;
+      try {
+        ready = await readiness;
+      } catch (error: unknown) {
+        return resolveLaunchFailure(errorMessage(error));
+      }
+      const { runtimeRecord, reportedLeaderIncarnation, childRoot, exitPromise } = ready;
+      if (
+        initiallyObservedLeaderIncarnation !== null &&
+        reportedLeaderIncarnation !== null &&
+        initiallyObservedLeaderIncarnation !== reportedLeaderIncarnation
+      ) {
+        void exitPromise.catch(() => {});
+        return resolveLaunchFailure('Durable wrapper identity changed before launch readiness. Retry the job.');
+      }
+      const leaderIncarnation = initiallyObservedLeaderIncarnation ?? reportedLeaderIncarnation;
+      if (leaderIncarnation === null || childRoot === null) {
+        void exitPromise.catch(() => {});
+        return resolveLaunchFailure(
+          'Durable launch could not establish a recoverable process identity. Retry the job; if this persists, verify process inspection permissions.',
+        );
+      }
+      const processSubject: DurableCliProcessSubject = {
+        pid: runtimeRecord.pid,
+        incarnation: leaderIncarnation,
+        processGroupId: runtimeRecord.pid,
+        childRoot,
+      };
+      try {
+        options.onSpawned?.({
+          runtimeRecord,
+          leaderIncarnation,
+          childRoot,
+          ...(signalAuthority === undefined ? {} : { signalAuthority }),
+        });
+      } catch (error: unknown) {
+        void exitPromise.catch(() => {});
+        return resolveLaunchFailure(errorMessage(error));
+      }
+      const launchHandle = randomUUID() as DurableLaunchHandle;
+      durableExitRegistrations.set(launchHandle, { pid: runtimeRecord.pid, processSubject, exitPromise });
+      unrefWrapper();
 
       return {
+        disposition: 'launched',
+        launchHandle,
         pid: runtimeRecord.pid,
         stdoutPath: runtimeRecord.stdoutPath,
         stderrPath: runtimeRecord.stderrPath,
         runtimeRecord,
+        processSubject,
+        ...(signalAuthority === undefined ? {} : { signalAuthority }),
       };
     },
     waitForExit: async (handle) => {
-      const exitPromise = durableExitPromises.get(handle.pid);
-      if (!exitPromise) {
-        let exitedAt = null as number | null;
-        while (true) {
-          // Only an observed absence ends the wait. An unanswerable probe leaves the wrapper exactly as it
-          // was — failing a durable job here would abandon a process that may still be running.
-          if (observeProcessLiveness(handle.pid) === 'absent') {
-            exitedAt ??= time.now();
-            if (time.now() - exitedAt >= DURABLE_EXIT_GRACE_MS) {
-              throw new Error(`Durable process ${handle.pid} exited before the wrapper reported completion`);
-            }
-          } else {
-            exitedAt = null;
-          }
-
-          await time.sleep(DURABLE_POLL_INTERVAL_MS);
-          const pending = durableExitPromises.get(handle.pid);
-          if (pending) {
-            return pending.finally(() => {
-              durableExitPromises.delete(handle.pid);
-            });
-          }
-        }
+      const registration = durableExitRegistrations.get(handle.launchHandle);
+      if (
+        registration === undefined ||
+        registration.pid !== handle.pid ||
+        registration.processSubject.pid !== handle.processSubject.pid ||
+        registration.processSubject.incarnation !== handle.processSubject.incarnation ||
+        registration.processSubject.processGroupId !== handle.processSubject.processGroupId ||
+        registration.processSubject.childRoot.pid !== handle.processSubject.childRoot.pid ||
+        registration.processSubject.childRoot.incarnation !== handle.processSubject.childRoot.incarnation
+      ) {
+        throw new Error(`Durable launch ${handle.launchHandle} is not attached to process ${handle.pid}.`);
       }
 
-      return exitPromise.finally(() => {
-        durableExitPromises.delete(handle.pid);
-      });
+      try {
+        return await registration.exitPromise;
+      } catch (error: unknown) {
+        await waitForRecordedDurableExit(registration.processSubject, registration.pid, capturedEnv.platform, time);
+        throw error;
+      } finally {
+        if (durableExitRegistrations.get(handle.launchHandle) === registration) {
+          durableExitRegistrations.delete(handle.launchHandle);
+        }
+      }
     },
   };
+
+  const terminateProcessIncarnationProbe: ProcessIncarnationProbeTerminator = (child) => {
+    gracefulKill(child as ChildProcessLike, { time }, observeProcessLiveness);
+  };
+
+  const observeRecordedProcessAsync = createAsyncRecordedProcessObserver({
+    readIncarnation: (pid) => probeProcessIncarnationAsync(pid, terminateProcessIncarnationProbe, capturedEnv.platform),
+    observeLiveness: observeProcessLiveness,
+  });
 
   const runtimeProcess = {
     spawn: (options) => {
@@ -511,12 +707,12 @@ export function createRealRuntime(flavor: BuildFlavor, opts?: CreateRealRuntimeO
         process.kill(pid, signal);
         return true;
       } catch {
-        /* already dead */
         return false;
       }
     },
     observeLiveness: (pid) => observeProcessLiveness(pid),
     readProcessIncarnation: (pid, platform) => probeProcessIncarnation(pid, platform),
+    observeRecordedProcessAsync,
     observeProcessIdentities: (owners, deadlineMs) =>
       observeProcessIdentitiesWithoutSubprocesses(owners, deadlineMs, {
         platform: capturedEnv.platform,
@@ -557,10 +753,6 @@ export function createRealRuntime(flavor: BuildFlavor, opts?: CreateRealRuntimeO
     // decides otherwise, and nothing in this process gets a turn at all. `RuntimeExecOptions.timeout` stays
     // optional so a caller may widen or tighten it, but omission must not mean unbounded — and `0`, which
     // `spawnSync` reads as no bound, is not a tightening, so it is corrected rather than honoured.
-    //
-    // `tests/invariants/sync-subprocess-timeout.test.ts` excludes port callers from its literal-requiring scan
-    // on the stated grounds that this port owns their bound. Until this line, nothing here had taken that
-    // ownership up — the exclusion named a successor that had not accepted.
     if (execOptions.timeout === undefined || execOptions.timeout <= 0) {
       execOptions.timeout = DEFAULT_SYNC_EXEC_TIMEOUT_MS;
     }
@@ -728,21 +920,70 @@ function trimStderr(stderr: string): string {
   return trimmed.length > 0 ? `: ${trimmed}` : '';
 }
 
-function isExitRecord(value: unknown): value is DurableProcessExit {
+function hasExactKeys(value: unknown, keys: readonly string[]): value is Record<string, unknown> {
+  if (value === null || typeof value !== 'object' || Array.isArray(value)) return false;
+  const actualKeys = Object.keys(value);
+  return actualKeys.length === keys.length && keys.every((key) => Object.hasOwn(value, key));
+}
+
+function isDurableRuntimeRecord(value: unknown): value is DurableCliRuntimeRecord {
+  const keys =
+    value !== null && typeof value === 'object' && Object.hasOwn(value, 'tailWatermark')
+      ? ['transport', 'pid', 'stdoutPath', 'stderrPath', 'startTime', 'tailWatermark']
+      : ['transport', 'pid', 'stdoutPath', 'stderrPath', 'startTime'];
   return (
-    value !== null &&
-    typeof value === 'object' &&
-    typeof (value as { endTime?: unknown }).endTime === 'string' &&
-    ((value as { exitCode?: unknown }).exitCode === null ||
-      typeof (value as { exitCode?: unknown }).exitCode === 'number') &&
-    ((value as { signal?: unknown }).signal === null || typeof (value as { signal?: unknown }).signal === 'string')
+    hasExactKeys(value, keys) &&
+    value.transport === 'durable-cli' &&
+    typeof value.pid === 'number' &&
+    Number.isSafeInteger(value.pid) &&
+    value.pid > 0 &&
+    typeof value.stdoutPath === 'string' &&
+    typeof value.stderrPath === 'string' &&
+    typeof value.startTime === 'string' &&
+    (!Object.hasOwn(value, 'tailWatermark') ||
+      (typeof value.tailWatermark === 'number' &&
+        Number.isSafeInteger(value.tailWatermark) &&
+        value.tailWatermark >= 0))
   );
 }
 
-function waitForDurableRuntime(options: {
-  time: TimePort;
-  wrapper: ReturnType<typeof spawnChild>;
-}): Promise<{ runtimeRecord: DurableCliRuntimeRecord; exitPromise: Promise<DurableProcessExit> }> {
+function isExitRecord(value: unknown): value is DurableProcessExit {
+  return (
+    hasExactKeys(value, ['exitCode', 'signal', 'endTime']) &&
+    typeof value.endTime === 'string' &&
+    (value.exitCode === null || (typeof value.exitCode === 'number' && Number.isSafeInteger(value.exitCode))) &&
+    (value.signal === null || typeof value.signal === 'string')
+  );
+}
+
+function isRecordedProcessIdentity(value: unknown): value is RecordedProcessIdentity {
+  return (
+    hasExactKeys(value, ['pid', 'incarnation']) &&
+    typeof value.pid === 'number' &&
+    Number.isSafeInteger(value.pid) &&
+    value.pid > 0 &&
+    isProcessIncarnation(value.incarnation)
+  );
+}
+
+function isDurableControlMessage(value: unknown, expectedPid: number | undefined): value is DurableControlMessage {
+  if (hasExactKeys(value, ['type', 'runtimeRecord', 'leaderIncarnation', 'childRoot']) && value.type === 'runtime') {
+    return (
+      isDurableRuntimeRecord(value.runtimeRecord) &&
+      value.runtimeRecord.pid === expectedPid &&
+      (value.leaderIncarnation === null || isProcessIncarnation(value.leaderIncarnation)) &&
+      (value.childRoot === null || isRecordedProcessIdentity(value.childRoot))
+    );
+  }
+  return hasExactKeys(value, ['type', 'exitRecord']) && value.type === 'exit' && isExitRecord(value.exitRecord);
+}
+
+export function waitForDurableRuntime(options: { time: TimePort; wrapper: ReturnType<typeof spawnChild> }): Promise<{
+  runtimeRecord: DurableCliRuntimeRecord;
+  reportedLeaderIncarnation: ProcessIncarnation | null;
+  childRoot: RecordedProcessIdentity | null;
+  exitPromise: Promise<DurableProcessExit>;
+}> {
   const stdout = options.wrapper.stdout;
   const stderr = options.wrapper.stderr;
   if (!stdout || !stderr) {
@@ -754,66 +995,92 @@ function waitForDurableRuntime(options: {
 
   const runtimeDeferred = createDeferred<DurableCliRuntimeRecord>();
   const exitDeferred = createDeferred<DurableProcessExit>();
+  void exitDeferred.promise.catch(() => undefined);
   let runtimeRecord: DurableCliRuntimeRecord | null = null;
+  let reportedLeaderIncarnation: ProcessIncarnation | null = null;
+  let childRoot: RecordedProcessIdentity | null = null;
+  let exitRecord: DurableProcessExit | null = null;
   let stderrBuffer = '';
+  let stderrTruncated = false;
   let lineBuffer = '';
+  let controlFailed = false;
 
   const buildError = (detail: string): Error => new Error(`${detail}${trimStderr(stderrBuffer)}`);
+  const rejectControl = (error: Error): void => {
+    if (controlFailed) return;
+    controlFailed = true;
+    if (runtimeRecord === null) runtimeDeferred.reject(error);
+    else exitDeferred.reject(error);
+  };
 
   const handleControlLine = (line: string): void => {
     if (line.trim().length === 0) {
       return;
     }
 
-    let message: DurableControlMessage;
+    let parsed: unknown;
     try {
-      message = JSON.parse(line) as DurableControlMessage;
+      parsed = JSON.parse(line) as unknown;
     } catch (error: unknown) {
-      const wrapped = buildError(`Durable wrapper emitted invalid control JSON (${errorMessage(error)})`);
-      runtimeDeferred.reject(wrapped);
-      exitDeferred.reject(wrapped);
+      rejectControl(buildError(`Durable wrapper emitted invalid control JSON (${errorMessage(error)})`));
       return;
     }
 
+    if (!isDurableControlMessage(parsed, options.wrapper.pid)) {
+      rejectControl(buildError('Durable wrapper emitted an invalid control message'));
+      return;
+    }
+
+    const message = parsed;
     if (message.type === 'runtime') {
-      if (!isDurableCliRuntime(message.runtimeRecord)) {
-        const wrapped = buildError('Durable wrapper emitted an invalid runtime record');
-        runtimeDeferred.reject(wrapped);
-        exitDeferred.reject(wrapped);
-        return;
-      }
       runtimeRecord = message.runtimeRecord;
+      reportedLeaderIncarnation = message.leaderIncarnation;
+      childRoot = message.childRoot;
       runtimeDeferred.resolve(message.runtimeRecord);
       return;
     }
 
-    if (!isExitRecord(message.exitRecord)) {
-      const wrapped = buildError('Durable wrapper emitted an invalid exit record');
-      runtimeDeferred.reject(wrapped);
-      exitDeferred.reject(wrapped);
-      return;
-    }
-
-    exitDeferred.resolve(message.exitRecord);
+    exitRecord = message.exitRecord;
   };
 
   stdout.on('data', (chunk: string | Buffer) => {
-    lineBuffer += chunk.toString();
-    const lines = lineBuffer.split('\n');
-    lineBuffer = lines.pop() ?? '';
-    for (const line of lines) {
+    if (controlFailed) return;
+    const text = chunk.toString();
+    let offset = 0;
+    while (offset < text.length) {
+      const newline = text.indexOf('\n', offset);
+      const end = newline === -1 ? text.length : newline;
+      const segment = text.slice(offset, end);
+      if (lineBuffer.length + segment.length > MAX_BUFFER) {
+        lineBuffer = '';
+        rejectControl(buildError(`Durable wrapper control line exceeded the ${MAX_BUFFER}-character limit`));
+        return;
+      }
+      lineBuffer += segment;
+      if (newline === -1) return;
+      const line = lineBuffer;
+      lineBuffer = '';
       handleControlLine(line);
+      if (controlFailed) return;
+      offset = newline + 1;
     }
   });
 
   stderr.on('data', (chunk: string | Buffer) => {
-    stderrBuffer += chunk.toString();
+    if (stderrTruncated) return;
+    const text = chunk.toString();
+    const suffix = '\n[stderr truncated at buffer limit]';
+    const remaining = MAX_BUFFER - suffix.length - stderrBuffer.length;
+    if (text.length <= remaining) {
+      stderrBuffer += text;
+      return;
+    }
+    stderrBuffer += text.slice(0, Math.max(0, remaining)) + suffix;
+    stderrTruncated = true;
   });
 
   options.wrapper.on('error', (error: Error) => {
-    const wrapped = buildError(`Durable wrapper failed: ${error.message}`);
-    runtimeDeferred.reject(wrapped);
-    exitDeferred.reject(wrapped);
+    rejectControl(buildError(`Durable wrapper failed: ${error.message}`));
   });
 
   options.wrapper.on('close', (code, signal) => {
@@ -828,6 +1095,11 @@ function waitForDurableRuntime(options: {
       return;
     }
 
+    if (exitRecord !== null) {
+      exitDeferred.resolve(exitRecord);
+      return;
+    }
+
     exitDeferred.reject(
       buildError(
         signal
@@ -837,19 +1109,44 @@ function waitForDurableRuntime(options: {
     );
   });
 
-  const timeout = options.time.setTimeout(() => {
-    const wrapped = buildError(`Durable wrapper failed to report runtime within ${DURABLE_POLL_TIMEOUT_MS}ms`);
-    runtimeDeferred.reject(wrapped);
-    exitDeferred.reject(wrapped);
-  }, DURABLE_POLL_TIMEOUT_MS);
-  timeout.unref?.();
+  let readinessDeadline = options.time.monotonicNow() + BigInt(DURABLE_POLL_TIMEOUT_MS);
+  let requestedWake = readinessDeadline;
+  let postWakeTurnPending = false;
+  let timeout: ReturnType<TimePort['setTimeout']> | null = null;
+  const armReadinessCheck = (delayMs: number): void => {
+    requestedWake = options.time.monotonicNow() + BigInt(delayMs);
+    timeout = options.time.setTimeout(checkReadinessDeadline, delayMs);
+    timeout.unref?.();
+  };
+  function checkReadinessDeadline(): void {
+    if (runtimeRecord !== null || controlFailed) return;
+    const now = options.time.monotonicNow();
+    if (!postWakeTurnPending && now > requestedWake) {
+      readinessDeadline += now - requestedWake;
+    }
+    if (now < readinessDeadline) {
+      armReadinessCheck(Number(readinessDeadline - now));
+      return;
+    }
+    if (!postWakeTurnPending) {
+      postWakeTurnPending = true;
+      armReadinessCheck(0);
+      return;
+    }
+    rejectControl(buildError(`Durable wrapper failed to report runtime within ${DURABLE_POLL_TIMEOUT_MS}ms`));
+  }
+  armReadinessCheck(DURABLE_POLL_TIMEOUT_MS);
 
   return runtimeDeferred.promise
     .finally(() => options.time.clearTimeout(timeout))
-    .then((record) => ({
-      runtimeRecord: record,
-      exitPromise: exitDeferred.promise,
-    }));
+    .then((record) => {
+      return {
+        runtimeRecord: record,
+        reportedLeaderIncarnation,
+        childRoot,
+        exitPromise: exitDeferred.promise,
+      };
+    });
 }
 
 function normalizeSpawnSyncOutput(output: string | Buffer | null | undefined, encoding: BufferEncoding): string {

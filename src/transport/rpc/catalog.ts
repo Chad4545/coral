@@ -57,6 +57,8 @@ import { workflowRequestSchema } from './workflow.js';
 import { hostRefSchema } from '../../providers/host-ref-schema.js';
 import {
   liveProviderHostInventoryRecordSchema,
+  coordinatorShutdownHeldProviderHostInventoryRecordSchema,
+  proxyShutdownHeldProviderHostInventoryRecordSchema,
   reclamationFailedProviderHostInventoryRecordSchema,
   retiredBlockedProviderHostInventoryRecordSchema,
 } from '../../providers/host-inventory-schema.js';
@@ -68,6 +70,7 @@ import type {
 } from '../../recovery/unreadable-provider-operation.js';
 import {
   providerProxySetAliveEnforcerObservationsSchema,
+  providerProxySetEnforcerObservationsSchema,
   providerProxySetUnobservableEnforcerObservationsSchema,
 } from '../../provider-proxy/containment-proof-contract.js';
 import { PROVIDER_PROXY_SET_LIFECYCLE_STATES } from '../../provider-proxy/set-lifecycle-state-vocabulary.js';
@@ -129,10 +132,12 @@ export const unreadableProviderOperationDiscardResultSchema: ZodType<UnreadableP
   ]);
 
 const providerHostOwnerShape = { ownerId: z.string().min(1) };
-export const providerHostInventoryRowSchema = z.discriminatedUnion('status', [
+export const providerHostInventoryRowSchema = z.union([
   liveProviderHostInventoryRecordSchema.extend(providerHostOwnerShape).strict(),
   retiredBlockedProviderHostInventoryRecordSchema.extend(providerHostOwnerShape).strict(),
   reclamationFailedProviderHostInventoryRecordSchema.extend(providerHostOwnerShape).strict(),
+  coordinatorShutdownHeldProviderHostInventoryRecordSchema.extend(providerHostOwnerShape).strict(),
+  proxyShutdownHeldProviderHostInventoryRecordSchema.extend(providerHostOwnerShape).strict(),
 ]);
 
 export const providerHostListRequestSchema = z.object({}).strict();
@@ -152,6 +157,13 @@ export type ProviderHostInspectResponse = z.output<typeof providerHostInspectRes
 export type ProviderHostEvictResponse = z.output<typeof providerHostEvictResponseSchema>;
 
 export const providerProxySetContainRequestSchema = z
+  .object({
+    setIdentity: providerProxySetAddressSchema,
+    mode: z.enum(['contain', 'abandon']),
+  })
+  .strict();
+
+export const providerProxySetContainBooleanRequestSchema = z
   .object({
     setIdentity: providerProxySetAddressSchema,
     abandonWithoutAbsence: z.boolean(),
@@ -190,6 +202,23 @@ const providerProxySetOperationalIncidentSchema = z.discriminatedUnion('stage', 
 
 const providerProxySetClaimDischargeSchema = z.discriminatedUnion('kind', [
   z.object({ kind: z.literal('completed') }).strict(),
+  z
+    .object({
+      kind: z.literal('initial-disposition-pending'),
+      exit: z.literal('initial-disposition-settlement'),
+    })
+    .strict(),
+  z
+    .object({
+      kind: z.literal('operational-retry-owned'),
+      exit: z.literal('provider-proxy-set-release-retry'),
+      incidents: z.array(providerProxySetOperationalIncidentSchema).min(1).readonly(),
+    })
+    .strict(),
+]);
+
+const providerProxySetContainBooleanClaimDischargeSchema = z.discriminatedUnion('kind', [
+  z.object({ kind: z.literal('completed') }).strict(),
   z.object({ kind: z.literal('initial-disposition-retry-owned') }).strict(),
   z
     .object({
@@ -203,12 +232,28 @@ const providerProxySetContainEffectSchema = z
   .object({
     signalsSent: z.array(z.enum(['SIGTERM', 'SIGKILL'])).readonly(),
     containmentAbsent: z.boolean(),
+    representationAction: z.enum([
+      'none',
+      'absence-release-started',
+      'abandonment-release-started',
+      'fatal-release-abandoned',
+    ]),
+  })
+  .strict();
+const providerProxySetContainBooleanEffectSchema = z
+  .object({
+    signalsSent: z.array(z.enum(['SIGTERM', 'SIGKILL'])).readonly(),
+    containmentAbsent: z.boolean(),
     representationAction: z.enum(['none', 'absence-release-started', 'abandonment-release-started']),
   })
   .strict();
 const providerProxySetContainResultBase = {
   setIdentity: providerProxySetAddressSchema,
   effect: providerProxySetContainEffectSchema,
+};
+const providerProxySetContainBooleanResultBase = {
+  setIdentity: providerProxySetAddressSchema,
+  effect: providerProxySetContainBooleanEffectSchema,
 };
 const providerProxySetContainKnownResponseSchema = z.discriminatedUnion('kind', [
   z
@@ -223,18 +268,21 @@ const providerProxySetContainKnownResponseSchema = z.discriminatedUnion('kind', 
     .object({
       kind: z.literal('abandoned'),
       ...providerProxySetContainResultBase,
-      enforcerObservations: z.union([
-        providerProxySetAliveEnforcerObservationsSchema,
-        providerProxySetUnobservableEnforcerObservationsSchema,
-      ]),
+      enforcerObservations: providerProxySetEnforcerObservationsSchema,
       claimDischarge: providerProxySetClaimDischargeSchema,
     })
     .strict(),
   z
     .object({
-      kind: z.literal('unattributable-group-abandoned'),
+      kind: z.literal('representation-release-abandoned'),
       ...providerProxySetContainResultBase,
-      claimDischarge: providerProxySetClaimDischargeSchema,
+      successor: z.object({ owner: z.literal('operator-command'), acceptance: z.literal('accepted') }).strict(),
+    })
+    .strict(),
+  z
+    .object({
+      kind: z.literal('representation-release-abandonment-required'),
+      ...providerProxySetContainResultBase,
     })
     .strict(),
   z.object({ kind: z.literal('set-not-found'), ...providerProxySetContainResultBase }).strict(),
@@ -268,15 +316,108 @@ const providerProxySetContainKnownResponseSchema = z.discriminatedUnion('kind', 
     })
     .strict(),
   z.object({ kind: z.literal('recorded-group-unattributable'), ...providerProxySetContainResultBase }).strict(),
+  z.object({ kind: z.literal('signal-authorization-refused'), ...providerProxySetContainResultBase }).strict(),
+  z.object({ kind: z.literal('identity-unobservable'), ...providerProxySetContainResultBase }).strict(),
   z.object({ kind: z.literal('store-unreadable'), ...providerProxySetContainResultBase }).strict(),
+  z
+    .object({
+      kind: z.literal('containment-unconfirmed'),
+      ...providerProxySetContainResultBase,
+      recoveryAction: z.object({ kind: z.literal('retry-exact-set-containment') }).strict(),
+    })
+    .strict(),
 ]);
 
 export const providerProxySetContainResponseSchema = providerProxySetContainKnownResponseSchema;
 
-/** Exact-set containment input; abandonment authority must be chosen explicitly by the caller. */
+const providerProxySetContainBooleanLifecycleStateSchema = z.enum([
+  'acquiring',
+  'capsule-recovering',
+  'capsule-foreign',
+  'recovering',
+  'available',
+  'draining',
+  'reattaching',
+  'containing',
+  'containment-wait',
+  'absence-delivery-pending',
+  'abandonment-delivery-pending',
+]);
+
+export const providerProxySetContainBooleanResponseSchema = z.discriminatedUnion('kind', [
+  z
+    .object({
+      kind: z.literal('contained'),
+      ...providerProxySetContainBooleanResultBase,
+      disappearanceReceipt: z.string().min(1),
+      claimDischarge: providerProxySetContainBooleanClaimDischargeSchema,
+    })
+    .strict(),
+  z
+    .object({
+      kind: z.literal('abandoned'),
+      ...providerProxySetContainBooleanResultBase,
+      enforcerObservations: z.union([
+        providerProxySetAliveEnforcerObservationsSchema,
+        providerProxySetUnobservableEnforcerObservationsSchema,
+      ]),
+      claimDischarge: providerProxySetContainBooleanClaimDischargeSchema,
+    })
+    .strict(),
+  z
+    .object({
+      kind: z.literal('unattributable-group-abandoned'),
+      ...providerProxySetContainBooleanResultBase,
+      claimDischarge: providerProxySetContainBooleanClaimDischargeSchema,
+    })
+    .strict(),
+  z.object({ kind: z.literal('set-not-found'), ...providerProxySetContainBooleanResultBase }).strict(),
+  z
+    .object({
+      kind: z.literal('not-held'),
+      ...providerProxySetContainBooleanResultBase,
+      state: providerProxySetContainBooleanLifecycleStateSchema,
+    })
+    .strict(),
+  z
+    .object({
+      kind: z.literal('deadline-pending'),
+      ...providerProxySetContainBooleanResultBase,
+      remainingMs: z.number().finite().nonnegative(),
+    })
+    .strict(),
+  z.object({ kind: z.literal('authorization-stale'), ...providerProxySetContainBooleanResultBase }).strict(),
+  z
+    .object({
+      kind: z.literal('enforcer-alive'),
+      ...providerProxySetContainBooleanResultBase,
+      enforcerObservations: providerProxySetAliveEnforcerObservationsSchema,
+    })
+    .strict(),
+  z
+    .object({
+      kind: z.literal('enforcer-unobservable'),
+      ...providerProxySetContainBooleanResultBase,
+      enforcerObservations: providerProxySetUnobservableEnforcerObservationsSchema,
+    })
+    .strict(),
+  z.object({ kind: z.literal('recorded-group-unattributable'), ...providerProxySetContainBooleanResultBase }).strict(),
+  z.object({ kind: z.literal('signal-authorization-refused'), ...providerProxySetContainBooleanResultBase }).strict(),
+  z.object({ kind: z.literal('identity-unobservable'), ...providerProxySetContainBooleanResultBase }).strict(),
+  z.object({ kind: z.literal('store-unreadable'), ...providerProxySetContainBooleanResultBase }).strict(),
+  z
+    .object({
+      kind: z.literal('containment-unconfirmed'),
+      ...providerProxySetContainBooleanResultBase,
+      recoveryAction: z.object({ kind: z.literal('retry-exact-set-containment') }).strict(),
+    })
+    .strict(),
+]);
+
 export type ProviderProxySetContainRequest = z.output<typeof providerProxySetContainRequestSchema>;
-/** Exhaustive wire verdict including observable effects of a partially completed containment attempt. */
+export type ProviderProxySetContainBooleanRequest = z.output<typeof providerProxySetContainBooleanRequestSchema>;
 export type ProviderProxySetContainResponse = z.output<typeof providerProxySetContainResponseSchema>;
+export type ProviderProxySetContainBooleanResponse = z.output<typeof providerProxySetContainBooleanResponseSchema>;
 
 export const recoveryQuarantineClearRpcSpec = {
   name: 'coordinator.recovery_quarantine.clear',
@@ -335,15 +476,36 @@ export const providerHostEvictRpcSpec = {
   http: { method: 'POST', path: '/coordinator/provider-hosts/evict' },
 } as const satisfies RpcMethodSpec<unknown, unknown>;
 
-export const providerProxySetContainRpcSpec = {
+export const providerProxySetContainBooleanRpcSpec = {
   name: 'coordinator.provider_proxy_set.contain',
+  kind: 'unary',
+  requires: 'system:shutdown',
+  requestSchema: providerProxySetContainBooleanRequestSchema,
+  responseSchema: providerProxySetContainBooleanResponseSchema,
+  responseKind: 'json',
+  portKey: 'providerProxySets',
+  http: { method: 'POST', path: '/coordinator/provider-proxy-sets/contain' },
+} as const satisfies RpcMethodSpec<unknown, unknown>;
+
+export const providerProxySetContainRpcSpec = {
+  name: 'coordinator.provider_proxy_set.contain.v2',
   kind: 'unary',
   requires: 'system:shutdown',
   requestSchema: providerProxySetContainRequestSchema,
   responseSchema: providerProxySetContainResponseSchema,
   responseKind: 'json',
   portKey: 'providerProxySets',
-  http: { method: 'POST', path: '/coordinator/provider-proxy-sets/contain' },
+  http: { method: 'POST', path: '/coordinator/provider-proxy-sets/contain/v2' },
+} as const satisfies RpcMethodSpec<unknown, unknown>;
+
+export const jobsAbortRpcSpec = {
+  name: 'jobs.abort',
+  kind: 'unary',
+  requires: 'jobs:control',
+  requestSchema: jobAbortSchema,
+  responseKind: 'json',
+  portKey: 'jobs',
+  http: { method: 'POST', path: '/jobs/abort' },
 } as const satisfies RpcMethodSpec<unknown, unknown>;
 
 export const transportOperationalCarveouts = [
@@ -377,6 +539,7 @@ export const rpcCatalog = [
   providerHostListRpcSpec,
   providerHostInspectRpcSpec,
   providerHostEvictRpcSpec,
+  providerProxySetContainBooleanRpcSpec,
   providerProxySetContainRpcSpec,
   {
     name: 'coordinator.equipExpansion',
@@ -423,15 +586,7 @@ export const rpcCatalog = [
     portKey: 'expansion',
     http: { method: 'GET', path: '/coordinator/bindings/:binding' },
   },
-  {
-    name: 'jobs.abort',
-    kind: 'unary',
-    requires: 'jobs:control',
-    requestSchema: jobAbortSchema,
-    responseKind: 'json',
-    portKey: 'jobs',
-    http: { method: 'POST', path: '/jobs/abort' },
-  },
+  jobsAbortRpcSpec,
   {
     name: 'jobs.list',
     kind: 'unary',

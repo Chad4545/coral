@@ -4,14 +4,10 @@ import { z } from 'zod';
 import type { BuildFlavor } from './build-flavor.js';
 import type { CoralPaths } from './path/index.js';
 import type { EnvPort, StoragePort } from './port-types.js';
-import {
-  observeProcessLiveness,
-  processIncarnationSchema,
-  probeProcessIncarnation,
-  type ProcessIncarnation,
-} from './node-process.js';
+import { MAX_PROCESS_INCARNATION_LENGTH, observeProcessLiveness, type ProcessIncarnation } from './node-process.js';
 import { backendLog } from './backend-log.js';
 import { isNoEntryError } from './fs-errors.js';
+import type { Runtime } from '../runtime/ports.js';
 
 /** Connection and authentication evidence only; executable identity comes from authenticated health. */
 export interface CoordinatorDiscoveryRecord {
@@ -47,12 +43,19 @@ export type DiscoveryRuntime = {
   env: DiscoveryEnv;
   paths: { readonly coral: CoralPaths };
 };
+export type DiscoveryWriterRuntime = DiscoveryRuntime & {
+  process: Pick<Runtime['process'], 'readProcessIncarnation'>;
+};
 
 /** Where a record that names no host is assumed to be listening. */
 export const DEFAULT_DISCOVERY_HOST = '127.0.0.1';
 
 const nonEmptyStringSchema = z.string().min(1);
 const positiveIntegerSchema = z.number().int().positive();
+const durableProcessIncarnationSchema = z
+  .string()
+  .min(1)
+  .max(MAX_PROCESS_INCARNATION_LENGTH) as unknown as z.ZodType<ProcessIncarnation>;
 const coordinatorDiscoveryRecordSchema = z
   .object({
     pid: positiveIntegerSchema,
@@ -68,7 +71,7 @@ const coordinatorDiscoveryRecordSchema = z
     host: nonEmptyStringSchema.optional(),
     version: nonEmptyStringSchema.optional(),
     instanceId: nonEmptyStringSchema.optional(),
-    incarnation: processIncarnationSchema.optional(),
+    incarnation: durableProcessIncarnationSchema.optional(),
   })
   // A build older than a future field must still read this record — `.strict()` would make that build's
   // `probeCoordinator` reject it outright the day a newer writer adds one, when every field it already
@@ -84,10 +87,12 @@ function discoveryFilePath(runtime: DiscoveryRuntime): string {
   return runtime.paths.coral.coordinator.infoFile;
 }
 
-export function writeDiscoveryRecord(record: CoordinatorDiscoveryRecord, runtime: DiscoveryRuntime): void {
+export function writeDiscoveryRecord(record: CoordinatorDiscoveryRecord, runtime: DiscoveryWriterRuntime): void {
   const infoPath = discoveryFilePath(runtime);
   const incarnation =
-    record.incarnation ?? probeProcessIncarnation(record.pid, runtime.env.platform() as NodeJS.Platform) ?? undefined;
+    record.incarnation ??
+    runtime.process.readProcessIncarnation(record.pid, runtime.env.platform() as NodeJS.Platform) ??
+    undefined;
   if (incarnation === undefined) {
     // Said out loud because the consequence arrives much later and looks like something else: a contender can
     // only signal a pid whose incarnation the incumbent published, so a record written without one leaves this
@@ -230,7 +235,7 @@ export function probeCoordinator(runtime: DiscoveryRuntime): CoordinatorProbe {
   }
 }
 
-export function writeBackendInfo(info: BackendInfo, runtime: DiscoveryRuntime): void {
+export function writeBackendInfo(info: BackendInfo, runtime: DiscoveryWriterRuntime): void {
   writeDiscoveryRecord(info, runtime);
 }
 

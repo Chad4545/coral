@@ -121,21 +121,8 @@ export class ProviderHostUnserviceableResponseError extends Error {
   }
 }
 
-const SIGNALABLE_PROCESS_GROUP_PLATFORMS: ReadonlySet<string> = new Set([
-  'aix',
-  'android',
-  'cygwin',
-  'darwin',
-  'freebsd',
-  'haiku',
-  'linux',
-  'netbsd',
-  'openbsd',
-  'sunos',
-]);
-
 export function canSignalProviderHostProcessGroup(platform: string): boolean {
-  return SIGNALABLE_PROCESS_GROUP_PLATFORMS.has(platform);
+  return platform === 'linux';
 }
 
 export class ProviderHostUnsupportedPlatformError extends Error {
@@ -145,8 +132,8 @@ export class ProviderHostUnsupportedPlatformError extends Error {
   constructor(platform: string) {
     super(
       `Provider host admission is unsupported on platform '${platform}': ` +
-        'Coral requires detached provider servers to form a signalable POSIX process group. ' +
-        'Run Coral on a supported POSIX platform.',
+        'Coral requires detached provider servers whose recorded identity can authorize teardown after launch. ' +
+        'Run Coral on Linux.',
     );
     this.name = 'ProviderHostUnsupportedPlatformError';
     this.platform = platform;
@@ -198,6 +185,7 @@ type AdmissionEvent =
   | Readonly<{ kind: 'mark-live'; slot: AdmissionSlotKey; ref: HostRef; generation: number }>
   | Readonly<{ kind: 'block'; slot: AdmissionSlotKey; ref: HostRef; generation: number }>
   | Readonly<{ kind: 'retired'; ref: HostRef }>
+  | Readonly<{ kind: 'abandoned'; ref: HostRef }>
   | Readonly<{ kind: 'confirm-evicted'; ref: HostRef }>;
 
 export function admissionSlotKey(value: string): AdmissionSlotKey {
@@ -217,6 +205,16 @@ export function exactHostRefsMatch(left: HostRef, right: HostRef): boolean {
   return left.leaseMode === 'shared' || (right.leaseMode === 'job-exclusive' && left.ownerJobId === right.ownerJobId);
 }
 
+export function exactHostRefIdentityKey(ref: HostRef): string {
+  return JSON.stringify([
+    ref.provider,
+    ref.fingerprint,
+    ref.instanceId,
+    ref.leaseMode,
+    ref.leaseMode === 'job-exclusive' ? ref.ownerJobId : null,
+  ]);
+}
+
 export function reduceHostAdmission(state: HostAdmissionState, event: AdmissionEvent): HostAdmissionState {
   switch (event.kind) {
     case 'reserve':
@@ -227,6 +225,8 @@ export function reduceHostAdmission(state: HostAdmissionState, event: AdmissionE
       return blockAdmissionCandidate(state, event.slot, event.ref, event.generation);
     case 'retired':
       return retireAdmissionCandidate(state, event.ref);
+    case 'abandoned':
+      return abandonAdmissionCandidate(state, event.ref);
     case 'confirm-evicted':
       return confirmAdmissionCandidateEvicted(state, event.ref);
   }
@@ -273,6 +273,11 @@ function confirmAdmissionCandidateEvicted(state: HostAdmissionState, ref: HostRe
   return withoutEntry(state, match.slot);
 }
 
+function abandonAdmissionCandidate(state: HostAdmissionState, ref: HostRef): HostAdmissionState {
+  const match = findExactRef(state, ref);
+  return match === null ? state : withoutEntry(state, match.slot);
+}
+
 type Placement = Readonly<{
   slot: AdmissionSlotKey;
   ref: HostRef;
@@ -296,6 +301,7 @@ export type HostAdmissionCollection = Readonly<{
   observe(slot: AdmissionSlotKey, ref: HostRef, fact: ProviderResponseDiagnosticFact): void;
   correlateTerminalFailure<Result>(ref: HostRef, operation: () => Promise<Result>): Promise<Result>;
   observeRetired(ref: HostRef, processState: HostProcessState): void;
+  abandon(ref: HostRef): boolean;
   confirmEvicted(ref: HostRef): boolean;
   snapshot(): HostAdmissionSnapshot;
 }>;
@@ -352,6 +358,16 @@ export function createHostAdmissionCollection(options: {
       }
     },
     observeRetired,
+    abandon(ref) {
+      const before = data.state;
+      const match = findExactRef(before, ref);
+      data.state = reduceHostAdmission(before, { kind: 'abandoned', ref });
+      if (data.state === before || match === null) return false;
+      data.placements.delete(match.slot);
+      data.serviceability.delete(match.slot);
+      tombstones.delete(match.slot);
+      return true;
+    },
     confirmEvicted(ref) {
       return confirmHostEvicted(data, tombstones, ref);
     },

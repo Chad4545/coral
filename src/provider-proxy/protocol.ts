@@ -1,9 +1,10 @@
-import { processIncarnationSchema, type ProcessIncarnation } from '../infra/node-process.js';
 import { isAbsolute, normalize } from 'node:path';
 
 import { z } from 'zod';
 
 import { nonEmptyStringSchema } from '../infra/identifiers.js';
+import { processIncarnationSchema, type ProcessIncarnation } from '../infra/node-process.js';
+import type { RecordedContainmentIdentity, RecordedProcessIdentity } from '../infra/process-containment.js';
 import { jsonValueSchema } from '../infra/json-value.js';
 import { providerBindingEnvelopeSchema } from '../infra/provider-binding-envelope.js';
 import {
@@ -19,6 +20,7 @@ import { hostRefSchema } from '../providers/host-ref-schema.js';
 import { providerHostRemediationSchema } from '../providers/host-admission.js';
 import {
   providerHostInventoryRecordSchema as sharedProviderHostInventoryRecordSchema,
+  providerHostInventoryRecordV1Schema as sharedProviderHostInventoryRecordV1Schema,
   type ProviderHostInventoryRecordWire as SharedProviderHostInventoryRecordWire,
 } from '../providers/host-inventory-schema.js';
 import {
@@ -27,17 +29,23 @@ import {
   operationPrepareAttemptNumberSchema,
 } from './ledger.js';
 
+export const GUARDIAN_CONSTRUCTION_CONTAINMENT_SETTLED_EXIT_CODE = 74;
+
+export function providerProxyDisappearanceReceipt(
+  containment: RecordedContainmentIdentity,
+  roots: readonly RecordedProcessIdentity[],
+): string {
+  const targets = [
+    `group:${containment.processGroupId}`,
+    `leader:${containment.pid}@${containment.incarnation}`,
+    ...roots.map((root) => `root:${root.pid}@${root.incarnation}`),
+  ];
+  return targets.join(',');
+}
+
 /**
- * Every control method carries a `.vN` suffix, and every one of them is `.v1`.
- *
- * The suffix exists because this protocol is spoken between *processes*, not between code paths: a coordinator
- * can inherit a proxy set that an entirely different build spawned, and an already-running responder cannot be
- * retrofitted. So when a shape has to change incompatibly while an older set may still be answering, a second
- * number is the honest way to say so — the two versions coexist in different processes, never in one build.
- *
- * That is the only thing the suffix means. Nothing parses it; a peer that does not implement a method answers
- * `method_not_found` (`control-endpoint.ts`), which is what callers actually branch on. So a number may only be
- * raised once a build carrying the lower one has shipped.
+ * An incompatible cross-process shape must use its own versioned method address. Callers may fall back to an
+ * older address only when the peer reports `method_not_found`.
  */
 export const MAX_PROXY_CONTROL_FRAME_BYTES = 17 * 1024 * 1024;
 // Reflecting a peer-supplied challenge in the larger outbound params frame must stay far below the frame cap.
@@ -45,6 +53,8 @@ export const MAX_HEARTBEAT_CHALLENGE_CHARACTERS = 1_024;
 export const PROXY_CONTROL_RPC_TIMEOUT_MS = 5_000;
 export const PROXY_EVENT_COMMIT_TIMEOUT_MS = 30_000;
 export const PROXY_STATUS_RPC_TIMEOUT_MS = 500;
+/** Endpoint-refusal proof must be minted only before method invocation. */
+export const PROXY_CONTROL_PRE_DISPATCH_REFUSAL_JSON_RPC_CODE = -32_099;
 
 /**
  * How many operations one `operation.status.v1` request may name.
@@ -157,9 +167,16 @@ export const providerHostInventoryRecordSchema = sharedProviderHostInventoryReco
 export type ProviderHostInventoryRecordWire = SharedProviderHostInventoryRecordWire;
 
 export const providerHostListParamsSchema = z.object({}).strict();
-export const providerHostListResultSchema = z.object({ hosts: z.array(providerHostInventoryRecordSchema) }).strict();
+export const providerHostListResultV1Schema = z
+  .object({ hosts: z.array(sharedProviderHostInventoryRecordV1Schema) })
+  .strict();
+export const providerHostListResultV2Schema = z.object({ hosts: z.array(providerHostInventoryRecordSchema) }).strict();
 export const providerHostInspectParamsSchema = z.object({ hostRef: hostRefSchema }).strict();
-export const providerHostInspectResultSchema = z.discriminatedUnion('state', [
+export const providerHostInspectResultV1Schema = z.discriminatedUnion('state', [
+  z.object({ state: z.literal('matched'), host: sharedProviderHostInventoryRecordV1Schema }).strict(),
+  z.object({ state: z.literal('stale') }).strict(),
+]);
+export const providerHostInspectResultV2Schema = z.discriminatedUnion('state', [
   z.object({ state: z.literal('matched'), host: providerHostInventoryRecordSchema }).strict(),
   z.object({ state: z.literal('stale') }).strict(),
 ]);
@@ -167,6 +184,45 @@ export const providerHostEvictParamsSchema = z.object({ hostRef: hostRefSchema }
 export const providerHostEvictResultSchema = z.discriminatedUnion('state', [
   z.object({ state: z.literal('evicted') }).strict(),
   z.object({ state: z.literal('stale') }).strict(),
+]);
+const providerHostEvictedDispositionSchema = z.object({ kind: z.literal('evicted') }).strict();
+const providerHostOperatorAbandonedDispositionSchema = z
+  .object({
+    kind: z.literal('operator-abandoned'),
+    subject: z.discriminatedUnion('kind', [
+      z.object({ kind: z.literal('process'), pid: z.number().int().positive().safe().nullable() }).strict(),
+      z.object({ kind: z.literal('process-group'), processGroupId: z.number().int().positive().safe() }).strict(),
+      z
+        .object({
+          kind: z.literal('unattributable-process-group'),
+          processGroupId: z.number().int().positive().safe().nullable(),
+        })
+        .strict(),
+    ]),
+    processAbsenceProven: z.literal(false),
+    successor: z.object({ owner: z.literal('operator-command'), acceptance: z.literal('accepted') }).strict(),
+  })
+  .strict();
+export const providerHostTerminalEvictionDispositionSchema = z.discriminatedUnion('kind', [
+  providerHostEvictedDispositionSchema,
+  providerHostOperatorAbandonedDispositionSchema,
+]);
+export const providerHostTerminalEvictionResultV2Schema = z.discriminatedUnion('state', [
+  z.object({ state: z.literal('matched'), disposition: providerHostTerminalEvictionDispositionSchema }).strict(),
+  z.object({ state: z.literal('stale') }).strict(),
+]);
+export const providerHostEvictResultV2Schema = z.discriminatedUnion('kind', [
+  providerHostEvictedDispositionSchema,
+  z.object({ kind: z.literal('stale') }).strict(),
+  z
+    .object({
+      kind: z.literal('held'),
+      observation: z.enum(['alive', 'unobservable']),
+      successorOwner: z.string().min(1).nullable(),
+      operatorExit: z.string().min(1),
+    })
+    .strict(),
+  providerHostOperatorAbandonedDispositionSchema,
 ]);
 export const generationSchema = z.literal('gen2');
 export const flavorSchema = z.enum(['prod', 'dev']);
@@ -373,26 +429,20 @@ export function assertNamedCoordinatorBuild(
   }
 }
 
-/** The caller names the roots it believes are recorded. This is a subset check, not an equality check: the
- *  enforcer's recorded set is a superset of the caller's claim by construction. The coordinator can only ever
- *  claim roots its own live registry still tracks (`LocalOperationRegistry.providerRootsFor`), and an
- *  operation's root drops out of that live registry the instant its terminal commits (`settled()`) — which can
- *  race a concurrent teardown reading the enforcer's own, still-recorded set. A claim that undershoots what the
- *  enforcer recorded is exactly what that race looks like, not a fault. What teardown must still surface is the
- *  other direction: a claim naming a root the enforcer never recorded means one side is reasoning about a
- *  different containment — the same check both the guardian and the reaper perform on their own half of the
- *  same stop-and-reap request. */
-export function assertRecordedSetAgreement(
+/** Containment commit requires exact membership equality after both registration gates drain. */
+export function assertExactRecordedSetAgreement(
   role: 'guardian' | 'reaper',
-  claimed: readonly { pid: number; incarnation: ProcessIncarnation }[],
-  recorded: readonly { pid: number; incarnation: ProcessIncarnation }[],
+  guardianRoots: readonly { pid: number; incarnation: ProcessIncarnation }[],
+  reaperRoots: readonly { pid: number; incarnation: ProcessIncarnation }[],
 ): void {
   const key = (root: { pid: number; incarnation: ProcessIncarnation }): string => `${root.pid}@${root.incarnation}`;
-  const recordedKeys = new Set(recorded.map(key));
-  if (claimed.some((root) => !recordedKeys.has(key(root)))) {
+  const guardianKeys = new Set(guardianRoots.map(key));
+  const reaperKeys = new Set(reaperRoots.map(key));
+  const exact = guardianKeys.size === reaperKeys.size && [...guardianKeys].every((k) => reaperKeys.has(k));
+  if (!exact) {
     throw new ProxyControlProtocolError(
       'identity_mismatch',
-      `Teardown named a different provider-root set than this ${role} recorded.`,
+      `The guardian and reaper recorded a different provider-root set (checked by ${role}).`,
     );
   }
 }
@@ -534,24 +584,34 @@ export const guardianProxyOperationReleaseParamsSchema = z
   })
   .strict();
 
-/** `guardian.stop-and-reap.v1`'s request. Sent by `set-authority.ts`'s `stopAndReap`. */
-export const guardianStopAndReapParamsSchema = z
+/** A containment commit must derive roots from both enforcers, never coordinator claims. */
+export const guardianContainmentCommitParamsSchema = z
   .object({
     guardian: guardianIdentitySchema,
     reaper: reaperIdentitySchema,
     proxy: proxyIdentitySchema,
+  })
+  .strict();
+
+export const reaperContainmentPrepareParamsSchema = z.object({}).strict();
+
+/** A membership-barrier token may be consumed only by the matching containment abort. */
+export const containmentPrepareTokenSchema = z.string().min(1).brand<'ContainmentPrepareToken'>();
+export type ContainmentPrepareToken = z.infer<typeof containmentPrepareTokenSchema>;
+
+export const reaperContainmentPrepareResultSchema = z
+  .object({
+    state: z.literal('containment-prepared'),
+    token: containmentPrepareTokenSchema,
     providerRoots: z.array(providerRootSchema).max(MAX_PROXY_OPERATION_LEDGERS),
   })
   .strict();
 
-/** `reaper.stop-and-reap.v1`'s request. The coordinator sends this beside the guardian request and requires
- *  both replies before it may release the set slot. */
-export const reaperStopAndReapParamsSchema = z
-  .object({
-    reaper: reaperIdentitySchema,
-    proxy: proxyIdentitySchema,
-    providerRoots: z.array(providerRootSchema).max(MAX_PROXY_OPERATION_LEDGERS),
-  })
+/** A containment abort must present the current prepare token. */
+export const reaperContainmentAbortParamsSchema = z.object({ token: containmentPrepareTokenSchema }).strict();
+
+export const reaperContainmentAbortResultSchema = z
+  .object({ state: z.literal('containment-registration-reopened') })
   .strict();
 
 /**
@@ -571,13 +631,133 @@ export const guardianProxyOperationReleaseResultSchema = z
   .object({ state: z.enum(['membership-released', 'membership-absent']) })
   .strict();
 
-/** `guardian.stop-and-reap.v1`'s result. */
-export const guardianStopAndReapResultSchema = z
-  .object({ state: z.literal('containment-absent'), disappearanceReceipt: z.string().min(1) })
+/** Post-latch failure remains a result so a transport refusal continues to prove teardown never latched. */
+export const guardianContainmentCommitResultSchema = z.discriminatedUnion('state', [
+  z.object({ state: z.literal('containment-absent'), disappearanceReceipt: z.string().min(1) }).strict(),
+  z.object({ state: z.literal('teardown-latched-absence-unconfirmed'), reason: z.string() }).strict(),
+]);
+
+/** Initial acquisition must publish guardian and reaper before proxy while preserving their exact binding. */
+export const acquisitionPublicationCertificateSchema = z.string().min(1).brand<'AcquisitionPublicationCertificate'>();
+export type AcquisitionPublicationCertificate = z.infer<typeof acquisitionPublicationCertificateSchema>;
+
+export const guardianAcquisitionPublishParamsSchema = z
+  .object({ guardian: guardianIdentitySchema, reaper: reaperIdentitySchema, proxy: proxyIdentitySchema })
   .strict();
 
-export const reaperStopAndReapResultSchema = z
-  .object({ state: z.literal('containment-absent'), disappearanceReceipt: z.string().min(1) })
+const guardianAcquisitionPublishedResultSchema = z
+  .object({
+    state: z.literal('acquisition-published'),
+    certificate: acquisitionPublicationCertificateSchema,
+    guardian: guardianIdentitySchema,
+    reaper: reaperIdentitySchema,
+  })
+  .strict();
+
+export const acquisitionPublicationUnknownResultSchema = z
+  .object({ state: z.literal('acquisition-publication-unknown'), reason: z.string().min(1).max(500) })
+  .strict();
+
+/** Only transport-owned proof that no request left the guardian may construct this disposition. */
+export const acquisitionPublicationNotAttemptedResultSchema = z
+  .object({ state: z.literal('acquisition-publication-not-attempted'), reason: z.string().min(1).max(500) })
+  .strict();
+
+/** Publication success, proven non-attempt, and ambiguity must remain distinct on the wire. */
+export const guardianAcquisitionPublishResultSchema = z.discriminatedUnion('state', [
+  guardianAcquisitionPublishedResultSchema,
+  acquisitionPublicationNotAttemptedResultSchema,
+  acquisitionPublicationUnknownResultSchema,
+]);
+
+export const guardianAcquisitionAbortParamsSchema = z
+  .object({ guardian: guardianIdentitySchema, reaper: reaperIdentitySchema, proxy: proxyIdentitySchema })
+  .strict();
+
+export const guardianAcquisitionAbortResultSchema = z
+  .object({ state: z.enum(['acquisition-aborted', 'already-published']) })
+  .strict();
+
+export const reaperAcquisitionPublishParamsSchema = z.object({}).strict();
+export const reaperAcquisitionPublishResultSchema = z.object({ state: z.literal('acquisition-published') }).strict();
+
+export const proxyAcquisitionPublishParamsSchema = z
+  .object({
+    certificate: acquisitionPublicationCertificateSchema,
+    guardian: guardianIdentitySchema,
+    reaper: reaperIdentitySchema,
+  })
+  .strict();
+
+export const proxyAcquisitionPublishResultSchema = z.object({ state: z.literal('acquisition-published') }).strict();
+
+export const proxyAcquisitionAbortParamsSchema = z.object({}).strict();
+export const proxyAcquisitionAbortResultSchema = z
+  .object({ state: z.enum(['acquisition-aborted', 'already-published']) })
+  .strict();
+
+export const holderStatusDispositionSchema = z.enum(['alive', 'unobservable', 'departed']);
+export const holderLifecyclePhaseSchema = z.enum(['acquisition-provisional', 'published']);
+export const controlTenancyHolderWireSchema = coordinatorIdentitySchema
+  .pick({ instanceId: true, pid: true, incarnation: true })
+  .strict();
+
+export const providerProxyRoleIdentitySchema = z
+  .object({
+    role: z.enum(['guardian', 'reaper']),
+    pid: z.number().int().positive().safe(),
+    incarnation: processIncarnationSchema,
+  })
+  .strict();
+export type ProviderProxyRoleIdentity = z.infer<typeof providerProxyRoleIdentitySchema>;
+
+export const providerProxyRoleAbandonmentParamsSchema = z
+  .object({
+    credential: z.unknown(),
+    roleIdentity: providerProxyRoleIdentitySchema,
+  })
+  .strict();
+
+export const providerProxyRoleAbandonmentResultSchema = z
+  .object({ state: z.literal('unattributable-containment-abandoned') })
+  .strict();
+
+const enforcementHoldRetrySchema = z.discriminatedUnion('state', [
+  z.object({ state: z.literal('scheduled'), nextProbeAtMs: nonNegativeSafeIntegerSchema }).strict(),
+  z.object({ state: z.literal('in-progress') }).strict(),
+  z.object({ state: z.literal('operator-action-required') }).strict(),
+]);
+
+const enforcementHoldStatusBaseSchema = z.object({
+  attempts: z.number().int().safe().positive(),
+  roleIdentity: providerProxyRoleIdentitySchema,
+  retry: enforcementHoldRetrySchema,
+});
+
+export const enforcementHoldStatusSchema = z.discriminatedUnion('kind', [
+  enforcementHoldStatusBaseSchema
+    .extend({
+      kind: z.literal('recorded-group-unattributable'),
+    })
+    .strict(),
+  enforcementHoldStatusBaseSchema
+    .extend({
+      kind: z.literal('reap-failed'),
+      reason: z.literal('process-containment-reap-failed'),
+    })
+    .strict(),
+]);
+
+export const holderStatusResultSchema = z
+  .object({
+    disposition: holderStatusDispositionSchema,
+    phase: holderLifecyclePhaseSchema,
+    holder: controlTenancyHolderWireSchema,
+    controlEpoch: controlEpochSchema,
+    transitionSequence: nonNegativeSafeIntegerSchema,
+    changedAtMs: nonNegativeSafeIntegerSchema,
+    enforcementHold: enforcementHoldStatusSchema.nullable().default(null),
+  })
   .strict();
 
 /** The process-group containment a `reaper.open.v1` claims, and the one the reaper then holds for its whole

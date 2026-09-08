@@ -22,13 +22,15 @@ const WINDOWS = [
   { kind: 'clear' },
   {
     kind: 'silence',
-    firstObservedAtMonotonicMs: 0n,
+    lastObservedAtMonotonicMs: 0n,
+    observedDurationMs: 4_000,
     attempts: 2,
     schedulerLatenessAfterFirstObservationMs: 0,
   },
   {
     kind: 'answered-unusable',
-    firstObservedAtMonotonicMs: 0n,
+    lastObservedAtMonotonicMs: 0n,
+    observedDurationMs: 4_000,
     attempts: 2,
     schedulerLatenessAfterFirstObservationMs: 0,
   },
@@ -199,12 +201,15 @@ describe('heartbeat evidence-window reducer', () => {
               window.kind === 'answered-unusable'
                 ? {
                     ...window,
+                    lastObservedAtMonotonicMs: 10_000n,
+                    observedDurationMs: 5_000,
                     attempts: 3,
                     schedulerLatenessAfterFirstObservationMs: 100,
                   }
                 : {
                     kind: 'answered-unusable',
-                    firstObservedAtMonotonicMs: 10_000n,
+                    lastObservedAtMonotonicMs: 10_000n,
+                    observedDurationMs: 0,
                     attempts: 1,
                     schedulerLatenessAfterFirstObservationMs: 0,
                   },
@@ -221,10 +226,17 @@ describe('heartbeat evidence-window reducer', () => {
       effect: window.kind === 'silence' ? 'silence-bound-exhausted' : 'silence-holding',
       window:
         window.kind === 'silence'
-          ? { ...window, attempts: 3, schedulerLatenessAfterFirstObservationMs: 100 }
+          ? {
+              ...window,
+              lastObservedAtMonotonicMs: 10_000n,
+              observedDurationMs: 5_000,
+              attempts: 3,
+              schedulerLatenessAfterFirstObservationMs: 100,
+            }
           : {
               kind: 'silence',
-              firstObservedAtMonotonicMs: 10_000n,
+              lastObservedAtMonotonicMs: 10_000n,
+              observedDurationMs: 0,
               attempts: 1,
               schedulerLatenessAfterFirstObservationMs: 0,
             },
@@ -246,25 +258,65 @@ describe('heartbeat evidence-window reducer', () => {
     },
   );
 
-  it('excludes the opening observation lateness and resets only after accumulated later lateness is material', () => {
-    const opened = applyNoResponse({ kind: 'clear' }, NO_RESPONSE, {
+  it('rebases repeated sub-cadence scheduler lateness instead of charging it to the peer', () => {
+    let progress = applyNoResponse({ kind: 'clear' }, NO_RESPONSE, {
       nowMonotonicMs: 0n,
-      schedulerLatenessMs: BOUND.materialSchedulerLatenessMs,
+      schedulerLatenessMs: 0,
       bound: BOUND,
     });
-    expect(opened.window.schedulerLatenessAfterFirstObservationMs).toBe(0);
 
-    const reset = applyNoResponse(opened.window, NO_RESPONSE, {
-      nowMonotonicMs: BigInt(BOUND.spanMs),
-      schedulerLatenessMs: BOUND.materialSchedulerLatenessMs,
-      bound: BOUND,
-    });
-    expect(reset).toMatchObject({
+    for (const nowMonotonicMs of [1_250n, 2_500n, 3_750n, 5_000n]) {
+      progress = applyNoResponse(progress.window, NO_RESPONSE, {
+        nowMonotonicMs,
+        schedulerLatenessMs: 250,
+        bound: BOUND,
+      });
+    }
+
+    expect(progress).toMatchObject({
       effect: 'silence-holding',
       window: {
-        firstObservedAtMonotonicMs: BigInt(BOUND.spanMs),
+        lastObservedAtMonotonicMs: 5_000n,
+        observedDurationMs: 4_000,
+        attempts: 5,
+        schedulerLatenessAfterFirstObservationMs: 1_000,
+      },
+    });
+
+    const exhausted = applyNoResponse(progress.window, NO_RESPONSE, {
+      nowMonotonicMs: 6_250n,
+      schedulerLatenessMs: 250,
+      bound: BOUND,
+    });
+    expect(exhausted).toMatchObject({
+      effect: 'silence-holding',
+      window: {
+        lastObservedAtMonotonicMs: 6_250n,
+        observedDurationMs: 0,
         attempts: 1,
         schedulerLatenessAfterFirstObservationMs: 0,
+      },
+    });
+  });
+
+  it.each([60_000n, 600_000n])('charges a %sms late wake as one scheduled cadence', (lateWakeMs) => {
+    const opened = applyNoResponse({ kind: 'clear' }, NO_RESPONSE, {
+      nowMonotonicMs: 0n,
+      schedulerLatenessMs: 0,
+      bound: BOUND,
+    });
+    const afterLateWake = applyNoResponse(opened.window, NO_RESPONSE, {
+      nowMonotonicMs: lateWakeMs,
+      schedulerLatenessMs: Number(lateWakeMs - 1_000n),
+      bound: BOUND,
+    });
+
+    expect(afterLateWake).toMatchObject({
+      effect: 'silence-holding',
+      window: {
+        lastObservedAtMonotonicMs: lateWakeMs,
+        observedDurationMs: 1_000,
+        attempts: 2,
       },
     });
   });

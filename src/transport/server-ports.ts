@@ -10,7 +10,10 @@ import type { RpcPorts } from './rpc/ports.js';
 import type { Principal } from '../security/principal.js';
 import type { IpcAuthMetadata } from './ipc/json-rpc.js';
 import type { ProviderScope } from '../infra/provider-scope.js';
-import type { ProviderProxySetEnforcerObservations } from '../provider-proxy/containment-proof-contract.js';
+import type {
+  ProviderProxySetDurableDispositionSkipStatus,
+  ProviderProxySetOperatorStatus,
+} from '../provider-proxy/operator-disposition-vocabulary.js';
 
 interface AdminControlPort {
   getLifecycleState?(): 'starting' | 'kernel-ready' | 'running' | 'draining' | 'stopped';
@@ -174,28 +177,8 @@ export type HealthSnapshot = {
       contentSeq?: number;
       metadataSeq?: number;
     }>;
-    providerProxySets?: Array<{
-      setIdentity: { buildSetId: string; hostFingerprint: string; proxyInstanceId: string };
-      setToken: string;
-      disposition: 'held' | 'awaiting-containment-absence' | 'operator-exit-refused';
-      role?: string;
-      method?: string;
-      cause?: 'closed' | 'invalid-unattributable-frame';
-      attempts?: number;
-      elapsedMs?: number;
-      boundMs?: number;
-      liveClaims?: number;
-      enforcerObservations?: ProviderProxySetEnforcerObservations;
-      incidentReason: string;
-      waitingFor:
-        | 'heartbeat-evidence-window'
-        | 'control-reattachment'
-        | 'independent-containment-absence'
-        | 'ordinary-drain'
-        | 'set-adoption-deadline'
-        | 'operator-abandonment'
-        | 'store-repair';
-    }>;
+    providerProxySets?: ProviderProxySetOperatorStatus[];
+    providerProxyDispositionSkips?: ProviderProxySetDurableDispositionSkipStatus[];
   };
 };
 

@@ -298,6 +298,11 @@ function summarizeActions(actions: RecoveryAction[]) {
           jobId: action.jobId,
           fault: action.fault.kind,
         };
+      case 'resolvePreReadyLaunch':
+        return {
+          type: action.type,
+          jobId: action.jobId,
+        };
       case 'releaseSessionClaim':
         return {
           type: action.type,
@@ -358,9 +363,31 @@ describe('planRecovery', () => {
     expect(plan.register).toEqual([]);
     expect(plan.cleanup).toEqual([
       {
-        type: 'markError',
+        type: 'resolvePreReadyLaunch',
         jobId: 'ghost-job',
-        fault: { kind: 'ghost_launch' },
+        launchRecord: snapshot.readJob('ghost-job').launchRecord,
+        status,
+      },
+    ]);
+  });
+
+  it('does not adopt a launching job without a published runtime identity', () => {
+    const status = makeStatus('unpublished-launch-job', 'launching');
+    const snapshot = new InMemoryRecoverySnapshot().addJob({
+      jobId: 'unpublished-launch-job',
+      status,
+      launch: makeLaunch('unpublished-launch-job'),
+      hasLaunchRequest: true,
+      hasRuntimeStart: false,
+    });
+
+    const plan = planRecovery(snapshot);
+    expect(plan.register).toEqual([]);
+    expect(plan.cleanup).toEqual([
+      {
+        type: 'resolvePreReadyLaunch',
+        jobId: 'unpublished-launch-job',
+        launchRecord: snapshot.readJob('unpublished-launch-job').launchRecord,
         status,
       },
     ]);
@@ -945,7 +972,7 @@ describe('planRecovery', () => {
     expect(summarizeActions(plan.cleanup)).toEqual([
       { type: 'discardIncompleteAdmission', jobId: 'incomplete' },
       { type: 'markError', jobId: 'missing-launch', fault: 'missing_launch_record' },
-      { type: 'markError', jobId: 'ghost', fault: 'ghost_launch' },
+      { type: 'resolvePreReadyLaunch', jobId: 'ghost' },
       {
         type: 'releaseSessionClaim',
         sessionId: 'terminal-claim',

@@ -198,7 +198,157 @@ describe('provider-host RPC authorization', () => {
     });
   });
 
-  it('names all three inventory statuses when no provider host matches', async () => {
+  it('returns exact-reference remediation when work-directory eviction is refused', async () => {
+    const evict = vi.fn(async () => {
+      throw Object.assign(new Error('exact reference required'), {
+        code: 'provider_host_eviction_requires_exact_ref',
+      });
+    });
+    const ports = { providerHosts: { list: vi.fn(), inspect: vi.fn(), evict } } as unknown as HttpHandlerPorts;
+
+    await expect(
+      executeCatalogRequest(providerHostEvictRpcSpec, { workDir: '.', projectRoot: process.cwd() }, ports, operator),
+    ).resolves.toMatchObject({
+      kind: 'unary',
+      statusCode: 409,
+      body: {
+        code: 'provider_host_eviction_requires_exact_ref',
+        message: 'Provider-host eviction requires an exact host reference.',
+        remediation:
+          'Run `coral-cli backend provider-host list`, inspect the intended host, then run `coral-cli backend provider-host evict <ref>` with its exact reference.',
+      },
+    });
+    expect(evict).toHaveBeenCalledExactlyOnceWith({ workDir: process.cwd() });
+  });
+
+  it('renders a shutdown hold with its observation, successor, exit, and exact retry command', async () => {
+    const ref: HostRef = {
+      provider: 'codex',
+      fingerprint: 'a'.repeat(64),
+      instanceId: 'held-host',
+      leaseMode: 'shared',
+    };
+    const evict = vi.fn(async () => {
+      throw Object.assign(new Error('provider host remains held'), {
+        code: 'provider_host_shutdown_held',
+        ownerIds: ['proxy-a'],
+        matches: [ref],
+        hold: {
+          kind: 'held',
+          observation: 'alive',
+          successorOwner: 'broker-session-pool',
+          operatorExit: 'retry-broker-shutdown',
+        },
+      });
+    });
+    const ports = { providerHosts: { list: vi.fn(), inspect: vi.fn(), evict } } as unknown as HttpHandlerPorts;
+    const encodedRef = encodeHostRef(ref);
+
+    await expect(
+      executeCatalogRequest(providerHostEvictRpcSpec, { hostRef: ref }, ports, operator),
+    ).resolves.toMatchObject({
+      kind: 'unary',
+      statusCode: 409,
+      body: {
+        code: 'provider_host_shutdown_held',
+        message: expect.stringContaining(
+          `observation=alive; successorOwner=broker-session-pool; operatorExit=retry-broker-shutdown`,
+        ),
+        remediation: expect.stringContaining(`coral-cli backend provider-host evict ${encodedRef}`),
+        detail: {
+          ownerIds: ['proxy-a'],
+          hostRefs: [encodedRef],
+          observation: 'alive',
+          successorOwner: 'broker-session-pool',
+          operatorExit: 'retry-broker-shutdown',
+        },
+      },
+    });
+  });
+
+  it('renders terminal operator abandonment with the exact subject and retained exact-reference replay', async () => {
+    const ref: HostRef = {
+      provider: 'codex',
+      fingerprint: 'a'.repeat(64),
+      instanceId: 'abandoned-host',
+      leaseMode: 'shared',
+    };
+    const abandonment = {
+      kind: 'operator-abandoned' as const,
+      subject: { kind: 'unattributable-process-group' as const, processGroupId: 4_242 },
+      processAbsenceProven: false as const,
+      successor: { owner: 'operator-command' as const, acceptance: 'accepted' as const },
+    };
+    const evict = vi.fn(async () => {
+      throw Object.assign(new Error('provider host cleanup ownership was abandoned'), {
+        code: 'provider_host_operator_abandoned',
+        ownerIds: ['proxy-a'],
+        matches: [ref],
+        abandonment,
+      });
+    });
+    const ports = { providerHosts: { list: vi.fn(), inspect: vi.fn(), evict } } as unknown as HttpHandlerPorts;
+    const encodedRef = encodeHostRef(ref);
+
+    const result = await executeCatalogRequest(providerHostEvictRpcSpec, { hostRef: ref }, ports, operator);
+
+    expect(result).toMatchObject({
+      kind: 'unary',
+      statusCode: 409,
+      body: {
+        code: 'provider_host_operator_abandoned',
+        message: expect.stringContaining(`subject=${JSON.stringify(abandonment.subject)}`),
+        remediation: `Inspect the recorded process because it may still be live. Retry \`coral-cli backend provider-host evict ${encodedRef}\` to recover this retained terminal disposition for the owner process's lifetime; the retry does not prove that the abandoned process exited.`,
+        detail: {
+          ownerIds: ['proxy-a'],
+          hostRefs: [encodedRef],
+          abandonment,
+        },
+      },
+    });
+    expect(JSON.stringify(result)).toContain(`coral-cli backend provider-host evict ${encodedRef}`);
+  });
+
+  it('carries a proxy-owned shutdown hold through the operator inventory response', async () => {
+    const record = {
+      ref: { provider: 'codex', fingerprint: 'a'.repeat(64), instanceId: 'held-host', leaseMode: 'shared' as const },
+      status: 'shutdown-held' as const,
+      spec: {
+        provider: 'codex',
+        command: 'codex',
+        args: ['app-server'],
+        cwd: null,
+        leaseMode: 'shared' as const,
+        idleRetirement: 'never' as const,
+      },
+      host: {
+        owner: 'provider-proxy' as const,
+        hostKey: 'held-host-key',
+        ownerJobId: null,
+        pid: 123,
+        observation: 'unobservable' as const,
+        successorOwner: null,
+        operatorExit: 'retry-provider-shutdown',
+      },
+      diagnostics: {
+        hostLog: { entries: [], retainedBytes: 0, truncatedBeforeSeq: 0 },
+        completedObservations: [],
+        factsTruncatedBeforeSeq: 0,
+      },
+      diagnosticsRetention: { ownerBudgetTruncated: false },
+      ownerId: 'proxy-a',
+    };
+    const ports = {
+      providerHosts: { list: vi.fn(async () => ({ hosts: [record] })), inspect: vi.fn(), evict: vi.fn() },
+    } as unknown as HttpHandlerPorts;
+
+    await expect(executeCatalogRequest(providerHostListRpcSpec, {}, ports, operator)).resolves.toMatchObject({
+      kind: 'unary',
+      body: { hosts: [record] },
+    });
+  });
+
+  it('names every inventory status when no provider host matches', async () => {
     const inspect = vi.fn(async () => {
       throw Object.assign(new Error('provider_host_not_found'), { code: 'provider_host_not_found' });
     });
@@ -208,7 +358,9 @@ describe('provider-host RPC authorization', () => {
       executeCatalogRequest(providerHostInspectRpcSpec, { workDir: '.', projectRoot: process.cwd() }, ports, operator),
     ).resolves.toMatchObject({
       kind: 'unary',
-      body: { message: 'No live, retained-blocked, or reclamation-failed provider host matches the selector.' },
+      body: {
+        message: 'No live, retained-blocked, shutdown-held, or reclamation-failed provider host matches the selector.',
+      },
     });
   });
 

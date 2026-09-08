@@ -116,15 +116,26 @@ function createProductionProviderHostPorts(record: ProviderHostInventoryRecord) 
     admissionSnapshot: () => ({ state: new Map(), tombstones: [] }),
     listProviderHosts: vi.fn(() => [record]),
     inspectProviderHost: vi.fn(() => record),
-    evictHost: vi.fn(async () => true),
+    terminalEviction: vi.fn(() => null),
+    evictHost: vi.fn(async () => ({ kind: 'evicted' as const })),
   };
   const providerHostManager = {
     openSession: async () => {
       throw new Error('provider-host session creation was not expected');
     },
     attachSession: async () => null,
-    drainForHandoff: async () => undefined,
-    shutdown: async () => undefined,
+    drainForHandoff: async () => ({
+      kind: 'provider-hosts-quiesced',
+      liveProxySets: [],
+      acquisitionCleanupHolds: [],
+      closingHosts: [],
+    }),
+    shutdown: async () => ({
+      kind: 'provider-hosts-quiesced',
+      liveProxySets: [],
+      acquisitionCleanupHolds: [],
+      closingHosts: [],
+    }),
     routeAppServerOperation: () => null,
     ...administration,
   } satisfies ProviderHostManager & ProviderHostAdministrationAuthority;
@@ -409,7 +420,12 @@ describe('ipc server', () => {
         token: 'published-token',
         bootToken: 'published-boot-token',
       },
-      { storage: harness.runtime.storage, env: harness.runtime.env, paths: harness.runtime.paths },
+      {
+        storage: harness.runtime.storage,
+        env: harness.runtime.env,
+        paths: harness.runtime.paths,
+        process: harness.runtime.process,
+      },
     );
     let compatibilitySocket: Socket | null = null;
 

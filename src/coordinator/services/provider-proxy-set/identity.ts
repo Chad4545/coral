@@ -38,6 +38,8 @@ export type ProviderProxySetKey = string & { readonly __providerProxySetKey: uni
 
 export type ProviderProxySetAddressKey = string & { readonly __providerProxySetAddressKey: unique symbol };
 
+export type ProviderProxySetProtection = 'protected';
+
 const IDENTITY_FIELDS = [
   'buildSetId',
   'hostFingerprint',

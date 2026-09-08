@@ -96,7 +96,11 @@ describe('provider host idle close/acquire race', () => {
     expect(carrierBlocksRetirement).toHaveBeenCalledTimes(2);
     expect(carrierBlocksRetirement).toHaveBeenNthCalledWith(1, first.hostRef);
     expect(carrierBlocksRetirement).toHaveBeenNthCalledWith(2, first.hostRef);
-    expect(reapContainment).toHaveBeenCalledWith(closingContainment, expect.any(AbortSignal));
+    expect(reapContainment).toHaveBeenCalledWith(
+      closingContainment,
+      undefined,
+      expect.objectContaining({ pid: closingServer.handle.pid, hasExited: expect.any(Function) }),
+    );
     expect(closingEntry.closePromise).not.toBeNull();
     await expect(manager.openSession(spec)).rejects.toThrow(/^provider_host_draining:/u);
     expect(manager.admissionSnapshot().state.values().next().value).toMatchObject({ ref: first.hostRef });

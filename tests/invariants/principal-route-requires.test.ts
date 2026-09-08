@@ -14,6 +14,7 @@ const expectedRpcRequires = {
   'coordinator.provider_host.inspect': 'system:debug',
   'coordinator.provider_host.evict': 'system:shutdown',
   'coordinator.provider_proxy_set.contain': 'system:shutdown',
+  'coordinator.provider_proxy_set.contain.v2': 'system:shutdown',
   'coordinator.equipExpansion': 'expansion:manage',
   'coordinator.unequipExpansion': 'expansion:manage',
   'coordinator.removeExpansionCatalog': 'expansion:manage',
@@ -73,7 +74,11 @@ type ExpectedOperationalRouteId =
   | 'ipc.transport.ping'
   | 'ipc.transport.health'
   | 'ipc.transport.shutdown'
-  | 'ipc.transport.kb.restart';
+  | 'ipc.coordinator.shutdown-obligation.abandon'
+  | 'ipc.transport.kb.restart'
+  | 'ipc.jobs.abort.drain-recovery'
+  | 'ipc.provider-proxy-set.contain.drain-recovery'
+  | 'ipc.provider-proxy-set.contain-boolean.drain-recovery';
 
 type OperationalRouteSummary = {
   readonly transport: 'http' | 'ipc';
@@ -82,7 +87,14 @@ type OperationalRouteSummary = {
   readonly variant?: 'default' | 'detailed';
   readonly requires: Capability;
   readonly requiresRunningLifecycle: boolean;
-  readonly dispatchKind: 'ping' | 'health' | 'event-stream' | 'shutdown' | 'kb-restart';
+  readonly dispatchKind:
+    | 'ping'
+    | 'health'
+    | 'event-stream'
+    | 'shutdown'
+    | 'shutdown-abandon'
+    | 'kb-restart'
+    | 'catalog';
   readonly authentication: 'none' | 'principal';
 };
 
@@ -158,12 +170,44 @@ const expectedOperationalSpecs = {
     dispatchKind: 'shutdown',
     authentication: 'principal',
   },
+  'ipc.coordinator.shutdown-obligation.abandon': {
+    transport: 'ipc',
+    method: 'coordinator.shutdown_obligation.abandon',
+    requires: 'system:shutdown',
+    requiresRunningLifecycle: false,
+    dispatchKind: 'shutdown-abandon',
+    authentication: 'principal',
+  },
   'ipc.transport.kb.restart': {
     transport: 'ipc',
     method: 'transport.kb.restart',
     requires: 'system:shutdown',
     requiresRunningLifecycle: true,
     dispatchKind: 'kb-restart',
+    authentication: 'principal',
+  },
+  'ipc.jobs.abort.drain-recovery': {
+    transport: 'ipc',
+    method: 'jobs.abort',
+    requires: 'jobs:control',
+    requiresRunningLifecycle: false,
+    dispatchKind: 'catalog',
+    authentication: 'principal',
+  },
+  'ipc.provider-proxy-set.contain.drain-recovery': {
+    transport: 'ipc',
+    method: 'coordinator.provider_proxy_set.contain.v2',
+    requires: 'system:shutdown',
+    requiresRunningLifecycle: false,
+    dispatchKind: 'catalog',
+    authentication: 'principal',
+  },
+  'ipc.provider-proxy-set.contain-boolean.drain-recovery': {
+    transport: 'ipc',
+    method: 'coordinator.provider_proxy_set.contain',
+    requires: 'system:shutdown',
+    requiresRunningLifecycle: false,
+    dispatchKind: 'catalog',
     authentication: 'principal',
   },
 } as const satisfies Record<ExpectedOperationalRouteId, OperationalRouteSummary>;

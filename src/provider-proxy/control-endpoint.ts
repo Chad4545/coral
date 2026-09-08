@@ -2,14 +2,17 @@ import { timingSafeEqual } from 'node:crypto';
 import { createServer, type Server as NetServer, type Socket } from 'node:net';
 
 import { truncate } from '../infra/text.js';
+import type { ControlHolderAuthority, ControlHolderIdentity } from './holder-lifecycle.js';
 import {
   ProxyControlProtocolError,
+  PROXY_CONTROL_PRE_DISPATCH_REFUSAL_JSON_RPC_CODE,
   controlHeartbeatParamsSchema,
   controlPairParamsSchema,
   controlPairResultSchema,
   createFrameReader,
   decodeProxyControlFrame,
   encodeProxyControlFrame,
+  type CoordinatorIdentity,
   type ProxyControlJsonRpcMessage,
 } from './protocol.js';
 import { acceptedHeartbeatResult } from './heartbeat-observation.js';
@@ -100,16 +103,30 @@ class ControlHeartbeatRefusedError extends ProxyControlProtocolError {
 
 export type ControlMethodHandler = (params: unknown) => Promise<unknown> | unknown;
 
-/** Who holds a control tenancy. Two opens naming the same holder are one tenancy re-reported, not two. */
-export type ControlTenancyHolder = string;
+declare const activeControlAuthorizationBrand: unique symbol;
+/** Irreversible active-control mutations must revalidate this socket, holder, and epoch after every await. */
+export type ActiveControlAuthorization = Readonly<{ readonly [activeControlAuthorizationBrand]: true }>;
 
-/**
- * What an opening method answers: who earned the tenancy, and the role-specific result fields. The endpoint
- * merges the epoch and the first challenge into `fields`; a role that supplied those itself would be naming
- * a tenancy it has not been granted. `holder` is what lets a retry be recognised as the same tenancy rather
- * than refused or silently re-minted — every opening method already derives it from `coordinator.instanceId`
- * or `successor.instanceId`, so naming it here costs nothing the credential check did not already establish.
- */
+export type ActiveControlMethodHandler = (
+  params: unknown,
+  authorization: ActiveControlAuthorization,
+) => Promise<unknown> | unknown;
+
+/** Tenancy identity must distinguish process replacement from an exact retry. */
+export type ControlTenancyHolder = Readonly<Pick<CoordinatorIdentity, 'instanceId' | 'pid' | 'incarnation'>>;
+
+/** Holder equality must include instance id, pid, and incarnation. */
+export function sameControlTenancyHolder(left: ControlTenancyHolder, right: ControlTenancyHolder): boolean {
+  return left.instanceId === right.instanceId && left.pid === right.pid && left.incarnation === right.incarnation;
+}
+
+export function controlTenancyHolderOf(
+  identity: Pick<CoordinatorIdentity, 'instanceId' | 'pid' | 'incarnation'>,
+): ControlTenancyHolder {
+  return { instanceId: identity.instanceId, pid: identity.pid, incarnation: identity.incarnation };
+}
+
+/** Role handlers must not mint endpoint epochs or challenges, and every opening must name its complete holder. */
 export type ControlOpening = Readonly<{ holder: ControlTenancyHolder; fields: Record<string, unknown> }>;
 export type ControlOpenHandler = (params: unknown) => Promise<ControlOpening> | ControlOpening;
 
@@ -132,7 +149,8 @@ export type ControlMethod = Readonly<
     budgetMs?: number | 'caller-deadline';
   } & (
     | { authority: 'establishes-control'; handle: ControlOpenHandler }
-    | { authority: 'active' | 'pairing' | 'observation'; handle: ControlMethodHandler }
+    | { authority: 'active'; handle: ActiveControlMethodHandler }
+    | { authority: 'pairing' | 'observation' | 'operator'; handle: ControlMethodHandler }
   )
 >;
 
@@ -215,6 +233,8 @@ export type ControlEndpointOptions = Readonly<{
   challenges: ControlChallengeAuthority;
   timer: ControlEndpointTimer;
   requestTimeoutMs: number;
+  /** Admission and reattachment must share one holder authority. */
+  holderAuthority: ControlHolderAuthority;
 }>;
 
 export interface ControlEndpoint {
@@ -229,11 +249,15 @@ export interface ControlEndpoint {
    */
   pushOnTenancy(frame: string, timeoutMs: number): ControlTenancyPush;
   faultControlTenancy(expectedControlEpoch: ControlEpoch): void;
+  /** Irreversible latches must bind authorization to the exact holder admission they affect. */
+  activeControlAuthorizationIsCurrent(
+    authorization: ActiveControlAuthorization,
+    subject: ControlHolderIdentity | null,
+  ): boolean;
 }
 
 type Tenancy = {
   readonly epoch: ControlEpoch;
-  readonly holder: ControlTenancyHolder;
   /** Identity and admission fields are stable across retries of the opening that earned this tenancy. */
   readonly opening: Record<string, unknown>;
   socket: Socket; // one tenancy, successive connections
@@ -264,7 +288,11 @@ function failure(id: string | number | null, code: number, message: string): Pro
  * raw `ZodError` from a handler's `.parse()` — still has to report a code from the closed set rather than
  * escape it, because a caller only ever branches on `data.code`, never on prose.
  */
-function handlerFailure(id: string | number, error: unknown): ProxyControlJsonRpcMessage {
+function handlerFailure(
+  id: string | number,
+  error: unknown,
+  jsonRpcCode: number = JSON_RPC_INVALID_REQUEST,
+): ProxyControlJsonRpcMessage {
   const message = error instanceof Error ? error.message : 'Control request failed.';
   if (error instanceof UnknownControlMethodError) {
     // `data.code` carries `method_not_found` for the same reason every other branch below attaches one: a
@@ -280,7 +308,7 @@ function handlerFailure(id: string | number, error: unknown): ProxyControlJsonRp
     return {
       jsonrpc: '2.0',
       id,
-      error: { code: JSON_RPC_INVALID_REQUEST, message, data: { code: error.code, reason: error.reason } },
+      error: { code: jsonRpcCode, message, data: { code: error.code, reason: error.reason } },
     };
   }
   if (error instanceof ControlHeartbeatRefusedError) {
@@ -288,7 +316,7 @@ function handlerFailure(id: string | number, error: unknown): ProxyControlJsonRp
       jsonrpc: '2.0',
       id,
       error: {
-        code: JSON_RPC_INVALID_REQUEST,
+        code: jsonRpcCode,
         message,
         data: {
           code: error.code,
@@ -299,7 +327,7 @@ function handlerFailure(id: string | number, error: unknown): ProxyControlJsonRp
     };
   }
   if (error instanceof ProxyControlProtocolError) {
-    return { jsonrpc: '2.0', id, error: { code: JSON_RPC_INVALID_REQUEST, message, data: { code: error.code } } };
+    return { jsonrpc: '2.0', id, error: { code: jsonRpcCode, message, data: { code: error.code } } };
   }
   // Not one of this endpoint's own errors, so it carries no domain code to relay — only `protocol_violation`,
   // the closed set's catch-all. The message is truncated rather than passed through verbatim: a ZodError's
@@ -307,7 +335,7 @@ function handlerFailure(id: string | number, error: unknown): ProxyControlJsonRp
   return {
     jsonrpc: '2.0',
     id,
-    error: { code: JSON_RPC_INVALID_REQUEST, message: truncate(message, 200), data: { code: 'protocol_violation' } },
+    error: { code: jsonRpcCode, message: truncate(message, 200), data: { code: 'protocol_violation' } },
   };
 }
 
@@ -315,8 +343,27 @@ function success(id: string | number, result: unknown): ProxyControlJsonRpcMessa
   return { jsonrpc: '2.0', id, result };
 }
 
+/** Authorization state must remain private and unforgeable. */
+type ActiveControlAuthorizationRecord = Readonly<{
+  socket: Socket;
+  controlEpoch: ControlEpoch;
+  holder: ControlTenancyHolder;
+}>;
+
+const activeControlAuthorizationRecords = new WeakMap<object, ActiveControlAuthorizationRecord>();
+
+function mintActiveControlAuthorization(
+  socket: Socket,
+  controlEpoch: ControlEpoch,
+  holder: ControlTenancyHolder,
+): ActiveControlAuthorization {
+  const authorization = Object.freeze({}) as unknown as ActiveControlAuthorization;
+  activeControlAuthorizationRecords.set(authorization, { socket, controlEpoch, holder });
+  return authorization;
+}
+
 export function createControlEndpoint(options: ControlEndpointOptions): ControlEndpoint {
-  const { socketPath, role, observer, challenges, timer, requestTimeoutMs } = options;
+  const { socketPath, role, observer, challenges, timer, requestTimeoutMs, holderAuthority } = options;
   let server: NetServer | null = null;
   let tenancy: Tenancy | null = null;
   let nextEpoch: ControlEpoch = 1;
@@ -333,9 +380,12 @@ export function createControlEndpoint(options: ControlEndpointOptions): ControlE
   // type mismatch alone.
   const pendingPushes = new Map<string, PendingPush>();
 
-  const write = (socket: Socket, message: ProxyControlJsonRpcMessage): void => {
-    if (socket.destroyed) return;
-    socket.write(encodeProxyControlFrame(message));
+  const write = (socket: Socket, message: ProxyControlJsonRpcMessage, onWritten?: () => void): void => {
+    if (socket.destroyed) {
+      onWritten?.();
+      return;
+    }
+    socket.write(encodeProxyControlFrame(message), onWritten);
   };
 
   /**
@@ -347,7 +397,8 @@ export function createControlEndpoint(options: ControlEndpointOptions): ControlE
   const establishControl = async (socket: Socket, handle: ControlOpenHandler, params: unknown): Promise<unknown> => {
     const { holder, fields } = await handle(params);
     const live = tenancy;
-    if (live !== null && live.holder === holder) {
+    const installed = holderAuthority.current();
+    if (live !== null && installed !== null && sameControlTenancyHolder(installed.holder, holder)) {
       // The same tenancy earned again, on this socket or a new one — not a second tenancy to admit.
       const admitted = challenges.reattachControl();
       if (!admitted.accepted) throw new ControlAdmissionRefusedError(admitted.reason ?? 'rejected');
@@ -382,10 +433,12 @@ export function createControlEndpoint(options: ControlEndpointOptions): ControlE
     const epoch = nextEpoch;
     nextEpoch += 1;
     const opening = { ...fields, controlEpoch: epoch, heartbeatChallenge: issued.challenge };
+    // No await may separate holder installation, tenancy publication, and displaced-socket destruction.
+    holderAuthority.install({ controlEpoch: epoch, holder });
     // Record the replacement before destroying the predecessor: its `close` handler then sees a tenancy that
     // is not its own and reports no control loss. Reporting one would hand the deadline machine an EOF for
     // the tenancy that just began, and the successor would inherit its predecessor's death.
-    tenancy = { epoch, holder, opening, socket, active: false };
+    tenancy = { epoch, opening, socket, active: false };
     displaced?.socket.destroy();
     return opening;
   };
@@ -409,8 +462,14 @@ export function createControlEndpoint(options: ControlEndpointOptions): ControlE
     return acceptedHeartbeatResult(recorded.nextChallenge);
   };
 
-  const dispatch = async (socket: Socket, method: string, params: unknown): Promise<unknown> => {
+  const dispatch = async (
+    socket: Socket,
+    method: string,
+    params: unknown,
+    markHandlerStarted: () => void,
+  ): Promise<unknown> => {
     if (method === role.heartbeatMethod) {
+      markHandlerStarted();
       return echoChallenge(socket, params);
     }
     const pairing = role.pairing;
@@ -429,6 +488,7 @@ export function createControlEndpoint(options: ControlEndpointOptions): ControlE
       if (tenancy?.socket === socket) {
         throw new ProxyControlProtocolError('unauthorized_control', 'The control connection may not also pair.');
       }
+      markHandlerStarted();
       pairedSocket = socket;
       return controlPairResultSchema.parse({ state: 'paired' });
     }
@@ -437,12 +497,14 @@ export function createControlEndpoint(options: ControlEndpointOptions): ControlE
       throw new UnknownControlMethodError(method);
     }
     if (entry.authority === 'establishes-control') {
+      markHandlerStarted();
       return establishControl(socket, entry.handle, params);
     }
     if (entry.authority === 'pairing') {
       if (pairedSocket !== socket) {
         throw new ProxyControlProtocolError('unauthorized_control', `${method} requires the paired peer channel.`);
       }
+      markHandlerStarted();
       return entry.handle(params);
     }
     if (entry.authority === 'observation') {
@@ -454,79 +516,102 @@ export function createControlEndpoint(options: ControlEndpointOptions): ControlE
       // proxy's instance, build set, job, and operation together requires the runtime meta only a
       // coordinator's own store holds. The reply then discloses nothing the asker did not already name.
       // Read-only is what makes that trade sound — an observation moves no deadline and spends nothing.
+      markHandlerStarted();
+      return entry.handle(params);
+    }
+    if (entry.authority === 'operator') {
+      if (challenges.controlIsLive()) {
+        throw new ProxyControlProtocolError(
+          'invalid_state',
+          'Operator abandonment is refused while coordinator control is live. Use `coral-cli backend provider-proxy-set abandon <set-token>` through the coordinator.',
+        );
+      }
+      markHandlerStarted();
       return entry.handle(params);
     }
     const live = tenancy;
     if (live === null || live.socket !== socket || !live.active || !challenges.controlIsLive()) {
       throw new ProxyControlProtocolError('unauthorized_control', `${method} requires active control.`);
     }
-    return entry.handle(params);
+    const admittedHolder = holderAuthority.current();
+    if (admittedHolder === null) {
+      throw new ProxyControlProtocolError('invalid_state', `${method} found no admitted holder for a live tenancy.`);
+    }
+    markHandlerStarted();
+    return entry.handle(params, mintActiveControlAuthorization(socket, live.epoch, admittedHolder.holder));
   };
 
-  const serveRequest = async (socket: Socket, message: ProxyControlJsonRpcMessage): Promise<void> => {
+  const serveRequest = async (
+    socket: Socket,
+    message: ProxyControlJsonRpcMessage,
+    reply: (response: ProxyControlJsonRpcMessage) => Promise<void> = (response) => {
+      write(socket, response);
+      return Promise.resolve();
+    },
+  ): Promise<'control-admitted' | 'no-control-admitted'> => {
     if (!('method' in message)) {
       // Reached only by a response this endpoint has nothing outstanding for — a reply to a `pushOnTenancy`
       // is matched and consumed before dispatch ever gets here. The ordinary way to arrive is a benign race:
       // an ack that crossed its own push's timeout, which already dropped the pending entry. The refusal
       // carries a null id, which the peer's client drops, so answering costs one frame and never loops.
-      write(socket, failure(null, JSON_RPC_INVALID_REQUEST, 'Control endpoints accept requests only.'));
-      return;
+      await reply(failure(null, JSON_RPC_INVALID_REQUEST, 'Control endpoints accept requests only.'));
+      return 'no-control-admitted';
     }
     const { id, method, params } = message;
     let settled = false;
+    let handlerStarted = false;
+    const dispatchRequest = () =>
+      dispatch(socket, method, params, () => {
+        handlerStarted = true;
+      });
+    const requestFailure = (error: unknown) =>
+      handlerFailure(
+        id,
+        error,
+        handlerStarted ? JSON_RPC_INVALID_REQUEST : PROXY_CONTROL_PRE_DISPATCH_REFUSAL_JSON_RPC_CODE,
+      );
     if (role.methods.get(method)?.budgetMs === 'caller-deadline') {
       try {
-        write(socket, success(id, await dispatch(socket, method, params)));
+        await reply(success(id, await dispatchRequest()));
+        return tenancy?.socket === socket ? 'control-admitted' : 'no-control-admitted';
       } catch (error: unknown) {
-        write(socket, handlerFailure(id, error));
+        await reply(requestFailure(error));
+        return 'no-control-admitted';
       }
-      return;
     }
     const declared = role.methods.get(method)?.budgetMs;
     const budgetMs = typeof declared === 'number' ? declared : requestTimeoutMs;
     const budget = timer.setTimeout(() => {
       if (settled) return;
       settled = true;
-      write(socket, failure(id, JSON_RPC_INTERNAL_ERROR, `${method} exceeded its ${budgetMs}ms budget.`));
+      void reply(failure(id, JSON_RPC_INTERNAL_ERROR, `${method} exceeded its ${budgetMs}ms budget.`)).catch(() => {
+        socket.destroy();
+      });
     }, budgetMs);
     budget.unref?.();
     try {
-      const result = await dispatch(socket, method, params);
-      if (settled) return;
+      const result = await dispatchRequest();
+      const disposition = tenancy?.socket === socket ? 'control-admitted' : 'no-control-admitted';
+      if (settled) return disposition;
       settled = true;
-      write(socket, success(id, result));
+      await reply(success(id, result));
+      return disposition;
     } catch (error: unknown) {
-      if (settled) return;
+      if (settled) return 'no-control-admitted';
       settled = true;
-      write(socket, handlerFailure(id, error));
+      await reply(requestFailure(error));
+      return 'no-control-admitted';
     } finally {
       timer.clearTimeout(budget);
     }
   };
 
-  // Whether this role ever answers a connection that claims neither slot. `establishControl` already
-  // refuses a second control tenancy on its own (the challenge authority's `admitSuccessor` refusal), and
-  // the pairing branch in `dispatch` already refuses a second peer the same way — so accept-time refusal
-  // below protects nothing an RPC-level refusal does not already cover for a connection that goes on to
-  // request one of those slots. It does matter for a connection that never asks for either: an `observation`
-  // method promises exactly that, so a role that serves one must not have every connection destroyed the
-  // moment control is merely held, or its one tenancy-free method becomes unreachable in the case it exists
-  // for — a live tenancy is the *normal* state, not an edge case, for whoever wants to ask about it.
-  const hasObservationMethod = [...role.methods.values()].some((method) => method.authority === 'observation');
+  // Tenancy-free methods must remain reachable while control and pairing slots are occupied.
+  const hasTenancyFreeMethod = [...role.methods.values()].some(
+    (method) => method.authority === 'observation' || method.authority === 'operator',
+  );
 
-  const acceptConnection = (socket: Socket): void => {
-    // One connection holds control and, when the role has a peer, one more may hold pairing. A third
-    // connection is refused only once both slots are already filled — before the peer has ever paired, or
-    // while an incumbent's lease has merely lapsed, a connection is admitted holding neither authority yet.
-    // It is tracked in `sockets` below regardless, so it is not a party sitting unaccounted-for on the
-    // endpoint: close() still reaches it even if it never claims a slot.
-    const controlTaken = tenancy !== null && !tenancy.socket.destroyed && challenges.controlIsLive();
-    const pairingTaken = pairedSocket !== null && !pairedSocket.destroyed;
-    if (!hasObservationMethod && controlTaken && (role.pairing === undefined || pairingTaken)) {
-      socket.destroy();
-      return;
-    }
-    sockets.add(socket);
+  const serveAdmittedConnection = (socket: Socket): void => {
     const read = createFrameReader(
       (frame) => {
         let message: ProxyControlJsonRpcMessage;
@@ -590,6 +675,135 @@ export function createControlEndpoint(options: ControlEndpointOptions): ControlE
       tenancy = null;
       observer.onControlLost(live.epoch);
     });
+  };
+
+  const acceptProvisionalTenancyFreeConnection = (socket: Socket): void => {
+    let settled = false;
+    let responseFlushBudget: { unref?: () => void } | null = null;
+    const idle = timer.setTimeout(() => {
+      if (settled) return;
+      settled = true;
+      socket.destroy();
+    }, requestTimeoutMs);
+    idle.unref?.();
+
+    const serveOneFrame = async (
+      message: ProxyControlJsonRpcMessage,
+    ): Promise<'control-admitted' | 'no-control-admitted'> => {
+      const flushReply = (response: ProxyControlJsonRpcMessage): Promise<void> => {
+        if (responseFlushBudget === null) {
+          responseFlushBudget = timer.setTimeout(() => socket.destroy(), requestTimeoutMs);
+          responseFlushBudget.unref?.();
+        }
+        return new Promise<void>((resolve) => write(socket, response, resolve));
+      };
+      if (!('method' in message)) {
+        await flushReply(failure(null, JSON_RPC_INVALID_REQUEST, 'Control endpoints accept requests only.'));
+        return 'no-control-admitted';
+      }
+      if (role.pairing === undefined) {
+        return serveRequest(socket, message, flushReply);
+      }
+      const { id, method } = message;
+      const entry = role.methods.get(method);
+      if (entry === undefined) {
+        await flushReply(handlerFailure(id, new UnknownControlMethodError(method)));
+        return 'no-control-admitted';
+      }
+      if (entry.authority === 'establishes-control' && challenges.controlIsLive()) {
+        await flushReply(handlerFailure(id, new ControlAdmissionRefusedError('control-active')));
+        return 'no-control-admitted';
+      }
+      if (
+        entry.authority !== 'establishes-control' &&
+        entry.authority !== 'operator' &&
+        entry.authority !== 'observation'
+      ) {
+        await flushReply(
+          handlerFailure(
+            id,
+            new ProxyControlProtocolError(
+              'unauthorized_control',
+              'This connection holds no tenancy for the requested method.',
+            ),
+          ),
+        );
+        return 'no-control-admitted';
+      }
+      return serveRequest(socket, message, flushReply);
+    };
+
+    const onError = (): void => {
+      socket.destroy();
+    };
+    const onClose = (): void => {
+      settled = true;
+      timer.clearTimeout(idle);
+      if (responseFlushBudget !== null) timer.clearTimeout(responseFlushBudget);
+      sockets.delete(socket);
+    };
+    const promoteToAdmittedConnection = (): void => {
+      socket.off('data', read);
+      socket.off('error', onError);
+      socket.off('close', onClose);
+      serveAdmittedConnection(socket);
+    };
+
+    const read = createFrameReader(
+      (frame) => {
+        if (settled) return;
+        settled = true;
+        timer.clearTimeout(idle);
+        let message: ProxyControlJsonRpcMessage;
+        try {
+          message = decodeProxyControlFrame(frame);
+        } catch {
+          write(socket, failure(null, JSON_RPC_INVALID_REQUEST, 'Control frame failed strict validation.'));
+          socket.destroy();
+          return;
+        }
+        void serveOneFrame(message).then(
+          (disposition) => {
+            if (responseFlushBudget !== null) {
+              timer.clearTimeout(responseFlushBudget);
+              responseFlushBudget = null;
+            }
+            if (disposition === 'control-admitted' && !socket.destroyed) {
+              promoteToAdmittedConnection();
+              return;
+            }
+            if (!socket.destroyed) socket.end();
+          },
+          () => socket.destroy(),
+        );
+      },
+      () => {
+        if (settled) return;
+        settled = true;
+        timer.clearTimeout(idle);
+        write(socket, failure(null, JSON_RPC_INVALID_REQUEST, 'Control frame exceeded the frame cap.'));
+        socket.destroy();
+      },
+    );
+    socket.on('data', read);
+    socket.on('error', onError);
+    socket.on('close', onClose);
+  };
+
+  const acceptConnection = (socket: Socket): void => {
+    const controlTaken = tenancy !== null && !tenancy.socket.destroyed && challenges.controlIsLive();
+    const pairingTaken = pairedSocket !== null && !pairedSocket.destroyed;
+    const noSlotAvailable = controlTaken && (role.pairing === undefined || pairingTaken);
+    if (!hasTenancyFreeMethod && noSlotAvailable) {
+      socket.destroy();
+      return;
+    }
+    sockets.add(socket);
+    if (noSlotAvailable) {
+      acceptProvisionalTenancyFreeConnection(socket);
+      return;
+    }
+    serveAdmittedConnection(socket);
   };
 
   return {
@@ -709,6 +923,28 @@ export function createControlEndpoint(options: ControlEndpointOptions): ControlE
       live.active = false;
       observer.onControlLost(live.epoch);
       live.socket.destroy();
+    },
+    activeControlAuthorizationIsCurrent(
+      authorization: ActiveControlAuthorization,
+      subject: ControlHolderIdentity | null,
+    ): boolean {
+      const record = activeControlAuthorizationRecords.get(authorization);
+      if (record === undefined) return false;
+      const live = tenancy;
+      const admitted = holderAuthority.current();
+      return (
+        subject !== null &&
+        subject.controlEpoch === record.controlEpoch &&
+        sameControlTenancyHolder(subject.holder, record.holder) &&
+        live !== null &&
+        live.socket === record.socket &&
+        live.active &&
+        live.epoch === record.controlEpoch &&
+        admitted !== null &&
+        admitted.controlEpoch === record.controlEpoch &&
+        sameControlTenancyHolder(admitted.holder, record.holder) &&
+        challenges.controlIsLive()
+      );
     },
   };
 }

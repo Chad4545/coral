@@ -27,6 +27,7 @@ import {
   deleteProviderOperation,
   finishProviderOperationDueSelection,
   insertProviderOperation,
+  providerOperationMutationAdmission,
   readProviderOperation,
   readProviderOperationDueSelections,
   readProviderOperationForJob,
@@ -34,6 +35,8 @@ import {
   readProviderOperationsDue,
   ProviderOperationJournalError,
   type ProviderOperationDueSelection,
+  type ProviderOperationMutationAdmission,
+  type ProviderOperationMutationAdmissionDisposition,
   type ProviderOperationRetryOwnership,
 } from '../../store/provider-operation-journal.js';
 import {
@@ -45,7 +48,10 @@ import {
   type ProviderOperationRecord,
   type ProviderOperationTerminalDirective,
 } from '../../store/provider-operation-record.js';
-import type { DurableProviderProxyOperationAuthority } from '../live/provider-proxy/operation-route.js';
+import {
+  providerProxyOperationControlIsHeld,
+  type DurableProviderProxyOperationAuthority,
+} from '../live/provider-proxy/operation-route.js';
 import type { LocalOperationRegistry } from './operation-registry.js';
 import {
   providerOperationErrorCode,
@@ -149,6 +155,15 @@ export type StartupReconciliationReport = Readonly<{
   operationsVisited: number;
   incidents: readonly StartupReconciliationIncident[];
 }>;
+
+export type ProviderOperationReconcilerStopDisposition =
+  | ProviderOperationMutationAdmissionDisposition
+  | Readonly<{
+      kind: 'holding';
+      pendingMutations: readonly string[];
+      exit: 'provider-operation-mutation-admission-availability';
+      retryAfter: Promise<void>;
+    }>;
 
 export interface StartupSetRecoveryPort {
   recoverSetAtStartup(work: StartupProviderSetWork, signal: AbortSignal): Promise<StartupSetRecoveryResult>;
@@ -419,6 +434,8 @@ function retryDelayMs(retryCount: number): number {
   return Math.min(TIMER_MIN_MS * 2 ** Math.min(retryCount, 6), TIMER_MAX_MS);
 }
 
+const OPERATION_CONTROL_OUTCOME_UNKNOWN = 'operation-control-outcome-unknown';
+
 function isProviderOperationRecoveryAcceptance(
   value: unknown,
   jobId: string,
@@ -443,6 +460,8 @@ export class ProviderOperationReconciler
   readonly #settlements = new Map<string, ProviderOperationIdentity>();
   readonly #serializers = new Map<string, OperationSerializer>();
   readonly #driveContext = new AsyncLocalStorage<AuthorityDriveContext>();
+  #mutationAdmission: ProviderOperationMutationAdmission | null = null;
+  #admissionClosed = false;
   #unsubscribeSettlement: (() => void) | null = null;
   #timer: TimerHandle | null = null;
   #started = false;
@@ -460,7 +479,7 @@ export class ProviderOperationReconciler
   }
 
   start(): void {
-    if (this.#started || this.#fatal) return;
+    if (this.#started || this.#fatal || this.#admissionClosed) return;
     this.#started = true;
     const listener = (identity: ProviderOperationIdentity): void => this.settlementPending(identity);
     settlementListeners.add(listener);
@@ -468,17 +487,44 @@ export class ProviderOperationReconciler
     this.#schedule(TIMER_MIN_MS);
   }
 
-  stop(): void {
+  stop(): ProviderOperationReconcilerStopDisposition {
+    this.#admissionClosed = true;
     this.#started = false;
-    this.#unsubscribeSettlement?.();
-    this.#unsubscribeSettlement = null;
     if (this.#timer !== null) {
       this.#deps.time.clearTimeout(this.#timer);
       this.#timer = null;
     }
+    let admission = this.#mutationAdmission;
+    if (admission === null) {
+      try {
+        admission = this.#admission();
+      } catch {
+        const retryAfter = new Promise<void>((resolve) => {
+          const timer = this.#deps.time.setTimeout(resolve, TIMER_MIN_MS);
+          timer.unref?.();
+        });
+        return {
+          kind: 'holding',
+          pendingMutations: ['provider-operation-mutation-admission'],
+          exit: 'provider-operation-mutation-admission-availability',
+          retryAfter,
+        };
+      }
+    }
+    const disposition = admission.close();
+    if (disposition.kind === 'drained') {
+      this.#unsubscribeSettlement?.();
+      this.#unsubscribeSettlement = null;
+    }
+    return disposition;
   }
 
-  async reconcileAtStartup(signal: AbortSignal): Promise<StartupReconciliationReport> {
+  reconcileAtStartup(signal: AbortSignal): Promise<StartupReconciliationReport> {
+    if (!this.#canMutate()) return Promise.reject(new Error('Provider operation mutation admission is closed.'));
+    return this.#admission().run('provider-operation-startup-reconciliation', () => this.#reconcileAtStartup(signal));
+  }
+
+  async #reconcileAtStartup(signal: AbortSignal): Promise<StartupReconciliationReport> {
     const { records } = readProviderOperations(this.#deps.getProgressStore().getDb());
     const incidents: StartupReconciliationIncident[] = [];
     let setsVisited = 0;
@@ -624,6 +670,9 @@ export class ProviderOperationReconciler
   }
 
   begin(input: BeginProviderOperationPublication): Promise<AppServerProxyPlacementResult> {
+    if (!this.#canMutate()) {
+      return Promise.reject(new Error('Provider operation mutation admission is closed.'));
+    }
     const key = operationKey(input.record.operation);
     if (this.#publications.has(key)) {
       return Promise.reject(new Error('Provider operation publication is already active.'));
@@ -667,6 +716,7 @@ export class ProviderOperationReconciler
   }
 
   requestStop(jobId: string, cause: ProviderStopCause): void {
+    if (!this.#canMutate()) return;
     try {
       const record = readProviderOperationForJob(this.#deps.getProgressStore().getDb(), jobId);
       if (record === null) {
@@ -682,6 +732,7 @@ export class ProviderOperationReconciler
   }
 
   onControlEstablished(authority: DurableProviderProxyOperationAuthority): void {
+    if (this.#admissionClosed) return;
     void this.#reconcileActiveForAuthority(authority).catch((error: unknown) => {
       this.#deps.onError?.(
         `Provider operation control-established reconciliation failed: ${providerOperationErrorReason(error)}`,
@@ -690,12 +741,13 @@ export class ProviderOperationReconciler
   }
 
   settlementPending(identity: ProviderOperationIdentity): void {
+    if (this.#admissionClosed) return;
     this.#settlements.set(operationKey(identity), identity);
     this.wake();
   }
 
   wake(): void {
-    if (this.#fatal) return;
+    if (this.#fatal || this.#admissionClosed) return;
     if (this.#polling) {
       this.#pollRequested = true;
       return;
@@ -704,114 +756,128 @@ export class ProviderOperationReconciler
   }
 
   containmentDisappeared(notice: ContainmentDisappearanceNotice): Promise<DisappearanceDeliveryAttemptOutcome> {
-    const parsed = containmentDisappearanceNoticeSchema.parse(notice);
-    if (
-      parsed.operation.buildSetId !== parsed.setIdentity.buildSetId ||
-      parsed.operation.proxyInstanceId !== parsed.setIdentity.proxyInstanceId
-    ) {
-      return Promise.reject(new Error('containment_disappearance_identity_mismatch'));
-    }
-    const key = operationKey(parsed.operation);
-    const serializer = this.#serializerFor(key);
-    if (serializer.disappearance === null) {
-      serializer.disappearance = { notice: parsed, delivery: { kind: 'ready' } };
-      serializer.epoch += 1;
-      serializer.activeAbort?.abort(new RepresentationDriveFencedError());
-    } else if (!this.#sameDisappearanceNotice(serializer.disappearance.notice, parsed)) {
-      return Promise.reject(new Error('containment_disappearance_conflict'));
-    }
-
-    const disappearance = serializer.disappearance;
-    switch (disappearance.delivery.kind) {
-      case 'consumed':
-        return Promise.resolve({ kind: 'accepted', acceptance: disappearance.delivery.acceptance });
-      case 'delivering':
-        return disappearance.delivery.promise;
-      case 'ready':
-        break;
-    }
-
-    const active = serializer.inFlight ?? Promise.resolve();
-    const consume = async (): Promise<DisappearanceDeliveryAttemptOutcome> => {
-      const outcome = await this.#driveContext.exit(() => this.#consumeContainmentDisappearance(parsed));
-      return outcome.kind === 'operational-failure' ? outcome : { kind: 'accepted', acceptance: outcome };
-    };
-    const promise = active.then(consume, consume);
-    disappearance.delivery = { kind: 'delivering', promise };
-    void promise.then(
-      (outcome) => {
-        if (disappearance.delivery.kind !== 'delivering' || disappearance.delivery.promise !== promise) return;
-        if (outcome.kind === 'operational-failure') {
-          disappearance.delivery = { kind: 'ready' };
-          return;
-        }
-        disappearance.delivery = { kind: 'consumed', acceptance: outcome.acceptance };
-        this.wake();
-      },
+    if (!this.#canMutate()) return Promise.reject(new Error('Provider operation mutation admission is closed.'));
+    return this.#admission().run(
+      'provider-containment-disappearance',
       () => {
-        if (disappearance.delivery.kind !== 'delivering' || disappearance.delivery.promise !== promise) return;
-        disappearance.delivery = { kind: 'ready' };
+        const parsed = containmentDisappearanceNoticeSchema.parse(notice);
+        if (
+          parsed.operation.buildSetId !== parsed.setIdentity.buildSetId ||
+          parsed.operation.proxyInstanceId !== parsed.setIdentity.proxyInstanceId
+        ) {
+          return Promise.reject(new Error('containment_disappearance_identity_mismatch'));
+        }
+        const key = operationKey(parsed.operation);
+        const serializer = this.#serializerFor(key);
+        if (serializer.disappearance === null) {
+          serializer.disappearance = { notice: parsed, delivery: { kind: 'ready' } };
+          serializer.epoch += 1;
+          serializer.activeAbort?.abort(new RepresentationDriveFencedError());
+        } else if (!this.#sameDisappearanceNotice(serializer.disappearance.notice, parsed)) {
+          return Promise.reject(new Error('containment_disappearance_conflict'));
+        }
+
+        const disappearance = serializer.disappearance;
+        switch (disappearance.delivery.kind) {
+          case 'consumed':
+            return Promise.resolve({ kind: 'accepted', acceptance: disappearance.delivery.acceptance });
+          case 'delivering':
+            return disappearance.delivery.promise;
+          case 'ready':
+            break;
+        }
+
+        const active = serializer.inFlight ?? Promise.resolve();
+        const consume = async (): Promise<DisappearanceDeliveryAttemptOutcome> => {
+          const outcome = await this.#driveContext.exit(() => this.#consumeContainmentDisappearance(parsed));
+          return outcome.kind === 'operational-failure' ? outcome : { kind: 'accepted', acceptance: outcome };
+        };
+        const promise = active.then(consume, consume);
+        disappearance.delivery = { kind: 'delivering', promise };
+        void promise.then(
+          (outcome) => {
+            if (disappearance.delivery.kind !== 'delivering' || disappearance.delivery.promise !== promise) return;
+            if (outcome.kind === 'operational-failure') {
+              disappearance.delivery = { kind: 'ready' };
+              return;
+            }
+            disappearance.delivery = { kind: 'consumed', acceptance: outcome.acceptance };
+            this.wake();
+          },
+          () => {
+            if (disappearance.delivery.kind !== 'delivering' || disappearance.delivery.promise !== promise) return;
+            disappearance.delivery = { kind: 'ready' };
+          },
+        );
+        return promise;
       },
+      notice.operation,
     );
-    return promise;
   }
 
   representationAbandoned(
     notice: ProviderRepresentationAbandonmentNotice,
   ): Promise<RepresentationAbandonmentDeliveryAttemptOutcome> {
-    const parsed = providerRepresentationAbandonmentNoticeSchema.parse(notice);
-    if (
-      parsed.operation.buildSetId !== parsed.setIdentity.buildSetId ||
-      parsed.operation.proxyInstanceId !== parsed.setIdentity.proxyInstanceId
-    ) {
-      return Promise.reject(new Error('provider_representation_abandonment_identity_mismatch'));
-    }
-    const key = operationKey(parsed.operation);
-    const serializer = this.#serializerFor(key);
-    if (serializer.disappearance !== null) {
-      return Promise.reject(new Error('provider_representation_abandonment_after_disappearance'));
-    }
-    if (serializer.abandonment === null) {
-      serializer.abandonment = { notice: parsed, delivery: { kind: 'ready' } };
-      serializer.epoch += 1;
-      serializer.activeAbort?.abort(new RepresentationDriveFencedError());
-    } else if (!this.#sameAbandonmentNotice(serializer.abandonment.notice, parsed)) {
-      return Promise.reject(new Error('provider_representation_abandonment_conflict'));
-    }
-
-    const abandonment = serializer.abandonment;
-    switch (abandonment.delivery.kind) {
-      case 'consumed':
-        return Promise.resolve({ kind: 'accepted', acceptance: abandonment.delivery.acceptance });
-      case 'delivering':
-        return abandonment.delivery.promise;
-      case 'ready':
-        break;
-    }
-
-    const active = serializer.inFlight ?? Promise.resolve();
-    const consume = async (): Promise<RepresentationAbandonmentDeliveryAttemptOutcome> => {
-      const outcome = await this.#driveContext.exit(() => this.#consumeRepresentationAbandonment(parsed));
-      return outcome.kind === 'operational-failure' ? outcome : { kind: 'accepted', acceptance: outcome };
-    };
-    const promise = active.then(consume, consume);
-    abandonment.delivery = { kind: 'delivering', promise };
-    void promise.then(
-      (outcome) => {
-        if (abandonment.delivery.kind !== 'delivering' || abandonment.delivery.promise !== promise) return;
-        if (outcome.kind === 'operational-failure') {
-          abandonment.delivery = { kind: 'ready' };
-          return;
-        }
-        abandonment.delivery = { kind: 'consumed', acceptance: outcome.acceptance };
-        this.wake();
-      },
+    if (!this.#canMutate()) return Promise.reject(new Error('Provider operation mutation admission is closed.'));
+    return this.#admission().run(
+      'provider-representation-abandonment',
       () => {
-        if (abandonment.delivery.kind !== 'delivering' || abandonment.delivery.promise !== promise) return;
-        abandonment.delivery = { kind: 'ready' };
+        const parsed = providerRepresentationAbandonmentNoticeSchema.parse(notice);
+        if (
+          parsed.operation.buildSetId !== parsed.setIdentity.buildSetId ||
+          parsed.operation.proxyInstanceId !== parsed.setIdentity.proxyInstanceId
+        ) {
+          return Promise.reject(new Error('provider_representation_abandonment_identity_mismatch'));
+        }
+        const key = operationKey(parsed.operation);
+        const serializer = this.#serializerFor(key);
+        if (serializer.disappearance !== null) {
+          return Promise.reject(new Error('provider_representation_abandonment_after_disappearance'));
+        }
+        if (serializer.abandonment === null) {
+          serializer.abandonment = { notice: parsed, delivery: { kind: 'ready' } };
+          serializer.epoch += 1;
+          serializer.activeAbort?.abort(new RepresentationDriveFencedError());
+        } else if (!this.#sameAbandonmentNotice(serializer.abandonment.notice, parsed)) {
+          return Promise.reject(new Error('provider_representation_abandonment_conflict'));
+        }
+
+        const abandonment = serializer.abandonment;
+        switch (abandonment.delivery.kind) {
+          case 'consumed':
+            return Promise.resolve({ kind: 'accepted', acceptance: abandonment.delivery.acceptance });
+          case 'delivering':
+            return abandonment.delivery.promise;
+          case 'ready':
+            break;
+        }
+
+        const active = serializer.inFlight ?? Promise.resolve();
+        const consume = async (): Promise<RepresentationAbandonmentDeliveryAttemptOutcome> => {
+          const outcome = await this.#driveContext.exit(() => this.#consumeRepresentationAbandonment(parsed));
+          return outcome.kind === 'operational-failure' ? outcome : { kind: 'accepted', acceptance: outcome };
+        };
+        const promise = active.then(consume, consume);
+        abandonment.delivery = { kind: 'delivering', promise };
+        void promise.then(
+          (outcome) => {
+            if (abandonment.delivery.kind !== 'delivering' || abandonment.delivery.promise !== promise) return;
+            if (outcome.kind === 'operational-failure') {
+              abandonment.delivery = { kind: 'ready' };
+              return;
+            }
+            abandonment.delivery = { kind: 'consumed', acceptance: outcome.acceptance };
+            this.wake();
+          },
+          () => {
+            if (abandonment.delivery.kind !== 'delivering' || abandonment.delivery.promise !== promise) return;
+            abandonment.delivery = { kind: 'ready' };
+          },
+        );
+        return promise;
       },
+      notice.operation,
     );
-    return promise;
   }
 
   reconcile(
@@ -819,51 +885,58 @@ export class ProviderOperationReconciler
     preferredAuthority?: DurableProviderProxyOperationAuthority,
     signal?: AbortSignal,
   ): Promise<void> {
-    const key = operationKey(record.operation);
-    const serializer = this.#serializerFor(key);
-    if (serializer.disappearance !== null) {
-      switch (serializer.disappearance.delivery.kind) {
-        case 'ready':
-          return Promise.resolve();
-        case 'delivering':
-          return serializer.disappearance.delivery.promise.then(() => undefined);
-        case 'consumed':
-          break;
-      }
-    }
-    if (serializer.abandonment !== null) {
-      switch (serializer.abandonment.delivery.kind) {
-        case 'ready':
-          return Promise.resolve();
-        case 'delivering':
-          return serializer.abandonment.delivery.promise.then(() => undefined);
-        case 'consumed':
-          break;
-      }
-    }
-    if (serializer.inFlight !== null) return serializer.inFlight;
-    serializer.epoch += 1;
-    const abort = new AbortController();
-    serializer.activeAbort = abort;
-    const context: AuthorityDriveContext = {
-      key,
-      epoch: serializer.epoch,
-      abort,
-      signal: signal === undefined ? abort.signal : AbortSignal.any([abort.signal, signal]),
-    };
-    const running = this.#driveContext
-      .run(context, () => this.#drive(record, preferredAuthority, context.signal))
-      .catch((error: unknown) => {
-        if (error instanceof RepresentationDriveFencedError) return;
-        throw error;
-      })
-      .finally(() => {
-        if (serializer.inFlight === running) serializer.inFlight = null;
-        if (serializer.activeAbort === abort) serializer.activeAbort = null;
-        if (record.phase !== 'settlement-pending' && this.#settlements.has(key)) this.wake();
-      });
-    serializer.inFlight = running;
-    return running;
+    if (!this.#canMutate()) return Promise.reject(new Error('Provider operation mutation admission is closed.'));
+    return this.#admission().run(
+      `provider-operation:${operationKey(record.operation)}`,
+      () => {
+        const key = operationKey(record.operation);
+        const serializer = this.#serializerFor(key);
+        if (serializer.disappearance !== null) {
+          switch (serializer.disappearance.delivery.kind) {
+            case 'ready':
+              return Promise.resolve();
+            case 'delivering':
+              return serializer.disappearance.delivery.promise.then(() => undefined);
+            case 'consumed':
+              break;
+          }
+        }
+        if (serializer.abandonment !== null) {
+          switch (serializer.abandonment.delivery.kind) {
+            case 'ready':
+              return Promise.resolve();
+            case 'delivering':
+              return serializer.abandonment.delivery.promise.then(() => undefined);
+            case 'consumed':
+              break;
+          }
+        }
+        if (serializer.inFlight !== null) return serializer.inFlight;
+        serializer.epoch += 1;
+        const abort = new AbortController();
+        serializer.activeAbort = abort;
+        const context: AuthorityDriveContext = {
+          key,
+          epoch: serializer.epoch,
+          abort,
+          signal: signal === undefined ? abort.signal : AbortSignal.any([abort.signal, signal]),
+        };
+        const running = this.#driveContext
+          .run(context, () => this.#drive(record, preferredAuthority, context.signal))
+          .catch((error: unknown) => {
+            if (error instanceof RepresentationDriveFencedError) return;
+            throw error;
+          })
+          .finally(() => {
+            if (serializer.inFlight === running) serializer.inFlight = null;
+            if (serializer.activeAbort === abort) serializer.activeAbort = null;
+            if (record.phase !== 'settlement-pending' && this.#settlements.has(key)) this.wake();
+          });
+        serializer.inFlight = running;
+        return running;
+      },
+      record.operation,
+    );
   }
 
   #serializerFor(key: string): OperationSerializer {
@@ -878,6 +951,16 @@ export class ProviderOperationReconciler
     };
     this.#serializers.set(key, created);
     return created;
+  }
+
+  #admission(): ProviderOperationMutationAdmission {
+    this.#mutationAdmission ??= providerOperationMutationAdmission(this.#deps.getProgressStore().getDb());
+    return this.#mutationAdmission;
+  }
+
+  #canMutate(): boolean {
+    if (!this.#admissionClosed) return this.#admission().accepting;
+    return this.#mutationAdmission?.admitted === true;
   }
 
   #sameDisappearanceNotice(left: ContainmentDisappearanceNotice, right: ContainmentDisappearanceNotice): boolean {
@@ -957,15 +1040,24 @@ export class ProviderOperationReconciler
     if (initial.phase === 'executing') {
       this.#attachments.set(operationKey(initial.operation), initial.operation);
     }
-    let authority =
-      preferredAuthority !== undefined && sameAuthority(initial, preferredAuthority) ? preferredAuthority : null;
+    const preferredOperationalAuthority =
+      preferredAuthority !== undefined &&
+      sameAuthority(initial, preferredAuthority) &&
+      !providerProxyOperationControlIsHeld(preferredAuthority)
+        ? preferredAuthority
+        : null;
+    let authority = preferredOperationalAuthority;
 
     for (let transitionCount = 0; transitionCount < 8 && record !== null; transitionCount += 1) {
       if (record.phase === 'local-recovery-pending') {
         record = await this.#driveLocalRecovery(record, signal ?? NEVER_ABORTS);
         continue;
       }
-      authority = authority !== null && sameAuthority(record, authority) ? authority : this.#deps.authorityFor(record);
+      if (record.lastError?.code === OPERATION_CONTROL_OUTCOME_UNKNOWN && authority === null) return;
+      authority =
+        authority !== null && sameAuthority(record, authority) && !providerProxyOperationControlIsHeld(authority)
+          ? authority
+          : this.#deps.authorityFor(record);
       if (authority === null && this.#deps.acquireAuthority !== undefined) {
         const acquired = await this.#awaitAuthority(this.#deps.acquireAuthority(record, signal ?? NEVER_ABORTS));
         if (isTemporarilyUnavailableAcquisition(acquired)) {
@@ -1539,7 +1631,11 @@ export class ProviderOperationReconciler
         prepareAttemptKey: released.prepareAttemptKey,
       });
       if (verdict.kind !== 'released-never-started') {
-        await this.#recordRetry(record, new Error('Cancellation acknowledgement did not match the journal attempt.'));
+        await this.#recordRetry(
+          record,
+          new Error('Cancellation acknowledgement did not match the journal attempt.'),
+          providerProxyOperationControlIsHeld(authority),
+        );
         return null;
       }
       if (record.afterRelease.kind !== 'local-authorized') {
@@ -1550,7 +1646,7 @@ export class ProviderOperationReconciler
         this.#toLocalRecoveryPending(record, record.afterRelease.reason, this.#deps.time.now()),
       );
     } catch (error: unknown) {
-      await this.#recordRetry(record, error);
+      await this.#recordRetry(record, error, providerProxyOperationControlIsHeld(authority));
       return null;
     }
   }
@@ -2123,10 +2219,11 @@ export class ProviderOperationReconciler
     return deleteProviderOperation(this.#deps.getProgressStore().getDb(), record);
   }
 
-  async #recordRetry(record: ProviderOperationRecord, error: unknown): Promise<void> {
+  async #recordRetry(record: ProviderOperationRecord, error: unknown, operationControlHeld = false): Promise<void> {
     this.#assertActiveDrive();
     const now = this.#deps.time.now();
     const preserveHostRefusal =
+      !operationControlHeld &&
       record.phase === 'prestart-cleanup-pending' &&
       record.afterRelease.kind === 'terminal-failed' &&
       record.afterRelease.code === 'provider_host_unserviceable' &&
@@ -2135,17 +2232,17 @@ export class ProviderOperationReconciler
       ...record,
       revision: record.revision + 1,
       retryCount: record.retryCount + 1,
-      retryNotBeforeMs: now + retryDelayMs(record.retryCount),
+      retryNotBeforeMs: operationControlHeld ? Number.MAX_SAFE_INTEGER : now + retryDelayMs(record.retryCount),
       lastError: preserveHostRefusal
         ? record.lastError
         : {
             observedAtMs: now,
-            code: providerOperationErrorCode(error),
+            code: operationControlHeld ? OPERATION_CONTROL_OUTCOME_UNKNOWN : providerOperationErrorCode(error),
             message: providerOperationErrorReason(error),
           },
     });
     const transitioned = this.#transition(record, next);
-    if (transitioned !== null) this.#schedule(retryDelayMs(record.retryCount));
+    if (transitioned !== null && !operationControlHeld) this.#schedule(retryDelayMs(record.retryCount));
   }
 
   #complete(identity: ProviderOperationIdentity, result: AppServerProxyPlacementResult): void {
@@ -2166,73 +2263,76 @@ export class ProviderOperationReconciler
     publication.reject(error);
   }
 
-  async #poll(preferredAuthority?: DurableProviderProxyOperationAuthority): Promise<void> {
-    if (this.#fatal) return;
-    if (this.#polling) {
-      this.#pollRequested = true;
-      return;
-    }
-    this.#polling = true;
-    try {
-      const progressStore = this.#deps.getProgressStore();
-      const scanCutoffMs = this.#deps.time.now();
-      let selections: readonly ProviderOperationDueSelection[];
-      try {
-        selections = readProviderOperationDueSelections(progressStore.getDb(), scanCutoffMs, this.#batchSize);
-      } catch (error: unknown) {
-        if (error instanceof ProviderOperationJournalError) {
-          this.#latchFatal(
-            new ProviderOperationReconcilerFatalError(
-              'due-index-corruption',
-              `Provider operation due-index selection failed: ${providerOperationErrorReason(error)}`,
-              { cause: error },
-            ),
-          );
-          return;
-        }
-        throw error;
-      }
-      for (const selection of selections) {
-        const result = await this.#reconcileDueSelection(selection, scanCutoffMs, preferredAuthority);
-        if (result === 'fatal') return;
-      }
+  #poll(preferredAuthority?: DurableProviderProxyOperationAuthority): Promise<void> {
+    if (!this.#canMutate()) return Promise.resolve();
+    return this.#admission().run('provider-operation-due-poll', async () => {
       if (this.#fatal) return;
-      for (const [key, identity] of this.#settlements) {
-        const record = readProviderOperation(progressStore.getDb(), identity);
-        if (record === null) {
-          this.#settlements.delete(key);
-          continue;
+      if (this.#polling) {
+        this.#pollRequested = true;
+        return;
+      }
+      this.#polling = true;
+      try {
+        const progressStore = this.#deps.getProgressStore();
+        const scanCutoffMs = this.#deps.time.now();
+        let selections: readonly ProviderOperationDueSelection[];
+        try {
+          selections = readProviderOperationDueSelections(progressStore.getDb(), scanCutoffMs, this.#batchSize);
+        } catch (error: unknown) {
+          if (error instanceof ProviderOperationJournalError) {
+            this.#latchFatal(
+              new ProviderOperationReconcilerFatalError(
+                'due-index-corruption',
+                `Provider operation due-index selection failed: ${providerOperationErrorReason(error)}`,
+                { cause: error },
+              ),
+            );
+            return;
+          }
+          throw error;
         }
-        if (record.phase !== 'settlement-pending' || record.retryNotBeforeMs > this.#deps.time.now()) continue;
-        if (preferredAuthority !== undefined && !sameAuthority(record, preferredAuthority)) continue;
-        await this.reconcile(record, preferredAuthority);
-      }
-      for (const [key, identity] of this.#attachments) {
-        const record = readProviderOperation(progressStore.getDb(), identity);
-        if (record === null || record.phase !== 'executing') {
-          this.#attachments.delete(key);
-          continue;
+        for (const selection of selections) {
+          const result = await this.#reconcileDueSelection(selection, scanCutoffMs, preferredAuthority);
+          if (result === 'fatal') return;
         }
-        if (record.retryNotBeforeMs > this.#deps.time.now()) continue;
-        if (preferredAuthority !== undefined && !sameAuthority(record, preferredAuthority)) continue;
-        await this.reconcile(record, preferredAuthority);
-      }
-    } catch (error: unknown) {
-      if (!this.#observeFatal(error)) {
-        this.#deps.onError?.(`Provider operation reconciliation failed: ${providerOperationErrorReason(error)}`);
-      }
-    } finally {
-      this.#polling = false;
-      const pollRequested = this.#pollRequested;
-      this.#pollRequested = false;
-      if (!this.#fatal) {
-        if (pollRequested) {
-          void this.#poll();
-        } else if (this.#started) {
-          this.#schedule(TIMER_MAX_MS);
+        if (this.#fatal) return;
+        for (const [key, identity] of this.#settlements) {
+          const record = readProviderOperation(progressStore.getDb(), identity);
+          if (record === null) {
+            this.#settlements.delete(key);
+            continue;
+          }
+          if (record.phase !== 'settlement-pending' || record.retryNotBeforeMs > this.#deps.time.now()) continue;
+          if (preferredAuthority !== undefined && !sameAuthority(record, preferredAuthority)) continue;
+          await this.reconcile(record, preferredAuthority);
+        }
+        for (const [key, identity] of this.#attachments) {
+          const record = readProviderOperation(progressStore.getDb(), identity);
+          if (record === null || record.phase !== 'executing') {
+            this.#attachments.delete(key);
+            continue;
+          }
+          if (record.retryNotBeforeMs > this.#deps.time.now()) continue;
+          if (preferredAuthority !== undefined && !sameAuthority(record, preferredAuthority)) continue;
+          await this.reconcile(record, preferredAuthority);
+        }
+      } catch (error: unknown) {
+        if (!this.#observeFatal(error)) {
+          this.#deps.onError?.(`Provider operation reconciliation failed: ${providerOperationErrorReason(error)}`);
+        }
+      } finally {
+        this.#polling = false;
+        const pollRequested = this.#pollRequested;
+        this.#pollRequested = false;
+        if (!this.#fatal) {
+          if (pollRequested) {
+            void this.#poll();
+          } else if (this.#started) {
+            this.#schedule(TIMER_MAX_MS);
+          }
         }
       }
-    }
+    });
   }
 
   async #reconcileDueSelection(

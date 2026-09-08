@@ -1,6 +1,364 @@
-import { MAX_BUFFER, SIGTERM_GRACE_MS } from './process-constants.js';
-import type { ChildProcessLike } from './port-types.js';
-import type { Runtime } from '../runtime/ports.js';
+import { MAX_BUFFER, SIGKILL_GRACE_MS, SIGTERM_GRACE_MS } from './process-constants.js';
+import { incarnationMayAuthorizeSignal, type ProcessIncarnation, type ProcessLiveness } from './node-process.js';
+import type { ChildProcessLike, TimePort } from './port-types.js';
+
+type ProcessSignal = (pid: number, signal: NodeJS.Signals | 0) => boolean;
+
+type ProcessGroupObservationRuntime = Readonly<{
+  process: Readonly<{
+    observeLiveness(pid: number): ProcessLiveness;
+  }>;
+}>;
+
+type SpawnedProcessGroupCleanupRuntime = ProcessGroupObservationRuntime &
+  Readonly<{
+    time: Pick<TimePort, 'sleep'>;
+    process: Readonly<{
+      kill: ProcessSignal;
+      observeLiveness(pid: number): ProcessLiveness;
+    }>;
+  }>;
+
+type GracefulKillByPidRuntime = Readonly<{
+  time: Pick<TimePort, 'setTimeout'>;
+  env: Readonly<{ platform(): string }>;
+  process: Readonly<{
+    kill: ProcessSignal;
+    observeLiveness(pid: number): ProcessLiveness;
+    readProcessIncarnation(pid: number, platform: NodeJS.Platform): ProcessIncarnation | null;
+  }>;
+}>;
+
+type GracefulKillRuntime = Readonly<{
+  time: Pick<TimePort, 'setTimeout' | 'clearTimeout'>;
+}>;
+
+declare const liveChildAuthorityBrand: unique symbol;
+declare const spawnedProcessGroupCleanupBrand: unique symbol;
+const spawnedProcessGroupAbsenceEvidenceBrand: unique symbol = Symbol(
+  'coral.process-supervision.spawned-process-group-absence',
+);
+
+export type SpawnedProcessGroupCleanup<ProcessGroupId extends number = number> = Readonly<{
+  processGroupId: ProcessGroupId;
+  child: ChildProcessLike;
+  cleanup(
+    runtime: SpawnedProcessGroupCleanupRuntime,
+    signal?: AbortSignal,
+  ): Promise<SpawnedProcessGroupCleanupDisposition<ProcessGroupId>>;
+  [spawnedProcessGroupCleanupBrand]: true;
+}>;
+
+export type LiveChildAuthority = Readonly<{
+  pid: number;
+  hasExited(): boolean;
+  [liveChildAuthorityBrand]: true;
+}>;
+
+export function liveChildAuthority(child: ChildProcessLike): LiveChildAuthority | undefined {
+  if (child.pid === undefined) return undefined;
+  return Object.freeze({
+    pid: child.pid,
+    hasExited: () => child.exitCode !== null || child.signalCode !== null,
+  }) as LiveChildAuthority;
+}
+
+export type OwnedGroupSignalDelivery = 'delivered' | 'not-delivered' | 'leader-collected';
+
+export function signalOwnedProcessGroup(
+  child: ChildProcessLike,
+  kill: ProcessSignal,
+  signal: NodeJS.Signals,
+): OwnedGroupSignalDelivery {
+  const authority = liveChildAuthority(child);
+  if (authority === undefined || authority.hasExited()) return 'leader-collected';
+  return kill(-authority.pid, signal) ? 'delivered' : 'not-delivered';
+}
+
+export type SpawnedProcessGroupCleanupSubject<ProcessGroupId extends number = number> = Readonly<{
+  kind: 'process-group';
+  processGroupId: ProcessGroupId;
+}>;
+
+export type SpawnedProcessGroupAbsenceEvidence<ProcessGroupId extends number = number> = Readonly<{
+  subject: SpawnedProcessGroupCleanupSubject<ProcessGroupId>;
+  [spawnedProcessGroupAbsenceEvidenceBrand]: true;
+}>;
+
+export type SpawnedProcessGroupObservedAbsent<ProcessGroupId extends number = number> = Readonly<{
+  kind: 'observed-absent';
+  evidence: SpawnedProcessGroupAbsenceEvidence<ProcessGroupId>;
+}>;
+
+export type UnattributableSpawnedProcessGroupObservation<ProcessGroupId extends number = number> =
+  | SpawnedProcessGroupObservedAbsent<ProcessGroupId>
+  | Readonly<{
+      kind: 'held-unattributable';
+      subject: SpawnedProcessGroupCleanupSubject<ProcessGroupId>;
+      observation: 'unattributable';
+    }>
+  | Readonly<{
+      kind: 'held-unobservable';
+      subject: SpawnedProcessGroupCleanupSubject<ProcessGroupId>;
+      observation: 'unobservable';
+    }>;
+
+export type SpawnedProcessGroupCleanupDisposition<ProcessGroupId extends number = number> =
+  | SpawnedProcessGroupObservedAbsent<ProcessGroupId>
+  | Readonly<{
+      kind: 'held-alive';
+      subject: SpawnedProcessGroupCleanupSubject<ProcessGroupId>;
+      observation: 'alive';
+      exit: 'process-group-absence';
+      retry(signal?: AbortSignal): Promise<SpawnedProcessGroupCleanupDisposition<ProcessGroupId>>;
+    }>
+  | Readonly<{
+      kind: 'held-unobservable';
+      subject: SpawnedProcessGroupCleanupSubject<ProcessGroupId>;
+      observation: 'unobservable';
+      exit: 'process-group-absence';
+      retry(signal?: AbortSignal): Promise<SpawnedProcessGroupCleanupDisposition<ProcessGroupId>>;
+    }>;
+
+export function retainSpawnedProcessGroupCleanup(child: ChildProcessLike): SpawnedProcessGroupCleanup {
+  const authority = liveChildAuthority(child);
+  if (authority === undefined) {
+    throw new RangeError('Cannot retain spawned process-group cleanup before the child has a pid.');
+  }
+  const processGroupId = authority.pid;
+  if (!Number.isSafeInteger(processGroupId) || processGroupId <= 0) {
+    throw new RangeError(`Spawned process-group id must be a positive safe integer; received ${processGroupId}.`);
+  }
+  const capability = Object.freeze({
+    processGroupId,
+    child,
+    cleanup: (runtime: SpawnedProcessGroupCleanupRuntime, signal?: AbortSignal) =>
+      cleanupSpawnedProcessGroup(capability, runtime, signal),
+  }) as SpawnedProcessGroupCleanup;
+  return capability;
+}
+
+function observeSpawnedProcessGroup<ProcessGroupId extends number>(
+  cleanup: SpawnedProcessGroupCleanup<ProcessGroupId>,
+  runtime: ProcessGroupObservationRuntime,
+): 'alive' | 'absent' | 'unobservable' {
+  try {
+    const groupLiveness = runtime.process.observeLiveness(-cleanup.processGroupId);
+    if (groupLiveness === 'absent') return 'absent';
+    if (groupLiveness === 'unknown') return 'unobservable';
+    return liveChildAuthority(cleanup.child)?.hasExited() === false ? 'alive' : 'unobservable';
+  } catch {
+    return 'unobservable';
+  }
+}
+
+function observedSpawnedProcessGroupAbsent<ProcessGroupId extends number>(
+  processGroupId: ProcessGroupId,
+): SpawnedProcessGroupObservedAbsent<ProcessGroupId> {
+  const subject: SpawnedProcessGroupCleanupSubject<ProcessGroupId> = {
+    kind: 'process-group',
+    processGroupId,
+  };
+  return {
+    kind: 'observed-absent',
+    evidence: Object.freeze({ subject, [spawnedProcessGroupAbsenceEvidenceBrand]: true as const }),
+  };
+}
+
+function heldSpawnedProcessGroupCleanup<ProcessGroupId extends number>(
+  cleanup: SpawnedProcessGroupCleanup<ProcessGroupId>,
+  runtime: SpawnedProcessGroupCleanupRuntime,
+  observation: 'alive' | 'unobservable',
+): SpawnedProcessGroupCleanupDisposition<ProcessGroupId> {
+  const subject: SpawnedProcessGroupCleanupSubject<ProcessGroupId> = {
+    kind: 'process-group',
+    processGroupId: cleanup.processGroupId,
+  };
+  const retry = (signal?: AbortSignal) => cleanupSpawnedProcessGroup(cleanup, runtime, signal);
+  return observation === 'alive'
+    ? { kind: 'held-alive', subject, observation, exit: 'process-group-absence', retry }
+    : { kind: 'held-unobservable', subject, observation, exit: 'process-group-absence', retry };
+}
+
+export function observeRetainedSpawnedProcessGroup<ProcessGroupId extends number>(
+  cleanup: SpawnedProcessGroupCleanup<ProcessGroupId>,
+  runtime: SpawnedProcessGroupCleanupRuntime,
+): SpawnedProcessGroupCleanupDisposition<ProcessGroupId> {
+  const observation = observeSpawnedProcessGroup(cleanup, runtime);
+  return observation === 'absent'
+    ? observedSpawnedProcessGroupAbsent(cleanup.processGroupId)
+    : heldSpawnedProcessGroupCleanup(cleanup, runtime, observation);
+}
+
+/**
+ * The kernel may recycle a process-group id, so a present group under that number is not evidence that the
+ * spawned group is alive; only its absence is decisive for whatever once held the number.
+ */
+export function observeUnattributableSpawnedProcessGroup<ProcessGroupId extends number>(
+  processGroupId: ProcessGroupId,
+  runtime: ProcessGroupObservationRuntime,
+): UnattributableSpawnedProcessGroupObservation<ProcessGroupId> {
+  const subject: SpawnedProcessGroupCleanupSubject<ProcessGroupId> = { kind: 'process-group', processGroupId };
+  let liveness: ProcessLiveness;
+  try {
+    liveness = runtime.process.observeLiveness(-processGroupId);
+  } catch {
+    return { kind: 'held-unobservable', subject, observation: 'unobservable' };
+  }
+  if (liveness === 'absent') return observedSpawnedProcessGroupAbsent(processGroupId);
+  if (liveness === 'alive') return { kind: 'held-unattributable', subject, observation: 'unattributable' };
+  return { kind: 'held-unobservable', subject, observation: 'unobservable' };
+}
+
+function signalSpawnedProcessGroup<ProcessGroupId extends number>(
+  cleanup: SpawnedProcessGroupCleanup<ProcessGroupId>,
+  runtime: SpawnedProcessGroupCleanupRuntime,
+  signal: NodeJS.Signals,
+  abortSignal?: AbortSignal,
+): 'delivered' | 'alive' | 'absent' | 'unobservable' {
+  if (abortSignal?.aborted) return observeSpawnedProcessGroup(cleanup, runtime);
+  const delivery = signalOwnedProcessGroup(cleanup.child, runtime.process.kill, signal);
+  return delivery === 'delivered' ? delivery : observeSpawnedProcessGroup(cleanup, runtime);
+}
+
+function dispositionForSpawnedProcessGroupObservation<ProcessGroupId extends number>(
+  cleanup: SpawnedProcessGroupCleanup<ProcessGroupId>,
+  runtime: SpawnedProcessGroupCleanupRuntime,
+  observation: 'alive' | 'absent' | 'unobservable',
+): SpawnedProcessGroupCleanupDisposition<ProcessGroupId> {
+  return observation === 'absent'
+    ? observedSpawnedProcessGroupAbsent(cleanup.processGroupId)
+    : heldSpawnedProcessGroupCleanup(cleanup, runtime, observation);
+}
+
+async function waitForSpawnedProcessGroupGrace(
+  runtime: SpawnedProcessGroupCleanupRuntime,
+  milliseconds: number,
+  signal?: AbortSignal,
+): Promise<void> {
+  try {
+    await runtime.time.sleep(milliseconds, signal === undefined ? undefined : { signal });
+  } catch (error: unknown) {
+    if (!signal?.aborted) throw error;
+  }
+}
+
+type SpawnedProcessGroupSignalPhaseDisposition<ProcessGroupId extends number> =
+  | Readonly<{ kind: 'still-alive' }>
+  | Readonly<{
+      kind: 'disposition';
+      disposition: SpawnedProcessGroupCleanupDisposition<ProcessGroupId>;
+    }>;
+
+async function runSpawnedProcessGroupSignalPhase<ProcessGroupId extends number>(
+  cleanup: SpawnedProcessGroupCleanup<ProcessGroupId>,
+  runtime: SpawnedProcessGroupCleanupRuntime,
+  processSignal: NodeJS.Signals,
+  graceMs: number,
+  signal?: AbortSignal,
+): Promise<SpawnedProcessGroupSignalPhaseDisposition<ProcessGroupId>> {
+  const delivery = signalSpawnedProcessGroup(cleanup, runtime, processSignal, signal);
+  if (delivery !== 'delivered') {
+    return {
+      kind: 'disposition',
+      disposition: dispositionForSpawnedProcessGroupObservation(cleanup, runtime, delivery),
+    };
+  }
+  const immediateObservation = observeSpawnedProcessGroup(cleanup, runtime);
+  if (immediateObservation !== 'alive') {
+    return {
+      kind: 'disposition',
+      disposition: dispositionForSpawnedProcessGroupObservation(cleanup, runtime, immediateObservation),
+    };
+  }
+  await waitForSpawnedProcessGroupGrace(runtime, graceMs, signal);
+
+  const observation = observeSpawnedProcessGroup(cleanup, runtime);
+  return observation === 'alive' && !signal?.aborted
+    ? { kind: 'still-alive' }
+    : {
+        kind: 'disposition',
+        disposition: dispositionForSpawnedProcessGroupObservation(cleanup, runtime, observation),
+      };
+}
+
+export async function cleanupSpawnedProcessGroup<ProcessGroupId extends number>(
+  cleanup: SpawnedProcessGroupCleanup<ProcessGroupId>,
+  runtime: SpawnedProcessGroupCleanupRuntime,
+  signal?: AbortSignal,
+): Promise<SpawnedProcessGroupCleanupDisposition<ProcessGroupId>> {
+  const initialObservation = observeSpawnedProcessGroup(cleanup, runtime);
+  if (initialObservation !== 'alive' || signal?.aborted)
+    return dispositionForSpawnedProcessGroupObservation(cleanup, runtime, initialObservation);
+
+  const sigterm = await runSpawnedProcessGroupSignalPhase(cleanup, runtime, 'SIGTERM', SIGTERM_GRACE_MS, signal);
+  if (sigterm.kind === 'disposition') return sigterm.disposition;
+
+  const sigkill = await runSpawnedProcessGroupSignalPhase(cleanup, runtime, 'SIGKILL', SIGKILL_GRACE_MS, signal);
+  return sigkill.kind === 'disposition'
+    ? sigkill.disposition
+    : dispositionForSpawnedProcessGroupObservation(cleanup, runtime, 'alive');
+}
+
+type GracefulKillByPidSignalRefusal = Readonly<{
+  kind: 'signal-refused';
+  pid: number;
+  reason:
+    | 'recorded-incarnation-unavailable'
+    | 'platform-incarnation-cannot-authorize-signal'
+    | 'signal-authorizing-incarnation-unavailable'
+    | 'expected-incarnation-mismatch';
+}>;
+
+type GracefulKillByPidSignalFailure = Readonly<{
+  kind: 'signal-failed';
+  pid: number;
+  signal: 'SIGTERM' | 'SIGKILL';
+  reason: 'kill-port-returned-false';
+}>;
+
+export type GracefulKillByPidOutcome =
+  | GracefulKillByPidSignalRefusal
+  | GracefulKillByPidSignalFailure
+  | Readonly<{
+      kind: 'signal-delivered-escalation-unavailable';
+      pid: number;
+      signal: 'SIGTERM';
+      reason: 'platform-incarnation-cannot-authorize-signal';
+    }>
+  | Readonly<{ kind: 'observed-absent'; pid: number }>
+  | Readonly<{ kind: 'target-unobservable'; pid: number; stage: 'after-sigterm' | 'after-sigkill' }>
+  | Readonly<{ kind: 'target-alive'; pid: number; stage: 'after-sigkill' }>;
+
+export type GracefulKillByPidDisposition =
+  | Readonly<{ kind: 'escalation-scheduled'; pid: number; settlement: Promise<GracefulKillByPidOutcome> }>
+  | GracefulKillByPidSignalRefusal
+  | GracefulKillByPidSignalFailure;
+
+type GracefulKillSignalFailure = Readonly<{
+  kind: 'signal-failed';
+  pid: number | null;
+  signal: 'SIGTERM' | 'SIGKILL';
+  reason: 'kill-port-returned-false' | 'kill-port-threw';
+}>;
+
+export type GracefulKillOutcome =
+  | GracefulKillSignalFailure
+  | Readonly<{ kind: 'observed-absent'; pid: number | null }>
+  | Readonly<{ kind: 'target-unobservable'; pid: number; stage: 'after-sigterm' | 'after-sigkill' }>
+  | Readonly<{ kind: 'target-alive'; pid: number; stage: 'after-sigkill' }>;
+
+export type GracefulKillPendingDisposition =
+  | Readonly<{ kind: 'escalation-scheduled'; pid: number; settlement: Promise<GracefulKillOutcome> }>
+  | Readonly<{
+      kind: 'signal-delivered-escalation-unavailable';
+      pid: null;
+      signal: 'SIGTERM';
+      reason: 'child-pid-unavailable';
+      settlement: Promise<GracefulKillOutcome>;
+    }>;
+
+export type GracefulKillDisposition = GracefulKillPendingDisposition | GracefulKillSignalFailure;
 
 export function safeKill(child: ChildProcessLike, signal: NodeJS.Signals): void {
   try {
@@ -10,28 +368,225 @@ export function safeKill(child: ChildProcessLike, signal: NodeJS.Signals): void 
   }
 }
 
-export function gracefulKill(child: ChildProcessLike, runtime: Runtime): void {
-  safeKill(child, 'SIGTERM');
-  const killTimer = runtime.time.setTimeout(() => {
-    safeKill(child, 'SIGKILL');
-  }, SIGTERM_GRACE_MS);
-  // Unref so a caller that fires gracefulKill on an already-closed child (whose
-  // 'close' won't fire again to clear the timer) can't pin the event loop for
-  // the SIGTERM grace window. Matches gracefulKillByPid's escalation timer.
-  killTimer.unref?.();
-  child.on('close', () => runtime.time.clearTimeout(killTimer));
+type ChildSignalDelivery = 'delivered' | 'returned-false' | 'threw';
+
+function deliverChildSignal(child: ChildProcessLike, signal: 'SIGTERM' | 'SIGKILL'): ChildSignalDelivery {
+  try {
+    return child.kill(signal) ? 'delivered' : 'returned-false';
+  } catch {
+    return 'threw';
+  }
 }
 
-/**
- * PID-based variant of {@link gracefulKill} for callers that detached the
- * child handle (e.g., durable transports that hand the spawned PID off to a
- * background watcher). Fires-and-forgets the SIGKILL escalation; the returned
- * timer is unref'd so it never holds the event loop alive on its own.
- */
-export function gracefulKillByPid(runtime: Runtime, pid: number): void {
-  runtime.process.kill(pid, 'SIGTERM');
-  const escalation = runtime.time.setTimeout(() => runtime.process.kill(pid, 'SIGKILL'), SIGTERM_GRACE_MS);
-  escalation.unref?.();
+function settleGracefulKill(
+  child: ChildProcessLike,
+  runtime: GracefulKillRuntime,
+  observeLiveness: (pid: number) => ProcessLiveness,
+  pid: number,
+): Promise<GracefulKillOutcome> {
+  return new Promise((resolve) => {
+    let timer: ReturnType<TimePort['setTimeout']> | undefined;
+    let settled = false;
+    const finish = (outcome: GracefulKillOutcome): void => {
+      if (settled) return;
+      settled = true;
+      if (timer !== undefined) runtime.time.clearTimeout(timer);
+      resolve(outcome);
+    };
+    const observe = (stage: 'after-sigterm' | 'after-sigkill'): 'alive' | undefined => {
+      try {
+        const observation = observeLiveness(pid);
+        if (observation === 'absent') {
+          finish({ kind: 'observed-absent', pid });
+          return undefined;
+        }
+        if (observation === 'unknown') {
+          finish({ kind: 'target-unobservable', pid, stage });
+          return undefined;
+        }
+        return 'alive';
+      } catch {
+        finish({ kind: 'target-unobservable', pid, stage });
+        return undefined;
+      }
+    };
+
+    child.on('close', () => finish({ kind: 'observed-absent', pid }));
+    timer = runtime.time.setTimeout(() => {
+      if (observe('after-sigterm') !== 'alive') return;
+      const delivery = deliverChildSignal(child, 'SIGKILL');
+      if (delivery !== 'delivered') {
+        finish({
+          kind: 'signal-failed',
+          pid,
+          signal: 'SIGKILL',
+          reason: delivery === 'returned-false' ? 'kill-port-returned-false' : 'kill-port-threw',
+        });
+        return;
+      }
+      timer = runtime.time.setTimeout(() => {
+        if (observe('after-sigkill') === 'alive') finish({ kind: 'target-alive', pid, stage: 'after-sigkill' });
+      }, SIGKILL_GRACE_MS);
+      timer.unref?.();
+    }, SIGTERM_GRACE_MS);
+    timer.unref?.();
+  });
+}
+
+export function gracefulKill(
+  child: ChildProcessLike,
+  runtime: GracefulKillRuntime,
+  observeLiveness: (pid: number) => ProcessLiveness,
+): GracefulKillDisposition {
+  const pid = child.pid;
+  const delivery = deliverChildSignal(child, 'SIGTERM');
+  if (delivery !== 'delivered') {
+    return {
+      kind: 'signal-failed',
+      pid: pid ?? null,
+      signal: 'SIGTERM',
+      reason: delivery === 'returned-false' ? 'kill-port-returned-false' : 'kill-port-threw',
+    };
+  }
+  if (pid === undefined) {
+    return {
+      kind: 'signal-delivered-escalation-unavailable',
+      pid: null,
+      signal: 'SIGTERM',
+      reason: 'child-pid-unavailable',
+      settlement: new Promise((resolve) => {
+        child.on('close', () => resolve({ kind: 'observed-absent', pid: null }));
+      }),
+    };
+  }
+  return { kind: 'escalation-scheduled', pid, settlement: settleGracefulKill(child, runtime, observeLiveness, pid) };
+}
+
+function observeRecordedTarget(
+  runtime: GracefulKillByPidRuntime,
+  pid: number,
+  platform: NodeJS.Platform,
+  expectedIncarnation: ProcessIncarnation,
+): 'alive' | 'absent' | 'unobservable' {
+  try {
+    const observedIncarnation = runtime.process.readProcessIncarnation(pid, platform);
+    if (observedIncarnation !== null) {
+      if (observedIncarnation !== expectedIncarnation) return 'absent';
+      const liveness = runtime.process.observeLiveness(pid);
+      return liveness === 'unknown' ? 'unobservable' : liveness;
+    }
+    return runtime.process.observeLiveness(pid) === 'absent' ? 'absent' : 'unobservable';
+  } catch {
+    return 'unobservable';
+  }
+}
+
+function settleAfterSigkill(
+  runtime: GracefulKillByPidRuntime,
+  pid: number,
+  platform: NodeJS.Platform,
+  expectedIncarnation: ProcessIncarnation,
+): Promise<GracefulKillByPidOutcome> {
+  return new Promise((resolve) => {
+    const settlement = runtime.time.setTimeout(() => {
+      const observation = observeRecordedTarget(runtime, pid, platform, expectedIncarnation);
+      if (observation === 'absent') {
+        resolve({ kind: 'observed-absent', pid });
+        return;
+      }
+      if (observation === 'unobservable') {
+        resolve({ kind: 'target-unobservable', pid, stage: 'after-sigkill' });
+        return;
+      }
+      resolve({ kind: 'target-alive', pid, stage: 'after-sigkill' });
+    }, SIGKILL_GRACE_MS);
+    settlement.unref?.();
+  });
+}
+
+function settleGracefulKillByPid(
+  runtime: GracefulKillByPidRuntime,
+  pid: number,
+  platform: NodeJS.Platform,
+  expectedIncarnation: ProcessIncarnation,
+): Promise<GracefulKillByPidOutcome> {
+  try {
+    const immediateLiveness = runtime.process.observeLiveness(pid);
+    if (immediateLiveness === 'absent') return Promise.resolve({ kind: 'observed-absent', pid });
+    if (immediateLiveness === 'unknown') {
+      return Promise.resolve({ kind: 'target-unobservable', pid, stage: 'after-sigterm' });
+    }
+  } catch {
+    return Promise.resolve({ kind: 'target-unobservable', pid, stage: 'after-sigterm' });
+  }
+
+  return new Promise<GracefulKillByPidOutcome>((resolve, reject) => {
+    const escalation = runtime.time.setTimeout(() => {
+      try {
+        if (!incarnationMayAuthorizeSignal(platform)) {
+          resolve({
+            kind: 'signal-delivered-escalation-unavailable',
+            pid,
+            signal: 'SIGTERM',
+            reason: 'platform-incarnation-cannot-authorize-signal',
+          });
+          return;
+        }
+        const observation = observeRecordedTarget(runtime, pid, platform, expectedIncarnation);
+        if (observation === 'absent') {
+          resolve({ kind: 'observed-absent', pid });
+          return;
+        }
+        if (observation === 'unobservable') {
+          resolve({ kind: 'target-unobservable', pid, stage: 'after-sigterm' });
+          return;
+        }
+        if (!runtime.process.kill(pid, 'SIGKILL')) {
+          resolve({ kind: 'signal-failed', pid, signal: 'SIGKILL', reason: 'kill-port-returned-false' });
+          return;
+        }
+        resolve(settleAfterSigkill(runtime, pid, platform, expectedIncarnation));
+      } catch (error: unknown) {
+        reject(error instanceof Error ? error : new Error(String(error)));
+      }
+    }, SIGTERM_GRACE_MS);
+    escalation.unref?.();
+  });
+}
+
+export function gracefulKillByPid(
+  runtime: GracefulKillByPidRuntime,
+  pid: number,
+  expectedIncarnation: ProcessIncarnation | null,
+): GracefulKillByPidDisposition {
+  const platform = runtime.env.platform() as NodeJS.Platform;
+  if (expectedIncarnation === null) {
+    return { kind: 'signal-refused', pid, reason: 'recorded-incarnation-unavailable' };
+  }
+  if (!incarnationMayAuthorizeSignal(platform)) {
+    return { kind: 'signal-refused', pid, reason: 'platform-incarnation-cannot-authorize-signal' };
+  }
+  let observedIncarnation: ProcessIncarnation | null;
+  try {
+    observedIncarnation = runtime.process.readProcessIncarnation(pid, platform);
+  } catch {
+    observedIncarnation = null;
+  }
+  if (observedIncarnation === null) {
+    return { kind: 'signal-refused', pid, reason: 'signal-authorizing-incarnation-unavailable' };
+  }
+  if (observedIncarnation !== expectedIncarnation) {
+    return { kind: 'signal-refused', pid, reason: 'expected-incarnation-mismatch' };
+  }
+  if (!runtime.process.kill(pid, 'SIGTERM')) {
+    return { kind: 'signal-failed', pid, signal: 'SIGTERM', reason: 'kill-port-returned-false' };
+  }
+
+  return {
+    kind: 'escalation-scheduled',
+    pid,
+    settlement: settleGracefulKillByPid(runtime, pid, platform, observedIncarnation),
+  };
 }
 
 export function requirePipedHandles(

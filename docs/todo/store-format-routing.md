@@ -6,8 +6,8 @@ conflict, and nobody has appetite for it. Split out of the containment-boundary 
 
 **Marked dormant 2026-08-15**, when a consolidation pass found a live defect buried at point 3 of the
 constraints list below — a real socket-identity bug blocked on a refactor that is not going to happen. It
-was extracted, fixed, and its entry retired. Nothing else in this document is a defect; read it as a design
-record, not as open work.
+was extracted, fixed, and its entry retired. What remains here is not a defect anyone has reproduced — it is a
+routing problem nobody has appetite for, stated under "Constraints" below. Dormant means unstarted, not done.
 
 **Why it is not part of containment**: routing shares coordinator election, cold start, and
 high-water identity with the cross-version continuity work — since landed, and described by

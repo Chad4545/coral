@@ -144,18 +144,15 @@ function isKbDaemonOwnedSource(source: string): boolean {
   return source.startsWith('src/kb-daemon/');
 }
 
-/** A target every coordinator file may reach regardless of source, whether because it sits on a seam
- *  (coordinator/store/runtime/infra/security) or because it is named as domain/contract/transport public
- *  surface. Shared by the containment check below and by the exemption self-checks: an entry in
- *  `COORDINATOR_GLUE_SOURCES`/`BROAD_IMPORT_PREFIXES` only earns its broad exemption by reaching a target this
- *  function says `false` for — one it would otherwise be forbidden to reach. */
+/** A broad-source exemption must reach at least one target outside the always-permitted set. */
 function isAlwaysPermittedTarget(target: string): boolean {
   if (
     target.startsWith('src/coordinator/') ||
     target.startsWith('src/store/') ||
     target.startsWith('src/runtime/') ||
     target.startsWith('src/infra/') ||
-    target.startsWith('src/security/')
+    target.startsWith('src/security/') ||
+    target.startsWith('src/obligation/')
   ) {
     return true;
   }

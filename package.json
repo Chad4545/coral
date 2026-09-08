@@ -19,7 +19,9 @@
     "clients/bridge/coral-backend.cjs",
     "clients/bridge/coral-cli.cjs",
     "clients/bridge/coral-claude-appserver.cjs",
-    "clients/bridge/manifest.json"
+    "clients/bridge/coral-durable-wrapper.cjs",
+    "clients/bridge/manifest.json",
+    "clients/bridge/manifest.v*.json"
   ],
   "scripts": {
     "clean:dist": "node scripts/clean-dist.mjs",

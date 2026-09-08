@@ -75,24 +75,31 @@ describe('simulation app-server and recording', () => {
     );
 
     const coordinator = new LaunchCoordinator({ runtime });
-    const handlePromise = coordinator.spawnProviderServer({
-      provider: 'codex',
-      command: 'codex',
-      args: ['app-server'],
-      cwd: '/tmp/sim/project',
-      initializeRequest: {
-        method: 'initialize',
-        params: {
-          clientInfo: {
-            name: 'test',
-            version: '0.0.1',
+    const handlePromise = coordinator.spawnProviderServer(
+      {
+        provider: 'codex',
+        command: 'codex',
+        args: ['app-server'],
+        cwd: '/tmp/sim/project',
+        initializeRequest: {
+          method: 'initialize',
+          params: {
+            clientInfo: {
+              name: 'test',
+              version: '0.0.1',
+            },
           },
         },
       },
-    });
+      undefined,
+      undefined,
+      undefined,
+      (hold) => ({ kind: 'accepted', owner: 'provider-host-manager', settlement: hold.settled }),
+    );
 
     await advance(runtime, 0);
     const handle = await handlePromise;
+    if ('kind' in handle) throw new Error('Expected a contained provider server handle.');
     const notifications: Array<{ method: string; params?: Record<string, unknown> }> = [];
     const unsubscribe = handle.onNotification((message) => {
       notifications.push(message);
@@ -252,12 +259,21 @@ describe('simulation app-server and recording', () => {
 
     const durableRuntime = new SimulationRuntime();
     durableRuntime.spawner.enqueueDurable(recordingToDurableScript(loaded));
-    const durable = await durableRuntime.process.durable.launch({
+    let durable = await durableRuntime.process.durable.launch({
       provider: 'mock-provider',
       command: 'mock-provider',
       args: ['--exec'],
       jobDir: '/tmp/sim/jobs/recording-roundtrip',
     });
+    if (durable.disposition === 'held') {
+      const reason = durable.reason;
+      while (durable.disposition === 'held') {
+        await durable.retryAfter;
+        const retry = await durable.retry();
+        if (retry.disposition === 'settled') throw new Error(reason);
+        durable = retry;
+      }
+    }
     const exitPromise = durableRuntime.process.durable.waitForExit(durable);
 
     await advance(durableRuntime, 4);

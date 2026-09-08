@@ -1,13 +1,26 @@
-import type { ProcessIncarnation } from '../infra/node-process.js';
 import { backendLog } from '../infra/backend-log.js';
 import { errorMessage } from '../infra/error-format.js';
 import { buildJsonRpcError } from '../infra/json-rpc.js';
-import { MAX_BUFFER } from '../infra/process-constants.js';
+import { MAX_BUFFER, SIGTERM_GRACE_MS } from '../infra/process-constants.js';
 import { shouldUseWindowsCommandShell } from '../infra/windows-shell.js';
 import type { ChildProcessLike } from '../infra/port-types.js';
+import type { ProcessIncarnation } from '../infra/node-process.js';
 import type { Runtime } from '../runtime/ports.js';
 import { AbortError } from '../runtime/abort.js';
-import { gracefulKill, requirePipedHandles } from '../infra/process-supervision.js';
+import {
+  cleanupSpawnedProcessGroup,
+  gracefulKill,
+  observeRetainedSpawnedProcessGroup,
+  observeUnattributableSpawnedProcessGroup,
+  requirePipedHandles,
+  retainSpawnedProcessGroupCleanup,
+  type GracefulKillDisposition,
+  type GracefulKillOutcome,
+  type GracefulKillPendingDisposition,
+  type SpawnedProcessGroupAbsenceEvidence,
+  type SpawnedProcessGroupCleanup,
+  type SpawnedProcessGroupCleanupDisposition,
+} from '../infra/process-supervision.js';
 import {
   assertRecordedContainmentIdentity,
   ProcessContainmentError,
@@ -24,11 +37,18 @@ import {
   type ProviderHostLogCursorSpan,
   type ProviderResponseObservationSink as HostResponseObservationSink,
 } from './host-diagnostics.js';
+import type {
+  ProviderServerFailedSpawnOperatorAbandonment,
+  ProviderServerFailedSpawnOperatorExit,
+  ProviderServerFailedSpawnSubject,
+} from './contract.js';
 
 export type ProviderResponseObservationSink = HostResponseObservationSink;
 
 export const PROVIDER_SERVER_MAX_JSONL_LINE_BYTES = MAX_BUFFER;
 export const PROVIDER_SERVER_INITIALIZE_TIMEOUT_MS = 30_000;
+export const PROVIDER_CONTAINMENT_ACCEPTED = Symbol('provider-containment-accepted');
+export type ProviderContainmentAcceptance = typeof PROVIDER_CONTAINMENT_ACCEPTED;
 
 class ProviderServerLineTooLargeError extends Error {
   readonly code = 'provider_server_line_too_large';
@@ -129,8 +149,32 @@ export type ProviderServerHandle = {
   isClosed(): boolean;
   inspectDiagnostics: () => ProviderHostDiagnosticsSnapshot;
   markExpectedClose: () => void;
-  close: () => Promise<void>;
+  close: (acceptCleanupHold: ProviderServerCleanupHoldAcceptor) => Promise<ProviderServerCloseDisposition>;
 };
+
+const providerServerShutdownRequests = new WeakMap<ProviderServerHandle, Map<string, Promise<unknown>>>();
+
+/** Concurrent shutdown requests for the same handle and method must join until the active request settles. */
+export function requestJoinableProviderServerShutdown(handle: ProviderServerHandle, method: string): Promise<unknown> {
+  const existing = providerServerShutdownRequests.get(handle);
+  const requests = existing ?? new Map<string, Promise<unknown>>();
+  if (existing === undefined) providerServerShutdownRequests.set(handle, requests);
+  const current = requests.get(method);
+  if (current !== undefined) return current;
+  const request = handle.rpc.request(method, {});
+  requests.set(method, request);
+  void request.then(
+    () => {
+      if (requests.get(method) === request) requests.delete(method);
+      if (requests.size === 0) providerServerShutdownRequests.delete(handle);
+    },
+    () => {
+      if (requests.get(method) === request) requests.delete(method);
+      if (requests.size === 0) providerServerShutdownRequests.delete(handle);
+    },
+  );
+  return request;
+}
 
 /** A provider server handle whose detached process-group identity was verified at spawn. */
 export type ContainedProviderServerHandle = ProviderServerHandle &
@@ -154,6 +198,7 @@ type ProviderServerEntry = {
   diagnosticRef: ProviderHostDiagnosticReference;
   observeProviderResponse: ProviderResponseObservationSink;
   closed: boolean;
+  processSettlement: ProviderProcessSettlement;
   closeRequested: boolean;
   closePromise: Promise<Error | void>;
   resolveClose: (outcome: Error | void) => void;
@@ -179,8 +224,103 @@ export type SpawnProviderServerFn = (
   options: SpawnProviderServerOptions,
   observeProviderResponse: ProviderResponseObservationSink,
   generation: number,
-  recordContainment?: (containment: RecordedContainmentIdentity) => void,
-) => Promise<ContainedProviderServerHandle>;
+  recordContainment: ((containment: RecordedContainmentIdentity) => ProviderContainmentAcceptance) | undefined,
+  acceptFailedSpawnCleanup: ProviderServerFailedSpawnCleanupAcceptor,
+) => Promise<ContainedProviderServerHandle | HeldProviderServerSpawn>;
+
+export type ProviderServerFailedSpawnAbsenceEvidence<ProcessGroupId extends number = number> =
+  | Readonly<{ subject: Extract<ProviderServerFailedSpawnSubject, { kind: 'process' }> }>
+  | Readonly<{ processGroupEvidence: SpawnedProcessGroupAbsenceEvidence<ProcessGroupId> }>;
+
+export type ProviderServerFailedSpawnCleanupDisposition<ProcessGroupId extends number = number> =
+  | Readonly<{ kind: 'observed-absent'; evidence: ProviderServerFailedSpawnAbsenceEvidence<ProcessGroupId> }>
+  | Readonly<{
+      kind: 'held-alive';
+      subject: Extract<ProviderServerFailedSpawnSubject<ProcessGroupId>, { kind: 'process' | 'process-group' }>;
+      observation: 'alive';
+      operatorExit: ProviderServerFailedSpawnOperatorExit<ProcessGroupId>;
+      settled: Promise<void>;
+      retry(signal?: AbortSignal): Promise<ProviderServerFailedSpawnCleanupDisposition<ProcessGroupId>>;
+    }>
+  | Readonly<{
+      kind: 'held-unobservable';
+      subject: ProviderServerFailedSpawnSubject<ProcessGroupId>;
+      observation: 'unobservable';
+      operatorExit: ProviderServerFailedSpawnOperatorExit<ProcessGroupId>;
+      settled: Promise<void>;
+      retry(signal?: AbortSignal): Promise<ProviderServerFailedSpawnCleanupDisposition<ProcessGroupId>>;
+    }>
+  | ProviderServerFailedSpawnOperatorAbandonment<ProcessGroupId>;
+
+export type ProviderServerFailedSpawnCleanupTerminalDisposition = Extract<
+  ProviderServerFailedSpawnCleanupDisposition,
+  { kind: 'observed-absent' | 'operator-abandoned' }
+>;
+
+/** An operator transfer discharges only the exact process obligation named by its accepted hold. */
+export function isAcceptedProviderServerOperatorAbandonment(
+  hold: Pick<ProviderServerCleanupHold, 'subject'>,
+  disposition: unknown,
+): disposition is ProviderServerFailedSpawnOperatorAbandonment {
+  if (
+    typeof disposition !== 'object' ||
+    disposition === null ||
+    !('kind' in disposition) ||
+    disposition.kind !== 'operator-abandoned' ||
+    !('processAbsenceProven' in disposition) ||
+    disposition.processAbsenceProven !== false ||
+    !('successor' in disposition) ||
+    typeof disposition.successor !== 'object' ||
+    disposition.successor === null ||
+    !('owner' in disposition.successor) ||
+    disposition.successor.owner !== 'operator-command' ||
+    !('acceptance' in disposition.successor) ||
+    disposition.successor.acceptance !== 'accepted' ||
+    !('subject' in disposition) ||
+    typeof disposition.subject !== 'object' ||
+    disposition.subject === null ||
+    !('kind' in disposition.subject) ||
+    disposition.subject.kind !== hold.subject.kind
+  ) {
+    return false;
+  }
+  if (hold.subject.kind === 'process') {
+    return 'pid' in disposition.subject && disposition.subject.pid === hold.subject.pid;
+  }
+  return 'processGroupId' in disposition.subject && disposition.subject.processGroupId === hold.subject.processGroupId;
+}
+
+export type ProviderServerCleanupHold = Extract<
+  ProviderServerFailedSpawnCleanupDisposition,
+  { kind: 'held-alive' | 'held-unobservable' }
+>;
+
+export type ProviderServerFailedSpawnCleanupHold = ProviderServerCleanupHold & Readonly<{ error: Error }>;
+
+export type ProviderServerFailedSpawnCleanupOwner = 'provider-host-manager' | 'provider-proxy-root-pool';
+
+export type ProviderServerFailedSpawnCleanupAcceptance = Readonly<{
+  kind: 'accepted';
+  owner: ProviderServerFailedSpawnCleanupOwner;
+  settlement: Promise<void>;
+}>;
+
+export type ProviderServerFailedSpawnCleanupAcceptor = (
+  hold: ProviderServerFailedSpawnCleanupHold,
+) => ProviderServerFailedSpawnCleanupAcceptance;
+
+export type ProviderServerCleanupHoldAcceptor = (
+  hold: ProviderServerCleanupHold,
+) => ProviderServerFailedSpawnCleanupAcceptance;
+
+export type ProviderServerCloseDisposition =
+  | Exclude<ProviderServerFailedSpawnCleanupDisposition, ProviderServerCleanupHold>
+  | (ProviderServerCleanupHold & Readonly<{ successor: ProviderServerFailedSpawnCleanupAcceptance }>);
+
+export type HeldProviderServerSpawn = ProviderServerFailedSpawnCleanupHold &
+  Readonly<{
+    successor: ProviderServerFailedSpawnCleanupAcceptance;
+  }>;
 
 function resolveProviderServerInitializeTimeoutMs(timeoutMs: number | undefined): number {
   return timeoutMs !== undefined && Number.isFinite(timeoutMs) && timeoutMs > 0
@@ -194,39 +334,248 @@ type SpawnProviderServerTransportParams = {
   generation: number;
   observeProviderResponse: ProviderResponseObservationSink;
   detached?: boolean;
-  recordContainment?: (containment: RecordedContainmentIdentity) => void;
+  recordContainment?: (containment: RecordedContainmentIdentity) => ProviderContainmentAcceptance;
+  acceptFailedSpawnCleanup: ProviderServerFailedSpawnCleanupAcceptor;
 };
 
 export function spawnProviderServerTransport(
   params: SpawnProviderServerTransportParams & { detached: true },
-): Promise<ContainedProviderServerHandle>;
-export function spawnProviderServerTransport(params: SpawnProviderServerTransportParams): Promise<ProviderServerHandle>;
+): Promise<ContainedProviderServerHandle | HeldProviderServerSpawn>;
+export function spawnProviderServerTransport(
+  params: SpawnProviderServerTransportParams & { detached?: false },
+): Promise<ProviderServerHandle | HeldProviderServerSpawn>;
 export async function spawnProviderServerTransport(
   params: SpawnProviderServerTransportParams,
-): Promise<ProviderServerHandle> {
-  const spawned = spawnProviderServerProcess(params);
+): Promise<ProviderServerHandle | HeldProviderServerSpawn> {
+  const spawned = await spawnProviderServerProcess(params);
+  if (spawned.kind !== 'spawned') return spawned;
   bindProviderServerEvents(spawned.entry, spawned.pipes, params.runtime);
-  const containmentIdentity =
-    params.detached === true ? establishDetachedProviderServerIdentity(spawned.entry, params.runtime) : undefined;
+  const containmentDisposition =
+    params.detached === true ? await establishDetachedProviderServerIdentity(spawned.entry, params.runtime) : undefined;
+  if (isHeldProviderServerSpawn(containmentDisposition)) return containmentDisposition;
+  const containmentIdentity = containmentDisposition;
   if (containmentIdentity !== undefined) {
-    params.recordContainment?.(containmentIdentity);
+    try {
+      params.recordContainment?.(containmentIdentity);
+    } catch (error: unknown) {
+      return settleFailedProviderServerSpawn(
+        spawned.entry.processSettlement,
+        params.runtime,
+        error instanceof Error ? error : new Error(String(error)),
+      );
+    }
   }
   const rpc = createProviderServerRpc(spawned.entry, params.runtime);
-  await initializeSpawnedProviderServer(
+  const initialization = await initializeSpawnedProviderServer(
     spawned.entry,
     rpc,
     params.options,
     params.runtime,
     containmentIdentity === undefined || params.recordContainment === undefined,
   );
+  if (initialization !== undefined) return initialization;
   return exposeProviderServerHandle(spawned.entry, rpc, params.runtime, containmentIdentity);
 }
 
 type ProviderServerPipes = ReturnType<typeof requirePipedHandles>;
 
-function spawnProviderServerProcess(
+type ProviderProcessSettlement = {
+  child: ChildProcessLike;
+  pid: number | null;
+  detached: boolean;
+  processGroupCleanup: SpawnedProcessGroupCleanup | null;
+  acceptFailedSpawnCleanup: ProviderServerFailedSpawnCleanupAcceptor;
+  closed: boolean;
+  processClosePromise: Promise<void>;
+  termination: GracefulKillPendingDisposition | null;
+  terminationOutcome: GracefulKillOutcome | null;
+  resolve(): void;
+};
+
+type ProviderProcessSettlementEvidence = ProviderServerFailedSpawnCleanupDisposition;
+
+function requestProviderServerKill(settlement: ProviderProcessSettlement, runtime: Runtime): GracefulKillDisposition {
+  return (
+    settlement.termination ?? gracefulKill(settlement.child, runtime, (pid) => runtime.process.observeLiveness(pid))
+  );
+}
+
+function acceptProviderServerKill(settlement: ProviderProcessSettlement, runtime: Runtime): void {
+  const disposition = requestProviderServerKill(settlement, runtime);
+  if (!('settlement' in disposition)) {
+    settlement.terminationOutcome = disposition;
+    return;
+  }
+  if (settlement.termination === disposition) return;
+  settlement.termination = disposition;
+  void disposition.settlement.then((outcome) => {
+    if (settlement.termination !== disposition) return;
+    settlement.termination = null;
+    settlement.terminationOutcome = outcome;
+  });
+}
+
+function createProviderProcessSettlement(
+  child: ChildProcessLike,
+  detached: boolean,
+  processGroupCleanup: SpawnedProcessGroupCleanup | null,
+  acceptFailedSpawnCleanup: ProviderServerFailedSpawnCleanupAcceptor,
+): ProviderProcessSettlement {
+  let resolve!: () => void;
+  const settlement: ProviderProcessSettlement = {
+    child,
+    pid: child.pid ?? null,
+    detached,
+    processGroupCleanup,
+    acceptFailedSpawnCleanup,
+    closed: false,
+    processClosePromise: new Promise<void>((settle) => {
+      resolve = settle;
+    }),
+    termination: null,
+    terminationOutcome: null,
+    resolve: () => resolve(),
+  };
+  child.on('close', () => {
+    if (settlement.closed) return;
+    settlement.closed = true;
+    settlement.resolve();
+  });
+  child.on('error', () => undefined);
+  return settlement;
+}
+
+function mapDetachedProviderServerCleanup<ProcessGroupId extends number>(
+  runtime: Runtime,
+  processGroupId: ProcessGroupId | null,
+  cleanup: SpawnedProcessGroupCleanupDisposition<ProcessGroupId> | null,
+): ProviderServerFailedSpawnCleanupDisposition<ProcessGroupId> {
+  const subject: ProviderServerFailedSpawnSubject<ProcessGroupId> =
+    cleanup === null
+      ? { kind: 'unattributable-process-group', processGroupId }
+      : cleanup.kind === 'observed-absent'
+        ? cleanup.evidence.subject
+        : cleanup.subject;
+  let abandoned = false;
+  let resolveSettled!: () => void;
+  const settled = new Promise<void>((resolve) => {
+    resolveSettled = resolve;
+  });
+  let activeRetry: Readonly<{ abort: AbortController; settlement: Promise<void> }> | null = null;
+  const abandonment: ProviderServerFailedSpawnOperatorAbandonment<ProcessGroupId> = {
+    kind: 'operator-abandoned',
+    subject,
+    processAbsenceProven: false,
+    successor: { owner: 'operator-command', acceptance: 'accepted' },
+  };
+  let releaseAbandonment!: () => void;
+  let acceptAbandonment!: () => void;
+  const abandonmentRequested = new Promise<void>((resolve) => {
+    releaseAbandonment = resolve;
+  });
+  const abandonmentAccepted = new Promise<void>((resolve) => {
+    acceptAbandonment = resolve;
+  });
+  const operatorExit: ProviderServerFailedSpawnOperatorExit<ProcessGroupId> = {
+    kind: 'abandon-provider-host-acquisition',
+    abandon: async () => {
+      abandoned = true;
+      releaseAbandonment();
+      const attempt = activeRetry;
+      attempt?.abort.abort(new Error('provider_server_spawn_cleanup_abandoned'));
+      if (attempt !== null) await attempt.settlement;
+      acceptAbandonment();
+      resolveSettled();
+      return abandonment;
+    },
+  };
+  const map = (
+    next: SpawnedProcessGroupCleanupDisposition<ProcessGroupId> | null,
+  ): ProviderServerFailedSpawnCleanupDisposition<ProcessGroupId> => {
+    if (abandoned) return abandonment;
+    if (next?.kind === 'observed-absent') {
+      resolveSettled();
+      return {
+        kind: 'observed-absent',
+        evidence: { processGroupEvidence: next.evidence },
+      };
+    }
+    const retry = async (
+      signal?: AbortSignal,
+    ): Promise<ProviderServerFailedSpawnCleanupDisposition<ProcessGroupId>> => {
+      if (abandoned) {
+        await abandonmentAccepted;
+        return abandonment;
+      }
+      await Promise.race([runtime.time.sleep(SIGTERM_GRACE_MS), abandonmentRequested]);
+      if (abandoned) {
+        await abandonmentAccepted;
+        return abandonment;
+      }
+      if (next === null) {
+        if (processGroupId === null) return map(null);
+        const observation = observeUnattributableSpawnedProcessGroup(processGroupId, runtime);
+        if (observation.kind === 'observed-absent') {
+          return map(observation);
+        }
+        return map(null);
+      }
+      const abort = new AbortController();
+      const attemptSignal = signal === undefined ? abort.signal : AbortSignal.any([signal, abort.signal]);
+      const operation = next.retry(attemptSignal);
+      const attempt = {
+        abort,
+        settlement: operation.then(
+          () => undefined,
+          () => undefined,
+        ),
+      };
+      activeRetry = attempt;
+      try {
+        const outcome = await operation;
+        if (abandoned) {
+          await abandonmentAccepted;
+          return abandonment;
+        }
+        return map(outcome);
+      } finally {
+        if (activeRetry === attempt) activeRetry = null;
+      }
+    };
+    if (next?.kind === 'held-alive') {
+      return { kind: next.kind, subject: next.subject, observation: next.observation, operatorExit, settled, retry };
+    }
+    return { kind: 'held-unobservable', subject, observation: 'unobservable', operatorExit, settled, retry };
+  };
+  return map(cleanup);
+}
+
+function isHeldProviderServerSpawn(disposition: unknown): disposition is HeldProviderServerSpawn {
+  if (disposition === null || typeof disposition !== 'object' || !('kind' in disposition)) return false;
+  return disposition.kind === 'held-alive' || disposition.kind === 'held-unobservable';
+}
+
+async function settleFailedProviderServerSpawn(
+  settlement: ProviderProcessSettlement,
+  runtime: Runtime,
+  error: Error,
+): Promise<HeldProviderServerSpawn> {
+  const cleanup = await terminateProviderServerProcess(settlement, runtime);
+  if (cleanup.kind === 'observed-absent') throw error;
+  if (cleanup.kind === 'operator-abandoned') throw error;
+  const hold: ProviderServerFailedSpawnCleanupHold = { ...cleanup, error };
+  const successor = settlement.acceptFailedSpawnCleanup(hold);
+  if (successor.kind !== 'accepted') {
+    throw new Error('Provider server failed-spawn cleanup owner did not accept the obligation.', { cause: error });
+  }
+  return { ...hold, successor };
+}
+
+async function spawnProviderServerProcess(
   params: SpawnProviderServerTransportParams,
-): Readonly<{ entry: ProviderServerEntry; pipes: ProviderServerPipes }> {
+): Promise<
+  Readonly<{ kind: 'spawned'; entry: ProviderServerEntry; pipes: ProviderServerPipes }> | HeldProviderServerSpawn
+> {
   const { runtime, options, generation, observeProviderResponse } = params;
   if (options.signal?.aborted) {
     throw createProviderServerSpawnAbortError(options.provider, options.signal);
@@ -241,11 +590,32 @@ function spawnProviderServerProcess(
     ...(options.exactEnv ? { env: options.exactEnv } : { envAdditions: options.extraEnv }),
     ...(params.detached === undefined ? {} : { detached: params.detached }),
   });
-  const pipes = requirePipedHandles(child, options.command);
-  const pid = child.pid;
-  if (pid === undefined) {
-    throw new Error(`Failed to spawn ${options.command}: child pid is unavailable`);
+  const processGroupCleanup =
+    params.detached === true && typeof child.pid === 'number' ? retainSpawnedProcessGroupCleanup(child) : null;
+  const processSettlement = createProviderProcessSettlement(
+    child,
+    params.detached === true,
+    processGroupCleanup,
+    params.acceptFailedSpawnCleanup,
+  );
+  let pipes: ProviderServerPipes;
+  try {
+    pipes = requirePipedHandles(child, options.command);
+  } catch (error: unknown) {
+    return settleFailedProviderServerSpawn(
+      processSettlement,
+      runtime,
+      error instanceof Error ? error : new Error(String(error)),
+    );
   }
+  if (child.pid === undefined) {
+    return settleFailedProviderServerSpawn(
+      processSettlement,
+      runtime,
+      new Error(`Failed to spawn ${options.command}: child pid is unavailable`),
+    );
+  }
+  const pid = child.pid;
   pipes.stdout.setEncoding('utf8');
   pipes.stderr.setEncoding('utf8');
 
@@ -268,18 +638,126 @@ function spawnProviderServerProcess(
     diagnosticRef: createProviderHostDiagnosticReference(generation, diagnostics),
     observeProviderResponse,
     closed: false,
+    processSettlement,
     closeRequested: false,
     closePromise,
     resolveClose,
     closeOutcome: undefined,
   };
-  return Object.freeze({ entry, pipes });
+  return Object.freeze({ kind: 'spawned', entry, pipes });
 }
 
-function establishDetachedProviderServerIdentity(
+async function terminateProviderServerProcess(
+  settlement: ProviderProcessSettlement,
+  runtime: Runtime,
+): Promise<ProviderProcessSettlementEvidence> {
+  if (settlement.detached) {
+    const disposition =
+      settlement.processGroupCleanup === null
+        ? null
+        : await cleanupSpawnedProcessGroup(settlement.processGroupCleanup, runtime);
+    return mapDetachedProviderServerCleanup(runtime, settlement.pid, disposition);
+  }
+
+  const subject = { kind: 'process', pid: settlement.pid } as const;
+  let abandoned = false;
+  const abandonment: ProviderServerFailedSpawnOperatorAbandonment = {
+    kind: 'operator-abandoned',
+    subject,
+    processAbsenceProven: false,
+    successor: { owner: 'operator-command', acceptance: 'accepted' },
+  };
+  const operatorExit: ProviderServerFailedSpawnOperatorExit = {
+    kind: 'abandon-provider-host-acquisition',
+    abandon: async () => {
+      abandoned = true;
+      return abandonment;
+    },
+  };
+  const observedAbsent = (): ProviderProcessSettlementEvidence => ({
+    kind: 'observed-absent',
+    evidence: { subject },
+  });
+  const retry = async (signal?: AbortSignal): Promise<ProviderProcessSettlementEvidence> => {
+    if (settlement.closed) return observedAbsent();
+    if (settlement.terminationOutcome?.kind === 'observed-absent') return observedAbsent();
+    if (abandoned) return abandonment;
+    if (signal?.aborted) {
+      return {
+        kind: 'held-unobservable',
+        subject,
+        observation: 'unobservable',
+        operatorExit,
+        settled: settlement.processClosePromise,
+        retry,
+      };
+    }
+
+    acceptProviderServerKill(settlement, runtime);
+    if (settlement.closed) return observedAbsent();
+    if (settlement.pid !== null) {
+      try {
+        const liveness = runtime.process.observeLiveness(settlement.pid);
+        if (settlement.closed) return observedAbsent();
+        if (liveness === 'absent') return observedAbsent();
+        if (liveness === 'alive') {
+          return {
+            kind: 'held-alive',
+            subject,
+            observation: liveness,
+            operatorExit,
+            settled: settlement.processClosePromise,
+            retry,
+          };
+        }
+      } catch {
+        // Exact close evidence remains authoritative when direct liveness observation cannot answer.
+      }
+    }
+    if (settlement.closed) return observedAbsent();
+    return {
+      kind: 'held-unobservable',
+      subject,
+      observation: 'unobservable',
+      operatorExit,
+      settled: settlement.processClosePromise,
+      retry,
+    };
+  };
+  return retry();
+}
+
+function terminateUnownedProviderServer(
   entry: ProviderServerEntry,
   runtime: Runtime,
-): RecordedContainmentIdentity {
+): Promise<ProviderProcessSettlementEvidence> {
+  return terminateProviderServerProcess(entry.processSettlement, runtime);
+}
+
+async function establishDetachedProviderServerIdentity(
+  entry: ProviderServerEntry,
+  runtime: Runtime,
+): Promise<RecordedContainmentIdentity | HeldProviderServerSpawn> {
+  const cleanup = entry.processSettlement.processGroupCleanup;
+  if (cleanup === null) {
+    const error = new ProcessContainmentError(
+      'process_identity_unverified',
+      `The spawned ${entry.provider} provider server (pid ${entry.pid}) has no retained process-group cleanup authority.`,
+      { provider: entry.provider, pid: entry.pid },
+    );
+    return settleFailedProviderServerSpawn(entry.processSettlement, runtime, error);
+  }
+
+  const observation = observeRetainedSpawnedProcessGroup(cleanup, runtime);
+  if (observation.kind !== 'held-alive') {
+    const error = new ProcessContainmentError(
+      'process_identity_unverified',
+      `The spawned ${entry.provider} provider server (pid ${entry.pid}) has no attributable live process group.`,
+      { provider: entry.provider, pid: entry.pid },
+    );
+    return settleFailedProviderServerSpawn(entry.processSettlement, runtime, error);
+  }
+
   let incarnation: ProcessIncarnation | null;
   try {
     incarnation = runtime.process.readProcessIncarnation(entry.pid, runtime.env.platform() as NodeJS.Platform);
@@ -287,41 +765,23 @@ function establishDetachedProviderServerIdentity(
     incarnation = null;
   }
   if (incarnation === null) {
-    gracefulKill(entry.child, runtime);
-    throw new ProcessContainmentError(
+    const error = new ProcessContainmentError(
       'process_identity_unverified',
-      `Could not read the incarnation of the spawned ${entry.provider} provider server (pid ${entry.pid}).`,
+      `Could not record the incarnation of the spawned ${entry.provider} provider server (pid ${entry.pid}).`,
       { provider: entry.provider, pid: entry.pid },
     );
+    return settleFailedProviderServerSpawn(entry.processSettlement, runtime, error);
   }
 
-  // Signal 0 tests existence and permission without delivering a signal. Addressing -pid proves a signalable
-  // process group with that id exists; it does not prove the group contains only this host's descendants.
-  let processGroupIsSignalable: boolean;
-  try {
-    processGroupIsSignalable = runtime.process.kill(-entry.pid, 0);
-  } catch {
-    processGroupIsSignalable = false;
-  }
-  if (!processGroupIsSignalable) {
-    gracefulKill(entry.child, runtime);
-    throw new ProcessContainmentError(
-      'process_identity_unverified',
-      `The spawned ${entry.provider} provider server (pid ${entry.pid}) is not a process-group leader.`,
-      { provider: entry.provider, pid: entry.pid },
-    );
-  }
-
-  const containmentIdentity = Object.freeze({
-    pid: entry.pid,
-    incarnation,
-    processGroupId: entry.pid,
-  });
+  const containmentIdentity = Object.freeze({ pid: entry.pid, incarnation, processGroupId: entry.pid });
   try {
     assertRecordedContainmentIdentity(containmentIdentity);
   } catch (error: unknown) {
-    gracefulKill(entry.child, runtime);
-    throw error;
+    return settleFailedProviderServerSpawn(
+      entry.processSettlement,
+      runtime,
+      error instanceof Error ? error : new Error(String(error)),
+    );
   }
   return containmentIdentity;
 }
@@ -348,7 +808,7 @@ function bindProviderServerEvents(entry: ProviderServerEntry, pipes: ProviderSer
     const stdinError = createProviderHostFault(entry, `stdin error: ${error.message}`);
     backendLog.error(stdinError.message, error);
     detachProviderServer(entry, stdinError);
-    gracefulKill(entry.child, runtime);
+    acceptProviderServerKill(entry.processSettlement, runtime);
   });
   entry.child.on('error', (error: Error) => {
     const closeError = createProviderHostFault(entry, `failed: ${error.message}`);
@@ -398,7 +858,7 @@ function createProviderServerRpc(entry: ProviderServerEntry, runtime: Runtime): 
         const notifyError = error instanceof Error ? error : createProviderHostFault(entry, `failed to send ${method}`);
         backendLog.error(notifyError.message, error);
         detachProviderServer(entry, notifyError);
-        gracefulKill(entry.child, runtime);
+        acceptProviderServerKill(entry.processSettlement, runtime);
       }
     },
   };
@@ -410,7 +870,7 @@ async function initializeSpawnedProviderServer(
   options: SpawnProviderServerOptions,
   runtime: Runtime,
   killOnFailure: boolean,
-): Promise<void> {
+): Promise<HeldProviderServerSpawn | void> {
   if (options.initializeRequest === undefined) return;
   try {
     await initializeProviderServer({
@@ -422,12 +882,10 @@ async function initializeSpawnedProviderServer(
       signal: options.signal,
     });
   } catch (error) {
-    // A detached caller records containment before initialization and owns the group from that point onward.
-    // Uncontained callers still need this layer to reap the child because no upstream owner can target it.
     const initError = error instanceof Error ? error : createProviderHostFault(entry, `initialize failed`);
     detachProviderServer(entry, initError);
     if (killOnFailure) {
-      gracefulKill(entry.child, runtime);
+      return settleFailedProviderServerSpawn(entry.processSettlement, runtime, initError);
     }
     throw initError;
   }
@@ -466,9 +924,15 @@ function exposeProviderServerHandle(
     markExpectedClose: () => {
       entry.closeRequested = true;
     },
-    close: async () => {
+    close: async (acceptCleanupHold) => {
       shutdownProviderServer(entry, 'closed', runtime);
-      await entry.closePromise;
+      const cleanup = await terminateUnownedProviderServer(entry, runtime);
+      if (cleanup.kind !== 'held-alive' && cleanup.kind !== 'held-unobservable') return cleanup;
+      const successor = acceptCleanupHold(cleanup);
+      if (successor.kind !== 'accepted') {
+        throw new Error('Provider server close cleanup owner did not accept the obligation.');
+      }
+      return { ...cleanup, successor };
     },
   };
 }
@@ -632,7 +1096,7 @@ function appendProviderServerLineFragment(entry: ProviderServerEntry, fragment: 
     entry.stdoutBuffer = '';
     entry.stdoutBufferBytes = 0;
     detachProviderServer(entry, protocolError);
-    gracefulKill(entry.child, runtime);
+    acceptProviderServerKill(entry.processSettlement, runtime);
     return false;
   }
 
@@ -670,7 +1134,7 @@ function parseProviderServerLine(
     });
     backendLog.error(parseError.message, error);
     detachProviderServer(entry, parseError);
-    gracefulKill(entry.child, runtime);
+    acceptProviderServerKill(entry.processSettlement, runtime);
     return undefined;
   }
 }
@@ -691,7 +1155,7 @@ function handleProviderServerRequest(
       error instanceof Error ? error : createProviderHostFault(entry, 'failed to answer server request');
     backendLog.error(protocolError.message, error);
     detachProviderServer(entry, protocolError);
-    gracefulKill(entry.child, runtime);
+    acceptProviderServerKill(entry.processSettlement, runtime);
   }
 }
 
@@ -747,7 +1211,7 @@ function handleProviderServerNotification(
     const protocolError = createProviderHostFault(entry, 'emitted a malformed JSON-RPC message', message);
     backendLog.error(protocolError.message);
     detachProviderServer(entry, protocolError);
-    gracefulKill(entry.child, runtime);
+    acceptProviderServerKill(entry.processSettlement, runtime);
     return;
   }
 
@@ -763,7 +1227,7 @@ function handleProviderServerNotification(
       backendLog.error(dispatchError.message, error);
       if (!entry.closed) {
         detachProviderServer(entry, dispatchError);
-        gracefulKill(entry.child, runtime);
+        acceptProviderServerKill(entry.processSettlement, runtime);
       }
       return;
     }
@@ -778,5 +1242,5 @@ function beginProviderServerShutdown(entry: ProviderServerEntry, detail: string)
 
 function shutdownProviderServer(entry: ProviderServerEntry, detail: string, runtime: Runtime): void {
   beginProviderServerShutdown(entry, detail);
-  gracefulKill(entry.child, runtime);
+  acceptProviderServerKill(entry.processSettlement, runtime);
 }

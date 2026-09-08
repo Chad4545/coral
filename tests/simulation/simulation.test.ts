@@ -40,7 +40,7 @@ const COMPLETE_SCENARIO: SimulationDocument = {
     { type: 'launch', provider: 'codex', prompt: 'simulate complete lifecycle' },
     { type: 'wait', until: { phase: 'running' }, stepMs: 5, maxSteps: 5 },
     { type: 'wait', until: { runtimeRecorded: true }, stepMs: 5, maxSteps: 5 },
-    { type: 'wait', until: { terminal: true }, stepMs: 500, maxSteps: 4 },
+    { type: 'wait', until: { terminal: true }, stepMs: 500, maxSteps: 6 },
     {
       type: 'expect',
       phase: 'completed',
@@ -143,6 +143,7 @@ const RESET_SCENARIO: SimulationDocument = {
   steps: [
     { type: 'boot' },
     { type: 'launch', provider: 'codex', prompt: 'simulate clean reset world' },
+    { type: 'advance', ms: 5 },
     { type: 'cycle' },
     {
       type: 'expect',
@@ -150,7 +151,7 @@ const RESET_SCENARIO: SimulationDocument = {
       sessionCount: { provider: 'codex', count: 0 },
     },
     { type: 'launch', provider: 'codex', prompt: 'simulate clean reset world' },
-    { type: 'wait', until: { terminal: true }, stepMs: 500, maxSteps: 4 },
+    { type: 'wait', until: { terminal: true }, stepMs: 500, maxSteps: 6 },
     {
       type: 'expect',
       phase: 'completed',
@@ -333,13 +334,16 @@ describe('deterministic simulation lifecycle replay', () => {
       },
     });
 
+    await world.advance(0);
+
     expect(world.isPidAlive(runtime.pid)).toBe(true);
-    expect(world.getKillLog()).toContainEqual({ pid: runtime.pid, signal: 'SIGTERM' });
+    expect(world.getKillLog()).toContainEqual({ pid: -runtime.pid, signal: 'SIGTERM' });
+    expect(world.getKillLog()).not.toContainEqual({ pid: runtime.pid, signal: 'SIGTERM' });
 
     await world.advance(25);
 
     expect(world.isPidAlive(runtime.pid)).toBe(false);
-    const terminalWait = await world.waitUntil(launch.jobId, { terminal: true }, 500, { maxSteps: 4 });
+    const terminalWait = await world.waitUntil(launch.jobId, { terminal: true }, 500, { maxSteps: 7 });
     expect(terminalWait.ok).toBe(true);
     expect(world.getJobStatus(launch.jobId)).toMatchObject({
       phase: 'aborted',
@@ -364,13 +368,13 @@ describe('deterministic simulation lifecycle replay', () => {
     worlds.push(world);
 
     expect(result.passed).toBe(true);
-    expect(result.steps[2]).toMatchObject({
+    expect(result.steps[3]).toMatchObject({
       ok: true,
       detail: {
         generation: 1,
       },
     });
-    expect(result.steps[3]).toMatchObject({
+    expect(result.steps[4]).toMatchObject({
       ok: true,
       actual: {
         jobCount: 0,
@@ -379,7 +383,7 @@ describe('deterministic simulation lifecycle replay', () => {
     });
 
     const firstLaunch = getLaunchReceipt(result.steps[1]);
-    const secondLaunch = getLaunchReceipt(result.steps[4]);
+    const secondLaunch = getLaunchReceipt(result.steps[5]);
 
     expect(secondLaunch).toMatchObject({
       jobId: firstLaunch.jobId,

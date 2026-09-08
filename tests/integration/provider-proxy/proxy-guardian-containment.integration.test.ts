@@ -1,4 +1,6 @@
 import type { ProcessLiveness } from '#src/infra/node-process.js';
+import type { RecordedProcessIdentity } from '#src/infra/process-containment.js';
+import type { PublicationReceipt } from '#src/coordinator/live/provider-proxy/set-publication.js';
 import { strictControlExchangeResult as strictTestExchange } from '#tests/support/control-exchange.js';
 import { testIncarnation } from '#tests/helpers/process-incarnation.js';
 import { randomUUID } from 'node:crypto';
@@ -20,6 +22,7 @@ const rotationDoubles = vi.hoisted(() => ({
   rehydrateBinding: vi.fn(),
   spawnProviderRoot: vi.fn(),
 }));
+const TEST_PUBLICATION_RECEIPT = { kind: 'provider-proxy-set-published' } as PublicationReceipt;
 
 vi.mock('#src/coordinator/live/provider-hosts/proxy-set-acquisition.js', async (importOriginal) => {
   const actual = await importOriginal<typeof ProxySetAcquisitionModule>();
@@ -102,6 +105,7 @@ import { readProviderOperation } from '#src/store/provider-operation-journal.js'
 import { connectControlClient } from '#src/provider-proxy/control-client.js';
 import type { EnforcementScheduler } from '#src/provider-proxy/enforcement.js';
 import { createGuardian } from '#src/provider-proxy/guardian.js';
+import { createControlHolderAuthority } from '#src/provider-proxy/holder-lifecycle.js';
 import { createOperationLedger, operationPrepareAttemptKey } from '#src/provider-proxy/ledger.js';
 import {
   guardianProxyOperationReleaseParamsSchema,
@@ -133,6 +137,8 @@ import {
   createTestProviderProxyContainmentProofProducer,
   createTestProviderProxyRecoveryDispatcher,
 } from '#tests/helpers/provider-proxy-recovery-dispatcher.js';
+import { testProviderProxySetLifecycleDurability } from '#tests/helpers/provider-proxy-set-lifecycle-durability.js';
+import { InMemoryStorage } from '#tools/simulation/core/memory-storage.js';
 import { createFakeProviderServerHandle } from '#tests/unit/coordinator/live/provider-hosts/helpers.js';
 
 /** The build this fixture lifecycle belongs to — the same one `providerOperationRecord` stamps on its identities, so a discovered capsule is inheritable rather than foreign. */
@@ -267,6 +273,8 @@ async function startGuardianAndReaper() {
       },
       observeLiveness: (pid: number) =>
         ((pid < 0 ? alive.has(-pid) : alive.has(pid)) ? 'alive' : 'absent') as ProcessLiveness,
+      observeRecordedProcessAsync: async (identity: RecordedProcessIdentity) =>
+        alive.has(identity.pid) && identity.incarnation === CONTAINMENT.incarnation ? 'alive' : 'absent',
     },
     platform: 'linux' as const,
     maxRecordedRoots: 128,
@@ -300,7 +308,8 @@ async function startGuardianAndReaper() {
     latchTeardown: () => {},
     markContainmentAbsent: () => {},
     markExited: () => {},
-    bounds: boundsOf,
+    renewHolderCheck: () => {},
+    bounds: () => ({ ...boundsOf(), holderCheckAt: boundsOf().adoptionDeadline, holderCheckAccelerated: false }),
     state: () => 'accepting-control' as const,
   };
 
@@ -309,6 +318,10 @@ async function startGuardianAndReaper() {
     receipts += 1;
     return `receipt-${receipts}`;
   };
+  // Each role must retain an independent holder authority.
+  const guardianHolderAuthority = createControlHolderAuthority();
+  const reaperHolderAuthority = createControlHolderAuthority();
+  const observeHolder = (): Promise<ProcessLiveness> => Promise.resolve('unknown' as const);
 
   const reaper = createReaper({
     capsule: {
@@ -326,6 +339,9 @@ async function startGuardianAndReaper() {
     timer,
     mintReceipt,
     self: { pid: 5_101, incarnation: testIncarnation(901) },
+    holderAuthority: reaperHolderAuthority,
+    observeHolder,
+    abandonUnattributable: () => false,
     onOutcome: () => {},
     onProgressViolation: () => {},
   });
@@ -358,6 +374,9 @@ async function startGuardianAndReaper() {
     reaperChannel,
     self: { pid: 5_102, incarnation: testIncarnation(902) },
     reaperSelf: { pid: 5_101, incarnation: testIncarnation(901) },
+    holderAuthority: guardianHolderAuthority,
+    observeHolder,
+    abandonUnattributable: () => false,
     onOutcome: () => {},
     onProgressViolation: () => {},
   });
@@ -530,6 +549,11 @@ function establishActivationRoute(setIdentity: ProviderProxySetIdentity) {
     claims,
     controlEstablished: () => undefined,
     time: { ...timer, now: () => 0, monotonicNow: () => 0n },
+    ...testProviderProxySetLifecycleDurability(new InMemoryStorage({ ...timer, now: () => 0 }), {
+      ...timer,
+      now: () => 0,
+      monotonicNow: () => 0n,
+    }),
     recoveryDispatcher: createTestProviderProxyRecoveryDispatcher({
       'containment-proof': () => new Promise<never>(() => undefined),
     }),
@@ -540,6 +564,7 @@ function establishActivationRoute(setIdentity: ProviderProxySetIdentity) {
     },
     reportLifecycle: () => undefined,
   });
+  lifecycle.activateDurableOperatorDispositions();
   lifecycle.initializeClaimSlots();
   lifecycle.completeStartupDiscovery();
   const authority = {
@@ -549,7 +574,7 @@ function establishActivationRoute(setIdentity: ProviderProxySetIdentity) {
       adoptionWindowMs: Number.MAX_SAFE_INTEGER,
       heartbeatHoldBound: {
         spanMs: Number.MAX_SAFE_INTEGER,
-        materialSchedulerLatenessMs: Number.MAX_SAFE_INTEGER,
+        materialSchedulerLatenessMs: Math.floor(Number.MAX_SAFE_INTEGER / 4),
       },
     },
     setIdentity,
@@ -562,11 +587,12 @@ function establishActivationRoute(setIdentity: ProviderProxySetIdentity) {
     },
     stopHeartbeats: () => undefined,
     stopAndReap: () => new Promise<never>(() => undefined),
+    commitContainment: () => new Promise<never>(() => undefined),
     initiateControlClose: async () => undefined,
   } as unknown as DurableProviderProxyOperationAuthority;
   const admission = lifecycle.beginFreshAcquisition('activation-route');
   if (admission.kind !== 'accepted') throw new Error('expected activation route admission');
-  lifecycle.acquisitionSucceeded(admission.slotId, authority);
+  lifecycle.acquisitionSucceeded(admission.slotId, authority, TEST_PUBLICATION_RECEIPT);
   return { lifecycle, authority, authorityFaults };
 }
 
@@ -836,7 +862,9 @@ async function completeCapacityLocalHandoff(
     time,
   });
   reconciler.start();
-  cleanups.push(() => reconciler.stop());
+  cleanups.push(() => {
+    reconciler.stop();
+  });
   const route = createAppServerProxyRoute({
     hostManager: { routeAppServerOperation: () => capacityAuthority },
     reconciler,
@@ -1233,7 +1261,7 @@ describe('provider proxy cancellation relinquishment against a real guardian pai
       forceClose: async () => {
         throw new Error('shared unconfirmed cancellation force-closed one operation');
       },
-      evictHost: async () => false,
+      evictHost: async () => ({ kind: 'stale' as const }),
     };
     const ledger = createOperationLedger<ProxyPreparedAppServerOperation>();
     const proxy = {
@@ -1331,7 +1359,13 @@ describe('provider proxy cumulative root rotation', () => {
       (
         _entry: unknown,
         _environment: unknown,
-        onSettled: (outcome: Readonly<{ kind: 'acquired'; set: RotationSet['authority'] }>) => void,
+        onSettled: (
+          outcome: Readonly<{
+            kind: 'acquired';
+            set: RotationSet['authority'];
+            publicationReceipt: PublicationReceipt;
+          }>,
+        ) => void,
       ) => {
         const factory = factories.shift();
         if (factory === undefined) throw new Error('coordinator attempted to acquire a third rotation set');
@@ -1347,13 +1381,18 @@ describe('provider proxy cumulative root rotation', () => {
                     if ('disappearanceReceipt' in outcome) rotationOrder.push('joint-absence');
                     return outcome;
                   },
+                  commitContainment: async (signal: AbortSignal) => {
+                    const outcome = await set.authority.commitContainment(signal);
+                    if (outcome.kind === 'containment-absent') rotationOrder.push('joint-absence');
+                    return outcome;
+                  },
                 }
               : set.authority;
             if (!isFirst) {
               rotationOrder.push('fresh-set-spawn');
               resolveFreshSet(set);
             }
-            onSettled({ kind: 'acquired', set: authority });
+            onSettled({ kind: 'acquired', set: authority, publicationReceipt: TEST_PUBLICATION_RECEIPT });
           },
           (error: unknown) => {
             throw error;
@@ -1372,6 +1411,7 @@ describe('provider proxy cumulative root rotation', () => {
       claims,
       controlEstablished: () => undefined,
       time: runtime.time,
+      ...testProviderProxySetLifecycleDurability(runtime.storage, runtime.time),
       recoveryDispatcher: createTestProviderProxyRecoveryDispatcher({
         'containment-proof': createTestProviderProxyContainmentProofProducer(runtime, containmentProofDb),
       }),
@@ -1383,6 +1423,7 @@ describe('provider proxy cumulative root rotation', () => {
       reportLifecycle: () => undefined,
       onSlotReleased: (routeKey) => manager.providerProxySlotReleased(routeKey),
     });
+    lifecycle.activateDurableOperatorDispositions();
     lifecycle.initializeClaimSlots();
     lifecycle.completeStartupDiscovery();
     const providerProxyLifecycleRef = new ProviderProxySetLifecycleRef();

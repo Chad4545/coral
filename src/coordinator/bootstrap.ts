@@ -25,6 +25,11 @@ import { resolveStrictBundleIdentity } from '../infra/bundle-manifest.js';
 import { parseProviderRoleArgv, type ProviderRole } from '../provider-proxy/role-argv.js';
 import { runProviderRoleMain } from '../provider-proxy/role-main.js';
 import { currentCoralStoreFormat } from '../store-format.js';
+import {
+  processIncarnationProbeRegistrySize,
+  snapshotProcessIncarnationProbeSubjects,
+  terminateProcessIncarnationProbes,
+} from '../infra/node-process.js';
 
 /**
  * Exit codes for a guardian/reaper/proxy role that failed to start, distinct from `0` (success), `1` (a
@@ -46,6 +51,73 @@ const PROVIDER_ROLE_STARTUP_FAILURE_EXIT_CODES: Readonly<Record<ProviderRole, nu
  * `coral-backend` and `coral-cli backend status` may not make the same claim with two different numbers.
  */
 const UNOBSERVED_STARTUP_DELEGATION_EXIT_CODE: ReturnType<typeof handoffRoutingStatusExitContribution> = 75;
+
+function createBootstrapProbeExitGate(): Readonly<{
+  recordExitCode(code: number): void;
+  requestExit(code: number): void;
+}> {
+  let requestedExitCode: number | null = null;
+  let cleanupInFlight = false;
+  let exited = false;
+
+  const requestCleanup = (): void => {
+    if (cleanupInFlight || exited) return;
+    cleanupInFlight = true;
+    const cleanupSubjects = snapshotProcessIncarnationProbeSubjects();
+    void terminateProcessIncarnationProbes().then(
+      (disposition) => {
+        if (disposition.disposition === 'hold') {
+          const holds = disposition.unsettled
+            .map((hold) =>
+              'key' in hold
+                ? `key=${hold.key} reason=${hold.reason} exit=${hold.exit}`
+                : `pid=${hold.pid ?? 'unavailable'} reason=${hold.reason} exit=${hold.exit}`,
+            )
+            .join('; ');
+          backendLog.error(`Coordinator exit remains held by unsettled process-incarnation probes: ${holds}`);
+          void disposition.untilSettled.then(() => {
+            cleanupInFlight = false;
+            requestCleanup();
+          });
+          return;
+        }
+        cleanupInFlight = false;
+        if (requestedExitCode !== null) {
+          exited = true;
+          process.exit(requestedExitCode);
+        }
+      },
+      (error: unknown) => {
+        cleanupInFlight = false;
+        const subjects = cleanupSubjects
+          .map((subject) => ('key' in subject ? `key=${subject.key}` : `pid=${subject.pid}`))
+          .join('; ');
+        backendLog.error(
+          `Coordinator process-incarnation probe cleanup failed; exit remains held; registered subjects: ${subjects || 'none'}`,
+          error,
+        );
+      },
+    );
+  };
+
+  const recordExitCode = (code: number): void => {
+    requestedExitCode = requestedExitCode === null ? code : Math.max(requestedExitCode, code);
+  };
+
+  return {
+    recordExitCode,
+    requestExit: (code): void => {
+      recordExitCode(code);
+      if (processIncarnationProbeRegistrySize() === 0 && requestedExitCode !== null) {
+        exited = true;
+        process.exit(requestedExitCode);
+      }
+      requestCleanup();
+    },
+  };
+}
+
+const bootstrapProbeExitGate = createBootstrapProbeExitGate();
 
 async function handleSmokeOpenStore(argv: readonly string[]): Promise<number> {
   const pathIdx = argv.indexOf('--path');
@@ -225,8 +297,13 @@ export async function main(): Promise<number> {
     const coordinator = createCoordinatorServer({
       pluginRoot: __PLUGIN_ROOT__,
       onStopped: () => {
-        process.exit(0);
+        bootstrapProbeExitGate.requestExit(0);
       },
+      acceptProcessExitRemainder: (remainder) => ({
+        kind: 'accepted',
+        remainder,
+        requestExit: () => bootstrapProbeExitGate.requestExit(0),
+      }),
       onFatalShutdownError: (error) => {
         backendLog.error('Fatal shutdown error', error);
         const diagnosticFile = writeBootstrapDiagnostic(__PLUGIN_ROOT__, 'fatal_shutdown_error', error, 1);
@@ -238,7 +315,7 @@ export async function main(): Promise<number> {
           1,
           diagnosticFile,
         );
-        process.exit(1);
+        bootstrapProbeExitGate.requestExit(1);
       },
     });
 
@@ -306,7 +383,7 @@ if (typeof __IS_CORAL_BACKEND_MAIN__ !== 'undefined' && __IS_CORAL_BACKEND_MAIN_
   void main()
     .then((code) => {
       if (code !== 0) {
-        process.exit(code);
+        bootstrapProbeExitGate.requestExit(code);
       }
     })
     .catch((error: unknown) => {
@@ -322,6 +399,6 @@ if (typeof __IS_CORAL_BACKEND_MAIN__ !== 'undefined' && __IS_CORAL_BACKEND_MAIN_
           diagnosticFile,
         );
       }
-      process.exit(1);
+      bootstrapProbeExitGate.requestExit(1);
     });
 }

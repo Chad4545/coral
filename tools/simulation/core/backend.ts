@@ -676,7 +676,7 @@ export function createSimulationBackend(
 
   const listenHost = scenario.listen?.host ?? DEFAULT_LISTEN_HOST;
   const listenPort = scenario.listen?.port ?? DEFAULT_LISTEN_PORT;
-  const kbDaemonHealth: KbDaemonHealthSnapshot = {
+  let kbDaemonHealth: KbDaemonHealthSnapshot = {
     enabled: true,
     phase: 'online',
     generation: 1,
@@ -711,7 +711,10 @@ export function createSimulationBackend(
     listActiveKbJobs: async () => ({ active: [] }),
     stop: async () => ({ ...kbDaemonHealth }),
     restart: async () => ({ ...kbDaemonHealth }),
-    dispose: async () => undefined,
+    dispose: async () => {
+      kbDaemonHealth = { ...kbDaemonHealth, phase: 'stopped', pid: null, readyAt: null };
+      return { kind: 'confirmed-absent', snapshot: { ...kbDaemonHealth } };
+    },
     onExit: () => () => {},
   };
 
@@ -765,6 +768,7 @@ export function createSimulationBackend(
           storage: runtime.storage,
           env: runtime.env,
           paths: runtime.paths,
+          process: runtime.process,
         });
       },
       removeBackendInfoIfOwnerFn: (instanceId) => {
@@ -872,11 +876,9 @@ export function createSimulationBackend(
   const backend: SimulationController = {
     start: () => core.lifecycleController.start(),
     shutdown: async (reason) => {
-      try {
-        await core.lifecycleController.shutdown(reason);
-      } finally {
-        cleanupRuntimeRoot();
-      }
+      const disposition = await core.lifecycleController.shutdown(reason);
+      if (disposition.disposition === 'finalized') cleanupRuntimeRoot();
+      return disposition;
     },
     waitForShutdown: () => core.lifecycleController.waitForShutdown(),
     getLifecycle: () => core.runtimeState.getLifecycle(),

@@ -1,34 +1,19 @@
-import { execFileSync, type ExecFileSyncOptionsWithStringEncoding } from 'node:child_process';
+import {
+  execFile,
+  execFileSync,
+  type ChildProcess,
+  type ExecFileOptionsWithStringEncoding,
+  type ExecFileSyncOptionsWithStringEncoding,
+} from 'node:child_process';
 import { readFileSync } from 'node:fs';
+import { readFile as readFileAsync } from 'node:fs/promises';
 import { z } from 'zod';
 
-/**
- * Bounds one probe *subprocess*, not one probe: `probeMacProcessIncarnation` issues two in sequence and does
- * not cache the first, so a wedged darwin probe costs twice this.
- *
- * Best-effort, and nothing may rely on more. Node implements a synchronous timeout by sending `killSignal`
- * and then continuing to wait for the child to exit, so a child that blocks or ignores it still overruns.
- * Nothing *can* rely on hardness anyway: every deadline mechanism here is asynchronous, and none of them
- * preempt a synchronous `execFileSync`, which blocks the event loop outright. This makes a wedged probe
- * return; it does not make any caller's deadline enforceable, and the difference is not academic for callers
- * that sweep a recorded set — `docs/todo/containment-observation-deadline.md` owns that analysis, deliberately
- * rather than here, because every fact in it belongs to a module this one cannot see change.
- *
- * 2s matches the bound `env-sanitize.ts` already uses for a synchronous subprocess. There is no measurement
- * behind either number — do not add one to a comment without taking it.
- *
- * What the bound cannot do is the part that makes it safe: it turns a would-be-successful observation into a
- * throw, and every call site's existing `catch` answers `null`. It cannot fabricate a token, so it cannot
- * make an equality check newly pass. That is narrower than "it cannot authorize a signal" — not every signal
- * is equality-gated — so it is the only claim to rely on.
- */
-const PROCESS_INCARNATION_PROBE_TIMEOUT_MS = 2_000;
+import { SIGTERM_GRACE_MS } from './process-constants.js';
 
-/**
- * The one exec shape the incarnation probes share. Named so the three call sites cannot drift apart on it —
- * a site that quietly loses the timeout is the defect the bound exists to prevent, and
- * `tests/invariants/sync-subprocess-timeout.test.ts` fails when one does.
- */
+/** Every async platform probe must share one deadline derived from this end-to-end allowance. */
+export const PROCESS_INCARNATION_PROBE_TIMEOUT_MS = 2_000;
+
 const PROBE_EXEC_OPTIONS: ExecFileSyncOptionsWithStringEncoding = {
   encoding: 'utf-8',
   stdio: ['ignore', 'pipe', 'ignore'],
@@ -292,6 +277,498 @@ export function createRecordedProcessObserver(
         return readers.observeLiveness(recorded.pid);
       }
       return observed === recorded.incarnation ? 'alive' : 'absent';
+    } catch {
+      return 'unknown';
+    }
+  };
+}
+
+// Guardian and reaper identity probes must not block their answering loops.
+
+type AsyncProbeExecOptions = ExecFileOptionsWithStringEncoding & Readonly<{ signal: AbortSignal }>;
+
+export type ProcessIncarnationProbeTerminator = (child: ChildProcess) => void;
+
+function asyncProbeExecOptions(signal: AbortSignal): AsyncProbeExecOptions {
+  return { encoding: 'utf-8', signal };
+}
+
+type ProcessIncarnationProbeRegistration = {
+  state: 'running' | 'terminating';
+  retryTimer: NodeJS.Timeout | null;
+  terminate: ProcessIncarnationProbeTerminator;
+  settlementWaiters: Set<(hold: ProcessIncarnationProbeHold | null) => void>;
+  lease: ProcessIncarnationProbeLease;
+};
+
+const processIncarnationProbeChildren = new Map<ChildProcess, ProcessIncarnationProbeRegistration>();
+
+type ProcessIncarnationProbeLease = {
+  key: string;
+  children: Set<ChildProcess>;
+  cleanupRequested: boolean;
+  probeSettled: boolean;
+  released: boolean;
+  settlement: Promise<void>;
+  resolveSettlement(): void;
+};
+
+const processIncarnationProbeLeases = new Map<string, ProcessIncarnationProbeLease>();
+
+export type ProcessIncarnationProbeHold =
+  | Readonly<{
+      child: ChildProcess;
+      pid: number | undefined;
+      reason: 'termination-failed' | 'close-unobserved';
+      exit: 'child-close';
+      error?: unknown;
+    }>
+  | Readonly<{
+      child: null;
+      pid: undefined;
+      key: string;
+      reason: 'probe-unsettled';
+      exit: 'probe-settlement';
+    }>;
+
+/** Probe cleanup cannot report settlement while an enrolled lease could still own a current or future child. */
+export type ProcessIncarnationProbeCleanupDisposition =
+  | Readonly<{ disposition: 'settled' }>
+  | Readonly<{
+      disposition: 'hold';
+      unsettled: readonly ProcessIncarnationProbeHold[];
+      untilSettled: Promise<void>;
+    }>;
+
+function settleProcessIncarnationProbeTermination(
+  registration: ProcessIncarnationProbeRegistration,
+  hold: ProcessIncarnationProbeHold | null,
+): void {
+  for (const resolve of registration.settlementWaiters) resolve(hold);
+  registration.settlementWaiters.clear();
+}
+
+function processIncarnationProbeHold(
+  child: ChildProcess,
+  reason: 'termination-failed' | 'close-unobserved',
+  error?: unknown,
+): ProcessIncarnationProbeHold {
+  return {
+    child,
+    pid: child.pid,
+    reason,
+    exit: 'child-close',
+    ...(error === undefined ? {} : { error }),
+  };
+}
+
+function releaseProcessIncarnationProbeLease(lease: ProcessIncarnationProbeLease): void {
+  if (!lease.probeSettled || lease.children.size > 0) return;
+  if (lease.released) return;
+  lease.released = true;
+  if (processIncarnationProbeLeases.get(lease.key) === lease) {
+    processIncarnationProbeLeases.delete(lease.key);
+  }
+  lease.resolveSettlement();
+}
+
+function terminateProcessIncarnationProbeChild(child: ChildProcess): void {
+  const registration = processIncarnationProbeChildren.get(child);
+  if (registration?.state !== 'running') return;
+  registration.state = 'terminating';
+  try {
+    registration.terminate(child);
+  } catch (error: unknown) {
+    registration.state = 'running';
+    settleProcessIncarnationProbeTermination(
+      registration,
+      processIncarnationProbeHold(child, 'termination-failed', error),
+    );
+    throw error;
+  }
+  if (processIncarnationProbeChildren.get(child) !== registration) return;
+  registration.retryTimer = setTimeout(() => {
+    if (processIncarnationProbeChildren.get(child) !== registration) return;
+    registration.state = 'running';
+    registration.retryTimer = null;
+    settleProcessIncarnationProbeTermination(registration, processIncarnationProbeHold(child, 'close-unobserved'));
+  }, SIGTERM_GRACE_MS);
+  registration.retryTimer.unref();
+}
+
+/** An active lease prevents a cleanup boundary from mistaking a gap between helper children for absence. */
+export function processIncarnationProbeRegistrySize(): number {
+  return processIncarnationProbeLeases.size;
+}
+
+export type ProcessIncarnationProbeSubject = Readonly<{ pid: number }> | Readonly<{ key: string }>;
+
+/** A cleanup caller must retain the actionable subjects before an asynchronous cleanup attempt can reject. */
+export function snapshotProcessIncarnationProbeSubjects(): readonly ProcessIncarnationProbeSubject[] {
+  const pids = new Set<number>();
+  for (const child of processIncarnationProbeChildren.keys()) {
+    if (child.pid !== undefined) pids.add(child.pid);
+  }
+  return [...[...pids].map((pid) => ({ pid })), ...[...processIncarnationProbeLeases.keys()].map((key) => ({ key }))];
+}
+
+/** Cleanup retains enrolled leases until their probes and every current or future child have settled. */
+export async function terminateProcessIncarnationProbes(
+  signal?: AbortSignal,
+): Promise<ProcessIncarnationProbeCleanupDisposition> {
+  const leases = [...processIncarnationProbeLeases.values()];
+  for (const lease of leases) lease.cleanupRequested = true;
+
+  const attempts = [...processIncarnationProbeChildren.entries()].map(([child, registration]) => {
+    const settled = new Promise<ProcessIncarnationProbeHold | null>((resolve) => {
+      let onAbort: (() => void) | null = null;
+      const finish = (hold: ProcessIncarnationProbeHold | null): void => {
+        registration.settlementWaiters.delete(finish);
+        if (onAbort !== null && signal !== undefined) signal.removeEventListener('abort', onAbort);
+        resolve(hold);
+      };
+      registration.settlementWaiters.add(finish);
+      if (signal !== undefined) {
+        onAbort = () => finish(processIncarnationProbeHold(child, 'close-unobserved'));
+        if (signal.aborted) onAbort();
+        else signal.addEventListener('abort', onAbort, { once: true });
+      }
+    });
+    if (signal?.aborted !== true) {
+      try {
+        terminateProcessIncarnationProbeChild(child);
+      } catch {
+        // A termination this call could not deliver decides nothing about the child: only `close` resolves the
+        // settlement promise below, so a throw here must not skip the wait that reports the child as unsettled.
+      }
+    }
+    return settled;
+  });
+
+  const unsettled = (await Promise.all(attempts)).filter((hold): hold is ProcessIncarnationProbeHold => hold !== null);
+  const leaseSettlement = Promise.all(leases.map(({ settlement }) => settlement)).then(() => undefined);
+  if (unsettled.length === 0 && signal?.aborted !== true) {
+    if (signal === undefined) {
+      await leaseSettlement;
+      return { disposition: 'settled' };
+    }
+
+    const settledBeforeAbort = await new Promise<boolean>((resolve) => {
+      let finished = false;
+      const finish = (settled: boolean): void => {
+        if (finished) return;
+        finished = true;
+        signal.removeEventListener('abort', onAbort);
+        resolve(settled);
+      };
+      const onAbort = (): void => finish(false);
+      signal.addEventListener('abort', onAbort, { once: true });
+      if (signal.aborted) onAbort();
+      void leaseSettlement.then(() => finish(true));
+    });
+    if (settledBeforeAbort) return { disposition: 'settled' };
+  }
+
+  const heldChildren = new Set(unsettled.flatMap((hold) => (hold.child === null ? [] : [hold.child])));
+  const lateChildHolds = leases.flatMap((lease) =>
+    [...lease.children]
+      .filter((child) => !heldChildren.has(child))
+      .map((child) => processIncarnationProbeHold(child, 'close-unobserved')),
+  );
+  const leaseHolds: ProcessIncarnationProbeHold[] = leases
+    .filter((lease) => !lease.released && lease.children.size === 0)
+    .map((lease) => ({
+      child: null,
+      pid: undefined,
+      key: lease.key,
+      reason: 'probe-unsettled',
+      exit: 'probe-settlement',
+    }));
+  if (unsettled.length === 0 && lateChildHolds.length === 0 && leaseHolds.length === 0) {
+    return { disposition: 'settled' };
+  }
+  return {
+    disposition: 'hold',
+    unsettled: [...unsettled, ...lateChildHolds, ...leaseHolds],
+    untilSettled: leaseSettlement,
+  };
+}
+
+function probeDeadlineError(signal: AbortSignal): Error {
+  const reason: unknown = signal.reason;
+  if (reason instanceof Error) return reason;
+  return new Error('Process incarnation probe deadline expired');
+}
+
+function execFileAsync(
+  file: string,
+  args: readonly string[],
+  options: AsyncProbeExecOptions,
+  terminate: ProcessIncarnationProbeTerminator,
+  lease: ProcessIncarnationProbeLease,
+): Promise<{ stdout: string; stderr: string }> {
+  const { signal, ...execOptions } = options;
+  if (lease.cleanupRequested) {
+    return Promise.reject(new Error('Process incarnation probe cleanup requested'));
+  }
+  if (signal.aborted) {
+    return Promise.reject(probeDeadlineError(signal));
+  }
+
+  return new Promise((resolve, reject) => {
+    let settled = false;
+    const child = execFile(file, args as string[], execOptions, (error, stdout, stderr) => {
+      if (settled) return;
+      settled = true;
+      signal.removeEventListener('abort', onAbort);
+      if (error) {
+        reject(error instanceof Error ? error : new Error(error.message));
+        return;
+      }
+      resolve({ stdout, stderr });
+    });
+
+    const onAbort = (): void => {
+      if (settled) return;
+      settled = true;
+      try {
+        terminateProcessIncarnationProbeChild(child);
+      } finally {
+        reject(probeDeadlineError(signal));
+      }
+    };
+
+    lease.children.add(child);
+    processIncarnationProbeChildren.set(child, {
+      state: 'running',
+      retryTimer: null,
+      terminate,
+      settlementWaiters: new Set(),
+      lease,
+    });
+    child.on('close', () => {
+      signal.removeEventListener('abort', onAbort);
+      const registration = processIncarnationProbeChildren.get(child);
+      if (registration?.retryTimer !== null && registration?.retryTimer !== undefined) {
+        clearTimeout(registration.retryTimer);
+      }
+      processIncarnationProbeChildren.delete(child);
+      if (registration !== undefined) {
+        settleProcessIncarnationProbeTermination(registration, null);
+        registration.lease.children.delete(child);
+        releaseProcessIncarnationProbeLease(registration.lease);
+      }
+    });
+    signal.addEventListener('abort', onAbort, { once: true });
+    if (lease.cleanupRequested) {
+      try {
+        terminateProcessIncarnationProbeChild(child);
+      } catch {
+        // Only observing child close can discharge a child whose termination request was rejected.
+      }
+    }
+    if (signal.aborted) onAbort();
+  });
+}
+
+function processIncarnationProbeSignal(): AbortSignal {
+  return AbortSignal.timeout(PROCESS_INCARNATION_PROBE_TIMEOUT_MS);
+}
+
+async function readLinuxBootIdAsync(signal: AbortSignal): Promise<string | null> {
+  try {
+    const raw = (await readFileAsync('/proc/sys/kernel/random/boot_id', { encoding: 'utf-8', signal })).trim();
+    return raw.length > 0 ? raw : null;
+  } catch {
+    return null;
+  }
+}
+
+async function probeLinuxProcessIncarnationAsync(pid: number): Promise<ProcessIncarnation | null> {
+  const signal = processIncarnationProbeSignal();
+  const bootId = await readLinuxBootIdAsync(signal);
+  if (bootId === null) {
+    return null;
+  }
+
+  try {
+    const stat = await readFileAsync(`/proc/${pid}/stat`, { encoding: 'utf-8', signal });
+    return parseLinuxProcessIncarnation(bootId, stat);
+  } catch {
+    return null;
+  }
+}
+
+async function readMacBootSessionIdAsync(
+  signal: AbortSignal,
+  terminate: ProcessIncarnationProbeTerminator,
+  lease: ProcessIncarnationProbeLease,
+): Promise<string | null> {
+  try {
+    const { stdout } = await execFileAsync(
+      'sysctl',
+      ['-n', 'kern.bootsessionuuid'],
+      asyncProbeExecOptions(signal),
+      terminate,
+      lease,
+    );
+    const raw = stdout.trim();
+    return raw.length > 0 ? raw : null;
+  } catch {
+    return null;
+  }
+}
+
+async function probeMacProcessIncarnationAsync(
+  pid: number,
+  terminate: ProcessIncarnationProbeTerminator,
+  lease: ProcessIncarnationProbeLease,
+): Promise<ProcessIncarnation | null> {
+  const signal = processIncarnationProbeSignal();
+  try {
+    const bootSessionId = await readMacBootSessionIdAsync(signal, terminate, lease);
+    if (bootSessionId === null) {
+      return null;
+    }
+
+    const { stdout } = await execFileAsync(
+      'ps',
+      ['-o', 'lstart=', '-p', String(pid)],
+      asyncProbeExecOptions(signal),
+      terminate,
+      lease,
+    );
+    const raw = stdout.trim();
+    if (!raw) {
+      return null;
+    }
+
+    const parsed = Date.parse(raw);
+    return Number.isFinite(parsed) ? (`darwin:${bootSessionId}:${parsed}` as ProcessIncarnation) : null;
+  } catch {
+    return null;
+  }
+}
+
+async function probeWindowsProcessIncarnationAsync(
+  pid: number,
+  terminate: ProcessIncarnationProbeTerminator,
+  lease: ProcessIncarnationProbeLease,
+): Promise<ProcessIncarnation | null> {
+  try {
+    const { stdout } = await execFileAsync(
+      'wmic',
+      ['process', 'where', `ProcessId=${pid}`, 'get', 'CreationDate', '/value'],
+      asyncProbeExecOptions(processIncarnationProbeSignal()),
+      terminate,
+      lease,
+    );
+    const match = stdout.match(/CreationDate=(\d{14}\.\d+[+-]\d+)/) ?? stdout.match(/CreationDate=(\d{14})/);
+    const value = match?.[1];
+    return value === undefined ? null : (`win32:${value}` as ProcessIncarnation);
+  } catch {
+    return null;
+  }
+}
+
+const ASYNC_PROCESS_INCARNATION_PROBES: ReadonlyMap<
+  string,
+  (
+    pid: number,
+    terminate: ProcessIncarnationProbeTerminator,
+    lease: ProcessIncarnationProbeLease,
+  ) => Promise<ProcessIncarnation | null>
+> = new Map([
+  ['linux', probeLinuxProcessIncarnationAsync],
+  ['darwin', probeMacProcessIncarnationAsync],
+  ['win32', probeWindowsProcessIncarnationAsync],
+]);
+
+/** Platform identity probes must resolve unreadable evidence as null and must not perform synchronous I/O. */
+export async function probeProcessIncarnationAsync(
+  pid: number,
+  terminate: ProcessIncarnationProbeTerminator,
+  platform: string = process.platform,
+): Promise<ProcessIncarnation | null> {
+  if (!Number.isInteger(pid) || pid <= 0) {
+    return null;
+  }
+
+  const probe = ASYNC_PROCESS_INCARNATION_PROBES.get(platform);
+  if (probe === undefined) return null;
+
+  const key = `${platform}:${pid}`;
+  if (processIncarnationProbeLeases.has(key)) return null;
+
+  let resolveSettlement!: () => void;
+  const settlement = new Promise<void>((resolve) => {
+    resolveSettlement = resolve;
+  });
+  const lease: ProcessIncarnationProbeLease = {
+    key,
+    children: new Set(),
+    cleanupRequested: false,
+    probeSettled: false,
+    released: false,
+    settlement,
+    resolveSettlement,
+  };
+  processIncarnationProbeLeases.set(key, lease);
+  try {
+    return await probe(pid, terminate, lease);
+  } finally {
+    lease.probeSettled = true;
+    releaseProcessIncarnationProbeLease(lease);
+  }
+}
+
+/** Identity-bound observation must preserve all three liveness outcomes without blocking. */
+export type AsyncRecordedProcessObserver = (
+  recorded: Readonly<{ pid: number; incarnation: ProcessIncarnation }>,
+  signal?: AbortSignal,
+) => Promise<ProcessLiveness>;
+
+/**
+ * Pid-only life cannot prove the recorded holder still owns the pid. Unreadable identity evidence and
+ * inconclusive liveness must remain `unknown`; only decisive disappearance or identity mismatch may answer
+ * `absent`.
+ */
+export function createAsyncRecordedProcessObserver(
+  readers: Readonly<{
+    readIncarnation: (pid: number, signal?: AbortSignal) => Promise<ProcessIncarnation | null>;
+    observeLiveness: (pid: number) => ProcessLiveness;
+  }>,
+): AsyncRecordedProcessObserver {
+  const readWhileAuthorized = (pid: number, signal: AbortSignal | undefined): Promise<ProcessIncarnation | null> => {
+    if (signal === undefined) return readers.readIncarnation(pid);
+    if (signal.aborted) return Promise.resolve(null);
+
+    return new Promise((resolve) => {
+      let settled = false;
+      const finish = (value: ProcessIncarnation | null): void => {
+        if (settled) return;
+        settled = true;
+        signal.removeEventListener('abort', onAbort);
+        resolve(value);
+      };
+      const onAbort = (): void => finish(null);
+      signal.addEventListener('abort', onAbort, { once: true });
+      if (signal.aborted) {
+        onAbort();
+        return;
+      }
+      void readers.readIncarnation(pid, signal).then(finish, () => finish(null));
+    });
+  };
+
+  return async (recorded, signal) => {
+    try {
+      const liveness = readers.observeLiveness(recorded.pid);
+      if (liveness === 'absent') return 'absent';
+      const observed = await readWhileAuthorized(recorded.pid, signal);
+      if (observed === null) return readers.observeLiveness(recorded.pid) === 'absent' ? 'absent' : 'unknown';
+      if (observed !== recorded.incarnation) return 'absent';
+      return liveness === 'unknown' ? 'unknown' : 'alive';
     } catch {
       return 'unknown';
     }

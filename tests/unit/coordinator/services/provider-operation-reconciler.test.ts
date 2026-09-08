@@ -6,7 +6,11 @@ import { afterAll, describe, expect, it, vi } from 'vitest';
 import type { JobProgressStore } from '#src/jobs/contracts/job-store.js';
 import type { TimePort } from '#src/infra/port-types.js';
 import type { ProviderProxyRecoveryProducerPorts } from '#src/coordinator/services/provider-proxy-recovery-policy.js';
-import type { DurableProviderProxyOperationAuthority } from '#src/coordinator/live/provider-proxy/operation-route.js';
+import {
+  holdProviderProxyOperationControl,
+  type DurableProviderProxyOperationAuthority,
+} from '#src/coordinator/live/provider-proxy/operation-route.js';
+import type { PublicationReceipt } from '#src/coordinator/live/provider-proxy/set-publication.js';
 import { providerOperationPrepareAttempt } from '#src/coordinator/services/provider-proxy-operation-activation.js';
 import { providerProxySetIdentityFromRecord } from '#src/coordinator/services/provider-proxy-set/identity.js';
 import { ProviderProxySetClaimMirror } from '#src/coordinator/services/provider-proxy-set/claim-mirror.js';
@@ -24,6 +28,7 @@ import type { ProviderOperationReconcilerFatalError } from '#src/coordinator/ser
 import { currentCoralStoreFormat } from '#src/store-format.js';
 import { applyBundledStoreSchema } from '#src/store/db.js';
 import {
+  acquireProviderOperationMutationAdmission,
   compareAndSwapProviderOperation,
   insertProviderOperation,
   readProviderOperation,
@@ -55,6 +60,7 @@ import {
   createTestProviderProxyContainmentProofProducer,
   createTestProviderProxyRecoveryDispatcher,
 } from '#tests/helpers/provider-proxy-recovery-dispatcher.js';
+import { testProviderProxySetLifecycleDurability } from '#tests/helpers/provider-proxy-set-lifecycle-durability.js';
 import {
   asJointActivationReceipt,
   asJointContainmentReceipt,
@@ -72,6 +78,8 @@ function proxyHeartbeatFault(error: unknown): ProviderProxyAuthorityFault {
 }
 
 import { providerOperationRecord } from '../../store/provider-operation-fixtures.js';
+
+const TEST_PUBLICATION_RECEIPT = { kind: 'provider-proxy-set-published' } as PublicationReceipt;
 
 /** The build this fixture lifecycle belongs to — the same one `providerOperationRecord` stamps on its identities, so a discovered capsule is inheritable rather than foreign. */
 const FIXTURE_BUILD_SET_ID = '00000000-0000-4000-8000-000000000004';
@@ -141,6 +149,12 @@ function connectLifecycleAuthority(
       return () => listeners.delete(listener);
     },
     stopAndReap: () => proof.promise,
+    commitContainment: async () => {
+      const result = await proof.promise;
+      return 'disappearanceReceipt' in result
+        ? ({ kind: 'containment-absent', disappearanceReceipt: result.disappearanceReceipt } as const)
+        : ({ kind: 'outcome-unknown', error: result.unconfirmed } as const);
+    },
   });
   return (fault) => {
     for (const listener of listeners) listener(fault);
@@ -154,16 +168,18 @@ function lifecycleForSchedule(
 ): ProviderProxySetLifecycle {
   const claims = new ProviderProxySetClaimMirror();
   claims.initialize([record]);
+  const time = {
+    now: () => 100,
+    monotonicNow: () => 100n,
+    setTimeout: () => ({ unref: () => undefined }),
+    clearTimeout: () => undefined,
+  };
   const lifecycle = new ProviderProxySetLifecycle({
     buildSetId: FIXTURE_BUILD_SET_ID,
     claims,
     controlEstablished: () => undefined,
-    time: {
-      now: () => 100,
-      monotonicNow: () => 100n,
-      setTimeout: () => ({ unref: () => undefined }),
-      clearTimeout: () => undefined,
-    },
+    time,
+    ...testProviderProxySetLifecycleDurability(containmentProofRuntime.storage, time),
     recoveryDispatcher: createTestProviderProxyRecoveryDispatcher(
       {
         'containment-proof': createTestProviderProxyContainmentProofProducer(
@@ -181,9 +197,10 @@ function lifecycleForSchedule(
     },
     reportLifecycle: () => undefined,
   });
+  lifecycle.activateDurableOperatorDispositions();
   lifecycle.initializeClaimSlots();
   lifecycle.completeStartupDiscovery();
-  lifecycle.registerInheritedSet(authority);
+  lifecycle.registerInheritedSet(authority, TEST_PUBLICATION_RECEIPT);
   return lifecycle;
 }
 
@@ -508,7 +525,7 @@ function createHarness(
       adoptionWindowMs: Number.MAX_SAFE_INTEGER,
       heartbeatHoldBound: {
         spanMs: Number.MAX_SAFE_INTEGER,
-        materialSchedulerLatenessMs: Number.MAX_SAFE_INTEGER,
+        materialSchedulerLatenessMs: Math.floor(Number.MAX_SAFE_INTEGER / 4),
       },
     },
     faulted: new Promise<never>(() => {}),
@@ -539,6 +556,7 @@ function createHarness(
     registerSuccessionOperation:
       overrides.registerSuccessionOperation ?? (async () => ({ kind: 'registered' as const })),
     stopAndReap: async () => ({ disappearanceReceipt: 'gone' }),
+    commitContainment: async () => ({ kind: 'containment-absent', disappearanceReceipt: 'gone' }),
     stopHeartbeats: () => undefined,
     initiateControlClose: async () => undefined,
     prepareOperation:
@@ -724,6 +742,45 @@ const cleanupRetryCases = [
     })) satisfies CancelOperation,
   },
 ] as const;
+
+describe('indeterminate operation-control hold', () => {
+  it('removes cancellation from ordinary retry until recovered control is supplied explicitly', async () => {
+    const cancelOperation = vi.fn<CancelOperation>(async () => {
+      holdProviderProxyOperationControl(harness.authority);
+      throw new Error('cancellation response was lost');
+    });
+    const harness = createHarness({ cancelOperation });
+    const initial = providerOperationRecord('prestart-cleanup-pending');
+    insertProviderOperation(harness.db, initial);
+
+    await harness.reconciler.reconcile(initial, harness.authority);
+
+    const held = readProviderOperation(harness.db, initial.operation);
+    expect(held).toMatchObject({
+      phase: 'prestart-cleanup-pending',
+      retryNotBeforeMs: Number.MAX_SAFE_INTEGER,
+      lastError: { code: 'operation-control-outcome-unknown' },
+    });
+    if (held === null) throw new Error('indeterminate cancellation did not retain its operation record');
+
+    await harness.reconciler.reconcile(held);
+    expect(cancelOperation).toHaveBeenCalledOnce();
+
+    const recoveredCancel = vi.fn<CancelOperation>(async (operation, prepareAttemptNumber, prepareAttemptKey) => ({
+      state: 'released-never-started',
+      operation,
+      prepareAttemptNumber,
+      prepareAttemptKey,
+    }));
+    const recoveredAuthority: DurableProviderProxyOperationAuthority = {
+      ...harness.authority,
+      cancelOperation: recoveredCancel,
+    };
+
+    await harness.reconciler.reconcile(held, recoveredAuthority);
+    expect(recoveredCancel).toHaveBeenCalledOnce();
+  });
+});
 
 describe('provider host unserviceable refusal durability', () => {
   function expectStructuredTerminal(appended: readonly unknown[], message = hostUnserviceableRefusal.reason): void {
@@ -1866,6 +1923,51 @@ describe('ProviderOperationReconciler publication', () => {
     expect(readProviderOperation(harness.db, harness.record.operation)?.phase).toBe('executing');
   });
 
+  it('holds shutdown admission until an accepted activation publishes its executing claim', async () => {
+    const activation = deferredValue<typeof activationAck>();
+    const harness = createHarness({ activatePreparedOperation: () => activation.promise });
+    const lifecycleAcquisition = acquireProviderOperationMutationAdmission(harness.db, 'test-coordinator');
+    expect(lifecycleAcquisition.kind).toBe('acquired');
+    if (lifecycleAcquisition.kind !== 'acquired') throw new Error('lifecycle admission was not acquired');
+    const observedPhases: string[] = [];
+    const unsubscribe = subscribeProviderOperationMutations(harness.db, (mutation) => {
+      if (mutation.kind === 'upserted') observedPhases.push(mutation.record.phase);
+    });
+
+    try {
+      const publication = harness.begin();
+      await vi.waitFor(() =>
+        expect(readProviderOperation(harness.db, harness.record.operation)?.phase).toBe('proxy-activation-pending'),
+      );
+
+      const stopping = harness.reconciler.stop();
+      expect(stopping).toMatchObject({
+        kind: 'holding',
+        exit: 'admitted-provider-operation-mutation-settlement',
+      });
+      if (stopping.kind !== 'holding') throw new Error('accepted activation was not retained by stop');
+
+      expect(() => insertProviderOperation(harness.db, providerOperationRecord('prepare-pending', { job: 2 }))).toThrow(
+        'Provider operation mutation admission is closed.',
+      );
+
+      activation.resolve(activationAck);
+      await expect(publication).resolves.toEqual({ kind: 'remote-executing' });
+      await stopping.retryAfter;
+
+      expect(readProviderOperation(harness.db, harness.record.operation)?.phase).toBe('executing');
+      expect(observedPhases).toContain('executing');
+      expect(harness.reconciler.stop()).toEqual({ kind: 'drained' });
+      expect(lifecycleAcquisition.admission.accepting).toBe(false);
+      expect(acquireProviderOperationMutationAdmission(harness.db, 'successor-coordinator').kind).toBe('acquired');
+      await expect(harness.reconciler.reconcile(harness.record)).rejects.toThrow(
+        'Provider operation mutation admission is closed.',
+      );
+    } finally {
+      unsubscribe();
+    }
+  });
+
   it('recreates a coordinator after the succession-register/prepare cut using only SQLite, capsule, and proxy state', async () => {
     const harness = createHarness();
     const recovered = harness.record;
@@ -1925,7 +2027,11 @@ describe('ProviderOperationReconciler publication', () => {
       modeledProxyState.redeem({
         grantId: capsule.grantId,
         secret: capsule.secret,
-        successorInstanceId: '88888888-8888-4888-8888-888888888888',
+        successor: {
+          instanceId: '88888888-8888-4888-8888-888888888888',
+          pid: 999,
+          incarnation: testIncarnation(999),
+        },
         binding: {
           generation: capsule.generation,
           flavor: capsule.flavor,

@@ -15,14 +15,25 @@ function catalogEntry(code: string): string {
 
 describe('provider-host operator documentation', () => {
   it('documents actionable recovery for every administration refusal', () => {
+    expect(catalogEntry('provider_host_inventory_unavailable')).toContain('retry the exact reference');
     expect(catalogEntry('provider_host_inventory_unavailable')).toContain(
-      'Retry the original command; if it persists, run `coral-cli backend shutdown`, then retry the original command to start a fresh coordinator.',
+      'If the error persists, run `coral-cli backend shutdown`, then retry the original command to start a fresh coordinator.',
     );
     expect(catalogEntry('provider_host_not_found')).toContain('coral-cli backend provider-host list');
     expect(catalogEntry('provider_host_ambiguous')).toContain('provider-host inspect <ref>');
     expect(catalogEntry('provider_host_ambiguous')).toContain('provider-host evict <ref>');
+    expect(catalogEntry('provider_host_eviction_requires_exact_ref')).toContain('cannot use a work directory');
+    expect(catalogEntry('provider_host_eviction_requires_exact_ref')).toContain('provider-host evict <ref>');
     expect(catalogEntry('provider_host_identity_integrity')).toContain('Do **not** evict');
     expect(catalogEntry('provider_host_identity_integrity')).toContain('coral-cli backend status');
+    expect(catalogEntry('provider_host_shutdown_held')).toContain('observation');
+    expect(catalogEntry('provider_host_shutdown_held')).toContain('successorOwner');
+    expect(catalogEntry('provider_host_shutdown_held')).toContain('operatorExit');
+    expect(catalogEntry('provider_host_shutdown_held')).toContain('provider-host evict <ref>');
+    expect(catalogEntry('provider_host_operator_abandoned')).toContain('processAbsenceProven: false');
+    expect(catalogEntry('provider_host_operator_abandoned')).toContain('Inspect the recorded process');
+    expect(catalogEntry('provider_host_operator_abandoned')).toContain("owner process's lifetime");
+    expect(catalogEntry('provider_host_operator_abandoned')).toContain('exact reference remains retryable');
     expect(catalogEntry('provider_host_stale')).toContain('coral-cli backend provider-host list');
   });
 
@@ -42,7 +53,7 @@ describe('provider-host operator documentation', () => {
 
   it('documents both inventory-unavailable and identity-integrity causes', () => {
     expect(catalogEntry('provider_host_inventory_unavailable')).toContain(
-      "selected owner's exact inspect/evict call failed after inventory capture",
+      "selected owner's exact inspect/evict call failed after owner selection",
     );
     expect(catalogEntry('provider_host_identity_integrity')).toContain('duplicate owner IDs before selecting a host');
     expect(catalogEntry('provider_host_identity_integrity')).toContain('exact host reference collided');

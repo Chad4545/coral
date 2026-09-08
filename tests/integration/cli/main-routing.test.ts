@@ -31,9 +31,18 @@ import { ProviderHostUnserviceableError } from '#src/providers/host-admission.js
 import { encodeHostRef } from '#src/providers/host-ref-codec.js';
 import type { HostRef } from '#src/providers/contract.js';
 import { fixtureCanonicalWorkDir } from '#tests/helpers/canonical-work-dir.js';
-import { registerBackendCommands, type BackendStatusCommandOperations } from '#src/cli/commands/backend.js';
+import {
+  registerBackendCommands,
+  type BackendStatusCommandOperations,
+  type ProviderHostCommandOperations,
+  type ProviderProxySetCommandOperations,
+} from '#src/cli/commands/backend.js';
+import type { ProviderProxyRoleTerminationCommandOperations } from '#src/cli/commands/provider-proxy-role-termination.js';
 import { assertNever } from '#src/infra/error-format.js';
+import { encodeProviderProxySetAddress, type ProviderProxySetAddress } from '#src/provider-proxy/set-address.js';
+import type { ProviderProxyRoleIdentity } from '#src/provider-proxy/protocol.js';
 import type { ShutdownReason, ShutdownResult } from '#src/transport/http/backend/shutdown.js';
+import { testIncarnation } from '#tests/helpers/process-incarnation.js';
 
 const genericInstallMethod = 'shell' satisfies InstallMethod;
 
@@ -463,6 +472,91 @@ describe('cli main routing', () => {
     expect(process.exitCode).toBe(1);
   });
 
+  it('renders a provider-host shutdown hold with its exact retry exit', async () => {
+    const ref: HostRef = {
+      provider: 'codex',
+      fingerprint: 'a'.repeat(64),
+      instanceId: 'held-host',
+      leaseMode: 'shared',
+    };
+    const encodedRef = encodeHostRef(ref);
+    const remediation =
+      `Run \`coral-cli backend provider-host evict ${encodedRef}\` to execute the reported ` +
+      'retry-broker-shutdown exit; Coral will report eviction only after no hold remains.';
+    const providerHosts: ProviderHostCommandOperations = {
+      list: vi.fn(),
+      inspect: vi.fn(),
+      evict: vi.fn(async () => {
+        throw new IpcRpcError({
+          code: -32_000,
+          message: 'The provider host remains shutdown-held.',
+          data: {
+            code: 'provider_host_shutdown_held',
+            message:
+              `The provider host remains shutdown-held: ${encodedRef}; observation=alive; ` +
+              'successorOwner=broker-session-pool; operatorExit=retry-broker-shutdown.',
+            remediation,
+          },
+        });
+      }),
+    };
+    const program = new Command();
+    program.exitOverride();
+    registerBackendCommands(program, { providerHosts });
+
+    await program.parseAsync(['node', 'coral-cli', 'backend', 'provider-host', 'evict', encodedRef]);
+
+    expect(stdout).toBe('');
+    expect(stderr).toContain('provider_host_shutdown_held');
+    expect(stderr).toContain('observation=alive');
+    expect(stderr).toContain('successorOwner=broker-session-pool');
+    expect(stderr).toContain('operatorExit=retry-broker-shutdown');
+    expect(stderr).toContain(remediation);
+    expect(process.exitCode).toBe(1);
+  });
+
+  it('renders terminal provider-host operator abandonment with its retained exact-reference replay', async () => {
+    const ref: HostRef = {
+      provider: 'codex',
+      fingerprint: 'a'.repeat(64),
+      instanceId: 'abandoned-host',
+      leaseMode: 'shared',
+    };
+    const encodedRef = encodeHostRef(ref);
+    const remediation = `Inspect the recorded process because it may still be live. Retry \`coral-cli backend provider-host evict ${encodedRef}\` to recover this retained terminal disposition for the owner process's lifetime; the retry does not prove that the abandoned process exited.`;
+    const providerHosts: ProviderHostCommandOperations = {
+      list: vi.fn(),
+      inspect: vi.fn(),
+      evict: vi.fn(async () => {
+        throw new IpcRpcError({
+          code: -32_000,
+          message: 'Provider-host cleanup was terminally abandoned without proof that its process exited.',
+          data: {
+            code: 'provider_host_operator_abandoned',
+            message:
+              `Provider-host cleanup was terminally abandoned without proof that its process exited: ${encodedRef}; ` +
+              'subject={"kind":"unattributable-process-group","processGroupId":4242}; ' +
+              'processAbsenceProven=false; successorOwner=operator-command.',
+            remediation,
+          },
+        });
+      }),
+    };
+    const program = new Command();
+    program.exitOverride();
+    registerBackendCommands(program, { providerHosts });
+
+    await program.parseAsync(['node', 'coral-cli', 'backend', 'provider-host', 'evict', encodedRef]);
+
+    expect(stdout).toBe('');
+    expect(stderr).toContain('provider_host_operator_abandoned');
+    expect(stderr).toContain('processAbsenceProven=false');
+    expect(stderr).toContain('successorOwner=operator-command');
+    expect(stderr).toContain(remediation);
+    expect(stderr).toContain(`coral-cli backend provider-host evict ${encodedRef}`);
+    expect(process.exitCode).toBe(1);
+  });
+
   it('names each exact provider-proxy set that successful handoff shutdown preserves', async () => {
     const token = 'pps1.preserved-set';
     const program = new Command();
@@ -482,13 +576,20 @@ describe('cli main routing', () => {
                       proxyInstanceId: '22222222-2222-4222-8222-222222222222',
                     },
                     setToken: token,
-                    disposition: 'held',
                     liveClaims: 1,
-                    incidentReason: 'control_channel_reattaching',
-                    waitingFor: 'control-reattachment',
+                    operatorExit: { kind: 'contain' },
+                    holds: [
+                      {
+                        disposition: 'held',
+                        incidentReason: 'control_channel_reattaching',
+                        waitingFor: 'control-reattachment',
+                      },
+                    ],
                   },
                 ],
               },
+              skippedProviderProxySetRows: 0,
+              skippedProviderProxySetTokens: [],
             },
           }) as never,
       } as unknown as BackendStatusCommandOperations,
@@ -502,7 +603,53 @@ describe('cli main routing', () => {
     expect(process.exitCode).toBeUndefined();
   });
 
-  it('reports an incomplete pre-shutdown set read and retains structurally valid opaque tokens', async () => {
+  it('renders the asserted wait exit before shutdown', async () => {
+    const token = 'pps1.waiting-set';
+    const program = new Command();
+    program.exitOverride();
+    registerBackendCommands(program, {
+      backendStatus: {
+        getStatus: async () =>
+          ({
+            status: 'ok',
+            health: {
+              diagnostics: {
+                providerProxySets: [
+                  {
+                    setIdentity: {
+                      buildSetId: '11111111-1111-4111-8111-111111111111',
+                      hostFingerprint: 'a'.repeat(64),
+                      proxyInstanceId: '22222222-2222-4222-8222-222222222222',
+                    },
+                    setToken: token,
+                    liveClaims: 0,
+                    operatorExit: { kind: 'none' },
+                    holds: [
+                      {
+                        disposition: 'held',
+                        incidentReason: 'publication_result_unknown',
+                        waitingFor: 'publication-confirmation-or-control-release',
+                      },
+                    ],
+                  },
+                ],
+              },
+              skippedProviderProxySetRows: 0,
+              skippedProviderProxySetTokens: [],
+            },
+          }) as never,
+      } as unknown as BackendStatusCommandOperations,
+    });
+    mockState.shutdownBackend.mockResolvedValueOnce({ ok: true });
+
+    await program.parseAsync(['node', 'coral-cli', 'backend', 'shutdown']);
+
+    expect(stdout).not.toContain(`coral-cli backend provider-proxy-set contain ${token}`);
+    expect(stdout).toContain('action=wait; Coral retries publication automatically');
+    expect(process.exitCode).toBeUndefined();
+  });
+
+  it('names a skipped set without offering a command this build cannot verify', async () => {
     const token = 'pps1.opaque-set';
     const program = new Command();
     program.exitOverride();
@@ -523,10 +670,12 @@ describe('cli main routing', () => {
 
     await program.parseAsync(['node', 'coral-cli', 'backend', 'shutdown']);
 
-    expect(stdout).toContain(`coral-cli backend provider-proxy-set contain ${token}`);
-    expect(stdout.split(token)).toHaveLength(2);
+    expect(stdout).toContain(`skipped candidate rawSetToken=${JSON.stringify(token)}`);
+    expect(stdout).not.toContain(`provider-proxy-set contain ${token}`);
+    expect(stdout).not.toContain(`provider-proxy-set abandon ${token}`);
     expect(stdout).toContain('could not interpret 1 provider proxy set row(s)');
     expect(stdout).toContain('could not confirm that every preserved set was named');
+    expect(stdout).toContain('Run coral-cli backend status from a build that understands the row.');
     expect(stdout).not.toContain('No held provider proxy sets were reported');
   });
 
@@ -615,6 +764,7 @@ describe('cli main routing', () => {
           getStatus,
           getLiveHandoffResult: () => null,
           getRoutingStatus: async () => ({ kind: 'absent' }),
+          readProviderProxySetHolderStatusDirect: async () => [],
         },
       });
       return program;
@@ -660,6 +810,112 @@ describe('cli main routing', () => {
       const { BACKEND_STATUS_EXIT_CODES } = await import('#src/cli/commands/backend.js');
 
       expect(Object.fromEntries(BACKEND_STATUS_EXIT_EXPECTATIONS)).toEqual(BACKEND_STATUS_EXIT_CODES);
+    });
+  });
+
+  describe('backend provider-proxy-set routing', () => {
+    const setIdentity = {
+      buildSetId: '11111111-1111-4111-8111-111111111111',
+      hostFingerprint: 'a'.repeat(64),
+      proxyInstanceId: '22222222-2222-4222-8222-222222222222',
+    } satisfies ProviderProxySetAddress;
+    const setToken = encodeProviderProxySetAddress(setIdentity);
+    const roleIdentity = {
+      role: 'reaper',
+      pid: 6101,
+      incarnation: testIncarnation(6101),
+    } satisfies ProviderProxyRoleIdentity;
+
+    function routingProgram() {
+      const contain = vi.fn<ProviderProxySetCommandOperations['contain']>(async (request) => ({
+        kind: 'unsupported-coordinator',
+        setIdentity: request.setIdentity,
+      }));
+      const terminate = vi.fn<ProviderProxyRoleTerminationCommandOperations['terminate']>(async (identity) => ({
+        kind: 'abandoned',
+        roleIdentity: identity,
+      }));
+      const retryReap = vi.fn<ProviderProxyRoleTerminationCommandOperations['retryReap']>(async (identity) => ({
+        kind: 'reap-retry-requested',
+        roleIdentity: identity,
+      }));
+      const program = new Command();
+      program.exitOverride();
+      registerBackendCommands(program, {
+        providerProxySets: { contain },
+        providerProxyRoleTermination: { terminate, retryReap },
+      });
+      return { program, contain, terminate, retryReap };
+    }
+
+    it('routes abandon to the child operation when the parent accepts an operator action', async () => {
+      const { program, contain, terminate, retryReap } = routingProgram();
+
+      await program.parseAsync(['node', 'coral-cli', 'backend', 'provider-proxy-set', 'abandon', setToken]);
+
+      expect(contain).toHaveBeenCalledOnce();
+      expect(contain).toHaveBeenCalledWith({ setIdentity, mode: 'abandon' });
+      expect(terminate).not.toHaveBeenCalled();
+      expect(retryReap).not.toHaveBeenCalled();
+    });
+
+    it('routes terminate-role to the parent operation with its parsed identity', async () => {
+      const { program, contain, terminate, retryReap } = routingProgram();
+
+      await program.parseAsync([
+        'node',
+        'coral-cli',
+        'backend',
+        'provider-proxy-set',
+        'terminate-role',
+        '--role',
+        roleIdentity.role,
+        '--pid',
+        String(roleIdentity.pid),
+        '--incarnation',
+        roleIdentity.incarnation,
+      ]);
+
+      expect(terminate).toHaveBeenCalledOnce();
+      expect(terminate).toHaveBeenCalledWith(roleIdentity);
+      expect(retryReap).not.toHaveBeenCalled();
+      expect(contain).not.toHaveBeenCalled();
+    });
+
+    it('routes retry-role-reap to the non-abandoning role recovery operation', async () => {
+      const { program, contain, terminate, retryReap } = routingProgram();
+
+      await program.parseAsync([
+        'node',
+        'coral-cli',
+        'backend',
+        'provider-proxy-set',
+        'retry-role-reap',
+        '--role',
+        roleIdentity.role,
+        '--pid',
+        String(roleIdentity.pid),
+        '--incarnation',
+        roleIdentity.incarnation,
+      ]);
+
+      expect(retryReap).toHaveBeenCalledOnce();
+      expect(retryReap).toHaveBeenCalledWith(roleIdentity);
+      expect(terminate).not.toHaveBeenCalled();
+      expect(contain).not.toHaveBeenCalled();
+    });
+
+    it('refuses an unrecognized provider-proxy-set subcommand', async () => {
+      const { program, contain, terminate, retryReap } = routingProgram();
+
+      await expect(
+        program.parseAsync(['node', 'coral-cli', 'backend', 'provider-proxy-set', 'nonsense']),
+      ).rejects.toThrow("error: unknown command 'nonsense'");
+
+      expect(contain).not.toHaveBeenCalled();
+      expect(terminate).not.toHaveBeenCalled();
+      expect(retryReap).not.toHaveBeenCalled();
+      expect(stderr).toContain("error: unknown command 'nonsense'");
     });
   });
 
@@ -1338,6 +1594,42 @@ describe('cli main routing', () => {
     expect(workflow?.helpInformation()).toContain('--detach');
     expect(workflow?.helpInformation()).toContain('-s, --start-prompt');
     expect(workflow?.helpInformation()).toContain('binds every provider profile referenced by the workflow');
+  });
+
+  it('passes a launch abort refusal through to the launch follower', async () => {
+    const { buildProgram } = await loadMainModule();
+    const program = buildProgram();
+    const result = {
+      aborted: [],
+      notFound: [],
+      refused: [
+        {
+          jobId: 'job-1',
+          reason: 'the recorded process containment could not be observed',
+          nextStep: 'Run coral-cli jobs detail job-1 and retry after the containment can be observed.',
+        },
+      ],
+    };
+
+    mockState.createSession.mockResolvedValueOnce({
+      kind: 'provider-session',
+      launchState: 'running',
+      jobId: 'job-1',
+      sessionId: 'session-1',
+    });
+    mockState.abortJobs.mockResolvedValueOnce(result);
+    mockState.launchAndFollow.mockImplementationOnce(
+      async (options: Parameters<typeof FollowMod.launchAndFollow>[0]) => {
+        await expect(options.abortJob('job-1')).resolves.toEqual(result);
+        return 3;
+      },
+    );
+
+    await program.parseAsync(['node', 'coral-cli', 'codex', '-i', 'launch prompt']);
+
+    expect(mockState.abortJobs).toHaveBeenCalledOnce();
+    expect(mockState.abortJobs).toHaveBeenCalledWith(['job-1']);
+    expect(process.exitCode).toBe(3);
   });
 
   it('passes unified flags through raw provider launches and resolves -i file input', async () => {

@@ -1,9 +1,23 @@
 import type { Capability } from '../../security/capability.js';
-import { transportOperationalCarveouts, type RequestBindingRule } from './catalog.js';
+import {
+  jobsAbortRpcSpec,
+  providerProxySetContainBooleanRpcSpec,
+  providerProxySetContainRpcSpec,
+  transportOperationalCarveouts,
+  type RequestBindingRule,
+} from './catalog.js';
+import { shutdownObligationAbandonMethod } from '../../obligation/shutdown-abandonment.js';
 
 const [healthPath, shutdownPath, kbRestartPath, eventsStreamPath] = transportOperationalCarveouts;
 
-type OperationalDispatchKind = 'ping' | 'health' | 'event-stream' | 'shutdown' | 'kb-restart';
+type OperationalDispatchKind =
+  | 'ping'
+  | 'health'
+  | 'event-stream'
+  | 'shutdown'
+  | 'shutdown-abandon'
+  | 'kb-restart'
+  | 'catalog';
 type OperationalAuthentication = 'none' | 'principal';
 
 type OperationalBaseSpec = {
@@ -27,7 +41,15 @@ export type HttpOperationalSpec = OperationalBaseSpec & {
 export type IpcOperationalSpec = OperationalBaseSpec & {
   readonly transport: 'ipc';
   readonly ipc: {
-    readonly method: 'transport.ping' | 'transport.health' | 'transport.shutdown' | 'transport.kb.restart';
+    readonly method:
+      | 'transport.ping'
+      | 'transport.health'
+      | 'transport.shutdown'
+      | typeof shutdownObligationAbandonMethod
+      | 'transport.kb.restart'
+      | typeof jobsAbortRpcSpec.name
+      | typeof providerProxySetContainBooleanRpcSpec.name
+      | typeof providerProxySetContainRpcSpec.name;
   };
 };
 
@@ -108,12 +130,48 @@ export const operationalRouteSpecs: readonly OperationalRouteSpec[] = [
     authentication: 'principal',
   },
   {
+    id: 'ipc.coordinator.shutdown-obligation.abandon',
+    transport: 'ipc',
+    ipc: { method: shutdownObligationAbandonMethod },
+    requires: 'system:shutdown',
+    requiresRunningLifecycle: false,
+    dispatch: { kind: 'shutdown-abandon' },
+    authentication: 'principal',
+  },
+  {
     id: 'ipc.transport.kb.restart',
     transport: 'ipc',
     ipc: { method: 'transport.kb.restart' },
     requires: 'system:shutdown',
     requiresRunningLifecycle: true,
     dispatch: { kind: 'kb-restart' },
+    authentication: 'principal',
+  },
+  {
+    id: 'ipc.jobs.abort.drain-recovery',
+    transport: 'ipc',
+    ipc: { method: jobsAbortRpcSpec.name },
+    requires: jobsAbortRpcSpec.requires,
+    requiresRunningLifecycle: false,
+    dispatch: { kind: 'catalog' },
+    authentication: 'principal',
+  },
+  {
+    id: 'ipc.provider-proxy-set.contain.drain-recovery',
+    transport: 'ipc',
+    ipc: { method: providerProxySetContainRpcSpec.name },
+    requires: providerProxySetContainRpcSpec.requires,
+    requiresRunningLifecycle: false,
+    dispatch: { kind: 'catalog' },
+    authentication: 'principal',
+  },
+  {
+    id: 'ipc.provider-proxy-set.contain-boolean.drain-recovery',
+    transport: 'ipc',
+    ipc: { method: providerProxySetContainBooleanRpcSpec.name },
+    requires: providerProxySetContainBooleanRpcSpec.requires,
+    requiresRunningLifecycle: false,
+    dispatch: { kind: 'catalog' },
     authentication: 'principal',
   },
 ] as const;

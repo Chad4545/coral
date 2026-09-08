@@ -16,13 +16,14 @@ import { DatabaseSync } from 'node:sqlite';
 
 import { afterEach, describe, expect, it, vi } from 'vitest';
 
+import { CURRENT_STRICT_BUNDLE_MANIFEST_FILE } from '#src/infra/bundle-manifest-address.js';
 import type { StrictBundleManifest } from '#src/infra/bundle-manifest.js';
 import { createForeignTargetValidator, type ForeignTargetValidator } from '#src/infra/handoff-target.js';
-import { sha256Hex } from '#src/infra/hash.js';
-import { canonicalContractJson } from '#src/infra/persisted-contract.js';
 import type { Runtime } from '#src/runtime/ports.js';
 import { createRealRuntime } from '#src/runtime/real.js';
 import {
+  ACTIVE_STORE_SELECTION_VERSION,
+  ACTIVE_STORE_TRANSITION_VERSION,
   encodeActiveStoreSelection,
   encodeActiveStoreTransition,
   readActiveStoreSelection,
@@ -35,7 +36,6 @@ import { coordinateActiveStoreSelection } from '#src/store/active-store-selectio
 import { classifyBackendStoreFailure, createBackendStoreResetAuthority } from '#src/store/backend-store-reset.js';
 import * as dbModule from '#src/store/db.js';
 import { openStoreDatabase } from '#src/store/db.js';
-import type { StoreFormatManifest } from '#src/store/format-fingerprint.js';
 import {
   isCanonicalStoreResetIncidentId,
   parseStoreResetIncidentManifest,
@@ -47,13 +47,11 @@ import { currentCoralStoreFormat } from '#src/store-format.js';
 
 const roots: string[] = [];
 const storeFormat = currentCoralStoreFormat();
-const priorStoreManifest = JSON.parse(
-  readFileSync(join(process.cwd(), 'tests/fixtures/store-format/approved-prior.manifest.json'), 'utf8'),
-) as StoreFormatManifest;
-const priorStoreFingerprint = `sha256:${sha256Hex(canonicalContractJson(priorStoreManifest))}`;
+const incompatibleStoreFingerprint = `sha256:${'0'.repeat(64)}`;
 const backendBundle = 'selection recovery backend';
 const cliBundle = 'selection recovery cli';
 const claudeAppserverBundle = 'selection recovery claude appserver';
+const durableWrapperBundle = 'selection recovery durable wrapper';
 
 type StoreEvidence = Record<'store.db' | 'store.db-wal' | 'store.db-shm' | 'store.db.format', Buffer>;
 
@@ -61,9 +59,9 @@ const PRIOR_STORE_SEED_SQL = `
   INSERT INTO events (seq, ts, type, stream_kind, stream_id, body)
   VALUES (1, '2026-08-21T00:00:00.000Z', 'prior.event', 'job', 'prior-job', '{}');
   INSERT INTO projection_jobs (
-    job_id, execution_owner, phase, diagnostics, project_root, backend_namespace,
+    job_id, execution_owner, phase, diagnostics, project_root, work_dir, backend_namespace,
     job_kind, created_at, last_seq
-  ) VALUES ('prior-job', '{}', 'terminal', '{}', '/prior', 'prior', 'provider', '2026-08-21T00:00:00.000Z', 1);
+  ) VALUES ('prior-job', '{}', 'terminal', '{}', '/prior', '/prior', 'prior', 'provider', '2026-08-21T00:00:00.000Z', 1);
   INSERT INTO projection_sessions (session_id, controller, resumable, scope_key, entry, last_seq)
   VALUES ('prior-session', 'provider', 1, 'prior', '{}', 1);
   INSERT INTO projection_discuss (discuss_id, state, last_seq) VALUES ('prior-discuss', '{}', 1);
@@ -112,6 +110,7 @@ function manifest(version: string, buildSetId: string): StrictBundleManifest {
     bundleHash: createHash('sha256').update(backendBundle).digest('hex').slice(0, 16),
     cliBundleHash: createHash('sha256').update(cliBundle).digest('hex').slice(0, 16),
     claudeAppserverBundleHash: createHash('sha256').update(claudeAppserverBundle).digest('hex').slice(0, 16),
+    durableWrapperBundleHash: createHash('sha256').update(durableWrapperBundle).digest('hex').slice(0, 16),
     flavor: 'prod',
     storeFormatFingerprint: storeFormat.fingerprint,
   };
@@ -119,7 +118,7 @@ function manifest(version: string, buildSetId: string): StrictBundleManifest {
 
 function selection(expected: StrictBundleManifest, bundleDir: string): ActiveStoreSelection {
   return {
-    version: 1,
+    version: ACTIVE_STORE_SELECTION_VERSION,
     manifest: expected,
     bundleDir,
     activeStoreFingerprint: expected.storeFormatFingerprint,
@@ -132,7 +131,8 @@ function createBundle(parent: string, expected: StrictBundleManifest): string {
   writeFileSync(join(bundleDir, 'coral-backend.cjs'), backendBundle);
   writeFileSync(join(bundleDir, 'coral-cli.cjs'), cliBundle);
   writeFileSync(join(bundleDir, 'coral-claude-appserver.cjs'), claudeAppserverBundle);
-  writeFileSync(join(bundleDir, 'manifest.json'), JSON.stringify(expected));
+  writeFileSync(join(bundleDir, 'coral-durable-wrapper.cjs'), durableWrapperBundle);
+  writeFileSync(join(bundleDir, CURRENT_STRICT_BUNDLE_MANIFEST_FILE), JSON.stringify(expected));
   return bundleDir;
 }
 
@@ -193,22 +193,25 @@ function createNewerStore(runtime: Runtime): void {
   }
 }
 
-function seedPriorFormatStore(db: DatabaseSync): void {
+function seedIncompatibleFormatStore(db: DatabaseSync): void {
   db.exec('PRAGMA journal_mode = WAL; PRAGMA wal_autocheckpoint = 0;');
-  db.exec(priorStoreManifest.ddl);
-  db.prepare('INSERT INTO meta (key, value) VALUES (?, ?)').run('store_format_fingerprint', priorStoreFingerprint);
+  db.exec(storeFormat.manifest.ddl);
+  db.prepare('INSERT INTO meta (key, value) VALUES (?, ?)').run(
+    'store_format_fingerprint',
+    incompatibleStoreFingerprint,
+  );
   db.prepare('INSERT INTO meta (key, value) VALUES (?, ?)').run('store_product_version', storeFormat.productVersion);
   db.exec(PRIOR_STORE_SEED_SQL);
 }
 
-function createPriorFormatStore(runtime: Runtime): StoreEvidence {
+function createIncompatibleFormatStore(runtime: Runtime): StoreEvidence {
   const path = runtime.paths.coral.store.dbFile;
   mkdirSync(dirname(path), { recursive: true });
   const db = new DatabaseSync(path);
   let evidence: StoreEvidence;
   try {
-    seedPriorFormatStore(db);
-    writeFileSync(`${path}.format`, `${priorStoreFingerprint}\n`);
+    seedIncompatibleFormatStore(db);
+    writeFileSync(`${path}.format`, `${incompatibleStoreFingerprint}\n`);
     evidence = {
       'store.db': readFileSync(path),
       'store.db-wal': readFileSync(`${path}-wal`),
@@ -289,7 +292,7 @@ describe('active-store selection recovery', () => {
     const olderManifest = manifest('0.0.0-rc.1', '223e4567-e89b-42d3-a456-426614174000');
     const olderSelection = selection(olderManifest, createBundle(root, olderManifest));
     const staleTransition: ActiveStoreTransition = {
-      version: 1,
+      version: ACTIVE_STORE_TRANSITION_VERSION,
       transitionId: '323e4567-e89b-42d3-a456-426614174000',
       kind: 'selection-recovery',
       evidence: { kind: 'selection-absent', storeEvidence: { kind: 'pending-classification' } },
@@ -325,7 +328,7 @@ describe('active-store selection recovery', () => {
     const newerManifest = manifest('99.0.0', '223e4567-e89b-42d3-a456-426614174000');
     const newerSelection = selection(newerManifest, createBundle(root, newerManifest));
     const staleTransition: ActiveStoreTransition = {
-      version: 1,
+      version: ACTIVE_STORE_TRANSITION_VERSION,
       transitionId: '423e4567-e89b-42d3-a456-426614174000',
       kind: 'selection-recovery',
       evidence: { kind: 'selection-absent', storeEvidence: { kind: 'pending-classification' } },
@@ -622,9 +625,9 @@ describe('active-store selection recovery', () => {
     });
   });
 
-  it('should quarantine the approved prior format, reset every SQL subsystem, and retain orphaned exports', async () => {
+  it('should quarantine an unsupported same-version format, reset every SQL subsystem, and retain orphaned exports', async () => {
     const { runtime, currentSelection, authority } = harness();
-    const evidence = createPriorFormatStore(runtime);
+    const evidence = createIncompatibleFormatStore(runtime);
     const dbPath = runtime.paths.coral.store.dbFile;
     const originalUnlinkSync = runtime.storage.unlinkSync.bind(runtime.storage);
     let shmAtQuarantine: Buffer | undefined;
@@ -738,7 +741,7 @@ describe('active-store selection recovery', () => {
     const priorSelection = selection(selectedManifest, createBundle(root, selectedManifest));
     unlinkSync(join(priorSelection.bundleDir, 'coral-cli.cjs'));
     const transition: ActiveStoreTransition = {
-      version: 1,
+      version: ACTIVE_STORE_TRANSITION_VERSION,
       transitionId: '323e4567-e89b-42d3-a456-426614174000',
       kind: 'selection-recovery',
       evidence: {

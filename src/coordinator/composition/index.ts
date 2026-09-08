@@ -12,7 +12,7 @@ import type { ServerResponse } from 'node:http';
 import { monitorEventLoopDelay } from 'node:perf_hooks';
 import { ZodError } from 'zod';
 import { resolveRunningBundleDir, resolveStrictBundleIdentity } from '../../infra/bundle-manifest.js';
-import { formatError } from '../../infra/error-format.js';
+import { assertNever, formatError } from '../../infra/error-format.js';
 import { invocationCoralEnvSnapshot } from '../../infra/env-sanitize.js';
 import { isRecord } from '../../infra/json.js';
 import { nowIsoString } from '../../infra/time.js';
@@ -35,14 +35,18 @@ import {
 } from '../../discuss/shell/tools.js';
 import { createHttpHandler, sendJson } from '../../transport/http/handler.js';
 import { closeIpcServer, createIpcServer, listenIpcServer } from '../../transport/ipc/server.js';
-import { probeProcessIncarnation, type ProcessIncarnation } from '../../infra/node-process.js';
+import type { ProcessIncarnation } from '../../infra/node-process.js';
 import type { RpcPorts } from '../../transport/rpc/ports.js';
 import {
   providerHostEvictResponseSchema,
   providerHostInspectResponseSchema,
   providerHostListResponseSchema,
+  providerProxySetContainBooleanResponseSchema,
   providerProxySetContainResponseSchema,
   unreadableProviderOperationDiscardResultSchema,
+  type ProviderProxySetContainBooleanResponse,
+  type ProviderProxySetContainRequest,
+  type ProviderProxySetContainResponse,
 } from '../../transport/rpc/catalog.js';
 import type { KbToolResult } from '../../kb/result.js';
 import type { InvocationContext } from '../../runtime/invocation-context.js';
@@ -126,6 +130,7 @@ import {
 } from '../../sessions/lifecycle-reactor.js';
 import { createWorkflowRecoveryRetryPlan } from '../../workflow/recover.js';
 import { jobInCallerScope } from '../../jobs/scope.js';
+import type { ProviderProxySetBooleanOperatorExitResult } from '../services/provider-proxy-set/index.js';
 
 export const MAX_EVENT_STREAM_CONNECTIONS = 100;
 const KB_DAEMON_JOB_ABORT_PROXY_TTL_MS = 24 * 60 * 60 * 1000;
@@ -155,6 +160,54 @@ const EVENT_STREAM_CAPACITY_RESPONSE = {
 };
 
 const TERMINAL_DISCUSS_STATUSES = new Set(['ended', 'completed', 'aborted', 'error', 'failed', 'closed']);
+
+type ProviderProxySetContainSuccess = Extract<ProviderProxySetContainResponse, { kind: 'contained' | 'abandoned' }>;
+type ProviderProxySetContainBooleanSuccess = Extract<
+  ProviderProxySetContainBooleanResponse,
+  { kind: 'contained' | 'abandoned' | 'unattributable-group-abandoned' }
+>;
+
+function providerProxySetContainBooleanClaimDischarge(
+  discharge: ProviderProxySetContainSuccess['claimDischarge'],
+): ProviderProxySetContainBooleanSuccess['claimDischarge'] {
+  switch (discharge.kind) {
+    case 'completed':
+      return discharge;
+    case 'initial-disposition-pending':
+      return { kind: 'initial-disposition-retry-owned' };
+    case 'operational-retry-owned':
+      return { kind: discharge.kind, incidents: discharge.incidents };
+    default:
+      return assertNever(discharge);
+  }
+}
+
+function providerProxySetContainBooleanResponse(
+  response: ProviderProxySetBooleanOperatorExitResult,
+): ProviderProxySetContainBooleanResponse {
+  if (response.kind === 'contained') {
+    return providerProxySetContainBooleanResponseSchema.parse({
+      ...response,
+      claimDischarge: providerProxySetContainBooleanClaimDischarge(response.claimDischarge),
+    });
+  }
+  if (response.kind === 'unattributable-group-abandoned') {
+    return providerProxySetContainBooleanResponseSchema.parse({
+      ...response,
+      claimDischarge: providerProxySetContainBooleanClaimDischarge(response.claimDischarge),
+    });
+  }
+  if (response.kind === 'abandoned') {
+    return providerProxySetContainBooleanResponseSchema.parse({
+      ...response,
+      claimDischarge: providerProxySetContainBooleanClaimDischarge(response.claimDischarge),
+    });
+  }
+  if (response.kind === 'not-held' && response.state === 'reattachment-hold') {
+    return providerProxySetContainBooleanResponseSchema.parse({ ...response, state: 'reattaching' });
+  }
+  return providerProxySetContainBooleanResponseSchema.parse(response);
+}
 
 function isTerminalDiscussStatus(status: string): boolean {
   return TERMINAL_DISCUSS_STATUSES.has(status);
@@ -497,7 +550,7 @@ export function createCoordinatorCore(
     },
   });
   const createRecoveryInvocationContext = (rawProjectRoot: string): InvocationContext => {
-    const projectRoot = canonicalizeWorkDir(rawProjectRoot, process.cwd());
+    const projectRoot = canonicalizeWorkDir(rawProjectRoot, runtime.env.cwd());
     return createSystemInvocationContext(projectRoot, 'recovery-retry');
   };
   recoverySources.register('coordinator-job-recovery', (subject, signal, quarantine) =>
@@ -608,10 +661,6 @@ export function createCoordinatorCore(
       ? { discardSessionArtifacts: options.discardSessionArtifacts }
       : {}),
   });
-  // Coordinator-owned abort registry for internal KB jobs (source-import,
-  // reindex). Shared with `createCoordinatorControl.abortJobs` so
-  // `coral-cli abort <kb-job-id>` reaches the KB job's AbortController —
-  // distinct from per-ExecutionService provider job registries.
   const internalJobAbortRegistry = new AbortRegistry(runtime.ids);
 
   const control = createCoordinatorControl({
@@ -636,7 +685,7 @@ export function createCoordinatorCore(
     return created;
   };
 
-  const readOnlyProjectRoot = canonicalizeWorkDir(process.cwd(), process.cwd());
+  const readOnlyProjectRoot = canonicalWorkDirWireSchema.parse(runtime.env.cwd());
   const readOnlyInvocationContext = createSystemInvocationContext(
     readOnlyProjectRoot,
     'coordinator-readonly',
@@ -870,6 +919,12 @@ export function createCoordinatorCore(
       }
       return localProviderHosts.inspectProviderHost(hostRef);
     },
+    terminalEviction: (hostRef) => {
+      if (localProviderHosts.terminalEviction === undefined) {
+        throw new Error('provider_host_inventory_unavailable: local manager has no administration authority');
+      }
+      return localProviderHosts.terminalEviction(hostRef);
+    },
     evictProviderHost: async (hostRef) => {
       if (localProviderHosts.evictHost === undefined) {
         throw new Error('provider_host_inventory_unavailable: local manager has no administration authority');
@@ -897,6 +952,12 @@ export function createCoordinatorCore(
               }
               return set.providerHosts.inspect(hostRef);
             },
+            terminalEviction: async (hostRef) => {
+              if (set.providerHosts === undefined) {
+                throw new Error('provider_host_inventory_unavailable: proxy set has no administration control');
+              }
+              return set.providerHosts.terminalEviction(hostRef);
+            },
             evictProviderHost: async (hostRef) => {
               if (set.providerHosts === undefined) {
                 throw new Error('provider_host_inventory_unavailable: proxy set has no administration control');
@@ -908,6 +969,66 @@ export function createCoordinatorCore(
       ];
     },
   });
+
+  const containProviderProxySet = async (
+    request: ProviderProxySetContainRequest,
+    contract: 'current' | 'boolean',
+    abandonWithoutAbsence: boolean,
+    signal?: AbortSignal,
+  ): Promise<ProviderProxySetBooleanOperatorExitResult | Readonly<{ kind: 'unsupported-contract' }>> => {
+    const lifecycle = world.providerProxyLifecycleRef.get();
+    if (lifecycle === null) throw new Error('provider_proxy_set_operator_exit_unavailable');
+    const authorization =
+      contract === 'boolean'
+        ? lifecycle.authorizeBooleanOperatorExit(request.setIdentity)
+        : lifecycle.authorizeOperatorExit(request.setIdentity);
+    if (authorization.kind === 'unsupported-contract') return authorization;
+    if (authorization.kind !== 'authorized') {
+      if (contract === 'current' && authorization.kind === 'set-not-found' && abandonWithoutAbsence) {
+        const abandonment = lifecycle.abandonDurableAcquisition(request.setIdentity);
+        if (abandonment.kind === 'retired') {
+          return {
+            kind: 'representation-release-abandoned',
+            setIdentity: request.setIdentity,
+            successor: { owner: 'operator-command', acceptance: 'accepted' },
+            effect: {
+              signalsSent: [],
+              containmentAbsent: false,
+              representationAction: 'fatal-release-abandoned',
+            },
+          };
+        }
+        if (abandonment.kind === 'held') {
+          return {
+            kind: 'store-unreadable',
+            setIdentity: request.setIdentity,
+            effect: { signalsSent: [], containmentAbsent: false, representationAction: 'none' },
+          };
+        }
+        if (abandonment.kind === 'transfer-pending') {
+          return {
+            kind: 'containment-unconfirmed',
+            setIdentity: request.setIdentity,
+            recoveryAction: { kind: 'retry-exact-set-containment' },
+            effect: { signalsSent: [], containmentAbsent: false, representationAction: 'none' },
+          };
+        }
+      }
+      return {
+        ...authorization,
+        setIdentity: request.setIdentity,
+        effect: { signalsSent: [], containmentAbsent: false, representationAction: 'none' },
+      };
+    }
+    const proof = await world.providerProxySetContainmentProver.collectContainmentProof(
+      authorization.capability.containmentProofAuthorization,
+      getProgressStore().getDb(),
+      signal ?? new AbortController().signal,
+    );
+    return contract === 'boolean'
+      ? lifecycle.completeBooleanOperatorExit(authorization.capability, proof, abandonWithoutAbsence, signal)
+      : lifecycle.completeOperatorExit(authorization.capability, proof, abandonWithoutAbsence, signal);
+  };
 
   const rpcPorts: RpcPorts = {
     sessions: {
@@ -1002,25 +1123,18 @@ export function createCoordinatorCore(
         providerHostEvictResponseSchema.parse(await providerHostAdministration.evict(selector)),
     },
     providerProxySets: {
-      contain: async (request, signal) => {
-        const lifecycle = world.providerProxyLifecycleRef.get();
-        if (lifecycle === null) throw new Error('provider_proxy_set_operator_exit_unavailable');
-        const authorization = lifecycle.authorizeOperatorExit(request.setIdentity);
-        if (authorization.kind !== 'authorized') {
-          return providerProxySetContainResponseSchema.parse({
-            ...authorization,
-            setIdentity: request.setIdentity,
-            effect: { signalsSent: [], containmentAbsent: false, representationAction: 'none' },
-          });
-        }
-        const proof = await world.providerProxySetContainmentProver.collectContainmentProof(
-          authorization.capability.containmentProofAuthorization,
-          getProgressStore().getDb(),
-          signal ?? new AbortController().signal,
+      contain: async (request, signal) =>
+        providerProxySetContainResponseSchema.parse(
+          await containProviderProxySet(request, 'current', request.mode === 'abandon', signal),
+        ),
+      containBoolean: async (request, signal) => {
+        const result = await containProviderProxySet(
+          { setIdentity: request.setIdentity, mode: 'contain' },
+          'boolean',
+          request.abandonWithoutAbsence,
+          signal,
         );
-        return providerProxySetContainResponseSchema.parse(
-          await lifecycle.completeOperatorExit(authorization.capability, proof, request.abandonWithoutAbsence, signal),
-        );
+        return result.kind === 'unsupported-contract' ? result : providerProxySetContainBooleanResponse(result);
       },
     },
     kb: kbRpcPort,
@@ -1056,7 +1170,10 @@ export function createCoordinatorCore(
    */
   let rememberedSelfIncarnation: ProcessIncarnation | null = null;
   const readSelfIncarnation = (): ProcessIncarnation | undefined => {
-    rememberedSelfIncarnation ??= probeProcessIncarnation(world.backendPid, runtime.env.platform() as NodeJS.Platform);
+    rememberedSelfIncarnation ??= runtime.process.readProcessIncarnation(
+      world.backendPid,
+      runtime.env.platform() as NodeJS.Platform,
+    );
     return rememberedSelfIncarnation ?? undefined;
   };
 
@@ -1174,6 +1291,9 @@ export function createCoordinatorCore(
           mutationBlocked?: { owner: string; ageMs: number; signaledAtMs: number };
           consumerStuck?: NonNullable<HealthSnapshot['diagnostics']>['consumerStuck'];
           providerProxySets?: NonNullable<HealthSnapshot['diagnostics']>['providerProxySets'];
+          providerProxyDispositionSkips?: NonNullable<
+            NonNullable<HealthSnapshot['diagnostics']>['providerProxyDispositionSkips']
+          >;
         } = { carriers: carrierDiagnostics };
         if (mutationBlocked !== undefined) {
           diagnostics.mutationBlocked = mutationBlocked;
@@ -1181,15 +1301,23 @@ export function createCoordinatorCore(
         if (consumerStuck.length > 0) {
           diagnostics.consumerStuck = consumerStuck;
         }
-        const providerProxySets = world.providerProxyLifecycleRef.get()?.snapshot().operatorDispositions ?? [];
+        const providerProxySnapshot = world.providerProxyLifecycleRef.get()?.snapshot();
+        const providerProxySets = [...(providerProxySnapshot?.operatorSets ?? [])] satisfies NonNullable<
+          NonNullable<HealthSnapshot['diagnostics']>['providerProxySets']
+        >;
         if (providerProxySets.length > 0) {
-          diagnostics.providerProxySets = [...providerProxySets];
+          diagnostics.providerProxySets = providerProxySets;
+        }
+        const providerProxyDispositionSkips = providerProxySnapshot?.skippedDurableOperatorDispositions ?? [];
+        if (providerProxyDispositionSkips.length > 0) {
+          diagnostics.providerProxyDispositionSkips = [...providerProxyDispositionSkips];
         }
         const hasDiagnostics =
           diagnostics.carriers !== undefined ||
           diagnostics.mutationBlocked !== undefined ||
           diagnostics.consumerStuck !== undefined ||
-          diagnostics.providerProxySets !== undefined;
+          diagnostics.providerProxySets !== undefined ||
+          diagnostics.providerProxyDispositionSkips !== undefined;
 
         return {
           status: coarseStatus,
@@ -1329,11 +1457,11 @@ export function createCoordinatorCore(
     providerHostManager: world.providerHostManager,
     ...(world.providerProxyAuthority === undefined ? {} : { providerProxyAuthority: world.providerProxyAuthority }),
     kbDaemonSupervisor: kbDaemonSupervisorWithTrackedShutdown,
-    disposeLifecycleReactor: () => {
+    disposeLifecycleReactor: async () => {
       disposeChildPrincipalTerminalListeners();
       disposeKbDaemonExitListener();
       disposeDaemonJobTerminalListeners();
-      options.disposeLifecycleReactor?.();
+      await options.disposeLifecycleReactor?.();
     },
     handoffQuiescePorts: () =>
       services
@@ -1360,19 +1488,22 @@ export function createCoordinatorCore(
           publishedCompatibilitySocketAddresses,
         )),
     onStopped: options.onStopped,
+    ...(options.acceptProcessExitRemainder === undefined
+      ? {}
+      : { acceptProcessExitRemainder: options.acceptProcessExitRemainder }),
     onFatalShutdownError: options.onFatalShutdownError,
   };
 
   lifecycleController = createLifecycle(lifecycleDeps, runStartupRecovery);
   const resolvedLifecycleController = lifecycleController;
-  // Install the starting-incumbent shutdown callback. `transport.shutdown`
-  // invokes both `requestDrain('replaced')` (idle-timer driven) AND this
-  // callback so a still-`starting` incumbent quits immediately rather than
-  // waiting for `idleTimer.startWatching` to be installed at lifecycle
-  // 'running'. The callback fires once per request — `lifecycleController.shutdown`
-  // is itself idempotent (returns the existing `state.shutdownPromise`).
+  // A starting incumbent must accept explicit shutdown before its idle watcher exists.
   ipcServer.onShutdownRequest = (reason) => {
     void resolvedLifecycleController.shutdown(reason).catch(() => {});
+  };
+  ipcServer.onShutdownObligationAbandonment = (request) =>
+    resolvedLifecycleController.abandonShutdownObligation(request);
+  ipcServer.onShutdownRecoveryAccepted = () => {
+    resolvedLifecycleController.requestShutdownRetry();
   };
 
   return {

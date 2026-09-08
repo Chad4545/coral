@@ -3,6 +3,7 @@ import { z } from 'zod';
 
 import { isLivePhase, jobPhaseSchema } from '../../jobs/phase.js';
 import type { JobStatus } from '../../jobs/records.js';
+import type { AbortResult } from '../../jobs/contracts/abort-registry.js';
 import type { ProviderRegistry } from '../../providers/registry.js';
 import { getProviderNames, makeClient, type AbortOptions } from '../dispatch.js';
 import { emitError, getTerminalContext } from '../emit.js';
@@ -11,7 +12,7 @@ import { flushPendingReadStoreNote } from '../read-store.js';
 import { UsageError, normalizeUsageError } from '../errors.js';
 import { formatAbortResult, formatJobDetail, formatJobsList, renderJobsList } from '../format/jobs.js';
 import { openCliCauseRefRenderer } from '../cause-renderer.js';
-import { followJobs } from '../follow.js';
+import { ABORT_REFUSED_EXIT_CODE, followJobs } from '../follow.js';
 
 type JobsOptions = {
   phase?: string;
@@ -110,6 +111,12 @@ export function registerSessionCommands(program: Command, providerRegistry: Prov
         });
       }
     });
+  const reportAbortResult = (result: AbortResult): void => {
+    process.stdout.write(formatAbortResult(result) + '\n');
+    if ((result.refused?.length ?? 0) + (result.held?.length ?? 0) + (result.abandoned?.length ?? 0) > 0) {
+      process.exitCode = ABORT_REFUSED_EXIT_CODE;
+    }
+  };
 
   const jobsCommand = program.command('jobs');
   jobsCommand
@@ -192,9 +199,7 @@ export function registerSessionCommands(program: Command, providerRegistry: Prov
         embed: opts.embed === true,
         verbose: opts.verbose === true,
       },
-      abortJobs: async (ids) => {
-        await client.abortJobs([...ids]);
-      },
+      abortJobs: async (ids) => client.abortJobs([...ids]),
       connect: async ({ jobIds: activeJobIds, cursor, timeoutSeconds, signal }) => ({
         kind: 'subscription',
         subscription: await client.subscribe<unknown>(
@@ -256,12 +261,12 @@ export function registerSessionCommands(program: Command, providerRegistry: Prov
         const jobIds = jobs.jobs.map(({ jobId }) => jobId);
 
         if (jobIds.length === 0) {
-          process.stdout.write(formatAbortResult({ aborted: [], notFound: [] }) + '\n');
+          reportAbortResult({ aborted: [], notFound: [] });
           return;
         }
 
         const result = await client.abortJobs(jobIds);
-        process.stdout.write(formatAbortResult(result) + '\n');
+        reportAbortResult(result);
       } catch (error) {
         emitError(normalizeUsageError(error));
       }
@@ -280,7 +285,7 @@ export function registerSessionCommands(program: Command, providerRegistry: Prov
         const projectRoot = process.cwd();
         const client = makeClient(projectRoot, abortJobsCommand);
         const result = await client.abortJobs(parseJobIds(jobIdArgs.join(' ')));
-        process.stdout.write(formatAbortResult(result) + '\n');
+        reportAbortResult(result);
       } catch (error) {
         emitError(normalizeUsageError(error));
       }

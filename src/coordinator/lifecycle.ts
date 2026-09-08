@@ -26,7 +26,10 @@ import { elapsedDurationMs } from '../jobs/duration.js';
 import type { ProviderHostManager } from './live/provider-hosts/index.js';
 import type { ProviderProxyAuthorityRegistry } from './live/provider-proxy/authority.js';
 import type { Runtime } from '../runtime/ports.js';
-import type { StartupReconciliationReport } from './services/provider-operation-reconciler.js';
+import type {
+  ProviderOperationReconcilerStopDisposition,
+  StartupReconciliationReport,
+} from './services/provider-operation-reconciler.js';
 import type { RuntimeComponent } from './runtime-components/contract.js';
 import type { RuntimeComponentRegistry } from './runtime-components/registry.js';
 import { createRecoveryComponent } from './runtime-components/recovery-component.js';
@@ -37,6 +40,16 @@ import {
   type ShutdownMode,
   HANDOFF_DRAIN_TIMEOUT_MS,
 } from './shutdown.js';
+import type {
+  ProcessExitRemainder,
+  ProcessExitRemainderAcceptance,
+  ShutdownDeferredFailure,
+  ShutdownHoldExit,
+  ShutdownHoldReason,
+  ShutdownOperatorAction,
+  ShutdownSequenceDisposition,
+} from './shutdown-settlement.js';
+import type { TerminateAllDisposition } from './live/admission.js';
 import type { HandoffQuiescePort } from './execution-service.js';
 import type { InterruptedAppServerReason } from '../jobs/reconcile/interrupted-reason.js';
 import {
@@ -66,6 +79,10 @@ import { createBackendStoreResetAuthority } from '../store/backend-store-reset.j
 import { resolveRunningBundleDir } from '../infra/bundle-manifest.js';
 import type { ValidatedHandoffTarget } from '../infra/handoff-target.js';
 import type { Database } from '../store/db.js';
+import {
+  acquireProviderOperationMutationAdmission,
+  type ProviderOperationMutationAdmission,
+} from '../store/provider-operation-journal.js';
 import { routeOrOpenBackendStoreAtStartup } from '../store/startup-store-routing.js';
 import { ACTIVE_STORE_SELECTION_VERSION } from '../store/active-store-selection.js';
 import { validateForeignHandoffTarget } from './handoff-routing/runner.js';
@@ -93,6 +110,12 @@ import {
 } from '../jobs/crashed-job-terminalization-recovery-source.js';
 import { staleJobCleanupSource, type RawStaleJobCleanupRow } from '../jobs/stale-job-cleanup-recovery-source.js';
 import { runShutdownCrashTerminalization } from './shutdown-recovery.js';
+import { recordShutdownObligationAbandonment } from './shutdown-abandonment.js';
+import type {
+  ShutdownObligationAbandonRequest,
+  ShutdownObligationAbandonResult,
+  ShutdownObligationSubject,
+} from '../obligation/shutdown-abandonment.js';
 import { runStartupStaleArtifactPrune } from './startup-recovery.js';
 import type { ProviderOperationStartupOwnership, RunJobsStartupFn } from '../jobs/startup.js';
 
@@ -133,6 +156,7 @@ export interface CoordinatorIdentity {
   readonly bundleHash: string;
   readonly cliBundleHash: string;
   readonly claudeAppserverBundleHash: string;
+  readonly durableWrapperBundleHash: string;
   readonly flavor: 'prod' | 'dev';
   readonly instanceId: string;
   readonly token: string;
@@ -773,7 +797,7 @@ export type LifecycleDeps = {
   readonly connectProviderOperationRecovery?: (recoveryCoordinator: RecoveryCoordinator) => void;
   readonly reconcileProviderOperationsAtStartup?: (signal: AbortSignal) => Promise<StartupReconciliationReport>;
   readonly startProviderOperationReconciler?: () => void;
-  readonly stopProviderOperationReconciler?: () => void;
+  readonly stopProviderOperationReconciler?: () => ProviderOperationReconcilerStopDisposition;
   /**
    * Optional only for narrow lifecycle harnesses; production composition supplies the sole publishing facet
    * so carrier readers cannot advance the startup boundary themselves.
@@ -786,7 +810,7 @@ export type LifecycleDeps = {
   readonly removeBackendInfoIfOwnerFn: (instanceId: string) => void;
   readonly cleanupStaleJobsFn: (currentBundleHash: string, signal: AbortSignal) => void | Promise<void>;
   readonly markJobsAsErrorFn: (message: string, signal: AbortSignal) => void | Promise<void>;
-  readonly terminateAllFn: () => void;
+  readonly terminateAllFn: (signal: AbortSignal) => TerminateAllDisposition | Promise<TerminateAllDisposition>;
   readonly providerHostManager: Pick<ProviderHostManager, 'drainForHandoff' | 'shutdown'>;
   /**
    * The live guardian/reaper/proxy sets, absent whenever the composition layer had no real acquisition path
@@ -811,20 +835,74 @@ export type LifecycleDeps = {
     publishedCompatibilitySocketAddresses?: readonly PublishedIpcSocketAddress[],
   ) => Promise<ListenIpcServerResult>;
   readonly onStopped?: () => void;
+  readonly acceptProcessExitRemainder?: (remainder: ProcessExitRemainder) => ProcessExitRemainderAcceptance;
   readonly onFatalShutdownError?: (error: unknown) => void;
 };
 
 export type LifecycleController = {
   start(): Promise<CoordinatorServerInfo>;
-  shutdown(reason: string): Promise<void>;
-  waitForShutdown(): Promise<void>;
+  shutdown(reason: string): Promise<LifecycleShutdownDisposition>;
+  abandonShutdownObligation(request: ShutdownObligationAbandonRequest): ShutdownObligationAbandonResult;
+  requestShutdownRetry(): void;
+  waitForShutdown(): Promise<LifecycleShutdownDisposition>;
   getRecoveryRegistry(): RecoveryRegistry | null;
 };
 
+const SHUTDOWN_AUTOMATIC_RETRY_LIMIT = 3;
+
+/** Lifecycle finalization is forbidden while coordinator authority remains retained. */
+type LifecycleShutdownHoldReason = ShutdownHoldReason;
+
+type LifecycleShutdownRecovery = Readonly<{
+  kind: 'retry-shutdown';
+  exit: ShutdownHoldExit;
+  owner: Readonly<
+    | { kind: 'lifecycle-finalization-continuation'; instanceId: string }
+    | { kind: 'lifecycle-shutdown-hold'; instanceId: string }
+  >;
+  automaticRetry:
+    | Readonly<{ status: 'scheduled'; attemptsStarted: number; attemptLimit: number }>
+    | Readonly<{ status: 'waiting-for-operator'; attemptsStarted: number; attemptLimit: number }>;
+  retainedOwnership: Readonly<{
+    kind: 'coordinator-exclusive-authority';
+    backendInfo: Readonly<{ kind: 'backend-info'; instanceId: string }>;
+    ipcSocket: boolean;
+    providerControlProxyInstanceIds: readonly string[];
+    cleanupObligations: readonly string[];
+    operatorActions: readonly ShutdownOperatorAction[];
+  }>;
+  retry(): Promise<LifecycleShutdownDisposition>;
+}>;
+
+export type LifecycleShutdownDisposition =
+  | Readonly<{ disposition: 'finalized' }>
+  | Readonly<{
+      disposition: 'held';
+      reason: LifecycleShutdownHoldReason;
+      recovery: LifecycleShutdownRecovery;
+    }>
+  | Readonly<{
+      disposition: 'transfer-pending';
+      owner: 'process-exit';
+      reason: LifecycleShutdownHoldReason;
+      deferredFailures: readonly ShutdownDeferredFailure[];
+      acceptance: Extract<ProcessExitRemainderAcceptance, { kind: 'accepted' }>;
+      boundaryFailure: ShutdownDeferredFailure;
+      recovery: LifecycleShutdownRecovery;
+    }>;
+
 type LifecycleControlState = LifecycleWiringState & {
-  shutdownPromise: Promise<void> | null;
+  shutdownPromise: Promise<LifecycleShutdownDisposition> | null;
+  shutdownContinuations: Set<Promise<void>>;
+  shutdownContinuationAbort: AbortController | null;
+  shutdownAutomaticRetryAttempts: number;
+  shutdownRetryAfter: Promise<void> | null;
+  shutdownRetry: (() => Promise<ShutdownSequenceDisposition>) | null;
+  lastShutdownDisposition: LifecycleShutdownDisposition | null;
+  operatorAbandonedShutdownObligations: Set<ShutdownObligationSubject>;
   started: boolean;
   recoveryCoordinator: RecoveryCoordinator | null;
+  providerOperationMutationAdmission: ProviderOperationMutationAdmission | null;
   startupAbort: AbortController | null;
 };
 
@@ -834,7 +912,7 @@ type LifecycleStartupContext = {
   state: LifecycleControlState;
   createInvocationContext: (projectRoot: string) => InvocationContext;
   ownershipChecker: ReturnType<typeof createReplacementBackendOwnershipChecker>;
-  shutdown: (reason: string) => Promise<void>;
+  shutdown: (reason: string) => Promise<LifecycleShutdownDisposition>;
 };
 
 async function runLifecycleStartup({
@@ -885,6 +963,7 @@ async function runLifecycleStartup({
     bundleHash,
     cliBundleHash,
     claudeAppserverBundleHash,
+    durableWrapperBundleHash,
     flavor,
     instanceId,
     now,
@@ -967,6 +1046,7 @@ async function runLifecycleStartup({
       bundleHash,
       cliBundleHash,
       claudeAppserverBundleHash,
+      durableWrapperBundleHash,
       flavor,
       storeFormatFingerprint: deps.storeFormat.fingerprint,
     };
@@ -1034,6 +1114,15 @@ async function runLifecycleStartup({
     // bugs while permitting the legitimate explicit reset pattern.
     storeServicesRef.clear();
     storeServicesRef.set(storeServices);
+    const mutationAdmission = acquireProviderOperationMutationAdmission(storeDb, instanceId);
+    if (mutationAdmission.kind === 'holding') {
+      throw new Error(
+        `Provider operation mutation admission remains owned by '${mutationAdmission.predecessorOwner}'; ` +
+          `successor '${mutationAdmission.successorOwner}' refused; exit=${mutationAdmission.exit}`,
+        { cause: mutationAdmission },
+      );
+    }
+    state.providerOperationMutationAdmission = mutationAdmission.admission;
     const progressStore = storeServices.progressStore;
     const recoveryCoordinator = createRecoveryCoordinator(
       {
@@ -1193,6 +1282,17 @@ async function runLifecycleStartup({
 
     return serverInfo;
   } catch (error: unknown) {
+    const mutationAdmissionDisposition = state.providerOperationMutationAdmission?.close();
+    if (
+      (error as { name?: string } | null)?.name === 'AbortError' &&
+      (state.shutdownPromise !== null || state.shutdownRetry !== null)
+    ) {
+      // Startup failure must not release authority owned by a shutdown attempt or its retained continuation.
+      throw error;
+    }
+    if (mutationAdmissionDisposition?.kind === 'holding') {
+      await mutationAdmissionDisposition.retryAfter;
+    }
     if (error instanceof IncumbentMatchesError) {
       // Translate to the existing bootstrap-recognized "redundant contender"
       // signal (info log + exit 0). The socket has not been bound by us, so
@@ -1200,21 +1300,16 @@ async function runLifecycleStartup({
       runtimeState.setLifecycle('stopped');
       throw new BackendAlreadyRunningError();
     }
-    if ((error as { name?: string } | null)?.name === 'AbortError' && state.shutdownPromise !== null) {
-      // Shutdown owns cleanup. Do not close IPC/backend-info here, because
-      // handoff finalizers may still hold socket authority until they
-      // complete or budget-skip.
-      throw error;
-    }
     runtimeState.setLifecycle('stopped');
     idleTimer.stopWatching();
     state.ownershipCheckerTeardown?.();
     state.ownershipCheckerTeardown = null;
-    // The KB daemon is started fire-and-forget above, so a failure at any later startup step can find a child
-    // already spawned. Everything else this block closes is in-process and dies with us; the daemon is the one
-    // piece that outlives this coordinator when it is skipped.
     try {
-      await kbDaemonSupervisor?.dispose('coordinator startup failed');
+      let disposal = await kbDaemonSupervisor?.dispose('coordinator startup failed');
+      while (disposal?.kind === 'holding') {
+        await disposal.retryAfter;
+        disposal = await disposal.retry();
+      }
     } catch {
       // best effort
     }
@@ -1267,6 +1362,7 @@ export function createLifecycle(
     closeIpcServerFn,
     ipcServer,
     onStopped,
+    acceptProcessExitRemainder,
     onFatalShutdownError,
   } = deps;
 
@@ -1274,9 +1370,17 @@ export function createLifecycle(
 
   const state: LifecycleControlState = {
     shutdownPromise: null,
+    shutdownContinuations: new Set(),
+    shutdownContinuationAbort: null,
+    shutdownAutomaticRetryAttempts: 0,
+    shutdownRetryAfter: null,
+    shutdownRetry: null,
+    lastShutdownDisposition: null,
+    operatorAbandonedShutdownObligations: new Set(),
     started: false,
     ownershipCheckerTeardown: null,
     recoveryCoordinator: null,
+    providerOperationMutationAdmission: null,
     startupAbort: null,
   };
   const ownershipChecker = createReplacementBackendOwnershipChecker({
@@ -1298,8 +1402,9 @@ export function createLifecycle(
     return { projectRoot, pluginRoot, coralEnv: {}, principal };
   }
 
-  async function shutdown(reason: string): Promise<void> {
+  async function shutdown(reason: string): Promise<LifecycleShutdownDisposition> {
     if (state.shutdownPromise) return state.shutdownPromise;
+    state.lastShutdownDisposition = null;
 
     // Calling `abort()` with no reason sets `signal.reason` to the platform
     // default (a DOMException whose `.name === 'AbortError'`). Downstream
@@ -1308,50 +1413,161 @@ export function createLifecycle(
     // reason would propagate as a bare string and lose the `name`
     // discriminator.
     state.startupAbort?.abort();
-    stopProviderOperationReconciler?.();
 
-    state.shutdownPromise = (async () => {
-      if (runtimeState.getLifecycle() === 'stopped') return;
-
-      await runShutdownSequence({
-        reason,
-        state,
-        teardownRecoveryCoordinator: async () => {
-          await state.recoveryCoordinator?.teardown();
-        },
-        runtimeState,
-        idleTimer,
-        closeServerFn,
-        waitForInflightDrain,
-        server,
-        closeIpcServerFn,
-        ipcServer,
-        streamResponses,
-        runtime,
-        markJobsAsErrorFn,
-        providerHostManager,
-        providerProxyAuthority,
-        kbDaemonSupervisor,
-        storeServicesRef,
-        terminateAllFn,
-        handoffQuiescePorts: deps.handoffQuiescePorts,
-        disposeLifecycleReactor,
-        hooks,
-        discussStores,
-        log,
-      });
-    })()
-      .catch((error) => {
-        onFatalShutdownError?.(error);
+    const finalizeStoppedLifecycle = (
+      onFinalized: (() => void) | undefined = onStopped,
+    ): LifecycleShutdownDisposition => {
+      runtimeState.setLifecycle('stopped');
+      removeBackendInfoIfOwnerFn(instanceId);
+      onFinalized?.();
+      return { disposition: 'finalized' };
+    };
+    const acceptShutdownDisposition = (disposition: ShutdownSequenceDisposition): LifecycleShutdownDisposition => {
+      if (disposition.disposition === 'held' || disposition.disposition === 'transfer-pending') {
+        state.shutdownRetryAfter = disposition.retryAfter;
+        state.shutdownRetry = disposition.retry;
+        const automaticRetry =
+          state.shutdownAutomaticRetryAttempts < SHUTDOWN_AUTOMATIC_RETRY_LIMIT
+            ? {
+                status: 'scheduled' as const,
+                attemptsStarted: state.shutdownAutomaticRetryAttempts,
+                attemptLimit: SHUTDOWN_AUTOMATIC_RETRY_LIMIT,
+              }
+            : {
+                status: 'waiting-for-operator' as const,
+                attemptsStarted: state.shutdownAutomaticRetryAttempts,
+                attemptLimit: SHUTDOWN_AUTOMATIC_RETRY_LIMIT,
+              };
+        const recovery: LifecycleShutdownRecovery = {
+          kind: 'retry-shutdown',
+          exit: disposition.exit,
+          owner: {
+            kind:
+              automaticRetry.status === 'scheduled' ? 'lifecycle-finalization-continuation' : 'lifecycle-shutdown-hold',
+            instanceId,
+          },
+          automaticRetry,
+          retainedOwnership: {
+            kind: 'coordinator-exclusive-authority',
+            backendInfo: { kind: 'backend-info', instanceId },
+            ipcSocket: disposition.retainedAuthority.ipcSocket,
+            providerControlProxyInstanceIds: disposition.retainedAuthority.providerControlProxyInstanceIds,
+            cleanupObligations: disposition.retainedAuthority.cleanupObligations,
+            operatorActions: disposition.retainedAuthority.operatorActions,
+          },
+          retry: () => shutdown(reason),
+        };
+        return disposition.disposition === 'held'
+          ? { disposition: 'held', reason: disposition.reason, recovery }
+          : {
+              disposition: 'transfer-pending',
+              owner: disposition.owner,
+              reason: disposition.reason,
+              deferredFailures: disposition.deferredFailures,
+              acceptance: disposition.acceptance,
+              boundaryFailure: disposition.boundaryFailure,
+              recovery,
+            };
+      }
+      state.shutdownRetryAfter = null;
+      state.shutdownRetry = null;
+      state.shutdownContinuationAbort?.abort();
+      state.shutdownContinuationAbort = null;
+      switch (disposition.disposition) {
+        case 'settled':
+          return finalizeStoppedLifecycle();
+        case 'delegated':
+          return finalizeStoppedLifecycle(disposition.acceptance.requestExit);
+      }
+    };
+    const attempt = (async (): Promise<LifecycleShutdownDisposition> => {
+      if (runtimeState.getLifecycle() === 'stopped') return { disposition: 'finalized' };
+      if (state.shutdownRetry !== null) return state.shutdownRetry().then(acceptShutdownDisposition);
+      const stopProviderOperationMutations = (): ProviderOperationReconcilerStopDisposition => {
+        const lifecycleDisposition = state.providerOperationMutationAdmission?.close() ?? {
+          kind: 'drained' as const,
+        };
+        const reconcilerDisposition = stopProviderOperationReconciler?.() ?? { kind: 'drained' as const };
+        return lifecycleDisposition.kind === 'holding' ? lifecycleDisposition : reconcilerDisposition;
+      };
+      return acceptShutdownDisposition(
+        await runShutdownSequence({
+          reason,
+          state,
+          teardownRecoveryCoordinator: async () => {
+            await state.recoveryCoordinator?.teardown();
+          },
+          runtimeState,
+          idleTimer,
+          closeServerFn,
+          waitForInflightDrain,
+          server,
+          closeIpcServerFn,
+          ipcServer,
+          streamResponses,
+          runtime,
+          markJobsAsErrorFn,
+          providerHostManager,
+          providerProxyAuthority,
+          stopProviderOperationReconciler: stopProviderOperationMutations,
+          kbDaemonSupervisor,
+          storeServicesRef,
+          terminateAllFn,
+          handoffQuiescePorts: deps.handoffQuiescePorts,
+          disposeLifecycleReactor,
+          hooks,
+          discussStores,
+          log,
+          isShutdownObligationAbandoned: (subject) => state.operatorAbandonedShutdownObligations.has(subject),
+          ...(acceptProcessExitRemainder === undefined ? {} : { acceptProcessExitRemainder }),
+        }),
+      );
+    })().catch((error) => {
+      onFatalShutdownError?.(error);
+      throw error;
+    });
+    const trackedAttempt = attempt.then(
+      (disposition) => {
+        state.lastShutdownDisposition = disposition;
+        if (disposition.disposition === 'held' || disposition.disposition === 'transfer-pending') {
+          state.shutdownPromise = null;
+          if (
+            state.shutdownContinuations.size === 0 &&
+            state.shutdownAutomaticRetryAttempts < SHUTDOWN_AUTOMATIC_RETRY_LIMIT
+          ) {
+            const continuationAbort = new AbortController();
+            state.shutdownContinuationAbort = continuationAbort;
+            const cancelled = new Promise<void>((resolve) => {
+              continuationAbort.signal.addEventListener('abort', () => resolve(), { once: true });
+            });
+            const continuation = (async () => {
+              while (state.shutdownAutomaticRetryAttempts < SHUTDOWN_AUTOMATIC_RETRY_LIMIT) {
+                await Promise.race([state.shutdownRetryAfter ?? Promise.resolve(), cancelled]);
+                if (continuationAbort.signal.aborted) return;
+                state.shutdownAutomaticRetryAttempts += 1;
+                const retried = await shutdown(reason);
+                if (retried.disposition === 'finalized') return;
+              }
+            })()
+              .catch((error: unknown) => {
+                log(`lifecycle finalization continuation failed (${formatError(error)})\n`);
+              })
+              .finally(() => {
+                state.shutdownContinuations.delete(continuation);
+                if (state.shutdownContinuationAbort === continuationAbort) state.shutdownContinuationAbort = null;
+              });
+            state.shutdownContinuations.add(continuation);
+          }
+        }
+        return disposition;
+      },
+      (error: unknown) => {
+        if (runtimeState.getLifecycle() !== 'stopped') state.shutdownPromise = null;
         throw error;
-      })
-      .finally(() => {
-        runtimeState.setLifecycle('stopped');
-        removeBackendInfoIfOwnerFn(instanceId);
-        onStopped?.();
-      });
-
-    return state.shutdownPromise;
+      },
+    );
+    state.shutdownPromise = trackedAttempt;
+    return trackedAttempt;
   }
 
   async function start(): Promise<CoordinatorServerInfo> {
@@ -1373,10 +1589,70 @@ export function createLifecycle(
     }
   }
 
+  function requestShutdownRetry(): void {
+    const currentAttempt = state.shutdownPromise;
+    if (currentAttempt === null) {
+      void shutdown('operator-recovery').catch((error: unknown) => {
+        log(`operator recovery shutdown retry failed (${formatError(error)})\n`);
+      });
+      return;
+    }
+    void currentAttempt
+      .then((disposition) => {
+        if (disposition.disposition === 'held' || disposition.disposition === 'transfer-pending') {
+          return shutdown('operator-recovery');
+        }
+      })
+      .catch((error: unknown) => {
+        log(`operator recovery shutdown retry failed (${formatError(error)})\n`);
+      });
+  }
+
+  function abandonmentDetail(subject: ShutdownObligationSubject): string {
+    return subject === 'app-server-handoff-quiesce'
+      ? 'App-server write completion was not observed; the write may or may not have landed.'
+      : `${subject} completion was not observed; the obligation may still be active.`;
+  }
+
+  function abandonShutdownObligation(request: ShutdownObligationAbandonRequest): ShutdownObligationAbandonResult {
+    const disposition = state.lastShutdownDisposition;
+    if (disposition === null || disposition.disposition === 'finalized') {
+      return { kind: 'not-held', subject: request.subject };
+    }
+    const offered = disposition.recovery.retainedOwnership.operatorActions.some(
+      (action) => action.kind === 'shutdown-obligation-abandonment' && action.subject === request.subject,
+    );
+    if (!offered) return { kind: 'not-offered', subject: request.subject };
+
+    const recorded = recordShutdownObligationAbandonment(
+      {
+        storage: runtime.storage,
+        time: runtime.time,
+        runDir: runtime.paths.coral.coordinator.runDir,
+      },
+      {
+        subject: request.subject,
+        instanceId,
+        detail: abandonmentDetail(request.subject),
+      },
+    );
+    if (recorded.kind === 'refused') {
+      return { kind: 'status-write-refused', subject: request.subject, detail: recorded.detail };
+    }
+    state.operatorAbandonedShutdownObligations.add(request.subject);
+    return { kind: 'accepted', receipt: recorded.receipt };
+  }
+
   return {
     start,
     shutdown,
-    waitForShutdown: () => state.shutdownPromise ?? Promise.resolve(),
+    abandonShutdownObligation,
+    requestShutdownRetry,
+    waitForShutdown: () => {
+      if (state.shutdownPromise !== null) return state.shutdownPromise;
+      if (state.lastShutdownDisposition !== null) return Promise.resolve(state.lastShutdownDisposition);
+      return Promise.reject(new Error('Shutdown has not been requested'));
+    },
     getRecoveryRegistry: () => state.recoveryCoordinator?.getRecoveryRegistry() ?? null,
   };
 }

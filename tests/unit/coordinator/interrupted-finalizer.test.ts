@@ -96,7 +96,9 @@ const durablePerformed = {
   artifactHandles: performed.kind === 'resolved' ? performed.artifactHandles : [],
 } as unknown as PerformedDurableRecovery;
 
-function createHarness(options: { artifactRecorded?: boolean; sessionFinalized?: boolean } = {}) {
+function createHarness(
+  options: { artifactRecorded?: boolean; sessionFinalized?: boolean; sessionFinalizeError?: Error } = {},
+) {
   const order: string[] = [];
   const append = vi.fn(() => {
     order.push('terminal');
@@ -108,6 +110,7 @@ function createHarness(options: { artifactRecorded?: boolean; sessionFinalized?:
   });
   const finalizeJobContinuityAtomic = vi.fn(async (_sessionId, commitOptions) => {
     order.push('session-cas');
+    if (options.sessionFinalizeError !== undefined) throw options.sessionFinalizeError;
     if (options.sessionFinalized === false) return false;
     commitOptions.appendBeforeRelease?.({ append });
     return true;
@@ -123,6 +126,7 @@ function createHarness(options: { artifactRecorded?: boolean; sessionFinalized?:
 
   return {
     order,
+    append,
     recordArtifactHandleAtomic,
     finalizeJobContinuityAtomic,
     remove,
@@ -143,6 +147,32 @@ function createHarness(options: { artifactRecorded?: boolean; sessionFinalized?:
 }
 
 describe('interrupted app-server recovery finalizer', () => {
+  it('records a provider-acknowledged user cancellation as user_abort', async () => {
+    const harness = createHarness();
+    const userAbortPlan = { ...plan, reason: 'user_abort' } as unknown as AppServerInterruptedRecoveryPlan;
+
+    await finalizeInterruptedAppServerRecovery(userAbortPlan, { kind: 'user-aborted' }, status, harness.deps);
+
+    expect(harness.finalizeJobContinuityAtomic).toHaveBeenCalledWith(
+      'interrupted-session',
+      expect.objectContaining({
+        expectedActiveJobId: 'interrupted-job',
+        expectedVersion: 7,
+        mutation: { kind: 'preserve' },
+      }),
+    );
+    expect(harness.append).toHaveBeenCalledWith(
+      expect.objectContaining({
+        type: 'job.terminal.recorded',
+        body: expect.objectContaining({
+          terminal: expect.objectContaining({ outcome: { kind: 'aborted', reason: 'user_abort' } }),
+        }),
+      }),
+    );
+    expect(harness.remove).toHaveBeenCalledWith('interrupted-job');
+    expect(harness.releaseLaunch).toHaveBeenCalledWith('interrupted-job', 'continuation');
+  });
+
   it('persists artifact handles before terminal settlement and carries the advanced CAS version', async () => {
     const harness = createHarness();
 
@@ -207,6 +237,19 @@ describe('interrupted app-server recovery finalizer', () => {
         name: 'InterruptedRecoveryCommitError',
         stage: 'session-finalize',
       }),
+    );
+
+    expect(harness.order).toEqual(['artifact-cas', 'session-cas']);
+    expect(harness.jobPools.has('interrupted-job')).toBe(true);
+    expect(harness.remove).not.toHaveBeenCalled();
+    expect(harness.releaseLaunch).not.toHaveBeenCalled();
+  });
+
+  it('preserves local ownership when the final session CAS throws', async () => {
+    const harness = createHarness({ sessionFinalizeError: new Error('session store unavailable') });
+
+    await expect(finalizeInterruptedAppServerRecovery(plan, performed, status, harness.deps)).rejects.toThrow(
+      'session store unavailable',
     );
 
     expect(harness.order).toEqual(['artifact-cas', 'session-cas']);

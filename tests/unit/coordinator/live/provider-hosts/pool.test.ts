@@ -7,20 +7,32 @@ import { fixtureCanonicalWorkDir } from '#tests/helpers/canonical-work-dir.js';
 // `ensureProxySetFor` (the manager's own dedup/registry wiring) is what these tests exercise; the acquisition
 // attempt it delegates to is already covered end to end by `proxy-set-acquisition.test.ts` and the real-spawn
 // integration test, so stubbing it here keeps this suite free of process spawning.
-vi.mock('#src/coordinator/live/provider-hosts/proxy-set-acquisition.js', () => ({
+vi.mock('#src/coordinator/live/provider-hosts/proxy-set-acquisition.js', async (importOriginal) => ({
+  ...(await importOriginal<object>()),
   ensureProviderProxySet: vi.fn(),
 }));
 
-import { hostKeyFromSpec } from '#src/coordinator/live/provider-hosts/state.js';
+import { hostFingerprintFromSpec, hostKeyFromSpec } from '#src/coordinator/live/provider-hosts/state.js';
 import type { ProviderHostEntry } from '#src/coordinator/live/provider-hosts/index.js';
 import { MAX_COORDINATOR_PROXY_SET_SLOTS } from '#src/coordinator/services/provider-proxy-set/index.js';
 import { ensureProviderProxySet } from '#src/coordinator/live/provider-hosts/proxy-set-acquisition.js';
 import type { ProviderProxySetAuthority } from '#src/coordinator/live/provider-proxy/authority.js';
+import type { HandoffCapsuleV3 } from '#src/provider-proxy/handoff-capsule.js';
+import type { PublicationReceipt } from '#src/coordinator/live/provider-proxy/set-publication.js';
+import type { ProviderProxySetRecoveryAuthority } from '#src/coordinator/live/provider-proxy/set-authority.js';
+import type { ProviderProxyAcquisitionRecoveryOutcome } from '#src/coordinator/live/provider-proxy/index.js';
+import { reobserveDurableProviderProxyAcquisitionContainment } from '#src/coordinator/live/provider-proxy/spawn-undo.js';
+import { PROXY_CONTROL_RPC_TIMEOUT_MS } from '#src/provider-proxy/protocol.js';
+import {
+  handOverProviderProxyAcquisitionControlSession,
+  providerProxyControlSessionOwner,
+} from '#src/coordinator/live/provider-proxy/control-session.js';
 import type {
   DurableProviderProxyOperationAuthority,
   ProviderProxyOperationAuthority,
 } from '#src/coordinator/live/provider-proxy/operation-route.js';
 import type { HostRef, ProviderServerSpec } from '#src/providers/contract.js';
+import type { ProviderServerCloseDisposition } from '#src/providers/app-server-transport.js';
 import { backendLog } from '#src/infra/backend-log.js';
 import { currentCoralStoreFormat } from '#src/store-format.js';
 import { applyBundledStoreSchema } from '#src/store/db.js';
@@ -42,19 +54,40 @@ import {
   createTestProviderProxyContainmentProofProducer,
   createTestProviderProxyRecoveryDispatcher,
 } from '#tests/helpers/provider-proxy-recovery-dispatcher.js';
+import { createPublicationUnknownAcquisitionSessionFixture } from '#tests/helpers/provider-proxy-acquisition-session.js';
+import { testProviderProxySetLifecycleDurability } from '#tests/helpers/provider-proxy-set-lifecycle-durability.js';
 
 /** The build this fixture lifecycle belongs to — the same one `providerOperationRecord` stamps on its identities, so a discovered capsule is inheritable rather than foreign. */
 const FIXTURE_BUILD_SET_ID = '00000000-0000-4000-8000-000000000004';
+const PUBLICATION_RECEIPT = { kind: 'provider-proxy-set-published' } as PublicationReceipt;
+
+function observedServerClose(pid: number): ProviderServerCloseDisposition {
+  return { kind: 'observed-absent', evidence: { subject: { kind: 'process', pid } } };
+}
+
 const containmentProofDb = newRawDatabase(':memory:');
 applyBundledStoreSchema(containmentProofDb, currentCoralStoreFormat());
 afterAll(() => containmentProofDb.close());
 
-const mockedEnsureProxySet = ensureProviderProxySet as unknown as ReturnType<typeof vi.fn>;
+const mockedEnsureProxySet = vi.mocked(ensureProviderProxySet);
+
+function commitContainmentFrom(
+  stopAndReap: DurableProviderProxyOperationAuthority['stopAndReap'],
+): DurableProviderProxyOperationAuthority['commitContainment'] {
+  return async (signal) => {
+    const result = await stopAndReap(signal);
+    return 'disappearanceReceipt' in result
+      ? { kind: 'containment-absent', disappearanceReceipt: result.disappearanceReceipt }
+      : { kind: 'outcome-unknown', error: result.unconfirmed };
+  };
+}
 
 function fakeProxySet(proxyInstanceId: string): ProviderProxySetAuthority {
+  const stopAndReap: ProviderProxySetAuthority['stopAndReap'] = async () => ({ disappearanceReceipt: 'r' });
   return {
     proxyInstanceId: /^[0-9a-f]{8}-/u.test(proxyInstanceId) ? proxyInstanceId : randomUUID(),
-    stopAndReap: async () => ({ disappearanceReceipt: 'r' }),
+    stopAndReap,
+    commitContainment: commitContainmentFrom(stopAndReap),
     stopHeartbeats: () => {},
     initiateControlClose: async () => {},
   };
@@ -71,7 +104,7 @@ function fakeInheritedProxySet(proxyInstanceId: string): ProviderProxyOperationA
       adoptionWindowMs: Number.MAX_SAFE_INTEGER,
       heartbeatHoldBound: {
         spanMs: Number.MAX_SAFE_INTEGER,
-        materialSchedulerLatenessMs: Number.MAX_SAFE_INTEGER,
+        materialSchedulerLatenessMs: Math.floor(Number.MAX_SAFE_INTEGER / 4),
       },
     },
     registerSuccessionOperation: async () => ({ kind: 'registered' as const }),
@@ -101,12 +134,14 @@ function fakeDurableProxySet(
   options: {
     prepareOperation?: DurableProviderProxyOperationAuthority['prepareOperation'];
     stopAndReap?: DurableProviderProxyOperationAuthority['stopAndReap'];
+    commitContainment?: DurableProviderProxyOperationAuthority['commitContainment'];
     stopHeartbeats?: DurableProviderProxyOperationAuthority['stopHeartbeats'];
     initiateControlClose?: DurableProviderProxyOperationAuthority['initiateControlClose'];
   } = {},
-): DurableProviderProxyOperationAuthority {
+): DurableProviderProxyOperationAuthority & ProviderProxySetRecoveryAuthority {
   const inherited = fakeInheritedProxySet(proxyInstanceId);
-  return {
+  const stopAndReap = options.stopAndReap ?? inherited.stopAndReap;
+  const authority: DurableProviderProxyOperationAuthority & ProviderProxySetRecoveryAuthority = {
     ...inherited,
     faulted: new Promise<never>(() => {}),
     onFault: () => () => undefined,
@@ -115,6 +150,11 @@ function fakeDurableProxySet(
     promoteControl: async () => {
       throw new Error('unused');
     },
+    controlReattachment: {
+      redeem: () => new Promise<never>(() => undefined),
+      promote: async () => authority,
+    },
+    installRecoveryCredential: () => new Promise<never>(() => undefined),
     prepareOperation:
       options.prepareOperation ??
       (async () => {
@@ -139,15 +179,61 @@ function fakeDurableProxySet(
       throw new Error('unused settleOperation');
     },
     buildOperationControl: () => ({ stop: async () => {} }),
-    stopAndReap: options.stopAndReap ?? inherited.stopAndReap,
+    stopAndReap,
+    commitContainment: options.commitContainment ?? commitContainmentFrom(stopAndReap),
     stopHeartbeats: options.stopHeartbeats ?? inherited.stopHeartbeats,
     initiateControlClose: options.initiateControlClose ?? inherited.initiateControlClose,
+  };
+  return authority;
+}
+
+function publicationUnknownCapsule(spec: ProviderServerSpec): HandoffCapsuleV3 {
+  const identity = fakeDurableProxySet(randomUUID()).setIdentity;
+  return {
+    version: 3,
+    grantId: randomUUID(),
+    secret: 'c'.repeat(64),
+    generation: 'gen2',
+    flavor: 'prod',
+    buildSetId: FIXTURE_BUILD_SET_ID,
+    hostFingerprint: hostFingerprintFromSpec(spec),
+    guardianInstanceId: identity.guardianInstanceId,
+    reaperInstanceId: identity.reaperInstanceId,
+    proxyInstanceId: identity.proxyInstanceId,
+    guardianControlEndpoint: identity.guardianControlEndpoint,
+    reaperControlEndpoint: identity.reaperControlEndpoint,
+    proxyEndpoint: identity.canonicalEndpoint,
+    orphanTimeoutMs: 30_000,
+    teardownReserveMs: 14_000,
+    guardianPid: identity.guardianPid,
+    guardianIncarnation: identity.guardianIncarnation,
+    proxyPid: identity.proxyPid,
+    reaperPid: identity.reaperPid,
+    reaperIncarnation: identity.reaperIncarnation,
+    containmentKind: identity.containmentKind,
+    proxyIncarnation: identity.proxyIncarnation,
+    proxyProcessGroupId: identity.proxyProcessGroupId,
+  };
+}
+
+function publicationUnknownHandoff(capsule: HandoffCapsuleV3) {
+  const fixture = createPublicationUnknownAcquisitionSessionFixture(
+    providerProxyControlSessionOwner.providerHostAcquisition,
+    capsule,
+  );
+  return {
+    handoff: handOverProviderProxyAcquisitionControlSession(
+      fixture.session,
+      providerProxyControlSessionOwner.providerHostManager,
+      { kind: 'publication-unknown', role: 'guardian', reason: 'publication response was lost' },
+    ),
+    ...fixture,
   };
 }
 
 const proxySetAcquisition = {
   pluginRoot: '/plugin',
-  identity: { instanceId: 'i', buildSetId: 'b', flavor: 'prod' as const },
+  identity: { instanceId: 'i', buildSetId: FIXTURE_BUILD_SET_ID, flavor: 'prod' as const },
   // This suite fakes `ensureProxySet` itself (`mockedEnsureProxySet`), so nothing here ever reads the
   // registry; empty is the honest answer regardless.
   operationRegistry: { operationsFor: () => [], providerRootsFor: () => [] },
@@ -161,7 +247,9 @@ function createProxySetLifecycleRef(onSlotReleased?: (routeKey: string) => void)
     claims,
     controlEstablished: () => undefined,
     time: runtime.time,
+    ...testProviderProxySetLifecycleDurability(runtime.storage, runtime.time),
     recoveryDispatcher: createTestProviderProxyRecoveryDispatcher({
+      'capsule-redemption': () => new Promise<never>(() => undefined),
       'containment-proof': createTestProviderProxyContainmentProofProducer(runtime, containmentProofDb),
     }),
     reapRecordedContainment: () => {
@@ -170,6 +258,7 @@ function createProxySetLifecycleRef(onSlotReleased?: (routeKey: string) => void)
     reportLifecycle: () => undefined,
     ...(onSlotReleased === undefined ? {} : { onSlotReleased }),
   });
+  lifecycle.activateDurableOperatorDispositions();
   lifecycle.initializeClaimSlots();
   lifecycle.completeStartupDiscovery();
   const ref = new ProviderProxySetLifecycleRef();
@@ -844,6 +933,7 @@ describe('provider host pool', () => {
     server.closeMock.mockImplementation(async () => {
       await close.promise;
       server.resolveClosed();
+      return observedServerClose(server.handle.pid);
     });
     const manager = new StubbedContainmentProviderHostManager({
       carrierBlocksRetirement: noCarrierBlocksRetirement,
@@ -875,6 +965,7 @@ describe('provider host pool', () => {
     server.closeMock.mockImplementation(async () => {
       await close.promise;
       server.resolveClosed();
+      return observedServerClose(server.handle.pid);
     });
     const manager = new StubbedContainmentProviderHostManager({
       carrierBlocksRetirement: noCarrierBlocksRetirement,
@@ -917,6 +1008,7 @@ describe('provider host pool', () => {
     server.closeMock.mockImplementation(async () => {
       await close.promise;
       server.resolveClosed();
+      return observedServerClose(server.handle.pid);
     });
     const manager = new StubbedContainmentProviderHostManager({
       carrierBlocksRetirement: noCarrierBlocksRetirement,
@@ -947,6 +1039,7 @@ describe('provider host pool', () => {
     server.closeMock.mockImplementation(async () => {
       await close.promise;
       server.resolveClosed();
+      return observedServerClose(server.handle.pid);
     });
     const manager = new StubbedContainmentProviderHostManager({
       carrierBlocksRetirement: noCarrierBlocksRetirement,
@@ -970,6 +1063,7 @@ describe('provider host pool', () => {
     server.closeMock.mockImplementation(async () => {
       await close.promise;
       server.resolveClosed();
+      return observedServerClose(server.handle.pid);
     });
     const manager = new StubbedContainmentProviderHostManager({
       carrierBlocksRetirement: noCarrierBlocksRetirement,
@@ -1002,6 +1096,7 @@ describe('provider host pool', () => {
     server.closeMock.mockImplementation(async () => {
       await close.promise;
       server.resolveClosed();
+      return observedServerClose(server.handle.pid);
     });
     const manager = new StubbedContainmentProviderHostManager({
       carrierBlocksRetirement: noCarrierBlocksRetirement,
@@ -1067,13 +1162,25 @@ describe('provider host pool proxy set registry', () => {
       proxySetAcquisition,
       providerProxyLifecycleRef: createProxySetLifecycleRef(),
     });
+    mockedEnsureProxySet.mockImplementationOnce(
+      (_entry, env: { signal: AbortSignal }, onSettled) =>
+        new Promise<void>((resolve, reject) => {
+          env.signal.addEventListener(
+            'abort',
+            () =>
+              void Promise.resolve(
+                onSettled({ kind: 'failed', reason: 'manager stopped', strandedArtifacts: [] }),
+              ).then(resolve, reject),
+            { once: true },
+          );
+        }),
+    );
 
     const spec = createSharedSpec();
     const first = await manager.openSession(createLaunch(spec), { jobId: 'job-a' });
     const second = await manager.openSession(createLaunch(spec), { jobId: 'job-b' });
 
-    // Same shared entry both times, so the same hostKey — the second call must not start a second attempt
-    // while the first is still pending (`onSettled` was never invoked).
+    // Concurrent acquisition through one shared host entry must start only one attempt.
     expect(mockedEnsureProxySet).toHaveBeenCalledTimes(1);
     first.close();
     second.close();
@@ -1090,8 +1197,8 @@ describe('provider host pool proxy set registry', () => {
       providerProxyLifecycleRef: createProxySetLifecycleRef(),
     });
     const set = fakeDurableProxySet('proxy-a');
-    mockedEnsureProxySet.mockImplementationOnce((_entry, _env, onSettled) => {
-      onSettled({ kind: 'acquired', set });
+    mockedEnsureProxySet.mockImplementationOnce(async (_entry, _env, onSettled) => {
+      await onSettled({ kind: 'acquired', set, publicationReceipt: PUBLICATION_RECEIPT });
     });
 
     const lease = await manager.openSession(createLaunch(createSharedSpec()), { jobId: 'job-a' });
@@ -1105,7 +1212,7 @@ describe('provider host pool proxy set registry', () => {
     await manager.shutdown();
   });
 
-  it('a failed acquisition does not fail openSession and leaves liveSets() empty', async () => {
+  it('a failed acquisition reports stranded artifacts without failing openSession', async () => {
     const server = createFakeProviderServerHandle();
     const manager = new StubbedContainmentProviderHostManager({
       carrierBlocksRetirement: noCarrierBlocksRetirement,
@@ -1114,14 +1221,166 @@ describe('provider host pool proxy set registry', () => {
       proxySetAcquisition,
       providerProxyLifecycleRef: createProxySetLifecycleRef(),
     });
-    mockedEnsureProxySet.mockImplementationOnce((_entry, _env, onSettled) => {
-      onSettled({ kind: 'failed', reason: 'guardian spawn exploded' });
+    const warning = vi.spyOn(backendLog, 'warn').mockImplementation(() => undefined);
+    mockedEnsureProxySet.mockImplementationOnce(async (_entry, _env, onSettled) => {
+      await onSettled({
+        kind: 'failed',
+        reason: 'guardian spawn exploded',
+        strandedArtifacts: ['guardian', 'handoff capsule'],
+      });
     });
 
     const lease = await manager.openSession(createLaunch(createSharedSpec()), { jobId: 'job-a' });
 
     expect(manager.liveSets()).toEqual([]);
+    expect(warning).toHaveBeenCalledWith(expect.stringContaining('stranded artifacts: guardian, handoff capsule'));
     lease.close();
+    await manager.shutdown();
+  });
+
+  it('retains an acquisition rejection as an unknown cleanup hold', async () => {
+    const server = createFakeProviderServerHandle();
+    const manager = new StubbedContainmentProviderHostManager({
+      carrierBlocksRetirement: noCarrierBlocksRetirement,
+      runtime,
+      spawnProviderServer: createSpawnProviderServerMock(server.handle),
+      proxySetAcquisition,
+      providerProxyLifecycleRef: createProxySetLifecycleRef(),
+    });
+    mockedEnsureProxySet.mockImplementationOnce(async (_entry, _env, onSettled) => {
+      await onSettled({ kind: 'outcome-unknown', reason: 'acquisition promise rejected' });
+    });
+
+    const lease = await manager.openSession(createLaunch(createSharedSpec()), { jobId: 'job-a' });
+    const [hold] = manager.cleanupObligations().acquisitionCleanupHolds;
+
+    expect(hold).toMatchObject({
+      kind: 'provider_proxy_acquisition_pending_cleanup',
+      owner: 'provider-host-manager',
+    });
+    if (hold === undefined) throw new Error('unknown acquisition cleanup hold was not retained');
+    await expect(hold.recoveryCapability.retry(new AbortController().signal)).resolves.toEqual({
+      kind: 'held',
+      reason: 'acquisition promise rejected',
+    });
+    lease.close();
+    const receipt = await manager.shutdown();
+    expect(receipt.acquisitionCleanupHolds).toContain(hold);
+  });
+
+  it('keeps an acquisition slot reserved while lifecycle owns a held guardian cleanup', async () => {
+    const server = createFakeProviderServerHandle();
+    const lifecycleRef = createProxySetLifecycleRef();
+    const manager = new StubbedContainmentProviderHostManager({
+      carrierBlocksRetirement: noCarrierBlocksRetirement,
+      runtime,
+      spawnProviderServer: createSpawnProviderServerMock(server.handle),
+      proxySetAcquisition,
+      providerProxyLifecycleRef: lifecycleRef,
+    });
+    const recovery = createDeferred<ProviderProxyAcquisitionRecoveryOutcome>();
+    const exactSubject = {
+      guardianIdentity: { pid: 101, incarnation: testIncarnation(101), processGroupId: 101 },
+      reaper: { kind: 'possible-unidentified' as const },
+      constructionContainmentSettled: true,
+      proxy: { kind: 'possible-unidentified' as const },
+    };
+    mockedEnsureProxySet.mockImplementationOnce(async (_entry, env, onSettled) => {
+      const hold = {
+        kind: 'provider_proxy_acquisition_held',
+        owner: 'provider-host-acquisition',
+        cut: 'control establishment',
+        reason: 'guardian teardown was unobservable',
+        strandedArtifacts: ['guardian'],
+        setAddress: {
+          buildSetId: '11111111-1111-4111-8111-111111111111',
+          hostFingerprint: 'a'.repeat(64),
+          proxyInstanceId: '22222222-2222-4222-8222-222222222222',
+        },
+        guardianIdentity: {
+          pid: 101,
+          incarnation: testIncarnation(101),
+          processGroupId: 101,
+        },
+        recoverySubject: exactSubject,
+        recoveryCapability: { retry: () => recovery.promise },
+      } as const;
+      await env.acceptHold(hold);
+      await onSettled({ ...hold, owner: 'provider-host-manager' });
+    });
+    const spec = createSharedSpec();
+
+    const first = await manager.openSession(createLaunch(spec), { jobId: 'job-a' });
+    const second = await manager.openSession(createLaunch(spec), { jobId: 'job-b' });
+
+    expect(mockedEnsureProxySet).toHaveBeenCalledTimes(1);
+    expect(lifecycleRef.get()?.snapshot()).toEqual(expect.objectContaining({ represented: 1, states: ['acquiring'] }));
+    first.close();
+    second.close();
+    await manager.shutdown();
+    const observed = await reobserveDurableProviderProxyAcquisitionContainment(
+      runtime,
+      exactSubject,
+      new AbortController().signal,
+    );
+    if (observed.kind !== 'containment-absent') throw new Error('expected exact acquisition absence evidence');
+    recovery.resolve({
+      kind: 'absence-confirmed',
+      evidence: observed.evidence,
+      strandedArtifacts: [],
+    });
+    await Promise.resolve();
+    await Promise.resolve();
+    expect(lifecycleRef.get()?.snapshot()).toEqual(expect.objectContaining({ represented: 0, states: [] }));
+  });
+
+  it('keeps a publication-unknown acquisition represented and single-flighted by executable identity', async () => {
+    const server = createFakeProviderServerHandle();
+    const lifecycleRef = createProxySetLifecycleRef();
+    const manager = new StubbedContainmentProviderHostManager({
+      carrierBlocksRetirement: noCarrierBlocksRetirement,
+      runtime,
+      spawnProviderServer: createSpawnProviderServerMock(server.handle),
+      proxySetAcquisition,
+      providerProxyLifecycleRef: lifecycleRef,
+    });
+    const spec = createSharedSpec();
+    const capsuleBinding = publicationUnknownCapsule(spec);
+    const publicationUnknown = publicationUnknownHandoff(capsuleBinding);
+    mockedEnsureProxySet.mockImplementationOnce(async (_entry, _env, onSettled) => {
+      await onSettled(publicationUnknown.handoff);
+    });
+
+    const first = await manager.openSession(createLaunch(spec), { jobId: 'job-a' });
+    const second = await manager.openSession(createLaunch(spec), { jobId: 'job-b' });
+
+    expect(mockedEnsureProxySet).toHaveBeenCalledTimes(1);
+    await vi.waitFor(() => expect(publicationUnknown.guardianExchange).toHaveBeenCalled());
+    expect(publicationUnknown.guardianExchange.mock.calls).toContainEqual([
+      'guardian.acquisition-publish.v1',
+      {
+        guardian: publicationUnknown.guardianIdentity,
+        reaper: publicationUnknown.reaperIdentity,
+        proxy: publicationUnknown.proxyIdentity,
+      },
+      PROXY_CONTROL_RPC_TIMEOUT_MS,
+    ]);
+    expect(publicationUnknown.proxyExchange).not.toHaveBeenCalled();
+    expect(lifecycleRef.get()?.snapshot()).toEqual(expect.objectContaining({ represented: 1, states: ['recovering'] }));
+    expect(lifecycleRef.get()?.snapshot().operatorDispositions).toContainEqual(
+      expect.objectContaining({ waitingFor: 'publication-confirmation-or-control-release' }),
+    );
+    expect(manager.routeAppServerOperation(spec)).toBeNull();
+
+    first.close();
+    second.close();
+    publicationUnknown.faults.latch({
+      kind: 'heartbeat-failed',
+      role: 'guardian',
+      method: 'guardian.heartbeat.v1',
+      terminalReason: 'local-failure',
+      error: 'test complete',
+    });
     await manager.shutdown();
   });
 
@@ -1135,8 +1394,8 @@ describe('provider host pool proxy set registry', () => {
       providerProxyLifecycleRef: createProxySetLifecycleRef(),
     });
     const set = fakeDurableProxySet('proxy-routed');
-    mockedEnsureProxySet.mockImplementationOnce((_entry, _env, onSettled) => {
-      onSettled({ kind: 'acquired', set });
+    mockedEnsureProxySet.mockImplementationOnce(async (_entry, _env, onSettled) => {
+      await onSettled({ kind: 'acquired', set, publicationReceipt: PUBLICATION_RECEIPT });
     });
     const spec = createSharedSpec();
 
@@ -1164,15 +1423,15 @@ describe('provider host pool proxy set registry', () => {
       providerProxyLifecycleRef: createProxySetLifecycleRef(),
     });
     const set = fakeDurableProxySet('proxy-shared');
-    mockedEnsureProxySet.mockImplementationOnce((_entry, _env, onSettled) => {
-      onSettled({ kind: 'acquired', set });
+    mockedEnsureProxySet.mockImplementationOnce(async (_entry, _env, onSettled) => {
+      await onSettled({ kind: 'acquired', set, publicationReceipt: PUBLICATION_RECEIPT });
     });
 
     const first = await manager.openSession(createLaunch(createExclusiveSpec()), { jobId: 'job-a' });
     const second = await manager.openSession(createLaunch(createExclusiveSpec()), { jobId: 'job-b' });
 
     // Two distinct entries — the per-job isolation of the hosts themselves is unchanged — but one set.
-    const entryKeys = mockedEnsureProxySet.mock.calls.map((call) => (call[0] as ProviderHostEntry).hostKey);
+    const entryKeys = mockedEnsureProxySet.mock.calls.map((call) => call[0].hostKey);
     expect(new Set(entryKeys).size).toBe(1);
     expect(mockedEnsureProxySet).toHaveBeenCalledTimes(1);
     expect(manager.liveSets()).toHaveLength(1);
@@ -1191,9 +1450,19 @@ describe('provider host pool proxy set registry', () => {
       proxySetAcquisition,
       providerProxyLifecycleRef: createProxySetLifecycleRef(),
     });
-    mockedEnsureProxySet.mockImplementation(() => {
-      // Every reserved slot remains pending while the fifth identity reaches the admission gate.
-    });
+    mockedEnsureProxySet.mockImplementation(
+      (_entry, env: { signal: AbortSignal }, onSettled) =>
+        new Promise<void>((resolve, reject) => {
+          env.signal.addEventListener(
+            'abort',
+            () =>
+              void Promise.resolve(
+                onSettled({ kind: 'failed', reason: 'manager stopped', strandedArtifacts: [] }),
+              ).then(resolve, reject),
+            { once: true },
+          );
+        }),
+    );
     const specs = servers.map((_, index) => createSharedSpec({ env: { CORAL_SET_ID: String(index) } }));
     const leases = [];
     for (const [index, spec] of specs.entries()) {
@@ -1234,10 +1503,10 @@ describe('provider host pool proxy set registry', () => {
       fakeDurableProxySet('proxy-a-fresh'),
     ];
     let nextSet = 0;
-    mockedEnsureProxySet.mockImplementation((_entry, _env, onSettled) => {
+    mockedEnsureProxySet.mockImplementation(async (_entry, _env, onSettled) => {
       const set = sets[nextSet++];
       if (set === undefined) throw new Error('unexpected extra proxy set acquisition');
-      onSettled({ kind: 'acquired', set });
+      await onSettled({ kind: 'acquired', set, publicationReceipt: PUBLICATION_RECEIPT });
     });
     const servers = Array.from({ length: 5 }, (_, index) => createFakeProviderServerHandle({ generation: index + 1 }));
     const providerProxyLifecycleRef = createProxySetLifecycleRef((routeKey) =>
@@ -1280,11 +1549,7 @@ describe('provider host pool proxy set registry', () => {
     await manager.shutdown();
   });
 
-  it('aborts a still-pending acquisition’s signal when the manager stops, without waiting for it to settle', async () => {
-    // The defect this guards against: a job acquires a lease, its proxy-set acquisition is still mid-
-    // handshake when shutdown begins, and nothing ever cuts it off — so it can go on to populate `liveSets()`
-    // after a caller (`runShutdownSequence`) has already read it. `stopAndClose` must sever it instead of
-    // merely outliving it.
+  it('waits for a stopped acquisition to finish containment before returning', async () => {
     const server = createFakeProviderServerHandle();
     const manager = new StubbedContainmentProviderHostManager({
       carrierBlocksRetirement: noCarrierBlocksRetirement,
@@ -1294,9 +1559,18 @@ describe('provider host pool proxy set registry', () => {
       providerProxyLifecycleRef: createProxySetLifecycleRef(),
     });
     let capturedSignal: AbortSignal | undefined;
-    mockedEnsureProxySet.mockImplementationOnce((_entry, env: { signal: AbortSignal }) => {
+    const stopAndReap = vi.fn(async () => ({ disappearanceReceipt: 'late-acquisition-contained' }) as const);
+    const set = fakeDurableProxySet('late-acquisition', { stopAndReap });
+    let settleAcquisition: (() => Promise<void>) | undefined;
+    mockedEnsureProxySet.mockImplementationOnce((_entry, env: { signal: AbortSignal }, onSettled) => {
       capturedSignal = env.signal;
-      // Deliberately never calls `onSettled` — this attempt is still running when shutdown begins.
+      return new Promise<void>((resolve, reject) => {
+        settleAcquisition = () =>
+          Promise.resolve(onSettled({ kind: 'acquired', set, publicationReceipt: PUBLICATION_RECEIPT })).then(
+            resolve,
+            reject,
+          );
+      });
     });
 
     const lease = await manager.openSession(createLaunch(createSharedSpec()), { jobId: 'job-a' });
@@ -1305,11 +1579,166 @@ describe('provider host pool proxy set registry', () => {
     expect(capturedSignal?.aborted).toBe(false);
 
     lease.close();
-    // Must resolve even though the acquisition it started never calls `onSettled` — shutdown does not await
-    // acquisition completion, it cuts it off.
-    await manager.shutdown();
+    let stopped = false;
+    const shutdown = manager.shutdown().then(() => {
+      stopped = true;
+    });
+    await Promise.resolve();
 
     expect(capturedSignal?.aborted).toBe(true);
+    expect(stopped).toBe(false);
+    if (settleAcquisition === undefined) throw new Error('acquisition settlement was not captured');
+    await settleAcquisition();
+    await shutdown;
+
+    expect(stopAndReap).toHaveBeenCalledOnce();
+    expect(manager.liveSets()).toEqual([]);
+  });
+
+  it('delegates a late handoff acquisition to the lifecycle before the drain settles', async () => {
+    const server = createFakeProviderServerHandle();
+    const lifecycleRef = createProxySetLifecycleRef();
+    const manager = new StubbedContainmentProviderHostManager({
+      carrierBlocksRetirement: noCarrierBlocksRetirement,
+      runtime,
+      spawnProviderServer: createSpawnProviderServerMock(server.handle),
+      proxySetAcquisition,
+      providerProxyLifecycleRef: lifecycleRef,
+    });
+    const stopAndReap = vi.fn(async () => ({ disappearanceReceipt: 'not-requested' }));
+    const stopHeartbeats = vi.fn();
+    const initiateControlClose = vi.fn(async () => {});
+    const set = fakeDurableProxySet('late-handoff-acquisition', {
+      stopAndReap,
+      stopHeartbeats,
+      initiateControlClose,
+    });
+    let settleAcquisition: (() => Promise<void>) | undefined;
+    mockedEnsureProxySet.mockImplementationOnce(
+      (_entry, _env, onSettled) =>
+        new Promise<void>((resolve, reject) => {
+          settleAcquisition = () =>
+            Promise.resolve(onSettled({ kind: 'acquired', set, publicationReceipt: PUBLICATION_RECEIPT })).then(
+              resolve,
+              reject,
+            );
+        }),
+    );
+
+    const lease = await manager.openSession(createLaunch(createSharedSpec()), { jobId: 'job-a' });
+    lease.close();
+    const drain = manager.drainForHandoff();
+    await Promise.resolve();
+    if (settleAcquisition === undefined) throw new Error('acquisition settlement was not captured');
+    await settleAcquisition();
+    const receipt = await drain;
+
+    expect(stopAndReap).not.toHaveBeenCalled();
+    expect(stopHeartbeats).not.toHaveBeenCalled();
+    expect(initiateControlClose).not.toHaveBeenCalled();
+    expect(receipt.liveProxySets.map(({ proxyInstanceId }) => proxyInstanceId)).toEqual([set.proxyInstanceId]);
+    expect(receipt.acquisitionCleanupHolds).toEqual([]);
+    expect(lifecycleRef.get()?.snapshot()).toEqual(expect.objectContaining({ represented: 1, states: ['available'] }));
+  });
+
+  it('retains a timed-out acquisition cleanup until a reachable retry confirms absence', async () => {
+    const server = createFakeProviderServerHandle();
+    const lifecycleRef = createProxySetLifecycleRef();
+    const manager = new StubbedContainmentProviderHostManager({
+      carrierBlocksRetirement: noCarrierBlocksRetirement,
+      runtime,
+      spawnProviderServer: createSpawnProviderServerMock(server.handle),
+      proxySetAcquisition,
+      providerProxyLifecycleRef: lifecycleRef,
+    });
+    const stopAndReap = vi
+      .fn()
+      .mockResolvedValueOnce({ unconfirmed: 'late acquisition is still alive' })
+      .mockResolvedValueOnce({ disappearanceReceipt: 'late-acquisition-contained' });
+    const set = fakeDurableProxySet('timed-out-acquisition', { stopAndReap });
+    let settleAcquisition: (() => Promise<void>) | undefined;
+    mockedEnsureProxySet.mockImplementationOnce(
+      (_entry, _env, onSettled) =>
+        new Promise<void>((resolve, reject) => {
+          settleAcquisition = () =>
+            Promise.resolve(onSettled({ kind: 'acquired', set, publicationReceipt: PUBLICATION_RECEIPT })).then(
+              resolve,
+              reject,
+            );
+        }),
+    );
+
+    const lease = await manager.openSession(createLaunch(createSharedSpec()), { jobId: 'job-a' });
+    lease.close();
+    const deadline = new AbortController();
+    const shutdown = manager.shutdown(deadline.signal);
+    deadline.abort();
+
+    await expect(shutdown).rejects.toThrow('provider_host_close_wait');
+    const [hold] = manager.cleanupObligations().acquisitionCleanupHolds;
+    expect(hold).toMatchObject({
+      kind: 'provider_proxy_acquisition_pending_cleanup',
+      owner: 'provider-host-manager',
+    });
+    if (hold === undefined || settleAcquisition === undefined) {
+      throw new Error('timed-out acquisition cleanup was not retained');
+    }
+
+    await settleAcquisition();
+    await vi.waitFor(() => expect(stopAndReap).toHaveBeenCalledOnce());
+    await expect(hold.recoveryCapability.retry(new AbortController().signal)).resolves.toEqual({
+      kind: 'absence-confirmed',
+      strandedArtifacts: [],
+    });
+
+    expect(stopAndReap).toHaveBeenCalledTimes(2);
+    expect(manager.cleanupObligations().acquisitionCleanupHolds).toEqual([]);
+    expect(lifecycleRef.get()?.snapshot()).toEqual(expect.objectContaining({ represented: 0, states: [] }));
+  });
+
+  it('keeps a deadline-expired publication recovery visible after lifecycle handoff', async () => {
+    const server = createFakeProviderServerHandle();
+    const lifecycleRef = createProxySetLifecycleRef();
+    const manager = new StubbedContainmentProviderHostManager({
+      carrierBlocksRetirement: noCarrierBlocksRetirement,
+      runtime,
+      spawnProviderServer: createSpawnProviderServerMock(server.handle),
+      proxySetAcquisition,
+      providerProxyLifecycleRef: lifecycleRef,
+    });
+    const spec = createSharedSpec();
+    const retained = publicationUnknownHandoff(publicationUnknownCapsule(spec));
+    let settleAcquisition: (() => Promise<void>) | undefined;
+    mockedEnsureProxySet.mockImplementationOnce(
+      (_entry, _env, onSettled) =>
+        new Promise<void>((resolve, reject) => {
+          settleAcquisition = () => Promise.resolve(onSettled(retained.handoff)).then(resolve, reject);
+        }),
+    );
+    const lease = await manager.openSession(createLaunch(spec), { jobId: 'job-a' });
+    lease.close();
+    const deadline = new AbortController();
+
+    const drain = manager.drainForHandoff(deadline.signal);
+    deadline.abort();
+    await expect(drain).rejects.toThrow();
+    if (settleAcquisition === undefined) throw new Error('acquisition settlement was not captured');
+    await settleAcquisition();
+
+    expect(retained.stop).not.toHaveBeenCalled();
+    expect(retained.close).not.toHaveBeenCalled();
+    expect(lifecycleRef.get()?.snapshot()).toEqual(expect.objectContaining({ represented: 1, states: ['recovering'] }));
+    const [hold] = manager.cleanupObligations().acquisitionCleanupHolds;
+    expect(hold).toMatchObject({
+      kind: 'provider_proxy_acquisition_publication_cleanup',
+      owner: 'provider-proxy-set-lifecycle',
+      exit: 'publication-confirmation-or-control-reattachment',
+    });
+    if (hold === undefined) throw new Error('publication recovery hold was not retained');
+    await expect(hold.recoveryCapability.retry(new AbortController().signal)).resolves.toEqual({
+      kind: 'held',
+      reason: 'publication confirmation remains pending',
+    });
   });
 });
 
@@ -1336,7 +1765,7 @@ describe('provider host pool proxy set registration', () => {
     });
     const set = fakeDurableProxySet('proxy-inherited');
 
-    manager.registerInheritedSet(set);
+    manager.registerInheritedSet(set, PUBLICATION_RECEIPT);
 
     expect(manager.liveSets()).toEqual([set]);
     // Inheritance never registers routing for new work — only an `ensureProxySetFor` acquisition does.
@@ -1354,13 +1783,13 @@ describe('provider host pool proxy set registration', () => {
       providerProxyLifecycleRef: createProxySetLifecycleRef(),
     });
     const acquired = fakeDurableProxySet('proxy-acquired');
-    mockedEnsureProxySet.mockImplementationOnce((_entry, _env, onSettled) => {
-      onSettled({ kind: 'acquired', set: acquired });
+    mockedEnsureProxySet.mockImplementationOnce(async (_entry, _env, onSettled) => {
+      await onSettled({ kind: 'acquired', set: acquired, publicationReceipt: PUBLICATION_RECEIPT });
     });
     const lease = await manager.openSession(createLaunch(createSharedSpec()), { jobId: 'job-a' });
     const inherited = fakeDurableProxySet('proxy-inherited');
 
-    manager.registerInheritedSet(inherited);
+    manager.registerInheritedSet(inherited, PUBLICATION_RECEIPT);
 
     expect(new Set(manager.liveSets().map((set) => set.proxyInstanceId))).toEqual(
       new Set([acquired.proxyInstanceId, inherited.proxyInstanceId]),

@@ -259,7 +259,7 @@ async function startProxy(
             }),
             rootIdentity: () => ({ pid: 7_001, incarnation: testIncarnation(800) }),
             closed: () => new Promise<Error | void>(() => {}),
-            forceClose: async () => {},
+            forceClose: async () => undefined,
           } as unknown as ProxyAppServerHostAuthority;
           return createSemanticOperationRuntime({
             runtime: createRealRuntime('prod'),
@@ -584,6 +584,7 @@ async function launchThroughRoute(
     controlReattachment: {} as never,
     registerSuccessionOperation: async () => ({ kind: 'registered' as const }),
     stopAndReap: async () => ({ disappearanceReceipt: 'gone' }),
+    commitContainment: async () => ({ kind: 'containment-absent' as const, disappearanceReceipt: 'gone' }),
     stopHeartbeats: () => undefined,
     initiateControlClose: async () => undefined,
   } as const;
@@ -689,7 +690,9 @@ async function launchThroughRoute(
     time,
   });
   reconciler.start();
-  cleanups.push(() => reconciler.stop());
+  cleanups.push(() => {
+    reconciler.stop();
+  });
   const route = createAppServerProxyRoute({
     hostManager: { routeAppServerOperation: () => authority },
     reconciler,

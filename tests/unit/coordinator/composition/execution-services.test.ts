@@ -1,5 +1,7 @@
 import type { ControlExchange } from '#src/provider-proxy/control-client.js';
 import { randomUUID } from 'node:crypto';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 
 import { describe, expect, it, vi } from 'vitest';
 
@@ -9,6 +11,7 @@ import {
   type DurableProviderProxyOperationAuthority,
 } from '#src/coordinator/live/provider-proxy/operation-route.js';
 import { createProviderProxySetAuthority } from '#src/coordinator/live/provider-proxy/set-authority.js';
+import type { PublicationReceipt } from '#src/coordinator/live/provider-proxy/set-publication.js';
 import { LocalOperationRegistry } from '#src/coordinator/services/operation-registry.js';
 import { ProviderOperationReconciler } from '#src/coordinator/services/provider-operation-reconciler.js';
 import {
@@ -41,6 +44,7 @@ import {
   CORAL_PROVIDER_PROXY_ORPHAN_TIMEOUT_MS_ENV,
   MAX_PROVIDER_PROXY_ORPHAN_TIMEOUT_MS,
   MIN_PROVIDER_PROXY_ORPHAN_TIMEOUT_MS,
+  PROXY_CONTROL_HEARTBEAT_MS,
   PROXY_TEARDOWN_RESERVE_MS,
   providerProxyHeartbeatHoldBound,
 } from '#src/provider-proxy/orphan-deadline.js';
@@ -70,6 +74,8 @@ import { testIncarnation } from '#tests/helpers/process-incarnation.js';
 
 /** The build these fixture worlds belong to; capsules built from the same fixtures are inheritable, not foreign. */
 const FIXTURE_BUILD_SET_ID = '00000000-0000-4000-8000-000000000004';
+const FIXTURE_COORDINATOR_INSTANCE_ID = '00000000-0000-4000-8000-000000000005';
+const TEST_PUBLICATION_RECEIPT = { kind: 'provider-proxy-set-published' } as PublicationReceipt;
 const TEST_AUTONOMOUS_DEADLINE = {
   orphanTimeoutMs: 37_000,
   adoptionWindowMs: 23_000,
@@ -89,6 +95,24 @@ const unexpectedRecordedContainmentReap = (): never => {
   throw new Error('execution services fixture unexpectedly requested recorded containment reaping');
 };
 
+function isolatedExecutionRuntime(time?: ReturnType<typeof createRealRuntime>['time']) {
+  const runtime = createRealRuntime('prod');
+  return {
+    ...runtime,
+    ...(time === undefined ? {} : { time }),
+    paths: {
+      ...runtime.paths,
+      coral: {
+        ...runtime.paths.coral,
+        coordinator: {
+          ...runtime.paths.coral.coordinator,
+          runDir: join(tmpdir(), `coral-execution-services-${randomUUID()}`),
+        },
+      },
+    },
+  };
+}
+
 type SharedSetControl = 'settlement-timeout' | 'heartbeat-failed';
 
 function setReference(identity: ProviderProxySetIdentity): string {
@@ -105,7 +129,7 @@ function providerOperationRecordKey(record: ProviderOperationRecord): string {
 }
 
 function createUnreadableStartupHarness() {
-  const runtime = createRealRuntime('prod');
+  const runtime = isolatedExecutionRuntime();
   const db = newRawDatabase(':memory:');
   applyBundledStoreSchema(db, currentCoralStoreFormat());
   const namespace = `execution-services-unreadable-${randomUUID()}`;
@@ -120,7 +144,7 @@ function createUnreadableStartupHarness() {
   insertProviderOperation(db, readable);
   db.prepare<[string, string]>('INSERT INTO meta (key, value) VALUES (?, ?)').run(unreadableKey, 'not-json');
   const world = {
-    identity: { buildSetId: FIXTURE_BUILD_SET_ID },
+    identity: { buildSetId: FIXTURE_BUILD_SET_ID, instanceId: FIXTURE_COORDINATOR_INSTANCE_ID },
     storeServicesRef: { tryGet: () => ({ progressStore }) },
     operationRegistry: new LocalOperationRegistry(),
     providerProxyClaims: claims,
@@ -162,6 +186,7 @@ describe('provider proxy operation routing', () => {
         return deadline;
       },
       stopAndReap: async () => ({ unconfirmed: 'unused' }) as const,
+      commitContainment: async () => ({ kind: 'outcome-unknown', error: 'unused' }) as const,
       stopHeartbeats: () => undefined,
       initiateControlClose: async () => undefined,
       controlReattachment: {} as never,
@@ -190,7 +215,7 @@ describe('provider proxy operation routing', () => {
 async function createSharedSetHarness(control: SharedSetControl) {
   const namespace = `execution-services-shared-set-${control}`;
   const time = new VirtualTime();
-  const runtime = { ...createRealRuntime('prod'), time };
+  const runtime = isolatedExecutionRuntime(time);
   const db = newRawDatabase(':memory:');
   applyBundledStoreSchema(db, currentCoralStoreFormat());
   const progressStore = new JobStore(namespace, runtime, createEventBodyCodec(), {
@@ -201,7 +226,7 @@ async function createSharedSetHarness(control: SharedSetControl) {
   const lifecycleRef = new ProviderProxySetLifecycleRef();
   const operationRegistry = new LocalOperationRegistry();
   const world = {
-    identity: { buildSetId: FIXTURE_BUILD_SET_ID },
+    identity: { buildSetId: FIXTURE_BUILD_SET_ID, instanceId: FIXTURE_COORDINATOR_INSTANCE_ID },
     storeServicesRef: { tryGet: () => ({ progressStore }) },
     operationRegistry,
     providerProxyClaims: claims,
@@ -277,17 +302,24 @@ async function createSharedSetHarness(control: SharedSetControl) {
     onFault: () => () => undefined,
     close: () => undefined,
   } satisfies ControlClient;
-  const stopAndReap = vi.fn(async () =>
+  const stopAndReap = vi.fn<DurableProviderProxyOperationAuthority['stopAndReap']>(async () =>
     control === 'settlement-timeout'
-      ? ({ unconfirmed: 'unexpected settlement containment' } as const)
-      : ({ disappearanceReceipt: `${control}-containment-absent` } as const),
+      ? { unconfirmed: 'unexpected settlement containment' }
+      : { disappearanceReceipt: `${control}-containment-absent` },
   );
+  const commitContainment: DurableProviderProxyOperationAuthority['commitContainment'] = async (signal) => {
+    const result = await stopAndReap(signal);
+    return 'disappearanceReceipt' in result
+      ? { kind: 'containment-absent', disappearanceReceipt: result.disappearanceReceipt }
+      : { kind: 'outcome-unknown', error: result.unconfirmed };
+  };
   const faults = createProviderProxyAuthorityFaultLatch();
   const authority = createProviderProxyOperationAuthority({
     base: {
       proxyInstanceId: setIdentity.proxyInstanceId,
       autonomousDeadline: TEST_AUTONOMOUS_DEADLINE,
       stopAndReap,
+      commitContainment,
       stopHeartbeats: () => undefined,
       initiateControlClose: async () => undefined,
       controlReattachment: {} as never,
@@ -302,7 +334,7 @@ async function createSharedSetHarness(control: SharedSetControl) {
   if (lifecycle === null) throw new Error('provider proxy lifecycle was not composed');
   const admission = lifecycle.beginFreshAcquisition(`shared-set-${control}`);
   if (admission.kind !== 'accepted') throw new Error(`fresh set was not admitted: ${admission.kind}`);
-  lifecycle.acquisitionSucceeded(admission.slotId, authority);
+  lifecycle.acquisitionSucceeded(admission.slotId, authority, TEST_PUBLICATION_RECEIPT);
 
   for (const record of records) {
     const sessionId = randomUUID();
@@ -351,7 +383,7 @@ describe('execution services provider-proxy proof composition', () => {
   // find out. The skip was pinned and the reporting was not — deleting the whole warn block left every gate
   // green, which turns "tolerated and reported" into "silently dropped" without a single test noticing.
   it('quarantines the rows it cannot read, by key, on the first boot-path scan', async () => {
-    const runtime = createRealRuntime('prod');
+    const runtime = isolatedExecutionRuntime();
     const db = newRawDatabase(':memory:');
     applyBundledStoreSchema(db, currentCoralStoreFormat());
     const namespace = 'execution-services-unreadable-report';
@@ -373,7 +405,7 @@ describe('execution services provider-proxy proof composition', () => {
     db.prepare<[string, string]>('INSERT INTO meta (key, value) VALUES (?, ?)').run(supersededKey, 'unparsed');
 
     const world = {
-      identity: { buildSetId: FIXTURE_BUILD_SET_ID },
+      identity: { buildSetId: FIXTURE_BUILD_SET_ID, instanceId: FIXTURE_COORDINATOR_INSTANCE_ID },
       storeServicesRef: { tryGet: () => ({ progressStore }) },
       operationRegistry: new LocalOperationRegistry(),
       providerProxyClaims: claims,
@@ -426,7 +458,7 @@ describe('execution services provider-proxy proof composition', () => {
   });
 
   it('retains repaired-row quarantine until the composed reconciler accepts ownership', async () => {
-    const runtime = createRealRuntime('prod');
+    const runtime = isolatedExecutionRuntime();
     const db = newRawDatabase(':memory:');
     applyBundledStoreSchema(db, currentCoralStoreFormat());
     const namespace = 'execution-services-repaired-row-adoption';
@@ -437,7 +469,7 @@ describe('execution services provider-proxy proof composition', () => {
     const claims = new ProviderProxySetClaimMirror();
     const lifecycleRef = new ProviderProxySetLifecycleRef();
     const world = {
-      identity: { buildSetId: FIXTURE_BUILD_SET_ID },
+      identity: { buildSetId: FIXTURE_BUILD_SET_ID, instanceId: FIXTURE_COORDINATOR_INSTANCE_ID },
       storeServicesRef: { tryGet: () => ({ progressStore }) },
       operationRegistry: new LocalOperationRegistry(),
       providerProxyClaims: claims,
@@ -598,7 +630,7 @@ describe('execution services provider-proxy proof composition', () => {
   });
 
   it('does not invoke the disappearance consumer producer during assembly', async () => {
-    const runtime = createRealRuntime('prod');
+    const runtime = isolatedExecutionRuntime();
     const claims = new ProviderProxySetClaimMirror();
     const lifecycleRef = new ProviderProxySetLifecycleRef();
     const operationRegistry = new LocalOperationRegistry();
@@ -608,7 +640,7 @@ describe('execution services provider-proxy proof composition', () => {
     });
     const proveContainmentAbsent = vi.fn(noContainmentProver.collectContainmentProof);
     const world = {
-      identity: { buildSetId: FIXTURE_BUILD_SET_ID },
+      identity: { buildSetId: FIXTURE_BUILD_SET_ID, instanceId: FIXTURE_COORDINATOR_INSTANCE_ID },
       storeServicesRef: { tryGet: () => null },
       operationRegistry,
       providerProxyClaims: claims,
@@ -643,7 +675,7 @@ describe('execution services provider-proxy proof composition', () => {
 
   it('does not publish a stored terminal-fault authority through the production subscriber', async () => {
     const time = new VirtualTime();
-    const runtime = { ...createRealRuntime('prod'), time };
+    const runtime = isolatedExecutionRuntime(time);
     const db = newRawDatabase(':memory:');
     applyBundledStoreSchema(db, currentCoralStoreFormat());
     const record = providerOperationRecord('executing');
@@ -653,7 +685,7 @@ describe('execution services provider-proxy proof composition', () => {
     const lifecycleRef = new ProviderProxySetLifecycleRef();
     const operationRegistry = new LocalOperationRegistry();
     const world = {
-      identity: { buildSetId: FIXTURE_BUILD_SET_ID },
+      identity: { buildSetId: FIXTURE_BUILD_SET_ID, instanceId: FIXTURE_COORDINATOR_INSTANCE_ID },
       storeServicesRef: { tryGet: () => ({ progressStore: { getDb: () => db } }) },
       operationRegistry,
       providerProxyClaims: claims,
@@ -677,6 +709,7 @@ describe('execution services provider-proxy proof composition', () => {
     claims.initialize([record]);
     const lifecycle = lifecycleRef.get();
     if (lifecycle === null) throw new Error('provider proxy lifecycle was not composed');
+    lifecycle.activateDurableOperatorDispositions();
     lifecycle.initializeClaimSlots();
     lifecycle.completeStartupDiscovery();
     const fault = {
@@ -702,12 +735,13 @@ describe('execution services provider-proxy proof composition', () => {
       onIncident: () => () => undefined,
       attachOperation,
       stopAndReap: async () => ({ unconfirmed: 'stored fault' }),
+      commitContainment: async () => ({ kind: 'outcome-unknown', error: 'stored fault' }),
       stopHeartbeats: () => undefined,
       initiateControlClose: async () => undefined,
       registerSuccessionOperation: async () => ({ kind: 'registered' as const }),
     } as unknown as DurableProviderProxyOperationAuthority;
 
-    lifecycle.registerInheritedSet(authority);
+    lifecycle.registerInheritedSet(authority, TEST_PUBLICATION_RECEIPT);
     await flushMicrotasks();
 
     expect({
@@ -720,7 +754,7 @@ describe('execution services provider-proxy proof composition', () => {
 
   it('publishes an accepted fresh authority once through the production subscriber', async () => {
     const time = new VirtualTime();
-    const runtime = { ...createRealRuntime('prod'), time };
+    const runtime = isolatedExecutionRuntime(time);
     const db = newRawDatabase(':memory:');
     applyBundledStoreSchema(db, currentCoralStoreFormat());
     const record = providerOperationRecord('executing');
@@ -744,7 +778,7 @@ describe('execution services provider-proxy proof composition', () => {
       request: { prompt: 'test', cwd: '/workspace', bypassPermissions: false, coralEnv: {} },
     }));
     const world = {
-      identity: { buildSetId: FIXTURE_BUILD_SET_ID },
+      identity: { buildSetId: FIXTURE_BUILD_SET_ID, instanceId: FIXTURE_COORDINATOR_INSTANCE_ID },
       storeServicesRef: { tryGet: () => ({ progressStore: { getDb: () => db, readLaunchProjection } }) },
       operationRegistry,
       providerProxyClaims: claims,
@@ -769,6 +803,7 @@ describe('execution services provider-proxy proof composition', () => {
     claims.initialize([record]);
     const lifecycle = lifecycleRef.get();
     if (lifecycle === null) throw new Error('provider proxy lifecycle was not composed');
+    lifecycle.activateDurableOperatorDispositions();
     lifecycle.initializeClaimSlots();
     lifecycle.completeStartupDiscovery();
     const attachOperation = vi.fn(async () => ({
@@ -785,6 +820,7 @@ describe('execution services provider-proxy proof composition', () => {
       onIncident: () => () => undefined,
       attachOperation,
       stopAndReap: async () => ({ unconfirmed: 'not requested' }),
+      commitContainment: async () => ({ kind: 'outcome-unknown', error: 'not requested' }),
       stopHeartbeats: () => undefined,
       initiateControlClose: async () => undefined,
       registerSuccessionOperation: async () => ({ kind: 'registered' as const }),
@@ -793,12 +829,12 @@ describe('execution services provider-proxy proof composition', () => {
     const admission = lifecycle.beginFreshAcquisition('fresh-publication');
     if (admission.kind !== 'accepted') throw new Error(`fresh set was not admitted: ${admission.kind}`);
 
-    lifecycle.acquisitionSucceeded(admission.slotId, authority);
+    lifecycle.acquisitionSucceeded(admission.slotId, authority, TEST_PUBLICATION_RECEIPT);
     await vi.waitFor(() => expect(attachOperation).toHaveBeenCalledTimes(1));
     await vi.waitFor(() =>
       expect(buildOperationControl.mock.calls.length + warning.mock.calls.length).toBeGreaterThan(0),
     );
-    lifecycle.registerInheritedSet(authority);
+    lifecycle.registerInheritedSet(authority, TEST_PUBLICATION_RECEIPT);
     await flushMicrotasks();
 
     expect(lifecycle.authorityFor(authority.setIdentity)).toBe(authority);
@@ -920,7 +956,7 @@ describe('execution services provider-proxy proof composition', () => {
 
   it('reaches the public independent proof after a closed control path', async () => {
     const time = new VirtualTime();
-    const runtime = { ...createRealRuntime('prod'), time };
+    const runtime = isolatedExecutionRuntime(time);
     const db = newRawDatabase(':memory:');
     applyBundledStoreSchema(db, currentCoralStoreFormat());
     const claims = new ProviderProxySetClaimMirror();
@@ -940,7 +976,7 @@ describe('execution services provider-proxy proof composition', () => {
       disappearanceReceipt: 'closed-control-path-containment-absent',
     }));
     const world = {
-      identity: { buildSetId: FIXTURE_BUILD_SET_ID },
+      identity: { buildSetId: FIXTURE_BUILD_SET_ID, instanceId: FIXTURE_COORDINATOR_INSTANCE_ID },
       storeServicesRef: {
         tryGet: () => ({ progressStore: { getDb: () => db } }),
       },
@@ -972,6 +1008,7 @@ describe('execution services provider-proxy proof composition', () => {
     claims.initialize([]);
     const lifecycle = lifecycleRef.get();
     if (lifecycle === null) throw new Error('provider proxy lifecycle was not composed');
+    lifecycle.activateDurableOperatorDispositions();
     lifecycle.initializeClaimSlots();
     lifecycle.completeStartupDiscovery();
 
@@ -1005,7 +1042,7 @@ describe('execution services provider-proxy proof composition', () => {
       initiateControlClose: async () => undefined,
       registerSuccessionOperation: async () => ({ kind: 'registered' as const }),
     } as unknown as DurableProviderProxyOperationAuthority;
-    lifecycle.registerInheritedSet(authority);
+    lifecycle.registerInheritedSet(authority, TEST_PUBLICATION_RECEIPT);
     const incidentListener = incidentSubscription.listener;
     if (incidentListener === null) throw new Error('lifecycle did not subscribe to authority incidents');
 
@@ -1015,7 +1052,10 @@ describe('execution services provider-proxy proof composition', () => {
       cause: 'closed',
       error: new ControlClientError('control_client_closed', 'control closed', 'closed'),
     });
-    await flushMicrotasks();
+    await vi.waitFor(() => {
+      expect(reapRecordedContainment).toHaveBeenCalledOnce();
+      expect(lifecycle.snapshot()).toEqual(expect.objectContaining({ represented: 0, states: [] }));
+    });
     time.tick(30_000);
     await flushMicrotasks();
     expect(proveContainmentAbsent.mock.calls.length).toBeGreaterThanOrEqual(1);
@@ -1036,11 +1076,11 @@ describe('execution services provider-proxy proof composition', () => {
 
   it('routes inherited disappearance through the recovering lifecycle slot before freeing all four admissions', async () => {
     const time = new VirtualTime();
-    const realRuntime = createRealRuntime('prod');
+    const realRuntime = isolatedExecutionRuntime(time);
     const runtime = {
       ...realRuntime,
       time,
-      storage: { readdirSync: () => [] },
+      storage: { ...realRuntime.storage, readdirSync: () => [] },
     } as never;
     const db = newRawDatabase(':memory:');
     applyBundledStoreSchema(db, currentCoralStoreFormat());
@@ -1054,7 +1094,7 @@ describe('execution services provider-proxy proof composition', () => {
       disappearanceReceipt: 'inheritance-process-proof',
     }));
     const world = {
-      identity: { buildSetId: FIXTURE_BUILD_SET_ID },
+      identity: { buildSetId: FIXTURE_BUILD_SET_ID, instanceId: FIXTURE_COORDINATOR_INSTANCE_ID },
       storeServicesRef: {
         tryGet: () => ({ progressStore: { getDb: () => db } }),
       },
@@ -1114,7 +1154,7 @@ describe('execution services provider-proxy heartbeat-hold composition', () => {
   async function createHeartbeatHoldHarness() {
     const namespace = 'execution-services-heartbeat-hold';
     const time = new VirtualTime();
-    const baseRuntime = createRealRuntime('prod');
+    const baseRuntime = isolatedExecutionRuntime(time);
     const runtime = {
       ...baseRuntime,
       time,
@@ -1136,7 +1176,7 @@ describe('execution services provider-proxy heartbeat-hold composition', () => {
     });
     const lifecycleRef = new ProviderProxySetLifecycleRef();
     const world = {
-      identity: { buildSetId: FIXTURE_BUILD_SET_ID },
+      identity: { buildSetId: FIXTURE_BUILD_SET_ID, instanceId: FIXTURE_COORDINATOR_INSTANCE_ID },
       storeServicesRef: { tryGet: () => ({ progressStore }) },
       operationRegistry: new LocalOperationRegistry(),
       providerProxyClaims: new ProviderProxySetClaimMirror(),
@@ -1199,7 +1239,7 @@ describe('execution services provider-proxy heartbeat-hold composition', () => {
             },
           });
         }
-        if (method === 'guardian.stop-and-reap.v1' || method === 'reaper.stop-and-reap.v1') {
+        if (method === 'guardian.containment-commit.v1') {
           return controlExchangeForTest({
             kind: 'response',
             response: {
@@ -1278,14 +1318,20 @@ describe('execution services provider-proxy heartbeat-hold composition', () => {
     });
     const installation = await base.installRecoveryCredential(new AbortController().signal);
     if (installation.kind !== 'installed') throw new Error(`recovery credential ${installation.kind}`);
-    const stopAndReap = vi.fn(base.stopAndReap);
+    const commitContainment = vi.fn(base.commitContainment);
     const authority = createProviderProxyOperationAuthority({
       base: {
         ...base,
         get autonomousDeadline() {
           return base.autonomousDeadline;
         },
-        stopAndReap,
+        commitContainment,
+        stopAndReap: async (signal) => {
+          const outcome = await commitContainment(signal);
+          return outcome.kind === 'containment-absent'
+            ? { disappearanceReceipt: outcome.disappearanceReceipt }
+            : { unconfirmed: outcome.error };
+        },
       },
       setIdentity,
       clients: { proxy: proxyClient, guardian: guardianClient, reaper: reaperClient },
@@ -1294,13 +1340,20 @@ describe('execution services provider-proxy heartbeat-hold composition', () => {
     });
     const admission = lifecycle.beginFreshAcquisition('heartbeat-hold-route');
     if (admission.kind !== 'accepted') throw new Error(`fresh set was not admitted: ${admission.kind}`);
-    lifecycle.acquisitionSucceeded(admission.slotId, authority);
+    lifecycle.acquisitionSucceeded(admission.slotId, authority, TEST_PUBLICATION_RECEIPT);
 
-    return { time, faults, stopAndReap, redeemedDeadline: base.autonomousDeadline, services };
+    return {
+      time,
+      faults,
+      stopAndReap: commitContainment,
+      redeemedDeadline: base.autonomousDeadline,
+      services,
+      lifecycle,
+    };
   }
 
   it("uses a redeemed set's capsule deadline instead of the successor coordinator's environment", async () => {
-    const { time, faults, stopAndReap, redeemedDeadline, services } = await createHeartbeatHoldHarness();
+    const { time, faults, stopAndReap, redeemedDeadline, services, lifecycle } = await createHeartbeatHoldHarness();
     expect(redeemedDeadline.heartbeatHoldBound).toEqual({ spanMs: 5_001, materialSchedulerLatenessMs: 1_250 });
 
     const incident = (error: string): void =>
@@ -1319,10 +1372,21 @@ describe('execution services provider-proxy heartbeat-hold composition', () => {
       });
 
     incident('first');
-    time.tick(redeemedDeadline.heartbeatHoldBound.spanMs);
-    incident('second');
+    expect(lifecycle.snapshot().states).toEqual(['available']);
+    let observedDurationMs = 0;
+    while (observedDurationMs + PROXY_CONTROL_HEARTBEAT_MS < redeemedDeadline.heartbeatHoldBound.spanMs) {
+      time.tick(PROXY_CONTROL_HEARTBEAT_MS);
+      observedDurationMs += PROXY_CONTROL_HEARTBEAT_MS;
+      incident(`holding-${observedDurationMs}`);
+    }
+    expect(lifecycle.snapshot().states).toEqual(['available']);
+    time.tick(redeemedDeadline.heartbeatHoldBound.spanMs - observedDurationMs);
+    incident('bound-exhausted');
 
-    expect(stopAndReap).toHaveBeenCalledOnce();
+    // Hold exhaustion must release routing and heartbeats, await independent absence proof, and use the
+    // redeemed capsule's timeout span.
+    expect(stopAndReap).not.toHaveBeenCalled();
+    expect(lifecycle.snapshot().states).toEqual(['containing']);
     services.stopProviderOperationReconciler();
   });
 });

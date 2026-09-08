@@ -109,8 +109,17 @@ describe('cli main — output format', () => {
   const formatFlag = `--output${'-format'}`;
   const jsonFormat = `js${'on'}`;
 
+  // Parse-time refusal fixtures must not discover a live coordinator.
+  let tmpDir: TemporaryHome;
+  beforeEach(() => {
+    tmpDir = temporaryHomes.create('coral-cli-format-', BUILD_FLAVOR);
+  });
+  afterEach(() => temporaryHomes.cleanup());
+
   it('rejects invalid kb --output-format values before command execution', () => {
-    const { stderr, status } = runCli(['kb', 'search', 'q', '--output-format', 'yaml']);
+    const { stderr, status } = runCli(['kb', 'search', 'q', '--output-format', 'yaml'], {
+      env: temporaryHomes.environment(tmpDir),
+    });
     expect(status).toBe(2);
     expect(stderr).toContain('output-format');
     expect(stderr).toContain('text');
@@ -119,7 +128,7 @@ describe('cli main — output format', () => {
 
   it('rejects non-KB --output-format at parse time', () => {
     const { stderr, status } = runCli(['backend', 'status', formatFlag, jsonFormat], {
-      env: { CORAL_BACKEND_DISABLE_AUTOSTART: '1' },
+      env: { ...temporaryHomes.environment(tmpDir), CORAL_BACKEND_DISABLE_AUTOSTART: '1' },
     });
 
     expect(status).toBe(2);

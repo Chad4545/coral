@@ -105,6 +105,31 @@ const mixedAbortResult = {
   notFound: ['job-9'],
 } satisfies AbortResult;
 
+const refusedAbortResult = {
+  aborted: [],
+  notFound: [],
+  refused: [
+    {
+      jobId: 'job-4',
+      reason: 'the recorded durable process containment is unavailable',
+      nextStep:
+        'Run coral-cli jobs detail job-4; Coral retains ownership until the recorded containment is observed absent.',
+    },
+  ],
+} satisfies AbortResult;
+
+const abandonedAbortResult = {
+  aborted: [],
+  notFound: [],
+  abandoned: [
+    {
+      jobId: 'job-6',
+      reason: 'recovery ownership was released without proof of recorded containment absence',
+      nextStep: 'Inspect the recorded process because it may still be live.',
+    },
+  ],
+} satisfies AbortResult;
+
 const personaSeedResult = {
   seed_used: 7,
   sigma_used: 1.2,
@@ -284,6 +309,46 @@ describe('cli format', () => {
 
     it('formats a result with both aborted and missing jobs', () => {
       expect(formatAbortResult(mixedAbortResult)).toBe('Aborted jobs: job-1\nNot found: job-9');
+    });
+
+    it('formats a held abort with its reason and next step', () => {
+      expect(formatAbortResult(refusedAbortResult)).toBe(
+        'No jobs aborted\n' +
+          'Abort held for job-4: the recorded durable process containment is unavailable\n' +
+          'Next step: Run coral-cli jobs detail job-4; Coral retains ownership until the recorded containment is observed absent.',
+      );
+    });
+
+    it('formats an asynchronous abort hold with its exit', () => {
+      expect(
+        formatAbortResult({
+          aborted: [],
+          notFound: [],
+          held: [
+            {
+              jobId: 'job-5',
+              reason: 'provider interruption acknowledgment is pending',
+              nextStep: 'Wait for provider acknowledgment, then inspect the job.',
+            },
+          ],
+        }),
+      ).toBe(
+        'No jobs aborted\n' +
+          'Abort held for job-5: provider interruption acknowledgment is pending\n' +
+          'Next step: Wait for provider acknowledgment, then inspect the job.',
+      );
+    });
+
+    it('reports explicit abandonment without claiming the job was aborted', () => {
+      const formatted = formatAbortResult(abandonedAbortResult);
+
+      expect(formatted).toBe(
+        'No jobs aborted\n' +
+          'Job ownership abandoned for job-6: recovery ownership was released without proof of recorded containment absence\n' +
+          'Warning: Process absence remains unproven.\n' +
+          'Next step: Inspect the recorded process because it may still be live.',
+      );
+      expect(formatted).not.toContain('Aborted jobs');
     });
   });
 
@@ -851,6 +916,68 @@ describe('cli format', () => {
           'Queue depth: 0',
         ].join('\n'),
       );
+    });
+
+    it('renders skipped provider-proxy-set candidate identities without offering an unauthorized command', () => {
+      const invalidToken = 'pps1.future-row';
+      const disagreementToken = 'pps2.other-identity';
+      const setIdentity = {
+        buildSetId: '11111111-1111-4111-8111-111111111111',
+        hostFingerprint: 'a'.repeat(64),
+        proxyInstanceId: '22222222-2222-4222-8222-222222222222',
+      };
+      const status = {
+        status: 'ok',
+        health: {
+          ...baseHealth,
+          components: [],
+          diagnostics: {
+            providerProxySetRowSkips: [
+              { reason: 'invalid-token' as const, setToken: invalidToken, setIdentity },
+              { reason: 'token-identity-disagreement' as const, setToken: disagreementToken, setIdentity },
+              { reason: 'malformed-row' as const, setToken: null, setIdentity },
+              { reason: 'malformed-row' as const, setToken: null, setIdentity: null },
+            ],
+          },
+          skippedProviderProxySetRows: 4,
+          skippedProviderProxySetTokens: [invalidToken, disagreementToken],
+        },
+      } satisfies BackendStatusFull;
+
+      const output = formatBackendStatus(status);
+      expect(output).toContain(`skipped candidate reason=invalid-token rawSetToken=${JSON.stringify(invalidToken)}`);
+      expect(output).toContain(
+        `skipped candidate reason=token-identity-disagreement rawSetToken=${JSON.stringify(disagreementToken)}`,
+      );
+      expect(output).toContain(
+        `skipped candidate reason=malformed-row rawSetIdentity buildSetId=${JSON.stringify(setIdentity.buildSetId)}`,
+      );
+      expect(output).toContain(`rawSetIdentity buildSetId=${JSON.stringify(setIdentity.buildSetId)}`);
+      expect(output).toContain('skipped row is structurally unidentifiable reason=malformed-row');
+      expect(output).toContain('No containment or abandonment command is available');
+      expect(output).not.toContain('provider-proxy-set contain');
+      expect(output).not.toContain('provider-proxy-set abandon');
+    });
+
+    it('renders the exact durable disposition key and unavailable action', () => {
+      const key = 'provider-proxy-set-operator-disposition.v2:pps2.future:writer:subject';
+      const status = {
+        status: 'ok',
+        health: {
+          ...baseHealth,
+          components: [],
+          diagnostics: {
+            providerProxyDispositionSkips: [
+              { key, setToken: null, unavailableAction: 'reconciliation-and-retirement' as const },
+            ],
+          },
+        },
+      } satisfies BackendStatusFull;
+
+      const output = formatBackendStatus(status);
+      expect(output).toContain(`key=${key}`);
+      expect(output).toContain('Unavailable action: reconciliation-and-retirement');
+      expect(output).toContain('will neither reconcile nor retire the record');
     });
 
     it('formats the redacted system provider scope without profile details', () => {

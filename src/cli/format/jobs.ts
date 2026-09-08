@@ -128,6 +128,19 @@ export function formatAbortResult(result: AbortResult): string {
   return joinLines([
     result.aborted.length > 0 ? `Aborted jobs: ${result.aborted.join(', ')}` : 'No jobs aborted',
     result.notFound.length > 0 ? `Not found: ${result.notFound.join(', ')}` : undefined,
+    ...(result.refused ?? []).flatMap((refusal) => [
+      `Abort held for ${refusal.jobId}: ${refusal.reason}`,
+      `Next step: ${refusal.nextStep}`,
+    ]),
+    ...(result.held ?? []).flatMap((hold) => [
+      `Abort held for ${hold.jobId}: ${hold.reason}`,
+      `Next step: ${hold.nextStep}`,
+    ]),
+    ...(result.abandoned ?? []).flatMap((abandonment) => [
+      `Job ownership abandoned for ${abandonment.jobId}: ${abandonment.reason}`,
+      'Warning: Process absence remains unproven.',
+      `Next step: ${abandonment.nextStep}`,
+    ]),
   ]);
 }
 

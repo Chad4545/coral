@@ -4,6 +4,7 @@ import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { describe, expect, it } from 'vitest';
 
+import { CURRENT_STRICT_BUNDLE_MANIFEST_FILE } from '#src/infra/bundle-manifest-address.js';
 import {
   assertLifecycleBundleSetFresh,
   lifecycleBundleSourceSha256,
@@ -22,7 +23,9 @@ const OUTPUTS = {
   backend: 'clients/build/coral-backend.cjs',
   cli: 'clients/build/coral-cli.cjs',
   claudeAppserver: 'clients/build/coral-claude-appserver.cjs',
-  manifest: 'clients/build/manifest.json',
+  durableWrapper: 'clients/build/coral-durable-wrapper.cjs',
+  legacyManifest: 'clients/build/manifest.json',
+  strictManifest: `clients/build/${CURRENT_STRICT_BUNDLE_MANIFEST_FILE}`,
 } as const;
 
 function sha256(content: string): string {
@@ -56,7 +59,18 @@ function createFreshBuildFixture(): string {
         path: OUTPUTS.claudeAppserver,
         sha256: sha256(`output:${OUTPUTS.claudeAppserver}`),
       },
-      manifest: { path: OUTPUTS.manifest, sha256: sha256(`output:${OUTPUTS.manifest}`) },
+      durableWrapper: {
+        path: OUTPUTS.durableWrapper,
+        sha256: sha256(`output:${OUTPUTS.durableWrapper}`),
+      },
+      legacyManifest: {
+        path: OUTPUTS.legacyManifest,
+        sha256: sha256(`output:${OUTPUTS.legacyManifest}`),
+      },
+      strictManifest: {
+        path: OUTPUTS.strictManifest,
+        sha256: sha256(`output:${OUTPUTS.strictManifest}`),
+      },
     },
   };
   writeFixtureFile(root, 'clients/build/build-receipt.json', JSON.stringify(receipt));
@@ -73,7 +87,7 @@ function captureFreshnessResult(root: string): string {
 }
 
 describe('lifecycle bundle build freshness', () => {
-  it('accepts a valid four-output receipt', () => {
+  it('accepts a valid lifecycle bundle receipt', () => {
     const root = createFreshBuildFixture();
 
     expect(() => assertLifecycleBundleSetFresh(root)).not.toThrow();
@@ -104,7 +118,7 @@ describe('lifecycle bundle build freshness', () => {
   it('rejects a manifest-only lifecycle build mutation', () => {
     const root = createFreshBuildFixture();
 
-    writeFixtureFile(root, OUTPUTS.manifest, 'changed manifest bytes');
+    writeFixtureFile(root, OUTPUTS.strictManifest, 'changed manifest bytes');
 
     expect(captureFreshnessResult(root)).toBe(STALE_BUILD_DIAGNOSTIC);
   });

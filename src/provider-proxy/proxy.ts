@@ -3,6 +3,7 @@ import type { ProviderEventBody } from '../providers/contract.js';
 import { createBootstrapNonceCredential, type ProxyBootstrapCapsule } from './bootstrap-capsule.js';
 import { ControlLeaseEvidence } from './control-lease.js';
 import {
+  controlTenancyHolderOf,
   createControlEndpoint,
   type ControlChallengeAuthority,
   type ControlEndpoint,
@@ -18,6 +19,7 @@ import {
   proxyHandoffInstallParamsSchema as handoffInstallParamsSchema,
   proxyHandoffRedeemParamsSchema as handoffRedeemParamsSchema,
 } from './handoff-capsule.js';
+import { createControlHolderAuthority } from './holder-lifecycle.js';
 import {
   operationActivationFingerprint,
   operationPrepareAttemptKey,
@@ -36,6 +38,10 @@ import {
   PROXY_EVENT_COMMIT_TIMEOUT_MS,
   PROXY_STATUS_RPC_TIMEOUT_MS,
   ProxyControlProtocolError,
+  proxyAcquisitionAbortParamsSchema,
+  proxyAcquisitionAbortResultSchema,
+  proxyAcquisitionPublishParamsSchema,
+  proxyAcquisitionPublishResultSchema,
   proxyOperationActivateParamsSchema as activateParamsSchema,
   proxyOperationAttachParamsSchema as attachParamsSchema,
   proxyOperationAttachResultSchema as attachResultSchema,
@@ -55,10 +61,14 @@ import {
   proxyOperationStopParamsSchema as stopParamsSchema,
   providerHostEvictParamsSchema,
   providerHostEvictResultSchema,
+  providerHostEvictResultV2Schema,
   providerHostInspectParamsSchema,
-  providerHostInspectResultSchema,
+  providerHostInspectResultV1Schema,
+  providerHostInspectResultV2Schema,
   providerHostListParamsSchema,
-  providerHostListResultSchema,
+  providerHostListResultV1Schema,
+  providerHostListResultV2Schema,
+  providerHostTerminalEvictionResultV2Schema,
   type CoordinatorIdentity,
   type OperationIdentity,
   type ProxyIdentity,
@@ -103,6 +113,8 @@ function ledgerKey(operation: OperationIdentity): ProviderOperationKey {
  */
 export function createProxy<Scope extends symbol>(options: ProxyOptions<Scope>): Proxy {
   const { capsule, clock, identity, host, timer, mintChallenge, mintReceipt } = options;
+  // Every proxy admission must install into one holder authority.
+  const holderAuthority = createControlHolderAuthority();
   const bootstrapNonce = createBootstrapNonceCredential(capsule.bootstrapNonce);
   const startedAt = clock.now();
   const nowMs = (): number => clock.millisecondsBetween(startedAt, clock.now());
@@ -198,7 +210,10 @@ export function createProxy<Scope extends symbol>(options: ProxyOptions<Scope>):
           const request = openParamsSchema.parse(params);
           bootstrapNonce.spend(request.bootstrapNonce);
           assertNamedCoordinatorBuild(request.coordinator);
-          return { holder: request.coordinator.instanceId, fields: { proxy: identity } };
+          return {
+            holder: controlTenancyHolderOf(request.coordinator),
+            fields: { proxy: identity },
+          };
         },
       },
     ],
@@ -352,6 +367,20 @@ export function createProxy<Scope extends symbol>(options: ProxyOptions<Scope>):
       },
     ],
     [
+      'provider-host.list.v2',
+      {
+        authority: 'observation',
+        budgetMs: PROXY_STATUS_RPC_TIMEOUT_MS,
+        handle: (params) => {
+          providerHostListParamsSchema.parse(params);
+          if (options.providerHosts === undefined) {
+            throw new ProxyControlProtocolError('invalid_state', 'Provider-host administration is unavailable.');
+          }
+          return providerHostListResultV2Schema.parse({ hosts: options.providerHosts.listProviderHosts() });
+        },
+      },
+    ],
+    [
       'provider-host.list.v1',
       {
         authority: 'observation',
@@ -361,7 +390,33 @@ export function createProxy<Scope extends symbol>(options: ProxyOptions<Scope>):
           if (options.providerHosts === undefined) {
             throw new ProxyControlProtocolError('invalid_state', 'Provider-host administration is unavailable.');
           }
-          return providerHostListResultSchema.parse({ hosts: options.providerHosts.listProviderHosts() });
+          const result = providerHostListResultV1Schema.safeParse({
+            hosts: options.providerHosts.listProviderHosts(),
+          });
+          if (!result.success) {
+            throw new ProxyControlProtocolError(
+              'invalid_state',
+              'Provider-host inventory requires provider-host.list.v2.',
+            );
+          }
+          return result.data;
+        },
+      },
+    ],
+    [
+      'provider-host.inspect.v2',
+      {
+        authority: 'observation',
+        budgetMs: PROXY_STATUS_RPC_TIMEOUT_MS,
+        handle: (params) => {
+          const request = providerHostInspectParamsSchema.parse(params);
+          if (options.providerHosts === undefined) {
+            throw new ProxyControlProtocolError('invalid_state', 'Provider-host administration is unavailable.');
+          }
+          const host = options.providerHosts.inspectProviderHost(request.hostRef);
+          return providerHostInspectResultV2Schema.parse(
+            host === null ? { state: 'stale' } : { state: 'matched', host },
+          );
         },
       },
     ],
@@ -376,7 +431,47 @@ export function createProxy<Scope extends symbol>(options: ProxyOptions<Scope>):
             throw new ProxyControlProtocolError('invalid_state', 'Provider-host administration is unavailable.');
           }
           const host = options.providerHosts.inspectProviderHost(request.hostRef);
-          return providerHostInspectResultSchema.parse(host === null ? { state: 'stale' } : { state: 'matched', host });
+          const result = providerHostInspectResultV1Schema.safeParse(
+            host === null ? { state: 'stale' } : { state: 'matched', host },
+          );
+          if (!result.success) {
+            throw new ProxyControlProtocolError(
+              'invalid_state',
+              'Provider-host inventory requires provider-host.inspect.v2.',
+            );
+          }
+          return result.data;
+        },
+      },
+    ],
+    [
+      'provider-host.terminal-eviction.v2',
+      {
+        authority: 'observation',
+        budgetMs: PROXY_STATUS_RPC_TIMEOUT_MS,
+        handle: (params) => {
+          const request = providerHostEvictParamsSchema.parse(params);
+          if (options.providerHosts === undefined) {
+            throw new ProxyControlProtocolError('invalid_state', 'Provider-host administration is unavailable.');
+          }
+          const disposition = options.providerHosts.terminalEviction(request.hostRef);
+          return providerHostTerminalEvictionResultV2Schema.parse(
+            disposition === null ? { state: 'stale' } : { state: 'matched', disposition },
+          );
+        },
+      },
+    ],
+    [
+      'provider-host.evict.v2',
+      {
+        authority: 'active',
+        budgetMs: 'caller-deadline',
+        handle: async (params) => {
+          const request = providerHostEvictParamsSchema.parse(params);
+          if (options.providerHosts === undefined) {
+            throw new ProxyControlProtocolError('invalid_state', 'Provider-host administration is unavailable.');
+          }
+          return providerHostEvictResultV2Schema.parse(await options.providerHosts.evictHost(request.hostRef));
         },
       },
     ],
@@ -390,9 +485,14 @@ export function createProxy<Scope extends symbol>(options: ProxyOptions<Scope>):
           if (options.providerHosts === undefined) {
             throw new ProxyControlProtocolError('invalid_state', 'Provider-host administration is unavailable.');
           }
-          return providerHostEvictResultSchema.parse(
-            (await options.providerHosts.evictHost(request.hostRef)) ? { state: 'evicted' } : { state: 'stale' },
-          );
+          const result = await options.providerHosts.evictHostV1(request.hostRef);
+          if (result.kind === 'requires-v2') {
+            throw new ProxyControlProtocolError(
+              'invalid_state',
+              'Provider-host eviction requires provider-host.evict.v2.',
+            );
+          }
+          return providerHostEvictResultSchema.parse({ state: result.kind });
         },
       },
     ],
@@ -435,11 +535,11 @@ export function createProxy<Scope extends symbol>(options: ProxyOptions<Scope>):
           const redemption = grants.redeem({
             grantId: request.grantId,
             secret: request.secret,
-            successorInstanceId: request.successor.instanceId,
+            successor: controlTenancyHolderOf(request.successor),
             binding: setIdentity,
           });
           return {
-            holder: request.successor.instanceId,
+            holder: controlTenancyHolderOf(request.successor),
             fields: proxyHandoffRedeemFieldsSchema.parse({
               state: 'redeemed-provisional',
               redemptionReceipt: redemption.redemptionReceipt,
@@ -447,6 +547,45 @@ export function createProxy<Scope extends symbol>(options: ProxyOptions<Scope>):
               operations: redemption.grant.operations,
             }),
           };
+        },
+      },
+    ],
+    [
+      'proxy.acquisition-publish.v1',
+      {
+        authority: 'active',
+        handle: (params) => {
+          const request = proxyAcquisitionPublishParamsSchema.parse(params);
+          // Publication certificates must remain opaque; only their accompanying binding may be inspected.
+          if (
+            request.guardian.guardianInstanceId !== capsule.guardianInstanceId ||
+            request.guardian.buildSetId !== capsule.buildSetId ||
+            request.guardian.generation !== capsule.generation ||
+            request.guardian.flavor !== capsule.flavor ||
+            request.guardian.hostFingerprint !== capsule.hostFingerprint ||
+            request.reaper.reaperInstanceId !== capsule.reaperInstanceId ||
+            request.reaper.guardianInstanceId !== capsule.guardianInstanceId ||
+            request.reaper.buildSetId !== capsule.buildSetId
+          ) {
+            throw new ProxyControlProtocolError(
+              'identity_mismatch',
+              'The acquisition certificate names a different guardian/reaper set.',
+            );
+          }
+          holderAuthority.publish();
+          return proxyAcquisitionPublishResultSchema.parse({ state: 'acquisition-published' });
+        },
+      },
+    ],
+    [
+      'proxy.acquisition-abort.v1',
+      {
+        authority: 'active',
+        handle: (params) => {
+          proxyAcquisitionAbortParamsSchema.parse(params);
+          return proxyAcquisitionAbortResultSchema.parse({
+            state: holderAuthority.phase() === 'published' ? 'already-published' : 'acquisition-aborted',
+          });
         },
       },
     ],
@@ -461,6 +600,7 @@ export function createProxy<Scope extends symbol>(options: ProxyOptions<Scope>):
       onControlLost: () => evidence.observeEof(clock.now()),
     },
     timer,
+    holderAuthority,
     requestTimeoutMs: PROXY_CONTROL_RPC_TIMEOUT_MS,
   });
 

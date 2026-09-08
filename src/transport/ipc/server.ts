@@ -25,8 +25,20 @@ import {
 import { isRelocatedSocket } from '../../infra/path/index.js';
 import { documentedCoralSetupError, type DocumentedCoralSetupErrorCode } from '../../runtime/errors.js';
 import { createLineFramer, FrameTooLargeError } from '../line-framing.js';
-import { rpcCatalog, type RpcMethodSpec } from '../rpc/catalog.js';
+import {
+  providerProxySetContainBooleanRpcSpec,
+  providerProxySetContainRpcSpec,
+  rpcCatalog,
+  type RpcMethodSpec,
+} from '../rpc/catalog.js';
 import { operationalRouteSpecs, type IpcOperationalSpec } from '../rpc/operational-catalog.js';
+import {
+  shutdownObligationAbandonMethod,
+  shutdownObligationAbandonRequestSchema,
+  shutdownObligationAbandonResultSchema,
+  type ShutdownObligationAbandonRequest,
+  type ShutdownObligationAbandonResult,
+} from '../../obligation/shutdown-abandonment.js';
 import { type CatalogRequestExecution, executeCatalogRequest } from '../dispatch.js';
 import { writeAuditEvent, writeAuthorizationDecisionAudit } from '../../infra/audit-log.js';
 import { buildJsonRpcError } from '../../infra/json-rpc.js';
@@ -101,6 +113,10 @@ export type IpcListener = {
    * has not yet been installed). Setting/clearing is composition's job.
    */
   onShutdownRequest: ((reason: string) => void) | null;
+  onShutdownObligationAbandonment?: (
+    request: ShutdownObligationAbandonRequest,
+  ) => ShutdownObligationAbandonResult | Promise<ShutdownObligationAbandonResult>;
+  onShutdownRecoveryAccepted?: (() => void) | null;
 };
 
 type IpcResourceTracker = {
@@ -249,6 +265,31 @@ const IPC_OPERATIONAL_SPECS: readonly IpcOperationalSpec[] = operationalRouteSpe
 
 function readIpcOperationalSpec(method: string): IpcOperationalSpec | null {
   return IPC_OPERATIONAL_SPECS.find((spec) => spec.ipc.method === method) ?? null;
+}
+
+function acceptedDrainingRecovery(method: string): boolean {
+  return (
+    method === 'jobs.abort' ||
+    method === shutdownObligationAbandonMethod ||
+    method === providerProxySetContainRpcSpec.name ||
+    method === providerProxySetContainBooleanRpcSpec.name
+  );
+}
+
+function armShutdownRecoveryContinuation(socket: Socket, continuation: () => void): () => void {
+  let completed = false;
+  const complete = () => {
+    if (completed) return;
+    completed = true;
+    socket.off('finish', complete);
+    socket.off('close', complete);
+    continuation();
+  };
+
+  socket.once('finish', complete);
+  socket.once('close', complete);
+  if (socket.destroyed || socket.writableEnded) complete();
+  return complete;
 }
 
 function authenticateIpcRequest(auth: IpcAuthMetadata | undefined, rpcPorts: HttpHandlerPorts): Principal | null {
@@ -542,6 +583,11 @@ export async function listenIpcServer(
         throw new Error('IPC listener does not support compatibility sockets');
       }
       compatibility.onShutdownRequest = (reason) => listener.onShutdownRequest?.(reason);
+      compatibility.onShutdownObligationAbandonment = (request) => {
+        const handler = listener.onShutdownObligationAbandonment;
+        return handler === undefined ? { kind: 'not-held', subject: request.subject } : handler(request);
+      };
+      compatibility.onShutdownRecoveryAccepted = () => listener.onShutdownRecoveryAccepted?.();
       const compatibilityResult =
         compatibilityAddress.kind === 'published'
           ? await bindPublishedSocket(compatibility.server, compatibilityAddress.address)
@@ -659,26 +705,34 @@ async function dispatchFrame(
   dispatchMap: ReadonlyMap<string, IpcDispatchEntry>,
   rpcPorts: HttpHandlerPorts,
   onShutdownRequest: ((reason: string) => void) | null,
+  onShutdownObligationAbandonment:
+    | ((
+        request: ShutdownObligationAbandonRequest,
+      ) => ShutdownObligationAbandonResult | Promise<ShutdownObligationAbandonResult>)
+    | null,
+  onShutdownRecoveryAccepted: (() => void) | null,
   startRequest: () => void,
   finishRequest: () => void,
   options: { writeDrainTimeoutMs: number },
 ): Promise<void> {
+  const finishUnaryResponse = async (response: JsonRpcEnvelope, onUnwritten?: () => void): Promise<void> => {
+    const wroteResponse = await writeEnvelope(socket, response, {
+      drainTimeoutMs: options.writeDrainTimeoutMs,
+    });
+    if (!wroteResponse) onUnwritten?.();
+    socket.end();
+  };
+
   let envelope: JsonRpcEnvelope;
   try {
     envelope = decode(frame);
   } catch (error: unknown) {
-    await writeEnvelope(socket, transportErrorResponse(INVALID_JSON_RESPONSE.message, { cause: String(error) }), {
-      drainTimeoutMs: options.writeDrainTimeoutMs,
-    });
-    socket.end();
+    await finishUnaryResponse(transportErrorResponse(INVALID_JSON_RESPONSE.message, { cause: String(error) }));
     return;
   }
 
   if (envelope.kind !== 'request') {
-    await writeEnvelope(socket, invalidRequestResponse('id' in envelope ? envelope.id : null), {
-      drainTimeoutMs: options.writeDrainTimeoutMs,
-    });
-    socket.end();
+    await finishUnaryResponse(invalidRequestResponse('id' in envelope ? envelope.id : null));
     return;
   }
 
@@ -687,18 +741,10 @@ async function dispatchFrame(
   if (operationalSpec?.dispatch.kind === 'ping') {
     const authError = authorizeIpcOperation(request, operationalSpec, IPC_BOOTSTRAP_LIVENESS_PRINCIPAL);
     if (authError) {
-      await writeEnvelope(socket, authError, { drainTimeoutMs: options.writeDrainTimeoutMs });
-      socket.end();
+      await finishUnaryResponse(authError);
       return;
     }
-    await writeEnvelope(
-      socket,
-      { kind: 'response', id: request.id, result: readPingSnapshot(rpcPorts) },
-      {
-        drainTimeoutMs: options.writeDrainTimeoutMs,
-      },
-    );
-    socket.end();
+    await finishUnaryResponse({ kind: 'response', id: request.id, result: readPingSnapshot(rpcPorts) });
     return;
   }
 
@@ -706,41 +752,26 @@ async function dispatchFrame(
   if (operationalSpec?.authentication === 'principal') {
     const authError = authorizeIpcOperation(request, operationalSpec, principal);
     if (authError) {
-      await writeEnvelope(socket, authError, { drainTimeoutMs: options.writeDrainTimeoutMs });
-      socket.end();
+      await finishUnaryResponse(authError);
       return;
     }
   }
 
   const lifecycleState =
     rpcPorts.admin.getLifecycleState?.() ?? (rpcPorts.admin.isLifecycleRunning() ? 'running' : 'stopped');
-  const backendUnavailable =
-    lifecycleState === 'draining' || lifecycleState === 'stopped' || rpcPorts.admin.isDrainRequested();
+  const draining = lifecycleState === 'draining' || rpcPorts.admin.isDrainRequested();
+  const backendUnavailable = draining || lifecycleState === 'stopped';
+  const drainingRecoveryIngress =
+    draining && (operationalSpec?.dispatch.kind === 'catalog' || operationalSpec?.dispatch.kind === 'shutdown-abandon');
 
   if (operationalSpec) {
     if (operationalSpec.requiresRunningLifecycle && backendUnavailable) {
-      await writeEnvelope(
-        socket,
-        {
-          kind: 'response',
-          id: request.id,
-          result: BACKEND_SHUTTING_DOWN_RESPONSE,
-        },
-        { drainTimeoutMs: options.writeDrainTimeoutMs },
-      );
-      socket.end();
+      await finishUnaryResponse({ kind: 'response', id: request.id, result: BACKEND_SHUTTING_DOWN_RESPONSE });
       return;
     }
 
     if (operationalSpec.dispatch.kind === 'health') {
-      await writeEnvelope(
-        socket,
-        { kind: 'response', id: request.id, result: rpcPorts.health.read() },
-        {
-          drainTimeoutMs: options.writeDrainTimeoutMs,
-        },
-      );
-      socket.end();
+      await finishUnaryResponse({ kind: 'response', id: request.id, result: rpcPorts.health.read() });
       return;
     }
 
@@ -762,27 +793,54 @@ async function dispatchFrame(
       // composition registers `onShutdownRequest` to drive `coordinator.shutdown`
       // directly. No-op when lifecycle is already running (drain handles it).
       onShutdownRequest?.(reason);
-      await writeEnvelope(
-        socket,
-        {
-          kind: 'response',
-          id: request.id,
-          result: { status: 'draining', instanceId: rpcPorts.identity.instanceId },
-        },
-        { drainTimeoutMs: options.writeDrainTimeoutMs },
+      await finishUnaryResponse({
+        kind: 'response',
+        id: request.id,
+        result: { status: 'draining', instanceId: rpcPorts.identity.instanceId },
+      });
+      return;
+    }
+
+    if (operationalSpec.dispatch.kind === 'shutdown-abandon') {
+      if (onShutdownObligationAbandonment === null) {
+        await finishUnaryResponse(methodNotFoundResponse(request.id));
+        return;
+      }
+      const parsedRequest = shutdownObligationAbandonRequestSchema.safeParse(request.params ?? {});
+      if (!parsedRequest.success) {
+        await finishUnaryResponse(validationErrorResponse(request.id, parsedRequest.error));
+        return;
+      }
+      const result = shutdownObligationAbandonResultSchema.parse(
+        await onShutdownObligationAbandonment(parsedRequest.data),
       );
-      socket.end();
+      if (result.kind === 'accepted') {
+        writeAuditEvent(
+          'shutdown_obligation_abandoned',
+          {
+            transport: 'ipc',
+            instanceId: rpcPorts.identity.instanceId,
+            subject: result.receipt.subject,
+            disposition: result.receipt.disposition,
+            detail: result.receipt.detail,
+            statusPath: result.receipt.statusPath,
+          },
+          'warn',
+        );
+      }
+      const completeShutdownRecovery =
+        result.kind === 'accepted' && onShutdownRecoveryAccepted !== null
+          ? armShutdownRecoveryContinuation(socket, onShutdownRecoveryAccepted)
+          : null;
+      await finishUnaryResponse({ kind: 'response', id: request.id, result }, completeShutdownRecovery ?? undefined);
       return;
     }
 
     if (operationalSpec.dispatch.kind === 'kb-restart') {
       if (!rpcPorts.admin.restartKbDaemon) {
-        await writeEnvelope(
-          socket,
+        await finishUnaryResponse(
           requestErrorResponse(request.id, KB_RESTART_UNAVAILABLE_RESPONSE.message, KB_RESTART_UNAVAILABLE_RESPONSE),
-          { drainTimeoutMs: options.writeDrainTimeoutMs },
         );
-        socket.end();
         return;
       }
       writeAuditEvent(
@@ -796,68 +854,42 @@ async function dispatchFrame(
       );
       try {
         const kbDaemon = await rpcPorts.admin.restartKbDaemon('ipc-admin');
-        await writeEnvelope(
-          socket,
-          {
-            kind: 'response',
-            id: request.id,
-            result: { status: 'ok', instanceId: rpcPorts.identity.instanceId, kbDaemon },
-          },
-          { drainTimeoutMs: options.writeDrainTimeoutMs },
-        );
-        socket.end();
+        await finishUnaryResponse({
+          kind: 'response',
+          id: request.id,
+          result: { status: 'ok', instanceId: rpcPorts.identity.instanceId, kbDaemon },
+        });
       } catch (error: unknown) {
         rpcPorts.identity.log(`IPC request error (${request.method}): ${formatError(error)}\n`);
         if (!socket.destroyed && !socket.writableEnded) {
           const response = buildTransportErrorResponse(error);
-          await writeEnvelope(socket, requestErrorResponse(request.id, response.message, response.data), {
-            drainTimeoutMs: options.writeDrainTimeoutMs,
-          });
-          socket.end();
+          await finishUnaryResponse(requestErrorResponse(request.id, response.message, response.data));
         }
       }
       return;
     }
   }
 
-  if (backendUnavailable) {
-    await writeEnvelope(
-      socket,
-      {
-        kind: 'response',
-        id: request.id,
-        result: BACKEND_SHUTTING_DOWN_RESPONSE,
-      },
-      { drainTimeoutMs: options.writeDrainTimeoutMs },
-    );
-    socket.end();
+  if (backendUnavailable && !drainingRecoveryIngress) {
+    await finishUnaryResponse({ kind: 'response', id: request.id, result: BACKEND_SHUTTING_DOWN_RESPONSE });
     return;
   }
 
   const entry = dispatchMap.get(request.method);
   if (!entry) {
-    await writeEnvelope(socket, methodNotFoundResponse(request.id), { drainTimeoutMs: options.writeDrainTimeoutMs });
-    socket.end();
+    await finishUnaryResponse(methodNotFoundResponse(request.id));
     return;
   }
   if (!principal) {
-    await writeEnvelope(
-      socket,
+    await finishUnaryResponse(
       requestErrorResponse(request.id, IPC_UNAUTHORIZED_RESPONSE.message, IPC_UNAUTHORIZED_RESPONSE),
-      {
-        drainTimeoutMs: options.writeDrainTimeoutMs,
-      },
     );
-    socket.end();
     return;
   }
 
   const parsed = entry.spec.requestSchema.safeParse(request.params ?? {});
   if (!parsed.success) {
-    await writeEnvelope(socket, validationErrorResponse(request.id, parsed.error), {
-      drainTimeoutMs: options.writeDrainTimeoutMs,
-    });
-    socket.end();
+    await finishUnaryResponse(validationErrorResponse(request.id, parsed.error));
     return;
   }
   startRequest();
@@ -870,6 +902,10 @@ async function dispatchFrame(
     subscriptionController = new AbortController();
     socket.once('close', abortDispatchOnClose);
     const invocation = await entry.dispatch(parsed.data, principal, subscriptionController.signal);
+    if (invocation.kind === 'unsupported-method') {
+      await finishUnaryResponse(methodNotFoundResponse(request.id));
+      return;
+    }
     if (invocation.kind === 'unary') {
       // Domain-level errors (statusCode >= 400) ride a JSON-RPC `error`
       // envelope so the client rejects with a typed error instead of
@@ -879,18 +915,17 @@ async function dispatchFrame(
       if (typeof invocation.statusCode === 'number' && invocation.statusCode >= 400) {
         const body = invocation.body as { code?: unknown; message?: unknown };
         const message = typeof body.message === 'string' ? body.message : 'request failed';
-        await writeEnvelope(socket, requestErrorResponse(request.id, message, invocation.body), {
-          drainTimeoutMs: options.writeDrainTimeoutMs,
-        });
-        socket.end();
+        await finishUnaryResponse(requestErrorResponse(request.id, message, invocation.body));
         return;
       }
-      await writeEnvelope(
-        socket,
+      const completeShutdownRecovery =
+        drainingRecoveryIngress && acceptedDrainingRecovery(request.method) && onShutdownRecoveryAccepted !== null
+          ? armShutdownRecoveryContinuation(socket, onShutdownRecoveryAccepted)
+          : null;
+      await finishUnaryResponse(
         { kind: 'response', id: request.id, result: invocation.body } as JsonRpcResponseEnvelope,
-        { drainTimeoutMs: options.writeDrainTimeoutMs },
+        completeShutdownRecovery ?? undefined,
       );
-      socket.end();
       return;
     }
 
@@ -903,10 +938,7 @@ async function dispatchFrame(
     rpcPorts.identity.log(`IPC request error (${request.method}): ${formatError(error)}\n`);
     if (!socket.destroyed && !socket.writableEnded) {
       const response = buildTransportErrorResponse(error);
-      await writeEnvelope(socket, requestErrorResponse(request.id, response.message, response.data), {
-        drainTimeoutMs: options.writeDrainTimeoutMs,
-      });
-      socket.end();
+      await finishUnaryResponse(requestErrorResponse(request.id, response.message, response.data));
     }
   } finally {
     socket.off('close', abortDispatchOnClose);
@@ -1047,6 +1079,8 @@ function createTrackedIpcListener(
           dispatchMap,
           rpcPorts,
           listenerRef.current?.onShutdownRequest ?? null,
+          listenerRef.current?.onShutdownObligationAbandonment ?? null,
+          listenerRef.current?.onShutdownRecoveryAccepted ?? null,
           () => {
             rpcPorts.admin.beginRequest();
             inflightRequest = true;
@@ -1068,6 +1102,7 @@ function createTrackedIpcListener(
     createCompatibilityListener: () => createTrackedIpcListener(rpcPorts, options, resources),
     socketPath: null,
     onShutdownRequest: null,
+    onShutdownRecoveryAccepted: null,
   };
   listenerRef.current = listener;
   return listener;

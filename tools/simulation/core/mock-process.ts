@@ -22,8 +22,12 @@ import type {
 import type { RecordedProcessIdentity } from '../../../src/infra/process-containment.js';
 import type {
   DurableExecutionTransport,
+  DurableLaunchDisposition,
+  DurableLaunchHandle,
+  DurableLaunchHeld,
   DurableLaunchOptions,
   DurableLaunchResult,
+  DurableLaunchRetryDisposition,
   RuntimeExecOptions,
   RuntimeSpawnOptions,
 } from '../../../src/runtime/ports.js';
@@ -48,6 +52,7 @@ type RegisteredProcess = {
   timers: Set<TimerHandle>;
   child: MockChildProcess | null;
   killActions: MockKillAction[];
+  onSignal?: (signal: NodeJS.Signals) => void;
   complete: (outcome: ProcessExitOutcome) => void;
   waitForExit: Deferred<DurableProcessExit> | null;
 };
@@ -56,6 +61,8 @@ type MockProcessSpawnerOptions = {
   buildDurableEnv: (envAdditions?: Record<string, string>) => Record<string, string>;
   runtimePid: number;
 };
+
+const DURABLE_LAUNCH_RETRY_INTERVAL_MS = 100;
 
 function asChunks(value: string | ChildOutputChunk[] | undefined): ChildOutputChunk[] {
   if (value === undefined) {
@@ -107,6 +114,8 @@ export class MockStdin extends EventEmitter implements ChildStdinLike {
 }
 
 export class MockChildProcess extends EventEmitter implements ChildProcessLike {
+  exitCode: number | null = null;
+  signalCode: NodeJS.Signals | null = null;
   readonly stdin: ChildStdinLike | null;
   readonly stdout: ChildReadableLike | null;
   readonly stderr: ChildReadableLike | null;
@@ -139,6 +148,9 @@ export class MockChildProcess extends EventEmitter implements ChildProcessLike {
   }
 
   emitClose(code: number | null, signal: string | null): void {
+    this.exitCode = code;
+    this.signalCode = signal as NodeJS.Signals | null;
+    this.emit('exit', this.exitCode, this.signalCode);
     (this.stdout as unknown as PassThrough | null)?.end();
     (this.stderr as unknown as PassThrough | null)?.end();
     if (this.stdin instanceof MockStdin) {
@@ -165,7 +177,7 @@ export class MockDurableTransport implements DurableExecutionTransport {
     this.spawner.enqueueDurable(script);
   }
 
-  async launch(options: DurableLaunchOptions): Promise<DurableLaunchResult> {
+  async launch(options: DurableLaunchOptions): Promise<DurableLaunchDisposition> {
     this.launchCalls.push({
       ...options,
       args: [...options.args],
@@ -377,7 +389,7 @@ export class MockProcessSpawner {
     }
   }
 
-  async launchDurable(options: DurableLaunchOptions): Promise<DurableLaunchResult> {
+  async launchDurable(options: DurableLaunchOptions): Promise<DurableLaunchDisposition> {
     const script = this.durableScripts.shift() ?? {};
     const pid = script.pid ?? this.allocatePid();
     const stdoutPath = script.runtimeRecord?.stdoutPath ?? join(options.jobDir, 'stdout');
@@ -409,7 +421,7 @@ export class MockProcessSpawner {
 
     const exitDeferred = createDeferred<DurableProcessExit>();
     const exitError = script.waitForExitError ? toError(script.waitForExitError) : null;
-    const record = this.registerProcess(pid, null, null, script.kills ?? [], exitDeferred, (outcome) => {
+    const leader = this.registerProcess(pid, pid, null, [], exitDeferred, (outcome) => {
       const exitRecord: DurableProcessExit = {
         exitCode: outcome.exitCode ?? null,
         signal: outcome.signal ?? null,
@@ -421,31 +433,13 @@ export class MockProcessSpawner {
         exitDeferred.resolve(exitRecord);
       }
     });
-
-    for (const chunk of asChunks(script.stdout)) {
-      this.schedule(record, chunk.delayMs ?? 0, () => {
-        if (record.closed) {
-          return;
-        }
-        this.storage.appendFileSync(stdoutPath, chunk.data);
-      });
-    }
-    for (const chunk of asChunks(script.stderr)) {
-      this.schedule(record, chunk.delayMs ?? 0, () => {
-        if (record.closed) {
-          return;
-        }
-        this.storage.appendFileSync(stderrPath, chunk.data);
-      });
-    }
-
-    if ((script.runtimeDelayMs ?? 0) > 0) {
-      await this.time.sleep(script.runtimeDelayMs ?? 0);
-    }
-    if (!record.alive) {
-      throw new Error(`Durable process ${pid} exited before runtime was reported`);
-    }
-
+    const childPid = this.allocatePid();
+    const child = this.registerProcess(childPid, pid, null, script.kills ?? [], null, (outcome) => {
+      leader.complete(outcome);
+    });
+    leader.onSignal = (signal) => {
+      this.applyKill(child, signal);
+    };
     const runtimeRecord: DurableCliRuntimeRecord = {
       ...script.runtimeRecord,
       transport: 'durable-cli',
@@ -454,21 +448,134 @@ export class MockProcessSpawner {
       stdoutPath,
       stderrPath,
     };
-    if (script.exit !== null) {
-      const exit = script.exit ?? { delayMs: 0, exitCode: 0, signal: null };
-      this.schedule(record, exit.delayMs ?? 0, () => {
-        record.complete({
-          exitCode: exit.exitCode ?? 0,
-          signal: exit.signal ?? null,
-        });
+    const wrapperSettlement = exitDeferred.promise.then(
+      () => undefined,
+      () => undefined,
+    );
+    const holdLaunchFailure = (reason: string): DurableLaunchHeld => {
+      const retry = async (): Promise<DurableLaunchRetryDisposition> => {
+        this.applyKill(leader, 'SIGTERM');
+        if (!leader.alive || this.observeLiveness(pid) === 'absent') return { disposition: 'settled' };
+        return holdLaunchFailure(reason);
+      };
+      return {
+        disposition: 'held',
+        owner: 'launch-caller',
+        pid,
+        reason,
+        retryAfter: Promise.race([wrapperSettlement, this.time.sleep(DURABLE_LAUNCH_RETRY_INTERVAL_MS)]),
+        retry,
+      };
+    };
+    let ownershipAccepted = false;
+    const resolveLaunchFailure = async (reason: string): Promise<DurableLaunchHeld> => {
+      let disposition = holdLaunchFailure(reason);
+      if (ownershipAccepted) return disposition;
+      while (true) {
+        await disposition.retryAfter;
+        const retry = await disposition.retry();
+        if (retry.disposition === 'settled') throw new Error(reason);
+        disposition = retry;
+      }
+    };
+    try {
+      const acceptance = options.onWrapperSpawned?.({
+        pid,
+        settled: wrapperSettlement,
+        requestTermination: () => {
+          this.applyKill(leader, 'SIGTERM');
+          return {
+            kind: 'escalation-scheduled',
+            pid,
+            settlement: wrapperSettlement.then(() => ({ kind: 'observed-absent' as const, pid })),
+          };
+        },
+      });
+      if (options.onWrapperSpawned !== undefined && acceptance?.kind !== 'accepted') {
+        return resolveLaunchFailure('Durable wrapper ownership was not accepted.');
+      }
+      ownershipAccepted = acceptance?.kind === 'accepted';
+    } catch (error: unknown) {
+      const detail = error instanceof Error ? error.message : String(error);
+      return resolveLaunchFailure(`Durable wrapper ownership was refused: ${detail}`);
+    }
+    try {
+      options.onWrapperIdentified?.({ runtimeRecord, pid, leaderIncarnation: leader.incarnation });
+    } catch (error: unknown) {
+      return resolveLaunchFailure(error instanceof Error ? error.message : String(error));
+    }
+
+    for (const chunk of asChunks(script.stdout)) {
+      this.schedule(child, chunk.delayMs ?? 0, () => {
+        if (child.closed) {
+          return;
+        }
+        this.storage.appendFileSync(stdoutPath, chunk.data);
+      });
+    }
+    for (const chunk of asChunks(script.stderr)) {
+      this.schedule(child, chunk.delayMs ?? 0, () => {
+        if (child.closed) {
+          return;
+        }
+        this.storage.appendFileSync(stderrPath, chunk.data);
       });
     }
 
+    const publishRuntime = (): void => {
+      if (!leader.alive || !child.alive) {
+        throw new Error(`Durable process ${pid} exited before runtime was reported`);
+      }
+
+      options.onSpawned?.({
+        runtimeRecord,
+        leaderIncarnation: leader.incarnation,
+        childRoot: { pid: childPid, incarnation: child.incarnation },
+      });
+      if (script.exit !== null) {
+        const exit = script.exit ?? { delayMs: 0, exitCode: 0, signal: null };
+        this.schedule(child, exit.delayMs ?? 0, () => {
+          child.complete({
+            exitCode: exit.exitCode ?? 0,
+            signal: exit.signal ?? null,
+          });
+        });
+      }
+    };
+
+    const runtimeDelayMs = script.runtimeDelayMs ?? 0;
+    try {
+      if (runtimeDelayMs > 0) {
+        await new Promise<void>((resolve, reject) => {
+          this.time.setTimeout(() => {
+            try {
+              publishRuntime();
+              resolve();
+            } catch (error: unknown) {
+              reject(error instanceof Error ? error : new Error(String(error), { cause: error }));
+            }
+          }, runtimeDelayMs);
+        });
+      } else {
+        publishRuntime();
+      }
+    } catch (error: unknown) {
+      return resolveLaunchFailure(error instanceof Error ? error.message : String(error));
+    }
+
     return {
+      disposition: 'launched',
+      launchHandle: `simulation-durable-launch:${leader.incarnation}` as DurableLaunchHandle,
       pid,
       stdoutPath,
       stderrPath,
       runtimeRecord,
+      processSubject: {
+        pid,
+        incarnation: leader.incarnation,
+        processGroupId: pid,
+        childRoot: { pid: childPid, incarnation: child.incarnation },
+      },
     };
   }
 
@@ -481,6 +588,9 @@ export class MockProcessSpawner {
   }
 
   private allocatePid(): number {
+    while (this.processes.has(this.nextPid)) {
+      this.nextPid += 1;
+    }
     const pid = this.nextPid;
     this.nextPid += 1;
     return pid;
@@ -552,6 +662,10 @@ export class MockProcessSpawner {
   }
 
   private applyKill(record: RegisteredProcess, signal: NodeJS.Signals): void {
+    if (record.onSignal) {
+      record.onSignal(signal);
+      return;
+    }
     const action = this.resolveKillAction(record.killActions, signal);
     if (!action) {
       record.complete({

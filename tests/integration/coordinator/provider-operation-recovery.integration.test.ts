@@ -110,7 +110,7 @@ describe('provider-operation startup recovery ownership', () => {
       finalizeInterruptedDurableJob: vi.fn(async () => {}),
       adoptRunningJob: vi.fn(async () => ({ adopted: true, cleanup: vi.fn() })),
       recoverQueuedJob,
-      interruptAppServerJob: vi.fn(async () => {}),
+      interruptAppServerJob: vi.fn(async () => ({ kind: 'acknowledged' as const })),
       completeRecoveredJob: vi.fn(),
     } as RecoveryCapableService;
     const cancelOperation: DurableProviderProxyOperationAuthority['cancelOperation'] = async (
@@ -181,6 +181,7 @@ describe('provider-operation startup recovery ownership', () => {
           bundleHash: '0123456789abcdef',
           cliBundleHash: '0123456789abcdef',
           claudeAppserverBundleHash: '0123456789abcdef',
+          durableWrapperBundleHash: '0123456789abcdef',
           flavor: 'prod',
           instanceId: 'provider-operation-recovery-integration',
           token: 'test-token',
@@ -223,7 +224,7 @@ describe('provider-operation startup recovery ownership', () => {
         removeBackendInfoIfOwnerFn: vi.fn(),
         cleanupStaleJobsFn: vi.fn(),
         markJobsAsErrorFn: vi.fn(),
-        terminateAllFn: vi.fn(),
+        terminateAllFn: vi.fn(async () => ({ kind: 'all-observed-absent' as const })),
         providerHostManager: { drainForHandoff: vi.fn(), shutdown: vi.fn(async () => {}) } as never,
         handoffQuiescePorts: () => [],
         createKbHealthComponentFn: () => ({

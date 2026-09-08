@@ -1,11 +1,21 @@
 import { chmodSync, existsSync, lstatSync, mkdirSync, mkdtempSync, rmSync, statSync, symlinkSync } from 'node:fs';
+import { ChildProcess } from 'node:child_process';
+import { EventEmitter } from 'node:events';
+import { PassThrough } from 'node:stream';
 import type * as NodeFs from 'node:fs';
 import { tmpdir } from 'node:os';
 import type * as NodeOs from 'node:os';
 import { join } from 'node:path';
 import { afterEach, describe, expect, it, vi } from 'vitest';
-import { createRealRuntime } from '#src/runtime/real.js';
-import type { ChildProcessLike } from '#src/infra/port-types.js';
+import { createRealRuntime, waitForDurableRuntime, waitForRecordedDurableExit } from '#src/runtime/real.js';
+import type * as NodeProcess from '#src/infra/node-process.js';
+import type { ChildProcessLike, TimePort } from '#src/infra/port-types.js';
+import type {
+  DurableLaunchDisposition,
+  DurableLaunchResult,
+  DurablePendingLaunchObligation,
+} from '#src/runtime/ports.js';
+import { testIncarnation } from '#tests/helpers/process-incarnation.js';
 
 const createdDirs: string[] = [];
 
@@ -21,6 +31,54 @@ function createTempDir(prefix: string): string {
   const dir = mkdtempSync(join(tmpdir(), prefix));
   createdDirs.push(dir);
   return dir;
+}
+
+async function requireLaunched(disposition: DurableLaunchDisposition): Promise<DurableLaunchResult> {
+  if (disposition.disposition === 'launched') return disposition;
+  const reason = disposition.reason;
+  let held = disposition;
+  while (true) {
+    await held.retryAfter;
+    const retry = await held.retry();
+    if (retry.disposition === 'settled') throw new Error(reason);
+    held = retry;
+  }
+}
+
+async function confirmExitGraceAcrossWallClockJump(wallClockJumpMs: number): Promise<{
+  wallClockMs: number;
+  sleepCount: number;
+}> {
+  let wallClockMs = 1_700_000_000_000;
+  let monotonicMs = 0n;
+  let sleepCount = 0;
+  const time: Pick<TimePort, 'now' | 'monotonicNow' | 'sleep'> = {
+    now: () => wallClockMs,
+    monotonicNow: () => monotonicMs,
+    sleep: (milliseconds) => {
+      sleepCount += 1;
+      if (sleepCount === 1) wallClockMs += wallClockJumpMs;
+      monotonicMs += BigInt(milliseconds);
+      return Promise.resolve();
+    },
+  };
+  const pid = 2_000_000_000;
+
+  await expect(
+    waitForRecordedDurableExit(
+      {
+        pid,
+        incarnation: testIncarnation('absent-wrapper'),
+        processGroupId: pid,
+        childRoot: { pid: pid + 1, incarnation: testIncarnation('absent-child') },
+      },
+      pid,
+      'linux',
+      time,
+    ),
+  ).rejects.toThrow(`Durable process ${pid} exited before the wrapper reported completion`);
+
+  return { wallClockMs, sleepCount };
 }
 
 function waitForClose(child: ChildProcessLike): Promise<{ code: number | null; signal: NodeJS.Signals | null }> {
@@ -54,6 +112,75 @@ async function readPipedOutput(child: ChildProcessLike): Promise<{
 }
 
 describe('createRealRuntime', () => {
+  it('rejects a silent durable wrapper after a late zero-delay post-wake turn', async () => {
+    let monotonicMs = 0n;
+    const pending: Array<{ callback: () => void; delayMs: number }> = [];
+    const time: TimePort = {
+      now: () => Number(monotonicMs),
+      monotonicNow: () => monotonicMs,
+      sleep: async () => undefined,
+      setTimeout: (callback, delayMs) => {
+        pending.push({ callback, delayMs });
+        return {};
+      },
+      clearTimeout: vi.fn(),
+      setInterval: vi.fn(() => ({})),
+      clearInterval: vi.fn(),
+    };
+    const wrapper = Object.assign(new EventEmitter(), {
+      pid: 101,
+      stdout: new PassThrough(),
+      stderr: new PassThrough(),
+    });
+    const readiness = waitForDurableRuntime({ time, wrapper: wrapper as never });
+    const runNext = (): void => {
+      const timer = pending.shift();
+      if (timer === undefined) throw new Error('expected a pending readiness timer');
+      monotonicMs += BigInt(timer.delayMs === 0 ? 1 : timer.delayMs);
+      timer.callback();
+    };
+
+    runNext();
+    runNext();
+
+    await expect(readiness).rejects.toThrow('Durable wrapper failed to report runtime within 5000ms');
+    expect(pending).toEqual([]);
+  });
+
+  it('rejects a malformed durable wrapper control message', async () => {
+    const time: TimePort = {
+      now: () => 0,
+      monotonicNow: () => 0n,
+      sleep: async () => undefined,
+      setTimeout: vi.fn(() => ({})),
+      clearTimeout: vi.fn(),
+      setInterval: vi.fn(() => ({})),
+      clearInterval: vi.fn(),
+    };
+    const wrapper = Object.assign(new EventEmitter(), {
+      pid: 101,
+      stdout: new PassThrough(),
+      stderr: new PassThrough(),
+    });
+    const readiness = waitForDurableRuntime({ time, wrapper: wrapper as never });
+
+    wrapper.stdout.write('null\n');
+
+    await expect(readiness).rejects.toThrow('Durable wrapper emitted an invalid control message');
+  });
+
+  it('measures durable exit confirmation across a forward wall-clock jump with monotonic time', async () => {
+    const result = await confirmExitGraceAcrossWallClockJump(60_000);
+
+    expect(result).toEqual({ wallClockMs: 1_700_000_060_000, sleepCount: 50 });
+  });
+
+  it('measures durable exit confirmation across a backward wall-clock jump with monotonic time', async () => {
+    const result = await confirmExitGraceAcrossWallClockJump(-60_000);
+
+    expect(result).toEqual({ wallClockMs: 1_699_999_940_000, sleepCount: 50 });
+  });
+
   it('captures a sealed CORAL_* snapshot once', () => {
     vi.stubEnv('CORAL_OWNER', 'owner-a');
     vi.stubEnv('CORAL_EFFORT', 'high');
@@ -143,25 +270,28 @@ describe('createRealRuntime', () => {
     const originalUmask = process.umask(0o022);
 
     try {
-      const durable = await runtime.process.durable.launch({
-        provider: 'codex',
-        command: process.execPath,
-        args: [
-          '-e',
-          [
-            "process.stdout.write('step-one\\n');",
-            "process.stderr.write('warn\\n');",
-            'setTimeout(() => process.exit(0), 25);',
-          ].join(''),
-        ],
-        jobDir,
-        envAdditions: {
-          CORAL_OWNER: 'durable-owner',
-        },
-      });
+      const durable = await requireLaunched(
+        await runtime.process.durable.launch({
+          provider: 'codex',
+          command: process.execPath,
+          args: [
+            '-e',
+            [
+              "process.stdout.write('step-one\\n');",
+              "process.stderr.write('warn\\n');",
+              'setTimeout(() => process.exit(0), 25);',
+            ].join(''),
+          ],
+          jobDir,
+          envAdditions: {
+            CORAL_OWNER: 'durable-owner',
+          },
+        }),
+      );
       const exit = await runtime.process.durable.waitForExit(durable);
 
       expect(durable.pid).toBeGreaterThan(0);
+      expect(durable.launchHandle).toEqual(expect.any(String));
       expect(exit).toMatchObject({ exitCode: 0, signal: null });
       expect(existsSync(join(jobDir, 'runtime.json'))).toBe(false);
       expect(existsSync(join(jobDir, 'exit.json'))).toBe(false);
@@ -176,6 +306,249 @@ describe('createRealRuntime', () => {
       process.umask(originalUmask);
     }
   });
+
+  it('retains an unreadable durable wrapper until its joinable retry observes settlement', async () => {
+    vi.resetModules();
+    vi.doMock('#src/infra/node-process.js', async () => {
+      const actual = await vi.importActual<typeof NodeProcess>('#src/infra/node-process.js');
+      return { ...actual, probeProcessIncarnation: () => null };
+    });
+
+    try {
+      const { createRealRuntime: createMockedRuntime } = await import('#src/runtime/real.js');
+      const runtime = createMockedRuntime('prod');
+      const jobDir = join(createTempDir('coral-runtime-unreadable-wrapper-'), 'job-1');
+      runtime.storage.mkdirSync(jobDir, { recursive: true });
+      let acceptedObligation: DurablePendingLaunchObligation | null = null;
+
+      const disposition = await runtime.process.durable.launch({
+        provider: 'codex',
+        command: process.execPath,
+        args: ['-e', 'setInterval(() => {}, 1000);'],
+        jobDir,
+        onWrapperSpawned: (obligation) => {
+          acceptedObligation = obligation;
+          return { kind: 'accepted' };
+        },
+      });
+
+      expect(disposition).toMatchObject({
+        disposition: 'held',
+        owner: 'launch-caller',
+        pid: expect.any(Number),
+        reason: expect.stringContaining('could not establish the wrapper process identity'),
+        retryAfter: expect.any(Promise),
+        retry: expect.any(Function),
+      });
+      if (disposition.disposition !== 'held') throw new Error('Expected unreadable wrapper launch to be held');
+      expect(acceptedObligation).toMatchObject({ pid: disposition.pid, settled: expect.any(Promise) });
+
+      await disposition.retryAfter;
+      let retryDisposition = await disposition.retry();
+      while (retryDisposition.disposition === 'held') {
+        await retryDisposition.retryAfter;
+        retryDisposition = await retryDisposition.retry();
+      }
+      expect(retryDisposition).toEqual({ disposition: 'settled' });
+    } finally {
+      vi.doUnmock('#src/infra/node-process.js');
+      vi.resetModules();
+    }
+  });
+
+  it('settles a durable wrapper internally when the ownership boundary does not accept it', async () => {
+    const runtime = createRealRuntime('prod');
+    const jobDir = join(createTempDir('coral-runtime-refused-wrapper-'), 'job-1');
+    runtime.storage.mkdirSync(jobDir, { recursive: true });
+    let observeRefusal!: (obligation: DurablePendingLaunchObligation) => void;
+    const refusalObserved = new Promise<DurablePendingLaunchObligation>((resolve) => {
+      observeRefusal = resolve;
+    });
+
+    const launch = runtime.process.durable.launch({
+      provider: 'codex',
+      command: process.execPath,
+      args: ['-e', 'setInterval(() => {}, 1000);'],
+      jobDir,
+      onWrapperSpawned: ((obligation: DurablePendingLaunchObligation) => {
+        observeRefusal(obligation);
+        return { kind: 'refused' };
+      }) as never,
+    });
+    const refusedObligation = await refusalObserved;
+
+    let launchSettled = false;
+    void launch.then(
+      () => {
+        launchSettled = true;
+      },
+      () => {
+        launchSettled = true;
+      },
+    );
+    await Promise.resolve();
+    expect(launchSettled).toBe(false);
+    expect(refusedObligation).toMatchObject({
+      pid: expect.any(Number),
+      settled: expect.any(Promise),
+      requestTermination: expect.any(Function),
+    });
+
+    await refusedObligation.settled;
+    await expect(launch).rejects.toThrow('Durable wrapper ownership was not accepted.');
+  });
+
+  it('publishes the wrapper leader and provider child before durable launch returns', async () => {
+    const runtime = createRealRuntime('prod');
+    const rootDir = createTempDir('coral-runtime-provisional-');
+    const jobDir = join(rootDir, 'job-1');
+    runtime.storage.mkdirSync(jobDir, { recursive: true });
+    const onSpawned = vi.fn();
+    const unref = vi.spyOn(ChildProcess.prototype, 'unref');
+
+    const durable = await requireLaunched(
+      await runtime.process.durable.launch({
+        provider: 'codex',
+        command: process.execPath,
+        args: ['-e', 'setTimeout(() => process.exit(0), 25);'],
+        jobDir,
+        onSpawned,
+      }),
+    );
+
+    expect(onSpawned).toHaveBeenCalledOnce();
+    expect(unref).toHaveBeenCalledOnce();
+    const provisional = onSpawned.mock.calls[0]?.[0];
+    expect(provisional).toMatchObject({
+      runtimeRecord: {
+        transport: 'durable-cli',
+        pid: expect.any(Number),
+        stdoutPath: join(jobDir, 'stdout'),
+        stderrPath: join(jobDir, 'stderr'),
+      },
+      leaderIncarnation: expect.any(String),
+      childRoot: {
+        pid: expect.any(Number),
+        incarnation: expect.any(String),
+      },
+      signalAuthority: {
+        pid: expect.any(Number),
+        hasExited: expect.any(Function),
+      },
+    });
+    expect(provisional?.childRoot?.pid).not.toBe(provisional?.runtimeRecord.pid);
+
+    expect(durable.runtimeRecord).toEqual(provisional?.runtimeRecord);
+    expect(durable.processSubject?.childRoot).toEqual(provisional?.childRoot);
+    expect(durable.signalAuthority).toBe(provisional?.signalAuthority);
+    expect(durable.signalAuthority?.hasExited()).toBe(false);
+    await runtime.process.durable.waitForExit(durable);
+    await vi.waitFor(() => expect(durable.signalAuthority?.hasExited()).toBe(true));
+  });
+
+  it('keeps the wrapper alive until a signalled durable child exits', async () => {
+    const runtime = createRealRuntime('prod');
+    const rootDir = createTempDir('coral-runtime-wrapper-owner-');
+    const jobDir = join(rootDir, 'job-1');
+    runtime.storage.mkdirSync(jobDir, { recursive: true });
+
+    const durable = await requireLaunched(
+      await runtime.process.durable.launch({
+        provider: 'codex',
+        command: process.execPath,
+        args: ['-e', "process.on('SIGTERM', () => {}); process.stdout.write('ready\\n'); setInterval(() => {}, 1000);"],
+        jobDir,
+      }),
+    );
+    const readyDeadline = Date.now() + 2_000;
+    while (!runtime.storage.readFileSync(durable.stdoutPath, 'utf-8').includes('ready')) {
+      if (Date.now() >= readyDeadline) throw new Error('durable child did not become ready');
+      await new Promise<void>((resolve) => setTimeout(resolve, 10));
+    }
+
+    expect(runtime.process.kill(durable.pid, 'SIGTERM')).toBe(true);
+    await expect(runtime.process.durable.waitForExit(durable)).resolves.toMatchObject({
+      exitCode: null,
+      signal: 'SIGKILL',
+    });
+    expect(runtime.process.observeLiveness(durable.pid)).toBe('absent');
+  }, 10_000);
+
+  it('refuses an exit promise from a different launch handle', async () => {
+    const runtime = createRealRuntime('prod');
+    const rootDir = createTempDir('coral-runtime-launch-handle-');
+    const firstJobDir = join(rootDir, 'job-1');
+    const secondJobDir = join(rootDir, 'job-2');
+    runtime.storage.mkdirSync(firstJobDir, { recursive: true });
+    runtime.storage.mkdirSync(secondJobDir, { recursive: true });
+
+    const first = await requireLaunched(
+      await runtime.process.durable.launch({
+        provider: 'codex',
+        command: process.execPath,
+        args: ['-e', 'setTimeout(() => process.exit(0), 100);'],
+        jobDir: firstJobDir,
+      }),
+    );
+    const second = await requireLaunched(
+      await runtime.process.durable.launch({
+        provider: 'codex',
+        command: process.execPath,
+        args: ['-e', 'setTimeout(() => process.exit(0), 100);'],
+        jobDir: secondJobDir,
+      }),
+    );
+
+    await expect(runtime.process.durable.waitForExit({ ...first, launchHandle: second.launchHandle })).rejects.toThrow(
+      `Durable launch ${second.launchHandle} is not attached to process ${first.pid}.`,
+    );
+    await expect(runtime.process.durable.waitForExit(first)).resolves.toMatchObject({ exitCode: 0, signal: null });
+    await expect(runtime.process.durable.waitForExit(second)).resolves.toMatchObject({ exitCode: 0, signal: null });
+  });
+
+  it('does not settle a failed wrapper while its recorded child is still running', async () => {
+    const runtime = createRealRuntime('prod');
+    const rootDir = createTempDir('coral-runtime-child-survives-wrapper-');
+    const jobDir = join(rootDir, 'job-1');
+    runtime.storage.mkdirSync(jobDir, { recursive: true });
+
+    const durable = await requireLaunched(
+      await runtime.process.durable.launch({
+        provider: 'codex',
+        command: process.execPath,
+        args: ['-e', "process.stdout.write('ready\\n'); setInterval(() => {}, 1000);"],
+        jobDir,
+      }),
+    );
+    const childPid = durable.processSubject?.childRoot.pid;
+    if (childPid === undefined) throw new Error('durable launch did not capture its child root');
+    const readyDeadline = Date.now() + 2_000;
+    while (!runtime.storage.readFileSync(durable.stdoutPath, 'utf-8').includes('ready')) {
+      if (Date.now() >= readyDeadline) throw new Error('durable child did not become ready');
+      await new Promise<void>((resolve) => setTimeout(resolve, 10));
+    }
+
+    const completion = runtime.process.durable.waitForExit(durable);
+    try {
+      expect(runtime.process.kill(durable.pid, 'SIGKILL')).toBe(true);
+      const earlyDisposition = await Promise.race([
+        completion.then(
+          () => 'settled',
+          () => 'settled',
+        ),
+        new Promise<'held'>((resolve) => setTimeout(() => resolve('held'), 250)),
+      ]);
+      expect(earlyDisposition).toBe('held');
+
+      expect(runtime.process.kill(childPid, 'SIGKILL')).toBe(true);
+      await expect(completion).rejects.toThrow(
+        `Durable process ${durable.pid} exited before the wrapper reported completion`,
+      );
+    } finally {
+      runtime.process.kill(-durable.pid, 'SIGKILL');
+      runtime.process.kill(childPid, 'SIGKILL');
+    }
+  }, 10_000);
 
   it('writes and appends through durable storage operations', () => {
     const runtime = createRealRuntime('prod');

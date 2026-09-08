@@ -1,5 +1,4 @@
-import { backendLog } from '../../../infra/backend-log.js';
-import { formatError } from '../../../infra/error-format.js';
+import { errorMessage, formatError } from '../../../infra/error-format.js';
 import { isTerminalPhase } from '../../../jobs/phase.js';
 import { isAppServerRuntime, type JobRuntime } from '../../../jobs/records.js';
 import type { DurableCliRuntimeRecord } from '../../../runtime/durable-runtime.js';
@@ -7,12 +6,30 @@ import { isDurableCliRuntime } from '../../../runtime/durable-runtime.js';
 import type { InvocationContext } from '../../../runtime/invocation-context.js';
 import type { JobStore } from '../../../jobs/store.js';
 import type { RecoveryAction } from '../../../jobs/reconcile/plan.js';
-import type { RecoveryRegistry } from '../../../jobs/reconcile/registry.js';
+import type { RecoveryAbortDisposition, RecoveryRegistry } from '../../../jobs/reconcile/registry.js';
 import type { Runtime } from '../../../runtime/ports.js';
 import type { ProviderRecoveryAuthority, RecoveryCapableService } from '../../../jobs/reconcile/contracts.js';
 import type { RecoveryCommitFence } from '../../../jobs/reconcile/contracts.js';
-import { gracefulKillByPid } from '../../../infra/process-supervision.js';
+import {
+  readDurableCliContainmentStatus,
+  readDurableCliPreReadyOwnershipEvidence,
+  writeDurableCliContainmentStatus,
+} from '../../../jobs/runtime-meta-store.js';
+import type {
+  DurableCliProcessRuntimeEvidence,
+  DurableCliProcessRuntimeMeta,
+  DurableCliProvisionalProcessRuntimeMeta,
+} from '../../../jobs/runtime-meta.js';
+import type { DurableCliPreReadyOwnershipEvidence } from '../../../jobs/runtime-meta-store.js';
 import type { JobLifecycleFault, JobProgressFault } from '../../../jobs/outcome.js';
+import { createMonotonicClock } from '../../../infra/monotonic-clock.js';
+import { reapRecordedContainment } from '../../../infra/process-containment.js';
+import {
+  CONTAINMENT_DISAPPEARANCE_CONFIRM_MS,
+  CONTAINMENT_PROCESS_CONTROL_CALL_MAX_MS,
+  SIGKILL_GRACE_MS,
+  SIGTERM_GRACE_MS,
+} from '../../../infra/process-constants.js';
 import type {
   RecoveryDisposition,
   RecoveryObligationId,
@@ -21,6 +38,12 @@ import type {
 
 export const COORDINATOR_TERMINAL_OBLIGATION = 'coordinator-job-terminal' as RecoveryObligationId;
 export const COORDINATOR_CLAIM_RELEASE_OBLIGATION = 'coordinator-session-claim-release' as RecoveryObligationId;
+const durableRecoveryClockScope = Symbol('durable-recovery');
+const DURABLE_RECOVERY_REAP_DEADLINE_MS =
+  SIGTERM_GRACE_MS +
+  SIGKILL_GRACE_MS +
+  CONTAINMENT_DISAPPEARANCE_CONFIRM_MS +
+  2 * CONTAINMENT_PROCESS_CONTROL_CALL_MAX_MS;
 
 export const COORDINATOR_NOT_APPLICABLE_FACTS: readonly RecoverySettlementFact[] = Object.freeze([
   Object.freeze({ obligation: COORDINATOR_TERMINAL_OBLIGATION, outcome: 'not-applicable' as const }),
@@ -33,6 +56,102 @@ export type RunningRecoverableJob = {
   authority: ProviderRecoveryAuthority;
   runtimeRecord: JobRuntime;
 };
+
+export async function reapDurableCliProcess(
+  runtime: Runtime,
+  record: DurableCliProcessRuntimeMeta | DurableCliProvisionalProcessRuntimeMeta,
+  signal: AbortSignal,
+): Promise<Readonly<{ kind: 'absence-confirmed' }> | Readonly<{ kind: 'held'; reason: string }>> {
+  const clock = createMonotonicClock(durableRecoveryClockScope, {
+    readMilliseconds: () => runtime.time.monotonicNow(),
+    sleep: (milliseconds) => runtime.time.sleep(milliseconds),
+  });
+  try {
+    const outcome = await reapRecordedContainment(
+      { pid: record.pid, incarnation: record.incarnation, processGroupId: record.processGroupId },
+      'childRoot' in record ? [record.childRoot] : [],
+      clock.shiftMilliseconds(clock.now(), DURABLE_RECOVERY_REAP_DEADLINE_MS),
+      {
+        maxRecordedRoots: 'childRoot' in record ? 1 : 0,
+        clock,
+        process: runtime.process,
+        platform: runtime.env.platform() as NodeJS.Platform,
+        readProcessIncarnation: (pid, platform) => runtime.process.readProcessIncarnation(pid, platform),
+        signal,
+      },
+    );
+    switch (outcome.kind) {
+      case 'containment-absent':
+        return { kind: 'absence-confirmed' };
+      case 'recorded-group-unattributable':
+        return { kind: 'held', reason: 'the recorded leader is gone but its process group remains unattributable' };
+      case 'signal-authorization-refused':
+        return {
+          kind: 'held',
+          reason: 'signal authorization could not be established for every recorded-containment target',
+        };
+      case 'identity-unobservable':
+        return {
+          kind: 'held',
+          reason: outcome.signalDelivered
+            ? 'process identity became unobservable after a recorded-containment signal was delivered'
+            : 'process identity could not be observed before recorded-containment signal authorization',
+        };
+    }
+  } catch (error: unknown) {
+    return { kind: 'held', reason: errorMessage(error) };
+  }
+}
+
+function abortDurableCliProcess(
+  jobId: string,
+  runtime: Runtime,
+  evidence: DurableCliPreReadyOwnershipEvidence,
+  signal: AbortSignal,
+  retainHold: (reason: string) => void,
+): RecoveryAbortDisposition {
+  if (evidence.kind !== 'current' && evidence.kind !== 'provisional') {
+    return { kind: 'refused', reason: durableOwnershipEvidenceHoldReason(evidence) };
+  }
+  const record = evidence.record;
+  const retry =
+    `Run coral-cli jobs detail ${jobId}; if cleanup remains held, run coral-cli abort jobs ${jobId} ` +
+    'again to explicitly abandon ownership.';
+  return {
+    kind: 'held',
+    reason: 'identity-safe SIGTERM/SIGKILL reaping is in progress until recorded containment absence is confirmed',
+    nextStep: retry,
+    settlement: reapDurableCliProcess(runtime, record, signal).then((result) => {
+      if (result.kind === 'absence-confirmed') return { kind: 'accepted' as const };
+      retainHold(result.reason);
+      return { kind: 'held' as const, reason: result.reason, nextStep: retry };
+    }),
+  };
+}
+
+export function durableRuntimeEvidenceHoldReason(
+  evidence: Exclude<DurableCliProcessRuntimeEvidence, { kind: 'current' }>,
+): string {
+  if (evidence.kind === 'predecessor') {
+    return (
+      `predecessor v1 evidence identifies pid ${evidence.record.pid} and its incarnation, but it does not name ` +
+      'the process group or child root and cannot authorize a signal'
+    );
+  }
+  switch (evidence.reason) {
+    case 'missing':
+      return 'durable process containment evidence is missing';
+    case 'corrupt-current':
+      return 'the current durable process containment evidence is corrupt';
+    case 'corrupt-predecessor':
+      return 'the predecessor durable process containment evidence is corrupt';
+    case 'identity-mismatch':
+      return 'the durable process containment evidence does not match the journal identity';
+  }
+  const exhaustive: never = evidence.reason;
+  return exhaustive;
+}
+
 type RecoveryActionContext = {
   progressStore: JobStore;
   recoveryRegistry: RecoveryRegistry;
@@ -47,6 +166,7 @@ type RecoveryActionContext = {
   settleClaim(jobId: string): readonly RecoverySettlementFact[];
   setProcessLocalCleanup(cleanup: () => void): void;
   clearProcessLocalCleanup(): void;
+  abandonHeldJob?(jobId: string): RecoveryAbortDisposition;
 };
 
 export async function applyRecoveryAction(
@@ -58,6 +178,8 @@ export async function applyRecoveryAction(
       return discardIncompleteAdmission(action, ctx);
     case 'markError':
       return markRecoveryError(action, ctx);
+    case 'resolvePreReadyLaunch':
+      return resolvePreReadyLaunch(action, ctx);
     case 'registerQueued':
       return registerQueuedRecovery(action, ctx);
     case 'registerRunning':
@@ -65,6 +187,111 @@ export async function applyRecoveryAction(
     case 'releaseSessionClaim':
       return releaseSessionClaim(action, ctx);
   }
+}
+
+export function durableOwnershipEvidenceHoldReason(evidence: DurableCliPreReadyOwnershipEvidence): string {
+  if (evidence.kind === 'current' || evidence.kind === 'provisional') {
+    return 'recorded durable containment absence is not yet proven';
+  }
+  if (evidence.kind === 'predecessor') return durableRuntimeEvidenceHoldReason(evidence);
+  switch (evidence.reason) {
+    case 'missing':
+      return 'durable process containment evidence is missing';
+    case 'corrupt-current':
+      return 'the current durable process containment evidence is corrupt';
+    case 'corrupt-provisional':
+      return 'the provisional durable process containment evidence is corrupt';
+    case 'corrupt-predecessor':
+      return 'the predecessor durable process containment evidence is corrupt';
+    case 'identity-mismatch':
+      return 'the durable process containment evidence names a different job';
+  }
+}
+
+export function durableOwnershipStatusEvidence(
+  evidence: DurableCliPreReadyOwnershipEvidence,
+): DurableCliProcessRuntimeEvidence {
+  if (evidence.kind === 'current' || evidence.kind === 'predecessor') return evidence;
+  if (evidence.kind === 'provisional') return { kind: 'unavailable', reason: 'missing' };
+  return {
+    kind: 'unavailable',
+    reason: evidence.reason === 'corrupt-provisional' ? 'corrupt-current' : evidence.reason,
+  };
+}
+
+async function resolvePreReadyLaunch(
+  action: Extract<RecoveryAction, { type: 'resolvePreReadyLaunch' }>,
+  ctx: RecoveryActionContext,
+): Promise<RecoveryDisposition> {
+  const persistedStatus = readDurableCliContainmentStatus(ctx.progressStore.getDb(), action.jobId);
+  if (persistedStatus.kind === 'valid' && persistedStatus.status.disposition.kind === 'operator-abandoned') {
+    return markRecoveryError(
+      { type: 'markError', jobId: action.jobId, fault: { kind: 'ghost_launch' }, status: action.status },
+      ctx,
+    );
+  }
+
+  const evidence = readDurableCliPreReadyOwnershipEvidence(ctx.progressStore.getDb(), action.jobId);
+  if (evidence.kind === 'unavailable' && evidence.reason === 'missing' && persistedStatus.kind === 'missing') {
+    return markRecoveryError(
+      { type: 'markError', jobId: action.jobId, fault: { kind: 'ghost_launch' }, status: action.status },
+      ctx,
+    );
+  }
+
+  let holdReason: string;
+  if (persistedStatus.kind === 'corrupt') {
+    holdReason = 'the durable containment status is corrupt';
+  } else if (evidence.kind === 'current' || evidence.kind === 'provisional') {
+    const cleanup = await reapDurableCliProcess(ctx.runtime, evidence.record, ctx.signal);
+    if (cleanup.kind === 'absence-confirmed') {
+      return markRecoveryError(
+        { type: 'markError', jobId: action.jobId, fault: { kind: 'ghost_launch' }, status: action.status },
+        ctx,
+      );
+    }
+    holdReason = cleanup.reason;
+  } else {
+    holdReason =
+      evidence.kind === 'unavailable' &&
+      evidence.reason === 'missing' &&
+      persistedStatus.kind === 'valid' &&
+      persistedStatus.status.disposition.kind === 'held'
+        ? persistedStatus.status.disposition.reason
+        : durableOwnershipEvidenceHoldReason(evidence);
+  }
+
+  ctx.recoveryRegistry.register(
+    action.jobId,
+    action.launchRecord,
+    undefined,
+    () =>
+      ctx.abandonHeldJob?.(action.jobId) ?? {
+        kind: 'refused',
+        reason: 'durable containment abandonment is unavailable',
+      },
+  );
+  ctx.setProcessLocalCleanup(() => ctx.recoveryRegistry.remove(action.jobId));
+  writeDurableCliContainmentStatus(ctx.progressStore.getDb(), {
+    jobId: action.jobId,
+    evidence: durableOwnershipStatusEvidence(evidence),
+    disposition: {
+      kind: 'held',
+      reason: holdReason,
+      retryIntervalMs: 500,
+      abandonment: 'abort-job',
+    },
+  });
+  if (!ctx.recoveryRegistry.has(action.jobId)) {
+    throw new Error('Pre-ready durable containment hold was not accepted by the recovery registry.');
+  }
+  ctx.clearProcessLocalCleanup();
+  const detail =
+    `Pre-ready durable containment cleanup remains held because ${holdReason}; recovery remains owned by the ` +
+    `recovery registry. Retry the coordinator-job-recovery quarantine, or run coral-cli abort jobs ${action.jobId} ` +
+    'to abandon job ownership without proving process absence or sending another signal.';
+  ctx.log(`Held pre-ready durable recovery for ${action.jobId}: ${detail}\n`);
+  return { kind: 'quarantine', detail };
 }
 
 function discardIncompleteAdmission(
@@ -145,6 +372,7 @@ async function registerRunningRecovery(
   ctx: RecoveryActionContext,
 ): Promise<RecoveryDisposition> {
   const {
+    progressStore,
     recoveryRegistry,
     runningRecoverable,
     log,
@@ -155,45 +383,153 @@ async function registerRunningRecovery(
     settleFault,
     setProcessLocalCleanup,
     clearProcessLocalCleanup,
+    abandonHeldJob = () => ({ kind: 'refused', reason: 'durable containment abandonment is unavailable' }),
   } = ctx;
   const service = getRecoveryService(createInvocationContext(action.launchRecord.projectRoot));
-  recoveryRegistry.register(action.jobId, action.launchRecord, action.runtimeRecord);
+  const authorityCapture = service.captureProviderRecoveryAuthority(action.launchRecord);
+  const appServerRuntimeRecord = isAppServerRuntime(action.runtimeRecord) ? action.runtimeRecord : null;
+  const appServerAbortHandler =
+    appServerRuntimeRecord !== null
+      ? () => {
+          const nextStep =
+            `Run coral-cli jobs detail ${action.jobId}; if interruption is refused, repair the reported condition, ` +
+            'then use coral-cli backend recovery-quarantine list and run its exact retry command.';
+          return {
+            kind: 'held' as const,
+            reason: 'waiting for recovery authority and provider acknowledgment of app-server interruption',
+            nextStep,
+            settlement: authorityCapture.then(
+              async (captured) => {
+                if (!captured.ok) {
+                  return {
+                    kind: 'refused' as const,
+                    reason: `provider recovery authority is unavailable: ${captured.failure.reason}`,
+                    nextStep,
+                  };
+                }
+                const result = await service.interruptAppServerJob(captured.authority, appServerRuntimeRecord);
+                return result.kind === 'acknowledged'
+                  ? {
+                      kind: 'finalization-pending' as const,
+                      reason:
+                        'the provider acknowledged interruption; user-abort terminal finalization remains pending',
+                      nextStep:
+                        `Wait for startup recovery to finalize ${action.jobId}; if it remains held, use coral-cli ` +
+                        'backend recovery-quarantine list and run its exact retry command.',
+                    }
+                  : {
+                      kind: 'refused' as const,
+                      reason: result.reason,
+                      nextStep: result.nextStep,
+                    };
+              },
+              (error: unknown) => ({
+                kind: 'refused' as const,
+                reason: `provider recovery authority failed: ${errorMessage(error)}`,
+                nextStep,
+              }),
+            ),
+          };
+        }
+      : undefined;
+  const recordedContainment = isDurableCliRuntime(action.runtimeRecord)
+    ? readDurableCliPreReadyOwnershipEvidence(progressStore.getDb(), action.jobId, action.runtimeRecord.pid)
+    : null;
+  const persistedContainment = isDurableCliRuntime(action.runtimeRecord)
+    ? readDurableCliContainmentStatus(progressStore.getDb(), action.jobId)
+    : null;
+  const resumesHeldContainment =
+    persistedContainment?.kind === 'valid' && persistedContainment.status.disposition.kind === 'held';
+  const resumesOperatorAbandonment =
+    persistedContainment?.kind === 'valid' && persistedContainment.status.disposition.kind === 'operator-abandoned';
+  if (!resumesHeldContainment || !recoveryRegistry.has(action.jobId)) {
+    recoveryRegistry.register(
+      action.jobId,
+      action.launchRecord,
+      action.runtimeRecord,
+      isDurableCliRuntime(action.runtimeRecord)
+        ? resumesHeldContainment
+          ? () => abandonHeldJob(action.jobId)
+          : resumesOperatorAbandonment
+            ? undefined
+            : () =>
+                abortDurableCliProcess(
+                  action.jobId,
+                  runtime,
+                  recordedContainment ?? { kind: 'unavailable', reason: 'missing' },
+                  signal,
+                  (reason) => {
+                    const evidence = recordedContainment ?? {
+                      kind: 'unavailable' as const,
+                      reason: 'missing' as const,
+                    };
+                    writeDurableCliContainmentStatus(progressStore.getDb(), {
+                      jobId: action.jobId,
+                      evidence: durableOwnershipStatusEvidence(evidence),
+                      disposition: {
+                        kind: 'held',
+                        reason,
+                        retryIntervalMs: 500,
+                        abandonment: 'abort-job',
+                      },
+                    });
+                    if (!recoveryRegistry.setAbortHandler(action.jobId, () => abandonHeldJob(action.jobId))) {
+                      throw new Error('Durable abort hold was not retained by the recovery registry.');
+                    }
+                  },
+                )
+        : appServerAbortHandler,
+    );
+  }
   setProcessLocalCleanup(() => recoveryRegistry.remove(action.jobId));
-  const captured = await service.captureProviderRecoveryAuthority(action.launchRecord);
+  const captured = await authorityCapture;
   signal.throwIfAborted();
   if (!captured.ok) {
-    // Settling here is a known gap, deliberately left in place rather than half-closed, and the argument that
-    // used to justify it was checked and found false: `profile-unavailable`, `identity-unavailable` and
-    // `subject-mismatch` are operator-repairable, so a retry after the operator restores the profile does find
-    // something new. The correct disposition is a durable quarantine — but a quarantine that hands the job back
-    // while its carrier is still running releases the only owner that can abort it, and the successor owner does
-    // not exist yet. Both halves are docs/todo/coordinator-process-disposition.md; until they ship together this
-    // path terminalizes as it always has, and this comment is the honest reason rather than a justification.
-    //
-    // What the three liveness answers do decide is the carrier:
-    // `alive`: install the pid-kill cleanup.
-    // `absent`: nothing to clean up.
-    // `unknown`: install nothing — signalling a pid nobody could observe is the one action this must not take —
-    //   but report the process that is being left behind rather than terminalizing over it in silence.
     const durableRecord = isDurableCliRuntime(action.runtimeRecord) ? action.runtimeRecord : null;
-    const durableLiveness = durableRecord === null ? 'absent' : runtime.process.observeLiveness(durableRecord.pid);
-    if (durableRecord !== null && durableLiveness === 'alive') {
-      const pid = durableRecord.pid;
-      const releaseRegistry = (): void => recoveryRegistry.remove(action.jobId);
-      setProcessLocalCleanup(() => {
-        gracefulKillByPid(runtime, pid);
-        releaseRegistry();
-      });
-    } else if (durableRecord !== null && durableLiveness === 'unknown') {
-      backendLog.warn(
-        `Terminalizing job ${action.jobId} for a provider binding failure while its durable process ` +
-          `(pid ${durableRecord.pid}) could not be observed; no signal was sent, so it may still be running ` +
-          'and nothing in Coral will reclaim it. That pid is not safe to act on by itself — the probe that ' +
-          'could not answer is also what would have proved the number still belongs to this job — so identify ' +
-          'the process independently before stopping it.',
-      );
-    }
     const message = `Provider '${captured.failure.provider}' recovery binding failed: ${captured.failure.reason}.`;
+    if (durableRecord === null) {
+      clearProcessLocalCleanup();
+      const detail =
+        `${message} The running carrier has no locally observable durable process identity, so recovery ` +
+        'remains owned. Retry after repairing the provider binding so adoption can succeed.';
+      log(`Held running recovery for ${action.jobId}: ${detail}\n`);
+      return { kind: 'quarantine', detail };
+    }
+
+    const recordedEvidence = readDurableCliPreReadyOwnershipEvidence(
+      progressStore.getDb(),
+      action.jobId,
+      durableRecord.pid,
+    );
+    let cleanupHold: string | null = null;
+    if (recordedEvidence.kind !== 'current' && recordedEvidence.kind !== 'provisional') {
+      cleanupHold = durableOwnershipEvidenceHoldReason(recordedEvidence);
+    } else {
+      const cleanup = await reapDurableCliProcess(runtime, recordedEvidence.record, signal);
+      if (cleanup.kind === 'held') cleanupHold = cleanup.reason;
+    }
+
+    if (cleanupHold !== null) {
+      writeDurableCliContainmentStatus(progressStore.getDb(), {
+        jobId: action.jobId,
+        evidence: durableOwnershipStatusEvidence(recordedEvidence),
+        disposition: {
+          kind: 'held',
+          reason: cleanupHold,
+          retryIntervalMs: 500,
+          abandonment: 'abort-job',
+        },
+      });
+      recoveryRegistry.setAbortHandler(action.jobId, () => abandonHeldJob(action.jobId));
+      clearProcessLocalCleanup();
+      const detail =
+        `${message} Durable process cleanup remains held because ${cleanupHold}; recovery remains owned by the ` +
+        'recovery registry. Retry after repairing the provider binding so adoption can succeed, or after the ' +
+        'recorded containment and child root are observed absent so fault settlement can complete.';
+      log(`Held running recovery for ${action.jobId}: ${detail}\n`);
+      return { kind: 'quarantine', detail };
+    }
+
     const facts = settleFault(
       {
         kind: 'provider_binding',
@@ -203,22 +539,10 @@ async function registerRunningRecovery(
       },
       message,
     );
-    log(
-      `Rejected running recovery with invalid provider authority: terminalized ${action.jobId}. Run coral-cli jobs detail ${action.jobId} for the recorded reason.\n`,
-    );
+    log(`Settled running recovery ${action.jobId} after its durable process was observed absent.\n`);
     return completed(facts, 'persisted-invalid running provider binding settled');
   }
   const { authority } = captured;
-  if (isAppServerRuntime(action.runtimeRecord)) {
-    const runtimeRecord = action.runtimeRecord;
-    recoveryRegistry.register(action.jobId, action.launchRecord, action.runtimeRecord, () => {
-      void service.interruptAppServerJob(authority, runtimeRecord).catch((error: unknown) => {
-        log(`Failed to interrupt recovered app-server job ${action.jobId}: ${formatError(error)}\n`);
-      });
-    });
-  } else {
-    recoveryRegistry.register(action.jobId, action.launchRecord, action.runtimeRecord);
-  }
   runningRecoverable.push({
     jobId: action.jobId,
     authority,
@@ -264,6 +588,9 @@ export function logRecoveryActionFailure(action: RecoveryAction, error: unknown,
           log(`Failed to handle recovery error-mark job ${action.jobId}: ${formatError(error)}\n`);
           break;
       }
+      return;
+    case 'resolvePreReadyLaunch':
+      log(`Failed to resolve pre-ready launch ${action.jobId}: ${formatError(error)}\n`);
       return;
     case 'registerQueued':
       log(`Failed to register queued recovery job ${action.jobId}: ${formatError(error)}\n`);

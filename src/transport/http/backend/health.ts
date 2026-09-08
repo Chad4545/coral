@@ -1,11 +1,22 @@
 import { isProcessIncarnation, type ProcessIncarnation } from '../../../infra/node-process.js';
+import { assertNever } from '../../../infra/error-format.js';
 import { isRecord } from '../../../infra/json.js';
 import { isSerializedCoralSetupError, type SerializedCoralSetupError } from '../../../runtime/errors.js';
-import {
-  providerProxySetEnforcerObservationsSchema,
-  type ProviderProxySetEnforcerObservations,
-} from '../../../provider-proxy/containment-proof-contract.js';
+import { providerProxySetEnforcerObservationsSchema } from '../../../provider-proxy/containment-proof-contract.js';
 import { decodeProviderProxySetAddress } from '../../../provider-proxy/set-address.js';
+import {
+  PROVIDER_PROXY_SET_OPERATOR_DISPOSITIONS,
+  PROVIDER_PROXY_SET_OPERATOR_DISPOSITION_CAUSES,
+  PROVIDER_PROXY_SET_OPERATOR_DISPOSITION_WAITING_FOR,
+  PROVIDER_PROXY_SET_OPERATOR_EXIT_KINDS,
+  PROVIDER_PROXY_SET_OPERATOR_EXIT_REFUSAL_GROUNDS,
+  type ProviderProxySetOperatorDisposition,
+  type ProviderProxySetDurableDispositionSkipStatus,
+  type ProviderProxySetOperatorExit,
+  type ProviderProxySetOperatorExitKind,
+  type ProviderProxySetOperatorExitRefusalGround,
+  type ProviderProxySetOperatorStatus,
+} from '../../../provider-proxy/operator-disposition-vocabulary.js';
 
 /**
  * Health metadata exposed by the Coral backend over HTTP.
@@ -129,30 +140,21 @@ export interface BackendHealth {
       contentSeq?: number;
       metadataSeq?: number;
     }>;
-    providerProxySets?: Array<{
-      setIdentity: { buildSetId: string; hostFingerprint: string; proxyInstanceId: string };
-      setToken: string;
-      disposition: 'held' | 'awaiting-containment-absence' | 'operator-exit-refused';
-      role?: string;
-      method?: string;
-      cause?: 'closed' | 'invalid-unattributable-frame';
-      attempts?: number;
-      elapsedMs?: number;
-      boundMs?: number;
-      liveClaims?: number;
-      enforcerObservations?: ProviderProxySetEnforcerObservations;
-      incidentReason: string;
-      waitingFor:
-        | 'heartbeat-evidence-window'
-        | 'control-reattachment'
-        | 'independent-containment-absence'
-        | 'ordinary-drain'
-        | 'set-adoption-deadline'
-        | 'operator-abandonment'
-        | 'store-repair';
-    }>;
+    providerProxySets?: ProviderProxySetOperatorStatus[];
+    providerProxySetRowSkips?: ProviderProxySetRowSkip[];
+    providerProxyDispositionSkips?: ProviderProxySetDurableDispositionSkipStatus[];
   };
 }
+
+export type ProviderProxySetRowSkip = Readonly<{
+  reason: 'malformed-row' | 'invalid-token' | 'token-identity-disagreement' | 'unsupported-row';
+  setToken: string | null;
+  setIdentity: Readonly<{
+    buildSetId: string;
+    hostFingerprint: string;
+    proxyInstanceId: string;
+  }> | null;
+}>;
 
 /** A decoded health payload plus any provider-proxy rows omitted because this build cannot interpret them. */
 export type BackendHealthParseResult = Readonly<{
@@ -213,9 +215,140 @@ type ProviderProxySet = NonNullable<NonNullable<BackendHealth['diagnostics']>['p
 
 type ProviderProxySetsParseResult = Readonly<{
   understoodRows: ProviderProxySet[];
-  skippedRows: number;
+  skippedRows: ProviderProxySetRowSkip[];
   skippedSetTokens: string[];
 }>;
+
+function parseProviderProxySetOperatorExit(value: unknown): ProviderProxySetOperatorExit | null {
+  if (
+    !isRecord(value) ||
+    typeof value.kind !== 'string' ||
+    !(PROVIDER_PROXY_SET_OPERATOR_EXIT_KINDS as readonly string[]).includes(value.kind)
+  ) {
+    return null;
+  }
+  const kind = value.kind as ProviderProxySetOperatorExitKind;
+  switch (kind) {
+    case 'none':
+    case 'contain':
+    case 'abandon':
+      return { kind };
+    case 'gated':
+      return isNonNegativeFiniteNumber(value.remainingMs) ? { kind: 'gated', remainingMs: value.remainingMs } : null;
+    case 'refused':
+      return (PROVIDER_PROXY_SET_OPERATOR_EXIT_REFUSAL_GROUNDS as readonly unknown[]).includes(value.ground)
+        ? {
+            kind: 'refused',
+            ground: value.ground as ProviderProxySetOperatorExitRefusalGround,
+          }
+        : null;
+    default:
+      return assertNever(kind);
+  }
+}
+
+function parseProviderProxySetHold(value: unknown): ProviderProxySet['holds'][number] | null {
+  if (
+    !isRecord(value) ||
+    typeof value.disposition !== 'string' ||
+    (value.cause !== undefined && typeof value.cause !== 'string') ||
+    typeof value.incidentReason !== 'string' ||
+    typeof value.waitingFor !== 'string' ||
+    !(PROVIDER_PROXY_SET_OPERATOR_DISPOSITIONS as readonly string[]).includes(value.disposition) ||
+    (value.cause !== undefined &&
+      !(PROVIDER_PROXY_SET_OPERATOR_DISPOSITION_CAUSES as readonly string[]).includes(value.cause)) ||
+    !(PROVIDER_PROXY_SET_OPERATOR_DISPOSITION_WAITING_FOR as readonly string[]).includes(value.waitingFor) ||
+    (value.role !== undefined && typeof value.role !== 'string') ||
+    (value.method !== undefined && typeof value.method !== 'string') ||
+    (value.attempts !== undefined && !isNonNegativeInteger(value.attempts)) ||
+    (value.elapsedMs !== undefined && !isNonNegativeFiniteNumber(value.elapsedMs)) ||
+    (value.boundMs !== undefined && !isNonNegativeFiniteNumber(value.boundMs)) ||
+    (value.cause !== undefined &&
+      (value.attempts === undefined || value.elapsedMs === undefined || value.boundMs === undefined))
+  ) {
+    return null;
+  }
+  const observations =
+    value.enforcerObservations === undefined
+      ? undefined
+      : providerProxySetEnforcerObservationsSchema.safeParse(value.enforcerObservations);
+  if (observations !== undefined && !observations.success) return null;
+  let durableObservation: ProviderProxySetOperatorDisposition['durableObservation'];
+  if (value.durableObservation !== undefined) {
+    if (!isRecord(value.durableObservation) || typeof value.durableObservation.writerIncarnation !== 'string') {
+      return null;
+    }
+    switch (value.durableObservation.kind) {
+      case 'stale':
+        if (
+          value.durableObservation.reobserveAction !== 'automatic-exact-set-containment-observation' &&
+          value.durableObservation.reobserveAction !== 'automatic-exact-acquisition-containment-observation'
+        ) {
+          return null;
+        }
+        durableObservation = {
+          kind: 'stale',
+          writerIncarnation: value.durableObservation.writerIncarnation,
+          reobserveAction: value.durableObservation.reobserveAction,
+        };
+        break;
+      case 'current-writer':
+        durableObservation = {
+          kind: 'current-writer',
+          writerIncarnation: value.durableObservation.writerIncarnation,
+        };
+        break;
+      case 'successor-observed':
+        if (typeof value.durableObservation.observedByIncarnation !== 'string') return null;
+        durableObservation = {
+          kind: 'successor-observed',
+          writerIncarnation: value.durableObservation.writerIncarnation,
+          observedByIncarnation: value.durableObservation.observedByIncarnation,
+        };
+        break;
+      default:
+        return null;
+    }
+  }
+  return {
+    disposition: value.disposition as ProviderProxySetOperatorDisposition['disposition'],
+    ...(value.role === undefined ? {} : { role: value.role }),
+    ...(value.method === undefined ? {} : { method: value.method }),
+    ...(value.cause === undefined
+      ? {}
+      : {
+          cause: value.cause as ProviderProxySetOperatorDisposition['cause'],
+          attempts: value.attempts as number,
+          elapsedMs: value.elapsedMs as number,
+          boundMs: value.boundMs as number,
+        }),
+    ...(observations === undefined ? {} : { enforcerObservations: observations.data }),
+    incidentReason: value.incidentReason,
+    waitingFor: value.waitingFor as ProviderProxySetOperatorDisposition['waitingFor'],
+    ...(durableObservation === undefined ? {} : { durableObservation }),
+  };
+}
+
+function parseProviderProxyDispositionSkips(value: unknown): ProviderProxySetDurableDispositionSkipStatus[] | null {
+  if (!Array.isArray(value)) return null;
+  const records: ProviderProxySetDurableDispositionSkipStatus[] = [];
+  for (const record of value) {
+    if (
+      !isRecord(record) ||
+      typeof record.key !== 'string' ||
+      (record.setToken !== null && typeof record.setToken !== 'string') ||
+      record.unavailableAction !== 'reconciliation-and-retirement'
+    ) {
+      return null;
+    }
+    records.push({
+      key: record.key,
+      setToken: record.setToken,
+      unavailableAction: 'reconciliation-and-retirement',
+    });
+  }
+  return records;
+}
 
 function parseProviderProxySets(value: unknown): ProviderProxySetsParseResult | null {
   if (!Array.isArray(value)) {
@@ -223,98 +356,65 @@ function parseProviderProxySets(value: unknown): ProviderProxySetsParseResult | 
   }
 
   const understoodRows: ProviderProxySet[] = [];
-  let skippedRows = 0;
+  const skippedRows: ProviderProxySetRowSkip[] = [];
   const skippedSetTokens: string[] = [];
   for (const entry of value) {
-    if (
-      !isRecord(entry) ||
-      !isRecord(entry.setIdentity) ||
-      typeof entry.setIdentity.buildSetId !== 'string' ||
-      typeof entry.setIdentity.hostFingerprint !== 'string' ||
-      typeof entry.setIdentity.proxyInstanceId !== 'string' ||
-      typeof entry.setToken !== 'string'
-    ) {
-      skippedRows += 1;
+    const setToken = isRecord(entry) && typeof entry.setToken === 'string' ? entry.setToken : null;
+    const setIdentity =
+      isRecord(entry) &&
+      isRecord(entry.setIdentity) &&
+      typeof entry.setIdentity.buildSetId === 'string' &&
+      typeof entry.setIdentity.hostFingerprint === 'string' &&
+      typeof entry.setIdentity.proxyInstanceId === 'string'
+        ? {
+            buildSetId: entry.setIdentity.buildSetId,
+            hostFingerprint: entry.setIdentity.hostFingerprint,
+            proxyInstanceId: entry.setIdentity.proxyInstanceId,
+          }
+        : null;
+    if (!isRecord(entry) || setIdentity === null || setToken === null) {
+      skippedRows.push({ reason: 'malformed-row', setToken, setIdentity });
+      if (setToken !== null) skippedSetTokens.push(setToken);
       continue;
     }
 
     let tokenAddress: ReturnType<typeof decodeProviderProxySetAddress>;
     try {
-      tokenAddress = decodeProviderProxySetAddress(entry.setToken);
+      tokenAddress = decodeProviderProxySetAddress(setToken);
     } catch {
-      skippedRows += 1;
+      skippedRows.push({ reason: 'invalid-token', setToken, setIdentity });
+      skippedSetTokens.push(setToken);
       continue;
     }
     if (
-      tokenAddress.buildSetId !== entry.setIdentity.buildSetId ||
-      tokenAddress.hostFingerprint !== entry.setIdentity.hostFingerprint ||
-      tokenAddress.proxyInstanceId !== entry.setIdentity.proxyInstanceId
+      tokenAddress.buildSetId !== setIdentity.buildSetId ||
+      tokenAddress.hostFingerprint !== setIdentity.hostFingerprint ||
+      tokenAddress.proxyInstanceId !== setIdentity.proxyInstanceId
     ) {
-      skippedRows += 1;
+      skippedRows.push({ reason: 'token-identity-disagreement', setToken, setIdentity });
+      skippedSetTokens.push(setToken);
       continue;
     }
 
-    if (
-      typeof entry.disposition !== 'string' ||
-      (entry.cause !== undefined && typeof entry.cause !== 'string') ||
-      typeof entry.incidentReason !== 'string' ||
-      typeof entry.waitingFor !== 'string'
-    ) {
-      skippedRows += 1;
-      skippedSetTokens.push(entry.setToken);
+    if (!isNonNegativeInteger(entry.liveClaims) || !Array.isArray(entry.holds)) {
+      skippedRows.push({ reason: 'unsupported-row', setToken, setIdentity });
+      skippedSetTokens.push(setToken);
       continue;
     }
-
-    const understandsEnums =
-      (entry.disposition === 'held' ||
-        entry.disposition === 'awaiting-containment-absence' ||
-        entry.disposition === 'operator-exit-refused') &&
-      (entry.cause === undefined || entry.cause === 'closed' || entry.cause === 'invalid-unattributable-frame') &&
-      (entry.waitingFor === 'heartbeat-evidence-window' ||
-        entry.waitingFor === 'control-reattachment' ||
-        entry.waitingFor === 'independent-containment-absence' ||
-        entry.waitingFor === 'ordinary-drain' ||
-        entry.waitingFor === 'set-adoption-deadline' ||
-        entry.waitingFor === 'operator-abandonment' ||
-        entry.waitingFor === 'store-repair');
-    if (!understandsEnums) {
-      skippedRows += 1;
-      skippedSetTokens.push(entry.setToken);
+    const operatorExit = parseProviderProxySetOperatorExit(entry.operatorExit);
+    const holds = entry.holds.map(parseProviderProxySetHold);
+    if (operatorExit === null || holds.some((hold) => hold === null)) {
+      skippedRows.push({ reason: 'unsupported-row', setToken, setIdentity });
+      skippedSetTokens.push(setToken);
       continue;
     }
-
-    if (
-      (entry.role !== undefined && typeof entry.role !== 'string') ||
-      (entry.method !== undefined && typeof entry.method !== 'string') ||
-      (entry.attempts !== undefined && !isNonNegativeInteger(entry.attempts)) ||
-      (entry.elapsedMs !== undefined && !isNonNegativeFiniteNumber(entry.elapsedMs)) ||
-      (entry.boundMs !== undefined && !isNonNegativeFiniteNumber(entry.boundMs)) ||
-      (entry.liveClaims !== undefined && !isNonNegativeInteger(entry.liveClaims)) ||
-      (entry.cause !== undefined &&
-        (entry.attempts === undefined ||
-          entry.elapsedMs === undefined ||
-          entry.boundMs === undefined ||
-          entry.liveClaims === undefined))
-    ) {
-      skippedRows += 1;
-      skippedSetTokens.push(entry.setToken);
-      continue;
-    }
-
-    const enforcerObservations =
-      entry.enforcerObservations === undefined
-        ? undefined
-        : providerProxySetEnforcerObservationsSchema.safeParse(entry.enforcerObservations);
-    if (enforcerObservations !== undefined && !enforcerObservations.success) {
-      skippedRows += 1;
-      skippedSetTokens.push(entry.setToken);
-      continue;
-    }
-
     understoodRows.push({
-      ...entry,
-      ...(enforcerObservations === undefined ? {} : { enforcerObservations: enforcerObservations.data }),
-    } as ProviderProxySet);
+      setIdentity,
+      setToken,
+      liveClaims: entry.liveClaims,
+      operatorExit,
+      holds: holds as ProviderProxySet['holds'],
+    });
   }
 
   return { understoodRows, skippedRows, skippedSetTokens };
@@ -493,6 +593,11 @@ function parseDiagnostics(value: unknown): DiagnosticsParseResult | null {
   if (value.providerProxySets !== undefined && providerProxySets === null) {
     return null;
   }
+  const providerProxyDispositionSkips =
+    value.providerProxyDispositionSkips === undefined
+      ? null
+      : parseProviderProxyDispositionSkips(value.providerProxyDispositionSkips);
+  if (value.providerProxyDispositionSkips !== undefined && providerProxyDispositionSkips === null) return null;
   if (
     value.carriers !== undefined &&
     (!isRecord(value.carriers) ||
@@ -503,12 +608,22 @@ function parseDiagnostics(value: unknown): DiagnosticsParseResult | null {
   ) {
     return null;
   }
+  const diagnostics = { ...value };
+  delete diagnostics.providerProxySetRowSkips;
   return {
     diagnostics: {
-      ...value,
-      ...(providerProxySets === null ? {} : { providerProxySets: providerProxySets.understoodRows }),
+      ...diagnostics,
+      ...(providerProxySets === null
+        ? {}
+        : {
+            providerProxySets: providerProxySets.understoodRows,
+            ...(providerProxySets.skippedRows.length === 0
+              ? {}
+              : { providerProxySetRowSkips: providerProxySets.skippedRows }),
+          }),
+      ...(providerProxyDispositionSkips === null ? {} : { providerProxyDispositionSkips }),
     },
-    skippedProviderProxySetRows: providerProxySets?.skippedRows ?? 0,
+    skippedProviderProxySetRows: providerProxySets?.skippedRows.length ?? 0,
     skippedProviderProxySetTokens: providerProxySets?.skippedSetTokens ?? [],
   } as DiagnosticsParseResult;
 }

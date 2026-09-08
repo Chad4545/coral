@@ -56,6 +56,12 @@ type RecoveryCommitPlan = Pick<
   'launchRecord' | 'session' | 'expectedSessionVersion'
 >;
 
+declare const recoveryCommitReceiptBrand: unique symbol;
+type RecoveryCommitReceipt = Readonly<{
+  plan: RecoveryCommitPlan;
+  [recoveryCommitReceiptBrand]: true;
+}>;
+
 type TerminalAppender = <Scope>(commit: CommitContext<Scope>) => void;
 
 async function recordArtifactHandlesExact(
@@ -89,7 +95,7 @@ async function finalizeSessionExact(
   mutation: ProviderValidatedSessionContinuityMutation,
   appendBeforeRelease: TerminalAppender | undefined,
   deps: InterruptedFinalizerDeps,
-): Promise<void> {
+): Promise<RecoveryCommitReceipt> {
   const finalized = await deps.sessionManager.finalizeJobContinuityAtomic(plan.session.sessionId, {
     expectedActiveJobId: plan.launchRecord.jobId,
     expectedVersion,
@@ -99,13 +105,16 @@ async function finalizeSessionExact(
   if (!finalized) {
     throw new InterruptedRecoveryCommitError(plan.launchRecord.jobId, 'session-finalize');
   }
+  // eslint-disable-next-line no-restricted-syntax -- RecoveryCommitReceipt may only be minted by finalizeSessionExact.
+  return Object.freeze({ plan }) as RecoveryCommitReceipt;
 }
 
 function exportResultAndReleaseOwnership(
-  plan: RecoveryCommitPlan,
+  receipt: RecoveryCommitReceipt,
   content: string,
   deps: InterruptedFinalizerDeps,
 ): void {
+  const { plan } = receipt;
   try {
     writeResultArtifact(
       deps.runtime.storage,
@@ -169,7 +178,20 @@ export async function finalizeInterruptedAppServerRecovery(
   let content: string;
   let mutation: ProviderValidatedSessionContinuityMutation;
   let appendTerminal: TerminalAppender;
-  if (performed.kind === 'unsupported') {
+  if (performed.kind === 'user-aborted') {
+    if (plan.reason !== 'user_abort') {
+      throw new Error(
+        `Recovered app-server user-abort evidence does not match finalization reason for ${status.jobId}.`,
+      );
+    }
+    content = '';
+    mutation = { kind: 'preserve' };
+    appendTerminal = directTerminalAppender(status, {
+      content,
+      durationMs,
+      outcome: { kind: 'aborted', reason: 'user_abort' },
+    });
+  } else if (performed.kind === 'unsupported') {
     content = '';
     mutation = { kind: 'preserve' };
     const fault = {
@@ -182,6 +204,11 @@ export async function finalizeInterruptedAppServerRecovery(
       appendJobRecoveryFaultTerminalInCommit(commit, fault, terminalOptions, { content, durationMs });
     };
   } else {
+    if (plan.reason === 'user_abort') {
+      throw new Error(
+        `Recovered app-server user-abort finalization lacks provider acknowledgment for ${status.jobId}.`,
+      );
+    }
     mutation = performed.mutation;
     const fault: SessionInterruptedFault = {
       trigger: plan.reason,
@@ -199,8 +226,8 @@ export async function finalizeInterruptedAppServerRecovery(
     };
   }
 
-  await finalizeSessionExact(plan, expectedVersion, mutation, appendTerminal, deps);
-  exportResultAndReleaseOwnership(plan, content, deps);
+  const receipt = await finalizeSessionExact(plan, expectedVersion, mutation, appendTerminal, deps);
+  exportResultAndReleaseOwnership(receipt, content, deps);
 }
 
 function directTerminalAppender(status: JobStatus, terminal: JobTerminalInput): TerminalAppender {
@@ -269,6 +296,6 @@ export async function finalizeInterruptedDurableRecovery(
       return assertNever(performed.terminal);
   }
 
-  await finalizeSessionExact(plan, expectedVersion, performed.mutation, appendTerminal, deps);
-  exportResultAndReleaseOwnership(plan, content, deps);
+  const receipt = await finalizeSessionExact(plan, expectedVersion, performed.mutation, appendTerminal, deps);
+  exportResultAndReleaseOwnership(receipt, content, deps);
 }

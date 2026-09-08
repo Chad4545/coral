@@ -10,7 +10,12 @@ import {
 import { encodeProviderProxySetAddress, type ProviderProxySetAddress } from '#src/provider-proxy/set-address.js';
 import { TOOL_TIMEOUT_MS } from '#src/transport/http/sse.js';
 import { IpcRpcError } from '#src/transport/ipc/client.js';
-import { providerProxySetContainResponseSchema } from '#src/transport/rpc/catalog.js';
+import {
+  providerProxySetContainBooleanResponseSchema,
+  providerProxySetContainBooleanRpcSpec,
+  providerProxySetContainResponseSchema,
+  providerProxySetContainRpcSpec,
+} from '#src/transport/rpc/catalog.js';
 
 const address: ProviderProxySetAddress = {
   buildSetId: '11111111-1111-4111-8111-111111111111',
@@ -62,7 +67,7 @@ const containCommandCases: readonly ContainCommandCase[] = [
       setIdentity: address,
       enforcerObservations: [
         { role: 'guardian', observation: 'absent' },
-        { role: 'reaper', observation: 'unknown' },
+        { role: 'reaper', observation: 'absent' },
       ],
       claimDischarge: { kind: 'completed' },
       effect: abandonedEffect,
@@ -70,18 +75,6 @@ const containCommandCases: readonly ContainCommandCase[] = [
     exitCode: 0,
     stream: 'stdout',
     message: 'was abandoned without absence proof',
-  },
-  {
-    name: 'unattributable group abandoned',
-    result: {
-      kind: 'unattributable-group-abandoned',
-      setIdentity: address,
-      claimDischarge: { kind: 'completed' },
-      effect: abandonedEffect,
-    },
-    exitCode: 0,
-    stream: 'stdout',
-    message: 'was abandoned after its recorded process group became unattributable',
   },
   {
     name: 'set-not-found',
@@ -116,6 +109,18 @@ const containCommandCases: readonly ContainCommandCase[] = [
     message: 'SIGTERM was sent',
   },
   {
+    name: 'containment remains unconfirmed after signal delivery',
+    result: {
+      kind: 'containment-unconfirmed',
+      setIdentity: address,
+      recoveryAction: { kind: 'retry-exact-set-containment' },
+      effect: { ...noEffect, signalsSent: ['SIGTERM', 'SIGKILL'] as const },
+    },
+    exitCode: 75,
+    stream: 'stderr',
+    message: 'reaping did not confirm absence',
+  },
+  {
     name: 'enforcer-alive',
     result: {
       kind: 'enforcer-alive',
@@ -140,6 +145,28 @@ const containCommandCases: readonly ContainCommandCase[] = [
     exitCode: 75,
     stream: 'stderr',
     message: 'the recorded leader identity is gone',
+  },
+  {
+    name: 'signal authorization refused',
+    result: {
+      kind: 'signal-authorization-refused',
+      setIdentity: address,
+      effect: noEffect,
+    },
+    exitCode: 75,
+    stream: 'stderr',
+    message: 'signal authorization was refused for an observed-live recorded target',
+  },
+  {
+    name: 'identity unobservable before signal authorization',
+    result: {
+      kind: 'identity-unobservable',
+      setIdentity: address,
+      effect: noEffect,
+    },
+    exitCode: 75,
+    stream: 'stderr',
+    message: 'process identity could not be observed',
   },
   {
     name: 'enforcer-unobservable',
@@ -168,7 +195,7 @@ const containCommandCases: readonly ContainCommandCase[] = [
     result: { kind: 'unsupported-coordinator', setIdentity: address },
     exitCode: 75,
     stream: 'stderr',
-    message: 'does not support coordinator.provider_proxy_set.contain',
+    message: 'does not support the requested containment operation',
   },
   {
     name: 'unsupported-coordinator-result',
@@ -227,15 +254,37 @@ async function runContain(
 }
 
 describe('backend provider-proxy-set contain', () => {
+  it('routes abandon through the operator-exit lifecycle mode', async () => {
+    const contain = vi.fn<ProviderProxySetCommandOperations['contain']>(async (request) => ({
+      kind: 'set-not-found',
+      setIdentity: request.setIdentity,
+      effect: noEffect,
+    }));
+    const program = new Command();
+    program.exitOverride();
+    registerBackendCommands(program, { providerProxySets: { contain } });
+
+    await program.parseAsync([
+      'node',
+      'coral-cli',
+      'backend',
+      'provider-proxy-set',
+      'abandon',
+      encodeProviderProxySetAddress(address),
+    ]);
+
+    expect(contain).toHaveBeenCalledExactlyOnceWith({ setIdentity: address, mode: 'abandon' });
+  });
+
   it('documents unattributable recorded groups as abandonment-authorized holds', () => {
     const program = new Command();
     registerBackendCommands(program);
     const backend = program.commands.find((command) => command.name() === 'backend');
     const providerProxySet = backend?.commands.find((command) => command.name() === 'provider-proxy-set');
-    const contain = providerProxySet?.commands.find((command) => command.name() === 'contain');
-    if (contain === undefined) throw new Error('expected provider-proxy-set contain command');
+    const abandon = providerProxySet?.commands.find((command) => command.name() === 'abandon');
+    if (abandon === undefined) throw new Error('expected provider-proxy-set abandon command');
 
-    expect(contain.helpInformation()).toContain('unattributable recorded group');
+    expect(abandon.helpInformation()).toContain('unattributable recorded group');
   });
 
   it.each(containCommandCases)(
@@ -270,10 +319,10 @@ describe('backend provider-proxy-set contain', () => {
         kind: 'contained',
         setIdentity: address,
         disappearanceReceipt: 'proxy-group-absent',
-        claimDischarge: { kind: 'initial-disposition-retry-owned' },
+        claimDischarge: { kind: 'initial-disposition-pending', exit: 'initial-disposition-settlement' },
         effect: containedEffect,
       }),
-    ).resolves.toEqual(expect.objectContaining({ stderr: expect.stringContaining('still owns retry') }));
+    ).resolves.toEqual(expect.objectContaining({ stderr: expect.stringContaining('still represents the set') }));
     expect(process.exitCode).toBe(75);
 
     await expect(
@@ -284,7 +333,7 @@ describe('backend provider-proxy-set contain', () => {
           { role: 'guardian', observation: 'absent' },
           { role: 'reaper', observation: 'unknown' },
         ],
-        claimDischarge: { kind: 'initial-disposition-retry-owned' },
+        claimDischarge: { kind: 'initial-disposition-pending', exit: 'initial-disposition-settlement' },
         effect: abandonedEffect,
       }),
     ).resolves.toEqual(
@@ -301,6 +350,7 @@ describe('backend provider-proxy-set contain', () => {
         disappearanceReceipt: 'proxy-group-absent',
         claimDischarge: {
           kind: 'operational-retry-owned',
+          exit: 'provider-proxy-set-release-retry',
           incidents: [
             {
               stage: 'disappearance-delivery',
@@ -332,7 +382,7 @@ describe('backend provider-proxy-set contain', () => {
         }) as never,
     });
 
-    const result = operations.contain({ setIdentity: address, abandonWithoutAbsence: false });
+    const result = operations.contain({ setIdentity: address, mode: 'contain' });
     await expect(result).resolves.toEqual({
       kind: 'unsupported-coordinator',
       setIdentity: address,
@@ -341,6 +391,56 @@ describe('backend provider-proxy-set contain', () => {
       expect.objectContaining({ stderr: expect.stringContaining('does not support') }),
     );
     expect(process.exitCode).toBe(75);
+  });
+
+  it('falls back to predecessor abandonment only after the addressed method is absent', async () => {
+    const request = vi.fn(async (method: string) => {
+      if (method === providerProxySetContainRpcSpec.name) {
+        throw new IpcRpcError({ code: -32601, message: 'Method not found' });
+      }
+      return {
+        kind: 'abandoned',
+        setIdentity: address,
+        enforcerObservations: [
+          { role: 'guardian', observation: 'absent' },
+          { role: 'reaper', observation: 'unknown' },
+        ],
+        claimDischarge: { kind: 'completed' },
+        effect: abandonedEffect,
+      };
+    });
+    const operations = createProviderProxySetCommandOperations({
+      getClient: async () => ({ request }) as never,
+    });
+
+    const result = await operations.contain({ setIdentity: address, mode: 'abandon' });
+
+    expect(request.mock.calls).toEqual([
+      [
+        providerProxySetContainRpcSpec.name,
+        { setIdentity: address, mode: 'abandon' },
+        expect.objectContaining({ timeoutMs: TOOL_TIMEOUT_MS }),
+      ],
+      [
+        providerProxySetContainBooleanRpcSpec.name,
+        { setIdentity: address, abandonWithoutAbsence: true },
+        expect.objectContaining({ timeoutMs: TOOL_TIMEOUT_MS }),
+      ],
+    ]);
+    expect(result).toEqual({
+      kind: 'abandoned',
+      setIdentity: address,
+      enforcerObservations: [
+        { role: 'guardian', observation: 'absent' },
+        { role: 'reaper', observation: 'unknown' },
+      ],
+      claimDischarge: { kind: 'completed' },
+      effect: abandonedEffect,
+    });
+    await expect(runContain(result)).resolves.toEqual(
+      expect.objectContaining({ stdout: expect.stringContaining('was abandoned') }),
+    );
+    expect(process.exitCode).toBe(0);
   });
 
   it('renders a stale authorization with the signal that was already delivered', async () => {
@@ -360,6 +460,20 @@ describe('backend provider-proxy-set contain', () => {
     expect(process.exitCode).toBe(75);
   });
 
+  it('reports accepted ownership of a fatal representation-release remainder', async () => {
+    const output = await runContain({
+      kind: 'representation-release-abandoned',
+      setIdentity: address,
+      successor: { owner: 'operator-command', acceptance: 'accepted' },
+      effect: { signalsSent: [], containmentAbsent: false, representationAction: 'fatal-release-abandoned' },
+    });
+
+    expect(output.stdout).toContain('fatal representation release was abandoned');
+    expect(output.stdout).toContain('operator command accepted the unresolved representation-release remainder');
+    expect(output.stdout).toContain('fatal operation was not retried');
+    expect(process.exitCode).toBe(0);
+  });
+
   it('names abandonment as the exit from an unattributable recorded-group hold', async () => {
     const output = await runContain({
       kind: 'recorded-group-unattributable',
@@ -368,8 +482,34 @@ describe('backend provider-proxy-set contain', () => {
     });
 
     expect(output.stderr).toContain('cannot be proven to belong to this set');
-    expect(output.stderr).toContain('--abandon-without-absence');
+    expect(output.stderr).toContain(`provider-proxy-set abandon ${encodeProviderProxySetAddress(address)}`);
     expect(output.stderr).toContain("releases Coral's representation without asserting absence");
+    expect(process.exitCode).toBe(75);
+  });
+
+  it('reports signal refusal without claiming the recorded leader is gone', async () => {
+    const output = await runContain({
+      kind: 'signal-authorization-refused',
+      setIdentity: address,
+      effect: noEffect,
+    });
+
+    expect(output.stderr).toContain('the containment was attributable');
+    expect(output.stderr).not.toContain('the recorded leader identity is gone');
+    expect(output.stderr).toContain(`provider-proxy-set abandon ${encodeProviderProxySetAddress(address)}`);
+    expect(process.exitCode).toBe(75);
+  });
+
+  it('refuses pre-signal identity uncertainty with recovery and abandonment exits', async () => {
+    const output = await runContain({
+      kind: 'identity-unobservable',
+      setIdentity: address,
+      effect: noEffect,
+    });
+
+    expect(output.stderr).toContain('before Coral delivered any process signal');
+    expect(output.stderr).toContain(`provider-proxy-set contain ${encodeProviderProxySetAddress(address)}`);
+    expect(output.stderr).toContain(`provider-proxy-set abandon ${encodeProviderProxySetAddress(address)}`);
     expect(process.exitCode).toBe(75);
   });
 
@@ -381,7 +521,7 @@ describe('backend provider-proxy-set contain', () => {
         }) as never,
     });
 
-    const result = await operations.contain({ setIdentity: address, abandonWithoutAbsence: false });
+    const result = await operations.contain({ setIdentity: address, mode: 'contain' });
     expect(result).toEqual({
       kind: 'coordinator-draining',
       setIdentity: address,
@@ -402,11 +542,11 @@ describe('backend provider-proxy-set contain', () => {
       getClient: async () => ({ request }) as never,
     });
 
-    const result = await operations.contain({ setIdentity: address, abandonWithoutAbsence: false });
+    const result = await operations.contain({ setIdentity: address, mode: 'contain' });
 
     expect(request).toHaveBeenCalledWith(
-      'coordinator.provider_proxy_set.contain',
-      { setIdentity: address, abandonWithoutAbsence: false },
+      providerProxySetContainRpcSpec.name,
+      { setIdentity: address, mode: 'contain' },
       expect.objectContaining({ timeoutMs: TOOL_TIMEOUT_MS }),
     );
     expect(result).toEqual({ kind: 'timeout', setIdentity: address });
@@ -430,7 +570,7 @@ describe('backend provider-proxy-set contain', () => {
         }) as never,
     });
 
-    await expect(operations.contain({ setIdentity: address, abandonWithoutAbsence: false })).resolves.toEqual({
+    await expect(operations.contain({ setIdentity: address, mode: 'contain' })).resolves.toEqual({
       kind: 'unsupported-coordinator-result',
       setIdentity: address,
     });
@@ -442,7 +582,11 @@ describe('backend provider-proxy-set contain', () => {
         kind: 'contained',
         setIdentity: address,
         disappearanceReceipt: 'receipt',
-        claimDischarge: { kind: 'operational-retry-owned', incidents: [] },
+        claimDischarge: {
+          kind: 'operational-retry-owned',
+          exit: 'provider-proxy-set-release-retry',
+          incidents: [],
+        },
       }).success,
     ).toBe(false);
     expect(
@@ -485,6 +629,76 @@ describe('backend provider-proxy-set contain', () => {
     ).toBe(false);
   });
 
+  it('keeps current fatal representation-release outcomes outside the predecessor response', () => {
+    expect(
+      providerProxySetContainBooleanResponseSchema.safeParse({
+        kind: 'representation-release-abandoned',
+        setIdentity: address,
+        successor: { owner: 'operator-command', acceptance: 'accepted' },
+        effect: { signalsSent: [], containmentAbsent: false, representationAction: 'fatal-release-abandoned' },
+      }).success,
+    ).toBe(false);
+    expect(
+      providerProxySetContainBooleanResponseSchema.safeParse({
+        kind: 'representation-release-abandonment-required',
+        setIdentity: address,
+        effect: noEffect,
+      }).success,
+    ).toBe(false);
+  });
+
+  it('requires effects and a recovery action on an unconfirmed containment hold', () => {
+    const hold = {
+      kind: 'containment-unconfirmed',
+      setIdentity: address,
+      recoveryAction: { kind: 'retry-exact-set-containment' },
+      effect: { ...noEffect, signalsSent: ['SIGTERM'] as const },
+    } as const;
+
+    expect(providerProxySetContainResponseSchema.parse(hold)).toEqual(hold);
+    expect(providerProxySetContainBooleanResponseSchema.parse(hold)).toEqual(hold);
+    expect(providerProxySetContainResponseSchema.safeParse({ ...hold, effect: undefined }).success).toBe(false);
+    expect(providerProxySetContainResponseSchema.safeParse({ ...hold, recoveryAction: undefined }).success).toBe(false);
+  });
+
+  it('carries signal-authorization refusal through both containment response contracts', () => {
+    const refusal = {
+      kind: 'signal-authorization-refused',
+      setIdentity: address,
+      effect: noEffect,
+    } as const;
+
+    expect(providerProxySetContainResponseSchema.parse(refusal)).toEqual(refusal);
+    expect(providerProxySetContainBooleanResponseSchema.parse(refusal)).toEqual(refusal);
+  });
+
+  it('carries pre-signal identity refusal through both containment response contracts', () => {
+    const refusal = {
+      kind: 'identity-unobservable',
+      setIdentity: address,
+      effect: noEffect,
+    } as const;
+
+    expect(providerProxySetContainResponseSchema.parse(refusal)).toEqual(refusal);
+    expect(providerProxySetContainBooleanResponseSchema.parse(refusal)).toEqual(refusal);
+    expect(providerProxySetContainResponseSchema.safeParse({ ...refusal, effect: undefined }).success).toBe(false);
+  });
+
+  it('accepts a pre-reap abandonment receipt with absent enforcer observations', () => {
+    const result = {
+      kind: 'abandoned',
+      setIdentity: address,
+      enforcerObservations: [
+        { role: 'guardian', observation: 'absent' },
+        { role: 'reaper', observation: 'absent' },
+      ],
+      claimDischarge: { kind: 'completed' },
+      effect: abandonedEffect,
+    } as const;
+
+    expect(providerProxySetContainResponseSchema.parse(result)).toEqual(result);
+  });
+
   it('turns a structurally identified unsupported result into a named no-verdict', async () => {
     const operations = createProviderProxySetCommandOperations({
       getClient: async () =>
@@ -493,7 +707,7 @@ describe('backend provider-proxy-set contain', () => {
         }) as never,
     });
 
-    const result = await operations.contain({ setIdentity: address, abandonWithoutAbsence: false });
+    const result = await operations.contain({ setIdentity: address, mode: 'contain' });
     expect(result).toEqual({ kind: 'unsupported-coordinator-result', setIdentity: address });
     await runContain(result);
     expect(process.exitCode).toBe(75);

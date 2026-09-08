@@ -1,12 +1,15 @@
 import { z } from 'zod';
 
 import {
+  incarnationMayAuthorizeSignal,
   isProcessIncarnation,
-  processIncarnationSchema,
+  MAX_PROCESS_INCARNATION_LENGTH,
   probeProcessIncarnation,
+  type AsyncRecordedProcessObserver,
   type ProcessIncarnation,
   type ProcessLiveness,
 } from './node-process.js';
+import type { LiveChildAuthority } from './process-supervision.js';
 import type { MonotonicClock, MonotonicInstant } from './monotonic-clock.js';
 import {
   CONTAINMENT_DISAPPEARANCE_CONFIRM_MS,
@@ -14,6 +17,7 @@ import {
   SIGKILL_GRACE_MS,
   SIGTERM_GRACE_MS,
 } from './process-constants.js';
+import type { ProcessIdentityObservation } from './port-types.js';
 
 /** How often a disappearance wait re-observes its targets. Shared by every caller that polls for a signalled
  *  process or process group to disappear, so the poll interval has exactly one owner rather than being
@@ -29,7 +33,7 @@ export type RecordedProcessIdentity = Readonly<{
 export const recordedProcessIdentitySchema: z.ZodType<RecordedProcessIdentity> = z
   .object({
     pid: z.number().int().positive().safe(),
-    incarnation: processIncarnationSchema,
+    incarnation: z.string().min(1).max(MAX_PROCESS_INCARNATION_LENGTH) as unknown as z.ZodType<ProcessIncarnation>,
   })
   .strict()
   .readonly();
@@ -40,8 +44,27 @@ export type RecordedContainmentIdentity = RecordedProcessIdentity &
     processGroupId: number;
   }>;
 
+export type RecordedContainmentObservationSubject = RecordedContainmentIdentity &
+  Readonly<{
+    childRoot: RecordedProcessIdentity | null;
+  }>;
+
+/** Observation authority must not expose process-control capability. */
+export type ProcessContainmentObservationEnvironment = {
+  readonly process: {
+    observeLiveness(pid: number): ProcessLiveness;
+    readonly observeRecordedProcessAsync?: AsyncRecordedProcessObserver;
+    readonly observeProcessIdentities?: (
+      owners: readonly RecordedProcessIdentity[],
+      deadlineMs: number,
+    ) => Promise<readonly ProcessIdentityObservation[]>;
+  };
+  readonly platform: NodeJS.Platform;
+  readonly readProcessIncarnation?: (pid: number, platform: NodeJS.Platform) => ProcessIncarnation | null;
+};
+
 /** Runtime capabilities required to reap one recorded containment. */
-export type ProcessContainmentEnvironment<Scope extends symbol> = {
+export type ProcessContainmentEnvironment<Scope extends symbol> = ProcessContainmentObservationEnvironment & {
   /**
    * The largest recorded set this containment will act on. It is injected because "how many targets" is the
    * caller's bound, not a process-control constant — naming a provider concept here would put a domain
@@ -55,6 +78,7 @@ export type ProcessContainmentEnvironment<Scope extends symbol> = {
   };
   readonly platform: NodeJS.Platform;
   readonly readProcessIncarnation?: (pid: number, platform: NodeJS.Platform) => ProcessIncarnation | null;
+  readonly knownLiveChildFor?: (pid: number) => LiveChildAuthority | undefined;
   /** Revalidates the caller's authority immediately before each process-control signal. */
   readonly assertSignalAuthorized?: () => void;
   /** Reports only signals whose process-control call returned success. */
@@ -89,6 +113,14 @@ export class ProcessContainmentError extends Error {
   }
 }
 
+class ContainmentIdentityObservationError extends ProcessContainmentError {
+  constructor() {
+    super('process_identity_unverified', 'Recorded containment liveness could not be observed.');
+    this.name = 'ContainmentIdentityObservationError';
+    Object.setPrototypeOf(this, ContainmentIdentityObservationError.prototype);
+  }
+}
+
 type TargetObservation = 'absent' | 'present' | 'recorded-group-unattributable';
 
 type RecordedSetObservation = Readonly<{
@@ -98,9 +130,51 @@ type RecordedSetObservation = Readonly<{
 
 type RecordedSetAbsenceVerdict = 'absent' | 'not-confirmed' | 'recorded-group-unattributable';
 
+type AsyncTargetObservation =
+  | Readonly<{ kind: 'observed'; observation: TargetObservation }>
+  | Readonly<{ kind: 'unobservable'; reason: 'deadline' | 'identity' }>;
+
+type AsyncRecordedSetObservation =
+  | Readonly<{ kind: 'observed'; observation: RecordedSetObservation }>
+  | Readonly<{ kind: 'unobservable'; reason: 'deadline' | 'identity' }>;
+
+type AsyncRecordedSetAbsenceVerdict = RecordedSetAbsenceVerdict | 'unobservable-deadline' | 'unobservable-identity';
+
+function throwObservationFailure(reason: 'deadline' | 'identity', deadlineName: string): never {
+  if (reason === 'deadline') {
+    throw reapFailure(`Recorded containment observation could not complete before the ${deadlineName}.`);
+  }
+  throw new ContainmentIdentityObservationError();
+}
+
+function requireObservedSet(result: AsyncRecordedSetObservation, deadlineName: string): RecordedSetObservation {
+  if (result.kind === 'unobservable') throwObservationFailure(result.reason, deadlineName);
+  return result.observation;
+}
+
+function requireAbsenceVerdict(
+  verdict: AsyncRecordedSetAbsenceVerdict,
+  deadlineName: string,
+): RecordedSetAbsenceVerdict {
+  if (verdict === 'unobservable-deadline') throwObservationFailure('deadline', deadlineName);
+  if (verdict === 'unobservable-identity') throwObservationFailure('identity', deadlineName);
+  return verdict;
+}
+
+export type RecordedContainmentObservation =
+  | Readonly<{ kind: 'alive' }>
+  | Readonly<{ kind: 'absent' }>
+  | Readonly<{ kind: 'unobservable'; reason: string }>;
+
+export type RecordedContainmentAbortResult =
+  | Readonly<{ kind: 'accepted' }>
+  | Readonly<{ kind: 'refused'; reason: string }>;
+
 export type RecordedContainmentReapResult =
   | Readonly<{ kind: 'containment-absent' }>
-  | Readonly<{ kind: 'recorded-group-unattributable' }>;
+  | Readonly<{ kind: 'recorded-group-unattributable' }>
+  | Readonly<{ kind: 'signal-authorization-refused' }>
+  | Readonly<{ kind: 'identity-unobservable'; signalDelivered: boolean }>;
 
 function reapFailure(message: string, context: Readonly<Record<string, unknown>> = {}): ProcessContainmentError {
   return new ProcessContainmentError('process_containment_reap_failed', message, context);
@@ -157,9 +231,9 @@ function assertRecordedSet(
   }
 }
 
-function readIncarnation<Scope extends symbol>(
+function readIncarnation(
   identity: RecordedProcessIdentity,
-  environment: ProcessContainmentEnvironment<Scope>,
+  environment: ProcessContainmentObservationEnvironment,
 ): ProcessIncarnation | null {
   const read = environment.readProcessIncarnation ?? probeProcessIncarnation;
   try {
@@ -169,9 +243,9 @@ function readIncarnation<Scope extends symbol>(
   }
 }
 
-function observeProcessIdentity<Scope extends symbol>(
+function observeProcessIdentity(
   identity: RecordedProcessIdentity,
-  environment: ProcessContainmentEnvironment<Scope>,
+  environment: ProcessContainmentObservationEnvironment,
 ): TargetObservation {
   const observedIncarnation = readIncarnation(identity, environment);
   if (observedIncarnation === identity.incarnation) {
@@ -190,9 +264,9 @@ function observeProcessIdentity<Scope extends symbol>(
   );
 }
 
-function observeContainment<Scope extends symbol>(
+function observeContainment(
   containment: RecordedContainmentIdentity,
-  environment: ProcessContainmentEnvironment<Scope>,
+  environment: ProcessContainmentObservationEnvironment,
 ): TargetObservation {
   const observedIncarnation = readIncarnation(containment, environment);
   if (observedIncarnation !== null && observedIncarnation !== containment.incarnation) {
@@ -231,10 +305,10 @@ function observeContainment<Scope extends symbol>(
   return groupLiveness === 'alive' ? 'present' : 'absent';
 }
 
-function observeRecordedSet<Scope extends symbol>(
+function observeRecordedSetSynchronously(
   containment: RecordedContainmentIdentity,
   recordedRoots: readonly RecordedProcessIdentity[],
-  environment: ProcessContainmentEnvironment<Scope>,
+  environment: ProcessContainmentObservationEnvironment,
 ): RecordedSetObservation {
   const roots: TargetObservation[] = [];
   let firstFailure: unknown;
@@ -260,6 +334,129 @@ function observeRecordedSet<Scope extends symbol>(
   return { containment: containmentObservation, recordedRoots: roots };
 }
 
+function observationMayStart<Scope extends symbol>(
+  deadline: MonotonicInstant<Scope>,
+  environment: ProcessContainmentEnvironment<Scope>,
+  allowAtDeadline = false,
+): boolean {
+  const comparison = environment.clock.compare(environment.clock.now(), deadline);
+  return comparison < 0 || (allowAtDeadline && comparison === 0);
+}
+
+async function observeProcessIdentityAsync<Scope extends symbol>(
+  identity: RecordedProcessIdentity,
+  deadline: MonotonicInstant<Scope>,
+  environment: ProcessContainmentEnvironment<Scope>,
+  allowAtDeadline = false,
+): Promise<AsyncTargetObservation> {
+  if (!observationMayStart(deadline, environment, allowAtDeadline)) {
+    return { kind: 'unobservable', reason: 'deadline' };
+  }
+  const child = environment.knownLiveChildFor?.(identity.pid);
+  if (child !== undefined && knownLiveChildMayAuthorizeSignal(identity, child)) {
+    return { kind: 'observed', observation: 'present' };
+  }
+  const observe = environment.process.observeRecordedProcessAsync;
+  let liveness: ProcessLiveness;
+  if (observe !== undefined) {
+    liveness = await observe(identity, environment.signal);
+  } else {
+    const observeMany = environment.process.observeProcessIdentities;
+    if (observeMany !== undefined) {
+      const remainingMs = environment.clock.millisecondsBetween(environment.clock.now(), deadline);
+      const [result] = await observeMany([identity], remainingMs);
+      if (result === undefined || result.evidence.kind === 'unobservable') {
+        return { kind: 'unobservable', reason: 'identity' };
+      }
+      liveness =
+        result.evidence.kind === 'pid-absent' || result.evidence.incarnation !== identity.incarnation
+          ? 'absent'
+          : 'alive';
+    } else {
+      return { kind: 'unobservable', reason: 'identity' };
+    }
+  }
+  assertContainmentAuthorized(environment.signal);
+  if (environment.clock.compare(environment.clock.now(), deadline) > 0) {
+    return { kind: 'unobservable', reason: 'deadline' };
+  }
+  if (liveness === 'unknown') return { kind: 'unobservable', reason: 'identity' };
+  return { kind: 'observed', observation: liveness === 'alive' ? 'present' : 'absent' };
+}
+
+async function observeContainmentAsync<Scope extends symbol>(
+  containment: RecordedContainmentIdentity,
+  deadline: MonotonicInstant<Scope>,
+  environment: ProcessContainmentEnvironment<Scope>,
+  allowAtDeadline = false,
+): Promise<AsyncTargetObservation> {
+  const leader = await observeProcessIdentityAsync(containment, deadline, environment, allowAtDeadline);
+  if (leader.kind === 'unobservable') return leader;
+  if (!observationMayStart(deadline, environment, allowAtDeadline)) {
+    return { kind: 'unobservable', reason: 'deadline' };
+  }
+
+  const groupLiveness = environment.process.observeLiveness(-containment.processGroupId);
+  if (groupLiveness === 'unknown') {
+    return leader.observation === 'absent'
+      ? { kind: 'observed', observation: 'recorded-group-unattributable' }
+      : { kind: 'unobservable', reason: 'identity' };
+  }
+  if (groupLiveness === 'absent') return { kind: 'observed', observation: 'absent' };
+  return leader.observation === 'present'
+    ? { kind: 'observed', observation: 'present' }
+    : { kind: 'observed', observation: 'recorded-group-unattributable' };
+}
+
+async function observeRecordedSet<Scope extends symbol>(
+  containment: RecordedContainmentIdentity,
+  recordedRoots: readonly RecordedProcessIdentity[],
+  deadline: MonotonicInstant<Scope>,
+  environment: ProcessContainmentEnvironment<Scope>,
+): Promise<AsyncRecordedSetObservation> {
+  const containmentResult = await observeContainmentAsync(containment, deadline, environment);
+  if (containmentResult.kind === 'unobservable') return containmentResult;
+  if (containmentResult.observation === 'recorded-group-unattributable') {
+    return {
+      kind: 'observed',
+      observation: { containment: containmentResult.observation, recordedRoots: [] },
+    };
+  }
+
+  const roots: TargetObservation[] = [];
+  for (const root of recordedRoots) {
+    const result = await observeProcessIdentityAsync(root, deadline, environment);
+    if (result.kind === 'unobservable') return result;
+    roots.push(result.observation);
+  }
+  return {
+    kind: 'observed',
+    observation: { containment: containmentResult.observation, recordedRoots: roots },
+  };
+}
+
+async function observeRecordedSetAbsence<Scope extends symbol>(
+  containment: RecordedContainmentIdentity,
+  recordedRoots: readonly RecordedProcessIdentity[],
+  deadline: MonotonicInstant<Scope>,
+  environment: ProcessContainmentEnvironment<Scope>,
+  allowAtDeadline = false,
+): Promise<AsyncRecordedSetAbsenceVerdict> {
+  const containmentResult = await observeContainmentAsync(containment, deadline, environment, allowAtDeadline);
+  if (containmentResult.kind === 'unobservable') return `unobservable-${containmentResult.reason}`;
+  if (containmentResult.observation === 'recorded-group-unattributable') {
+    return 'recorded-group-unattributable';
+  }
+  if (containmentResult.observation === 'present') return 'not-confirmed';
+
+  for (const root of recordedRoots) {
+    const result = await observeProcessIdentityAsync(root, deadline, environment, allowAtDeadline);
+    if (result.kind === 'unobservable') return `unobservable-${result.reason}`;
+    if (result.observation !== 'absent') return 'not-confirmed';
+  }
+  return 'absent';
+}
+
 function allRecordedTargetsAbsent(observation: RecordedSetObservation): boolean {
   return observation.containment === 'absent' && observation.recordedRoots.every((root) => root === 'absent');
 }
@@ -267,6 +464,26 @@ function allRecordedTargetsAbsent(observation: RecordedSetObservation): boolean 
 function recordedSetAbsenceVerdict(observation: RecordedSetObservation): RecordedSetAbsenceVerdict {
   if (observation.containment === 'recorded-group-unattributable') return 'recorded-group-unattributable';
   return allRecordedTargetsAbsent(observation) ? 'absent' : 'not-confirmed';
+}
+
+/** Absence requires the group and every recorded root to be absent; unanswerable evidence remains unobservable. */
+export function observeRecordedContainment(
+  subject: RecordedContainmentObservationSubject,
+  environment: ProcessContainmentObservationEnvironment,
+): RecordedContainmentObservation {
+  try {
+    const recordedRoots = subject.childRoot === null ? [] : [subject.childRoot];
+    assertRecordedSet(subject, recordedRoots, 1);
+    const verdict = recordedSetAbsenceVerdict(observeRecordedSetSynchronously(subject, recordedRoots, environment));
+    if (verdict === 'absent') return { kind: 'absent' };
+    if (verdict === 'not-confirmed') return { kind: 'alive' };
+    return { kind: 'unobservable', reason: 'the recorded process group is no longer attributable' };
+  } catch (error: unknown) {
+    return {
+      kind: 'unobservable',
+      reason: error instanceof Error ? error.message : 'recorded containment observation failed',
+    };
+  }
 }
 
 function assertSignalCallWithinBounds<Scope extends symbol>(
@@ -292,46 +509,168 @@ function assertSignalCallWithinBounds<Scope extends symbol>(
   }
 }
 
-function signalRecordedSet<Scope extends symbol>(
+type RecordedSetSignalResult =
+  | Readonly<{ kind: 'delivered'; count: number }>
+  | Readonly<{ kind: 'recorded-group-unattributable' }>
+  | Readonly<{ kind: 'signal-authorization-refused' }>;
+
+type RecordedSignalDelivery = 'delivered' | 'not-delivered' | 'authorization-refused';
+
+function knownLiveChildMayAuthorizeSignal(identity: RecordedProcessIdentity, child: LiveChildAuthority): boolean {
+  return child.pid === identity.pid && child.hasExited() === false;
+}
+
+function deliverSignal<Scope extends symbol>(
+  identity: RecordedProcessIdentity,
+  pid: number,
+  signal: NodeJS.Signals,
+  exitDeadline: MonotonicInstant<Scope>,
+  environment: ProcessContainmentEnvironment<Scope>,
+): RecordedSignalDelivery {
+  const callStartedAt = environment.clock.now();
+  assertContainmentAuthorized(environment.signal);
+  assertSignalCallWithinBounds(callStartedAt, exitDeadline, environment);
+  const child = environment.knownLiveChildFor?.(identity.pid);
+  if (child === undefined && !incarnationMayAuthorizeSignal(environment.platform)) return 'authorization-refused';
+  if (environment.process.observeLiveness(pid) !== 'alive') return 'not-delivered';
+  environment.assertSignalAuthorized?.();
+  let delivered: boolean;
+  if (child !== undefined) {
+    if (!knownLiveChildMayAuthorizeSignal(identity, child)) return 'authorization-refused';
+    delivered = environment.process.kill(pid, signal);
+  } else {
+    // Recovered records have no reap handle, so Node-only check-then-kill cannot be atomic. Measured on Ubuntu
+    // 24.04.4 under WSL2 Linux 6.18.33.2, kernel.pid_max is 4194304 and Linux pid allocation is cyclic:
+    // misdelivery requires collection by the target's own parent, pid wrap and reuse, and, for a group, a new
+    // holder calling setsid or setpgid, all within the read/kill adjacent-syscall gap with no await, bounded by
+    // scheduler latency. See liveChildAuthority in src/infra/process-supervision.ts.
+    if (readIncarnation(identity, environment) !== identity.incarnation) return 'authorization-refused';
+    delivered = environment.process.kill(pid, signal);
+  }
+  if (delivered) environment.onSignal?.({ pid, signal });
+  assertSignalCallWithinBounds(callStartedAt, exitDeadline, environment);
+  return delivered ? 'delivered' : 'not-delivered';
+}
+
+async function signalRecordedSet<Scope extends symbol>(
   containment: RecordedContainmentIdentity,
   recordedRoots: readonly RecordedProcessIdentity[],
   observation: RecordedSetObservation,
   signal: NodeJS.Signals,
   exitDeadline: MonotonicInstant<Scope>,
   environment: ProcessContainmentEnvironment<Scope>,
-): void {
+): Promise<RecordedSetSignalResult> {
   assertContainmentAuthorized(environment.signal);
-  const callStartedAt = environment.clock.now();
-  if (environment.clock.compare(callStartedAt, exitDeadline) >= 0) {
+  if (environment.clock.compare(environment.clock.now(), exitDeadline) >= 0) {
     throw reapFailure(`Recorded containment had no time remaining for ${signal}.`, {
-      remainingMs: environment.clock.millisecondsBetween(callStartedAt, exitDeadline),
+      remainingMs: environment.clock.millisecondsBetween(environment.clock.now(), exitDeadline),
     });
   }
 
-  const signalPid = (pid: number): void => {
-    // The model bounds each process-control call, not the sweep: with a full recorded set a sweep of fast
-    // syscalls would otherwise exceed the per-call bound and abandon a reap that was progressing fine. The
-    // sweep as a whole stays bounded by `exitDeadline`, which every step below still checks.
-    const thisCallStartedAt = environment.clock.now();
-    assertContainmentAuthorized(environment.signal);
-    assertSignalCallWithinBounds(thisCallStartedAt, exitDeadline, environment);
-    environment.assertSignalAuthorized?.();
-    if (environment.process.kill(pid, signal)) environment.onSignal?.({ pid, signal });
-    assertSignalCallWithinBounds(thisCallStartedAt, exitDeadline, environment);
-  };
+  let delivered = 0;
+  let authorizationRefused = false;
+  try {
+    if (observation.containment === 'present') {
+      const refreshed = await observeContainmentAsync(containment, exitDeadline, environment);
+      if (refreshed.kind === 'unobservable') throwObservationFailure(refreshed.reason, 'exit deadline');
+      if (refreshed.observation === 'recorded-group-unattributable') return { kind: refreshed.observation };
+      if (refreshed.observation === 'present') {
+        const delivery = deliverSignal(containment, -containment.processGroupId, signal, exitDeadline, environment);
+        if (delivery === 'authorization-refused') authorizationRefused = true;
+        else if (delivery === 'delivered') delivered += 1;
+      }
+    }
+    for (const [index, root] of recordedRoots.entries()) {
+      if (observation.recordedRoots[index] !== 'present') continue;
+      const refreshed = await observeProcessIdentityAsync(root, exitDeadline, environment);
+      if (refreshed.kind === 'unobservable') throwObservationFailure(refreshed.reason, 'exit deadline');
+      if (refreshed.observation !== 'present') continue;
+      const delivery = deliverSignal(root, root.pid, signal, exitDeadline, environment);
+      if (delivery === 'authorization-refused') authorizationRefused = true;
+      else if (delivery === 'delivered') delivered += 1;
+    }
+  } catch (error: unknown) {
+    if (error instanceof ProcessContainmentError) throw error;
+    throw reapFailure(`Recorded containment ${signal} delivery failed.`, { signal });
+  }
+  return authorizationRefused ? { kind: 'signal-authorization-refused' } : { kind: 'delivered', count: delivered };
+}
 
+function signalRecordedSetSynchronously<Scope extends symbol>(
+  containment: RecordedContainmentIdentity,
+  recordedRoots: readonly RecordedProcessIdentity[],
+  observation: RecordedSetObservation,
+  signal: NodeJS.Signals,
+  exitDeadline: MonotonicInstant<Scope>,
+  environment: ProcessContainmentEnvironment<Scope>,
+): RecordedSetSignalResult {
+  let delivered = 0;
+  let authorizationRefused = false;
   try {
     if (observation.containment === 'present' && observeContainment(containment, environment) === 'present') {
-      signalPid(-containment.processGroupId);
+      const delivery = deliverSignal(containment, -containment.processGroupId, signal, exitDeadline, environment);
+      if (delivery === 'authorization-refused') authorizationRefused = true;
+      else if (delivery === 'delivered') delivered += 1;
     }
     for (const [index, root] of recordedRoots.entries()) {
       if (observation.recordedRoots[index] === 'present' && observeProcessIdentity(root, environment) === 'present') {
-        signalPid(root.pid);
+        const delivery = deliverSignal(root, root.pid, signal, exitDeadline, environment);
+        if (delivery === 'authorization-refused') authorizationRefused = true;
+        else if (delivery === 'delivered') delivered += 1;
       }
     }
   } catch (error: unknown) {
     if (error instanceof ProcessContainmentError) throw error;
     throw reapFailure(`Recorded containment ${signal} delivery failed.`, { signal });
+  }
+  return authorizationRefused ? { kind: 'signal-authorization-refused' } : { kind: 'delivered', count: delivered };
+}
+
+/** A recycled leader forbids every signal, and a signal attempt cannot erase a refusal disposition. */
+export function abortRecordedContainment<Scope extends symbol>(
+  subject: RecordedContainmentObservationSubject,
+  exitDeadline: MonotonicInstant<Scope>,
+  environment: ProcessContainmentEnvironment<Scope>,
+): RecordedContainmentAbortResult {
+  try {
+    const recordedRoots = subject.childRoot === null ? [] : [subject.childRoot];
+    assertRecordedSet(subject, recordedRoots, 1);
+    const leaderIncarnation = readIncarnation(subject, environment);
+    if (leaderIncarnation !== null && leaderIncarnation !== subject.incarnation) {
+      return { kind: 'refused', reason: 'the recorded containment leader pid has been recycled' };
+    }
+
+    const observation = observeRecordedSetSynchronously(subject, recordedRoots, environment);
+    const verdict = recordedSetAbsenceVerdict(observation);
+    if (verdict === 'recorded-group-unattributable') {
+      return { kind: 'refused', reason: 'the recorded process group is no longer attributable' };
+    }
+    if (verdict === 'absent') return { kind: 'accepted' };
+
+    const delivery = signalRecordedSetSynchronously(
+      subject,
+      recordedRoots,
+      observation,
+      'SIGTERM',
+      exitDeadline,
+      environment,
+    );
+    const targeted =
+      (observation.containment === 'present' ? 1 : 0) +
+      observation.recordedRoots.filter((root) => root === 'present').length;
+    if (delivery.kind !== 'delivered') {
+      return { kind: 'refused', reason: 'the platform cannot authorize every recorded containment signal' };
+    }
+    if (delivery.count === targeted) return { kind: 'accepted' };
+
+    return observeRecordedContainment(subject, environment).kind === 'absent'
+      ? { kind: 'accepted' }
+      : { kind: 'refused', reason: 'SIGTERM was not accepted for every recorded containment target' };
+  } catch (error: unknown) {
+    return {
+      kind: 'refused',
+      reason: error instanceof Error ? error.message : 'recorded containment abort was refused',
+    };
   }
 }
 
@@ -370,11 +709,16 @@ async function waitForAbsence<Scope extends symbol>(
 ): Promise<RecordedSetAbsenceVerdict> {
   while (true) {
     assertContainmentAuthorized(environment.signal);
-    const verdict = recordedSetAbsenceVerdict(observeRecordedSet(containment, recordedRoots, environment));
-    if (verdict !== 'not-confirmed') return verdict;
     const remainingMs = environment.clock.millisecondsBetween(environment.clock.now(), waitDeadline);
     if (remainingMs <= 0) return 'not-confirmed';
-    await sleepWhileAuthorized(Math.min(ABSENCE_POLL_MS, remainingMs), environment);
+    const verdict = requireAbsenceVerdict(
+      await observeRecordedSetAbsence(containment, recordedRoots, waitDeadline, environment),
+      'wait deadline',
+    );
+    if (verdict !== 'not-confirmed') return verdict;
+    const remainingAfterObservationMs = environment.clock.millisecondsBetween(environment.clock.now(), waitDeadline);
+    if (remainingAfterObservationMs <= 0) return 'not-confirmed';
+    await sleepWhileAuthorized(Math.min(ABSENCE_POLL_MS, remainingAfterObservationMs), environment);
   }
 }
 
@@ -392,14 +736,18 @@ async function confirmAbsence<Scope extends symbol>(
 
   while (environment.clock.compare(environment.clock.now(), confirmationDeadline) < 0) {
     assertContainmentAuthorized(environment.signal);
-    const verdict = recordedSetAbsenceVerdict(observeRecordedSet(containment, recordedRoots, environment));
+    const verdict = requireAbsenceVerdict(
+      await observeRecordedSetAbsence(containment, recordedRoots, exitDeadline, environment),
+      'exit deadline',
+    );
     if (verdict !== 'absent') return verdict;
-    // Observing the set can outlast the remaining window; clamping keeps that from becoming a negative
-    // sleep, which would throw outside this module's closed failure set and report an absent set as failed.
     const remainingMs = environment.clock.millisecondsBetween(environment.clock.now(), confirmationDeadline);
     await sleepWhileAuthorized(Math.max(0, Math.min(ABSENCE_POLL_MS, remainingMs)), environment);
   }
-  return recordedSetAbsenceVerdict(observeRecordedSet(containment, recordedRoots, environment));
+  return requireAbsenceVerdict(
+    await observeRecordedSetAbsence(containment, recordedRoots, exitDeadline, environment, true),
+    'exit deadline',
+  );
 }
 
 /**
@@ -414,7 +762,33 @@ export async function reapRecordedContainment<Scope extends symbol>(
   assertContainmentAuthorized(environment.signal);
   assertRecordedSet(containment, recordedRoots, environment.maxRecordedRoots);
 
-  let observation = observeRecordedSet(containment, recordedRoots, environment);
+  let signalDelivered = false;
+  const trackedEnvironment: ProcessContainmentEnvironment<Scope> = {
+    ...environment,
+    onSignal: (effect) => {
+      signalDelivered = true;
+      environment.onSignal?.(effect);
+    },
+  };
+
+  try {
+    return await reapObservedRecordedContainment(containment, recordedRoots, exitDeadline, trackedEnvironment);
+  } catch (error: unknown) {
+    if (error instanceof ContainmentIdentityObservationError) {
+      return { kind: 'identity-unobservable', signalDelivered };
+    }
+    throw error;
+  }
+}
+
+async function reapObservedRecordedContainment<Scope extends symbol>(
+  containment: RecordedContainmentIdentity,
+  recordedRoots: readonly RecordedProcessIdentity[],
+  exitDeadline: MonotonicInstant<Scope>,
+  environment: ProcessContainmentEnvironment<Scope>,
+): Promise<Exclude<RecordedContainmentReapResult, { kind: 'identity-unobservable' }>> {
+  let observationResult = await observeRecordedSet(containment, recordedRoots, exitDeadline, environment);
+  let observation = requireObservedSet(observationResult, 'exit deadline');
   let verdict = recordedSetAbsenceVerdict(observation);
   if (verdict === 'recorded-group-unattributable') return { kind: verdict };
   if (verdict === 'absent') {
@@ -424,7 +798,8 @@ export async function reapRecordedContainment<Scope extends symbol>(
     throw reapFailure('Recorded containment absence could not be confirmed before the exit deadline.');
   }
 
-  signalRecordedSet(containment, recordedRoots, observation, 'SIGTERM', exitDeadline, environment);
+  let delivery = await signalRecordedSet(containment, recordedRoots, observation, 'SIGTERM', exitDeadline, environment);
+  if (delivery.kind !== 'delivered') return delivery;
   const termWaitDeadline = environment.clock.earlier(
     exitDeadline,
     environment.clock.shiftMilliseconds(environment.clock.now(), SIGTERM_GRACE_MS),
@@ -439,8 +814,10 @@ export async function reapRecordedContainment<Scope extends symbol>(
   }
 
   assertContainmentAuthorized(environment.signal);
-  observation = observeRecordedSet(containment, recordedRoots, environment);
-  signalRecordedSet(containment, recordedRoots, observation, 'SIGKILL', exitDeadline, environment);
+  observationResult = await observeRecordedSet(containment, recordedRoots, exitDeadline, environment);
+  observation = requireObservedSet(observationResult, 'exit deadline');
+  delivery = await signalRecordedSet(containment, recordedRoots, observation, 'SIGKILL', exitDeadline, environment);
+  if (delivery.kind !== 'delivered') return delivery;
   const killWaitDeadline = environment.clock.earlier(
     exitDeadline,
     environment.clock.shiftMilliseconds(environment.clock.now(), SIGKILL_GRACE_MS),

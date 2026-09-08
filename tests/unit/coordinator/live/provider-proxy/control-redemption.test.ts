@@ -21,7 +21,7 @@ import {
   ProviderProxyRoleControlRemoteError,
   ProviderProxyRoleControlUnavailableError,
 } from '#src/coordinator/live/provider-proxy/role-control.js';
-import { ControlClientError, type ControlClient } from '#src/provider-proxy/control-client.js';
+import { ControlClientError, controlExchangeForTest, type ControlClient } from '#src/provider-proxy/control-client.js';
 import type { HandoffCapsuleV3 } from '#src/provider-proxy/handoff-capsule.js';
 import type { CoordinatorIdentity, OperationIdentity } from '#src/provider-proxy/protocol.js';
 import { ESTABLISH_CONTROL_READY_DEADLINE_MS } from '#src/coordinator/live/provider-proxy/role-control.js';
@@ -121,10 +121,58 @@ function fakeClient(): ControlClient {
   return { close: vi.fn() } as unknown as ControlClient;
 }
 
-function sessions(proxy = proxyIdentity) {
+type PublicationPhases = {
+  guardian: 'acquisition-provisional' | 'published';
+  reaper: 'acquisition-provisional' | 'published';
+  proxy: 'acquisition-provisional' | 'published';
+};
+
+function publicationClient(
+  role: 'guardian' | 'proxy',
+  phases: PublicationPhases,
+  unknownRole: 'guardian' | 'proxy' | null,
+): ControlClient {
+  return {
+    exchange: vi.fn(async () => {
+      if (role === unknownRole) throw new Error(`${role} publication reply lost`);
+      if (role === 'guardian') {
+        phases.guardian = 'published';
+        phases.reaper = 'published';
+        return controlExchangeForTest({
+          kind: 'response',
+          response: {
+            kind: 'result',
+            value: {
+              state: 'acquisition-published',
+              certificate: 'publication-certificate',
+              guardian: guardianIdentity,
+              reaper: reaperIdentity,
+            },
+          },
+        });
+      }
+      phases.proxy = 'published';
+      return controlExchangeForTest({
+        kind: 'response',
+        response: { kind: 'result', value: { state: 'acquisition-published' } },
+      });
+    }),
+    close: vi.fn(),
+  } as unknown as ControlClient;
+}
+
+function sessions(
+  proxy = proxyIdentity,
+  phases: PublicationPhases = {
+    guardian: 'acquisition-provisional',
+    reaper: 'acquisition-provisional',
+    proxy: 'acquisition-provisional',
+  },
+  unknownRole: 'guardian' | 'proxy' | null = null,
+) {
   return [
     {
-      client: fakeClient(),
+      client: publicationClient('guardian', phases, unknownRole),
       opened: {
         controlEpoch: 11,
         heartbeatChallenge: 'guardian-first',
@@ -155,7 +203,7 @@ function sessions(proxy = proxyIdentity) {
       nextHeartbeatChallenge: 'reaper-next',
     },
     {
-      client: fakeClient(),
+      client: publicationClient('proxy', phases, unknownRole),
       opened: {
         controlEpoch: 13,
         heartbeatChallenge: 'proxy-first',
@@ -186,8 +234,12 @@ function runtimeWithNow(now: () => number = () => 1_000): Runtime {
   return { ...runtime, time: { ...runtime.time, now } };
 }
 
-function arrangeSessions(proxy = proxyIdentity): void {
-  const [guardian, reaper, providerProxy] = sessions(proxy);
+function arrangeSessions(
+  proxy = proxyIdentity,
+  phases?: PublicationPhases,
+  unknownRole: 'guardian' | 'proxy' | null = null,
+): void {
+  const [guardian, reaper, providerProxy] = sessions(proxy, phases, unknownRole);
   mockedEstablishRoleControl.mockResolvedValueOnce(guardian as never);
   mockedEstablishRoleControl.mockResolvedValueOnce(reaper as never);
   mockedEstablishRoleControl.mockResolvedValueOnce(providerProxy as never);
@@ -201,7 +253,12 @@ beforeEach(() => {
 
 describe('provider proxy control redemption', () => {
   it('redeems in proof order with a fresh role budget and carries the guardian receipt into rotation', async () => {
-    arrangeSessions();
+    const phases: PublicationPhases = {
+      guardian: 'acquisition-provisional',
+      reaper: 'acquisition-provisional',
+      proxy: 'acquisition-provisional',
+    };
+    arrangeSessions(proxyIdentity, phases);
     const wallClock = vi.fn<() => number>(() => {
       throw new Error('role retry budgets must not read wall time');
     });
@@ -230,8 +287,54 @@ describe('provider proxy control redemption', () => {
       Array.from({ length: 3 }, () => ESTABLISH_CONTROL_READY_DEADLINE_MS),
     );
     expect(wallClock).not.toHaveBeenCalled();
+    expect(calls.map((call) => call[2].monotonicNow())).toEqual([1_000n, 1_000n, 1_000n]);
     expect(monotonicNow).toHaveBeenCalledTimes(3);
     expect(startRole.mock.calls.map((call) => call[0])).toEqual(['guardian', 'reaper', 'proxy']);
+    expect(phases).toEqual({ guardian: 'published', reaper: 'published', proxy: 'published' });
+  });
+
+  it('re-publishes an already-published redemption as a no-op and still returns promotable control', async () => {
+    const phases: PublicationPhases = { guardian: 'published', reaper: 'published', proxy: 'published' };
+    arrangeSessions(proxyIdentity, phases);
+
+    const outcome = await redeemProviderProxyControl(
+      capsule,
+      setIdentity,
+      { runtime: runtimeWithNow(), coordinatorIdentity },
+      new AbortController().signal,
+    );
+
+    expect(outcome.kind).toBe('redeemed');
+    expect(phases).toEqual({ guardian: 'published', reaper: 'published', proxy: 'published' });
+  });
+
+  it('returns publication uncertainty as retryable unavailability instead of promotable control', async () => {
+    const phases: PublicationPhases = {
+      guardian: 'acquisition-provisional',
+      reaper: 'acquisition-provisional',
+      proxy: 'acquisition-provisional',
+    };
+    arrangeSessions(proxyIdentity, phases, 'proxy');
+
+    const outcome = await redeemProviderProxyControl(
+      capsule,
+      setIdentity,
+      { runtime: runtimeWithNow(), coordinatorIdentity },
+      new AbortController().signal,
+    );
+
+    expect(outcome).toEqual({
+      kind: 'unavailable',
+      incident: {
+        kind: 'publication-unknown',
+        role: 'proxy',
+        reason:
+          'First attempt was unknown: proxy publication reply lost; retry was unknown: proxy publication reply lost',
+      },
+    });
+    expect(phases).toEqual({ guardian: 'published', reaper: 'published', proxy: 'acquisition-provisional' });
+    expect(complete).not.toHaveBeenCalled();
+    expect(stop).toHaveBeenCalledOnce();
   });
 
   it('refuses a complete reply whose returned identity is not the requested set identity', async () => {
@@ -286,6 +389,92 @@ describe('provider proxy control redemption', () => {
     );
 
     expect(refused.kind).toBe('refused');
+    if (refused.kind !== 'refused') throw new Error('expected guardian refusal');
+    expect(refused.refusal.kind).toBe('guardian-role-refused');
     expect(unavailable.kind).toBe('unavailable');
+  });
+
+  it('returns verified guardian ownership when a downstream role refuses', async () => {
+    const [guardian] = sessions();
+    const remote = new ProviderProxyRoleControlRemoteError(
+      'reaper',
+      'open',
+      'reaper.handoff-rotate.v1',
+      new ControlClientError('control_call_failed', 'teardown latched', 'remote-response', {
+        kind: 'json-rpc-error',
+        jsonRpcCode: -32_600,
+        protocolCode: 'invalid_state',
+        admissionReason: 'teardown-latched',
+        heartbeatRefusal: null,
+      }),
+    );
+    mockedEstablishRoleControl.mockImplementationOnce(async (opened) => {
+      opened.push(guardian.client);
+      return guardian as never;
+    });
+    mockedEstablishRoleControl.mockRejectedValueOnce(remote);
+
+    const outcome = await redeemProviderProxyControl(
+      capsule,
+      setIdentity,
+      { runtime: runtimeWithNow(), coordinatorIdentity },
+      new AbortController().signal,
+    );
+
+    expect(outcome.kind).toBe('refused');
+    if (outcome.kind !== 'refused' || outcome.refusal.kind !== 'downstream-role-refused') {
+      throw new Error('expected downstream refusal with guardian ownership');
+    }
+    expect(stop).not.toHaveBeenCalled();
+    expect(guardian.client.close).not.toHaveBeenCalled();
+
+    outcome.refusal.guardianAuthority.stopHeartbeats();
+    await outcome.refusal.guardianAuthority.initiateControlClose();
+
+    expect(stop).toHaveBeenCalledOnce();
+    expect(guardian.client.close).toHaveBeenCalledOnce();
+  });
+
+  it('abandons guardian ownership and propagates cancellation before returning a late downstream refusal', async () => {
+    const [guardian] = sessions();
+    const remote = new ProviderProxyRoleControlRemoteError(
+      'reaper',
+      'open',
+      'reaper.handoff-rotate.v1',
+      new ControlClientError('control_call_failed', 'teardown latched', 'remote-response', {
+        kind: 'json-rpc-error',
+        jsonRpcCode: -32_600,
+        protocolCode: 'invalid_state',
+        admissionReason: 'teardown-latched',
+        heartbeatRefusal: null,
+      }),
+    );
+    let rejectReaper!: (error: unknown) => void;
+    mockedEstablishRoleControl.mockImplementationOnce(async (opened) => {
+      opened.push(guardian.client);
+      return guardian as never;
+    });
+    mockedEstablishRoleControl.mockImplementationOnce(
+      () =>
+        new Promise<never>((_resolve, reject) => {
+          rejectReaper = reject;
+        }),
+    );
+    const controller = new AbortController();
+    const cancellation = new Error('containment proof retired redemption');
+    const redemption = redeemProviderProxyControl(
+      capsule,
+      setIdentity,
+      { runtime: runtimeWithNow(), coordinatorIdentity },
+      controller.signal,
+    );
+    await vi.waitFor(() => expect(mockedEstablishRoleControl).toHaveBeenCalledTimes(2));
+
+    controller.abort(cancellation);
+    rejectReaper(remote);
+
+    await expect(redemption).rejects.toBe(cancellation);
+    expect(stop).toHaveBeenCalledOnce();
+    expect(guardian.client.close).toHaveBeenCalledOnce();
   });
 });

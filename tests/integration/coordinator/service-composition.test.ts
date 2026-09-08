@@ -30,6 +30,7 @@ import { type AgentRef } from '#src/jobs/agent-resolution.js';
 import { LaunchCoordinator } from '#src/coordinator/live/admission.js';
 import { getMaxWorkers } from '#src/coordinator/live/worker-limits.js';
 import type { ProviderServerHandle, SpawnProviderServerFn } from '#src/providers/app-server-transport.js';
+import type { ChildProcessLike } from '#src/infra/port-types.js';
 import { TypedEventBus } from '#src/coordinator/event-bus.js';
 import { JobStore } from '#src/jobs/store.js';
 import { createProviderHostManager, type ProviderHostManager } from '#src/coordinator/live/provider-hosts/index.js';
@@ -452,13 +453,28 @@ function createFakeProviderServerHandle(options?: {
     },
   );
   const markExpectedCloseMock = vi.fn();
-  const closeMock = vi.fn(async () => {});
+  const closeMock = vi.fn(async () => ({
+    kind: 'observed-absent' as const,
+    evidence: { subject: { kind: 'process' as const, pid: 43210 } },
+  }));
   const closePromise = new Promise<Error | void>(() => {});
+  const child: ChildProcessLike = {
+    pid: 43210,
+    exitCode: null,
+    signalCode: null,
+    stdin: null,
+    stdout: null,
+    stderr: null,
+    on() {
+      return this;
+    },
+    kill: () => true,
+  };
 
   return {
     handle: {
       pid: 43210,
-      child: {} as never,
+      child,
       generation: options?.generation ?? 7,
       rpc: {
         request: requestMock as unknown as ProviderServerHandle['rpc']['request'],
@@ -2415,14 +2431,14 @@ describe('ExecutionService', () => {
         cleanup();
       });
 
-      it('routes abort through runtime.process.kill', async () => {
+      it('does not expose recovered durable containment through the void abort registry', async () => {
         const killSpy = vi.spyOn(runtime.process, 'kill').mockImplementation(() => true);
         const service = createService(ctx);
         const { progressStore, abortRegistry } =
           /* @intentional-private-access — seed or inspect execution internals with no public test seam */
           getInternals(service);
 
-        const jobId = `adopt-abort-${randomUUID()}`;
+        const jobId = randomUUID();
         const sessionId = `session-adopt-abort-${randomUUID()}`;
         trackJob(jobId);
 
@@ -2444,17 +2460,16 @@ describe('ExecutionService', () => {
         const runtimeRecord = makeRuntimeRecord({ pid: 54321 });
         progressStore.appendLaunchRequested(jobId, launchRecord);
         progressStore.appendRuntimeStarted(jobId, runtimeRecord);
-
         const { cleanup } = await service.adoptRunningJob(
           await captureRecoveryAuthority(service, launchRecord),
           runtimeRecord,
         );
 
         expect(abortRegistry.abort([jobId])).toEqual({
-          aborted: [jobId],
-          notFound: [],
+          aborted: [],
+          notFound: [jobId],
         });
-        expect(killSpy).toHaveBeenCalledWith(54321, 'SIGTERM');
+        expect(killSpy).not.toHaveBeenCalled();
 
         cleanup();
       });

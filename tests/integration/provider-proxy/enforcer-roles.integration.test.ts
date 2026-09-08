@@ -8,10 +8,7 @@ import { join } from 'node:path';
 import { afterEach, describe, expect, it } from 'vitest';
 
 import { createMonotonicClock, type MonotonicClock } from '#src/infra/monotonic-clock.js';
-import { createProviderProxySetAuthority } from '#src/coordinator/live/provider-proxy/set-authority.js';
-import { LocalOperationRegistry } from '#src/coordinator/services/operation-registry.js';
-import { providerOperationRecordSchema } from '#src/store/provider-operation-record.js';
-import type { Runtime } from '#src/runtime/ports.js';
+import type { RecordedProcessIdentity } from '#src/infra/process-containment.js';
 import {
   connectControlClient,
   controlExchangeForTest,
@@ -19,6 +16,7 @@ import {
 } from '#src/provider-proxy/control-client.js';
 import { createGuardian } from '#src/provider-proxy/guardian.js';
 import { createReaper, type Reaper } from '#src/provider-proxy/reaper.js';
+import { createControlHolderAuthority } from '#src/provider-proxy/holder-lifecycle.js';
 import {
   MAX_PROXY_RECORDED_PROVIDER_ROOTS,
   type EnforcementOutcome,
@@ -35,7 +33,6 @@ import {
   resolveProviderProxyDeadlineConfiguration,
   type EnforcerDeadlineStateMachine,
 } from '#src/provider-proxy/orphan-deadline.js';
-import { providerOperationRecord } from '#tests/unit/store/provider-operation-fixtures.js';
 
 const NONCE = 'a'.repeat(64);
 const PAIR_SECRET = 'c'.repeat(64);
@@ -143,6 +140,11 @@ async function startSet(options: { recordContainment?: boolean } = {}) {
       },
       observeLiveness: (pid: number) =>
         ((pid < 0 ? alive.has(-pid) : alive.has(pid)) ? 'alive' : 'absent') as ProcessLiveness,
+      observeRecordedProcessAsync: async (identity: RecordedProcessIdentity) => {
+        if (!alive.has(identity.pid)) return 'absent';
+        const incarnation = identity.pid === CONTAINMENT.pid ? CONTAINMENT.incarnation : ROOT.incarnation;
+        return incarnation === identity.incarnation ? 'alive' : 'absent';
+      },
     },
     platform: 'linux' as const,
     maxRecordedRoots: 128,
@@ -158,8 +160,14 @@ async function startSet(options: { recordContainment?: boolean } = {}) {
       controlLossAt: start,
       adoptionDeadline: clock.shiftMilliseconds(start, 60_000),
       exitDeadline: clock.shiftMilliseconds(start, 74_000),
+      holderCheckAt: clock.shiftMilliseconds(start, 60_000),
+      holderCheckAccelerated: false,
     };
   };
+  // Each role must retain an independent holder authority.
+  const guardianHolderAuthority = createControlHolderAuthority();
+  const reaperHolderAuthority = createControlHolderAuthority();
+  const observeHolder = (): Promise<ProcessLiveness> => Promise.resolve('unknown' as const);
   let controlLive = true;
   let challengeCount = 0;
   const mintRoleChallenge = (): string => {
@@ -181,6 +189,7 @@ async function startSet(options: { recordContainment?: boolean } = {}) {
     latchTeardown: () => {},
     markContainmentAbsent: () => {},
     markExited: () => {},
+    renewHolderCheck: () => {},
   };
 
   let receipts = 0;
@@ -211,6 +220,9 @@ async function startSet(options: { recordContainment?: boolean } = {}) {
     timer,
     mintReceipt,
     self: { pid: reaperIdentity.pid, incarnation: reaperIdentity.incarnation },
+    holderAuthority: reaperHolderAuthority,
+    observeHolder,
+    abandonUnattributable: () => false,
     onOutcome: (outcome) => reaperOutcomes.push(outcome),
     onProgressViolation: () => {},
   });
@@ -249,6 +261,9 @@ async function startSet(options: { recordContainment?: boolean } = {}) {
     reaperChannel,
     self: { pid: guardianIdentity.pid, incarnation: guardianIdentity.incarnation },
     reaperSelf: { pid: reaperIdentity.pid, incarnation: reaperIdentity.incarnation },
+    holderAuthority: guardianHolderAuthority,
+    observeHolder,
+    abandonUnattributable: () => false,
     onOutcome: (outcome) => guardianOutcomes.push(outcome),
     onProgressViolation: () => {},
   });
@@ -499,12 +514,15 @@ function bareDeadlines<Scope extends symbol>(clock: MonotonicClock<Scope>): Enfo
     latchTeardown: () => {},
     markContainmentAbsent: () => {},
     markExited: () => {},
+    renewHolderCheck: () => {},
     bounds: () => ({
       lastRoundTripEvidenceAt: clock.now(),
       eofAt: null,
       controlLossAt: clock.now(),
       adoptionDeadline: clock.shiftMilliseconds(clock.now(), 60_000),
       exitDeadline: clock.shiftMilliseconds(clock.now(), 74_000),
+      holderCheckAt: clock.shiftMilliseconds(clock.now(), 60_000),
+      holderCheckAccelerated: false,
     }),
     state: () => 'accepting-control' as const,
   };
@@ -516,7 +534,8 @@ async function startBareReaper<Scope extends symbol>(
   shared: BareSharedIdentity,
   clock: MonotonicClock<Scope>,
   deadlines: EnforcerDeadlineStateMachine<Scope>,
-): Promise<{ reaperEndpoint: string; reaper: Reaper<Scope> }> {
+  holderAuthority: ReturnType<typeof createControlHolderAuthority> = createControlHolderAuthority(),
+): Promise<{ reaperEndpoint: string; reaper: Reaper }> {
   const reaperEndpoint = join(directory, 'r.sock');
   const reaper = createReaper({
     capsule: {
@@ -531,7 +550,11 @@ async function startBareReaper<Scope extends symbol>(
     deadlines,
     containmentEnvironment: {
       clock,
-      process: { kill: () => true, observeLiveness: () => 'alive' as const },
+      process: {
+        kill: () => true,
+        observeLiveness: () => 'alive' as const,
+        observeRecordedProcessAsync: async () => 'alive' as const,
+      },
       platform: 'linux' as const,
       maxRecordedRoots: 128,
       readProcessIncarnation: () => CONTAINMENT.incarnation,
@@ -540,6 +563,9 @@ async function startBareReaper<Scope extends symbol>(
     timer,
     mintReceipt: () => randomUUID(),
     self: { pid: 5_101, incarnation: testIncarnation(901) },
+    holderAuthority,
+    observeHolder: (): Promise<ProcessLiveness> => Promise.resolve('unknown' as const),
+    abandonUnattributable: () => false,
     onOutcome: () => {},
     onProgressViolation: () => {},
   });
@@ -660,12 +686,7 @@ describe('provider-proxy guardian and reaper', () => {
     ).rejects.toMatchObject({ remoteFailure: { protocolCode: 'invalid_state' } });
   });
 
-  // `guardian.stop-and-reap.v1` still refuses via its own `requireEnforcer()` while no containment is
-  // recorded (unchanged), but that state is no longer reachable through active control at all: control
-  // cannot open in the first place without a recorded containment (see the `guardian.open.v1` test below),
-  // and `stop-and-reap.v1` is an `authority: 'active'` method — reachable only once open already succeeded,
-  // which by then guarantees containment is recorded. The equivalent guarantee for a method reachable
-  // without active control (`authority: 'pairing'`) is still exercised directly, above.
+  // Active control methods must remain unreachable before containment is recorded.
 
   it('refuses guardian.open.v1 while no containment is recorded, and the nonce survives for a later successful open', async () => {
     const set = await startSet({ recordContainment: false });
@@ -706,7 +727,11 @@ describe('provider-proxy guardian and reaper', () => {
     const clock = createMonotonicClock(Symbol('arm-before-forward'), { readMilliseconds: () => 0n });
     const containmentEnvironment = {
       clock,
-      process: { kill: () => true, observeLiveness: () => 'alive' as const },
+      process: {
+        kill: () => true,
+        observeLiveness: () => 'alive' as const,
+        observeRecordedProcessAsync: async () => 'alive' as const,
+      },
       platform: 'linux' as const,
       maxRecordedRoots: 128,
       readProcessIncarnation: () => CONTAINMENT.incarnation,
@@ -740,6 +765,9 @@ describe('provider-proxy guardian and reaper', () => {
       reaperChannel: unreachableReaperChannel,
       self: { pid: 5_102, incarnation: testIncarnation(902) },
       reaperSelf: { pid: 5_101, incarnation: testIncarnation(901) },
+      holderAuthority: createControlHolderAuthority(),
+      observeHolder: (): Promise<ProcessLiveness> => Promise.resolve('unknown' as const),
+      abandonUnattributable: () => false,
       onOutcome: () => {},
       onProgressViolation: () => {},
     });
@@ -1050,7 +1078,11 @@ describe('provider-proxy guardian and reaper', () => {
     const clock = createMonotonicClock(Symbol('bare-guardian'), { readMilliseconds: () => 0n });
     const containmentEnvironment = {
       clock,
-      process: { kill: () => true, observeLiveness: () => 'alive' as const },
+      process: {
+        kill: () => true,
+        observeLiveness: () => 'alive' as const,
+        observeRecordedProcessAsync: async () => 'alive' as const,
+      },
       platform: 'linux' as const,
       maxRecordedRoots: 128,
       readProcessIncarnation: () => CONTAINMENT.incarnation,
@@ -1104,6 +1136,9 @@ describe('provider-proxy guardian and reaper', () => {
       },
       self: { pid: 5_102, incarnation: testIncarnation(902) },
       reaperSelf: { pid: 5_101, incarnation: testIncarnation(901) },
+      holderAuthority: createControlHolderAuthority(),
+      observeHolder: (): Promise<ProcessLiveness> => Promise.resolve('unknown' as const),
+      abandonUnattributable: () => false,
       onOutcome: () => {},
       onProgressViolation: () => {},
     });
@@ -1241,13 +1276,8 @@ describe('provider-proxy guardian and reaper', () => {
 
     const reaped = (await strictTestExchange(
       set.control,
-      'guardian.stop-and-reap.v1',
-      {
-        guardian: set.guardianIdentity,
-        reaper: set.reaperIdentity,
-        proxy: set.proxyIdentity,
-        providerRoots: [ROOT],
-      },
+      'guardian.containment-commit.v1',
+      { guardian: set.guardianIdentity, reaper: set.reaperIdentity, proxy: set.proxyIdentity },
       5_000,
     )) as { disappearanceReceipt: string };
 
@@ -1255,18 +1285,13 @@ describe('provider-proxy guardian and reaper', () => {
     expect(reaped.disappearanceReceipt).toContain(`root:${ROOT.pid}@${ROOT.incarnation}`);
   });
 
-  it('reaps the recorded set through the documented stop-and-reap request', async () => {
+  it('reaps the recorded set through the documented containment-commit request', async () => {
     const set = await startSet();
 
     const reaped = (await strictTestExchange(
       set.control,
-      'guardian.stop-and-reap.v1',
-      {
-        guardian: set.guardianIdentity,
-        reaper: set.reaperIdentity,
-        proxy: set.proxyIdentity,
-        providerRoots: [],
-      },
+      'guardian.containment-commit.v1',
+      { guardian: set.guardianIdentity, reaper: set.reaperIdentity, proxy: set.proxyIdentity },
       5_000,
     )) as { state: string; disappearanceReceipt: string };
 
@@ -1275,38 +1300,17 @@ describe('provider-proxy guardian and reaper', () => {
     expect(set.alive.has(CONTAINMENT.pid)).toBe(false);
   });
 
-  it('refuses a teardown that names a provider-root set the guardian never recorded', async () => {
-    const set = await startSet();
-
-    // The same set-agreement the reaper enforces on its own half of this request — one authority must not
-    // accept a teardown the other would refuse.
-    await expect(
-      strictTestExchange(
-        set.control,
-        'guardian.stop-and-reap.v1',
-        {
-          guardian: set.guardianIdentity,
-          reaper: set.reaperIdentity,
-          proxy: set.proxyIdentity,
-          providerRoots: [{ pid: 9_999, incarnation: testIncarnation(1) }],
-        },
-        5_000,
-      ),
-    ).rejects.toThrow(/different provider-root set/u);
-  });
-
   it('refuses a teardown that names a different guardian than this one', async () => {
     const set = await startSet();
 
     await expect(
       strictTestExchange(
         set.control,
-        'guardian.stop-and-reap.v1',
+        'guardian.containment-commit.v1',
         {
           guardian: { ...set.guardianIdentity, pid: set.guardianIdentity.pid + 1 },
           reaper: set.reaperIdentity,
           proxy: set.proxyIdentity,
-          providerRoots: [],
         },
         5_000,
       ),
@@ -1319,127 +1323,284 @@ describe('provider-proxy guardian and reaper', () => {
     await expect(
       strictTestExchange(
         set.control,
-        'guardian.stop-and-reap.v1',
+        'guardian.containment-commit.v1',
         {
           guardian: set.guardianIdentity,
           reaper: { ...set.reaperIdentity, pid: set.reaperIdentity.pid + 1 },
           proxy: set.proxyIdentity,
-          providerRoots: [],
         },
         5_000,
       ),
     ).rejects.toThrow(/different reaper than this one/u);
   });
 
-  it('refuses a teardown that names a provider-root set the reaper never recorded', async () => {
+  it(
+    'refuses reaper.containment-prepare.v1 and reaper.containment-abort.v1 over direct coordinator control — ' +
+      'only the guardian, over the paired channel, may ask',
+    async () => {
+      const set = await startSet();
+      const reaperControl = await openReaperControl(set);
+
+      await expect(strictTestExchange(reaperControl, 'reaper.containment-prepare.v1', {}, 5_000)).rejects.toMatchObject(
+        { remoteFailure: { protocolCode: 'unauthorized_control' } },
+      );
+      await expect(
+        strictTestExchange(reaperControl, 'reaper.containment-abort.v1', { token: 'x' }, 5_000),
+      ).rejects.toMatchObject({ remoteFailure: { protocolCode: 'unauthorized_control' } });
+    },
+  );
+
+  it('refuses a commit when the guardian and reaper cumulative roots disagree, and reopens both gates', async () => {
     const set = await startSet();
-    // Reach the reaper directly so its own set-agreement check is the one under test.
-    const reaperControl = await connectControlClient(set.reaperIdentity.canonicalControlEndpoint, timer, 5_000);
-    cleanups.push(() => reaperControl.close());
-    const opened = (await strictTestExchange(
-      reaperControl,
-      'reaper.open.v1',
-      {
-        bootstrapNonce: NONCE,
-        coordinator: {
-          instanceId: randomUUID(),
-          pid: 4_000,
-          incarnation: testIncarnation(700),
-          generation: 'gen2',
-          flavor: 'prod',
-          buildSetId: set.reaperIdentity.buildSetId,
-        },
-        guardian: set.guardianIdentity,
-        proxy: set.proxyIdentity,
-        containment: CONTAINMENT,
-      },
-      5_000,
-    )) as { controlEpoch: number; heartbeatChallenge: string };
-    await strictTestExchange(
-      reaperControl,
-      'reaper.heartbeat.v1',
-      { controlEpoch: opened.controlEpoch, heartbeatChallenge: opened.heartbeatChallenge },
-      5_000,
-    );
+    // This fixture must give the roles divergent containment snapshots.
+    const strayRoot = { pid: 9_999, incarnation: testIncarnation(1) };
+    await strictTestExchange(set.reaperChannel, 'reaper.register-provider-root.v1', { providerRoot: strayRoot }, 5_000);
 
     await expect(
       strictTestExchange(
-        reaperControl,
-        'reaper.stop-and-reap.v1',
-        {
-          reaper: set.reaperIdentity,
-          proxy: set.proxyIdentity,
-          providerRoots: [{ pid: 9_999, incarnation: testIncarnation(1) }],
-        },
+        set.control,
+        'guardian.containment-commit.v1',
+        { guardian: set.guardianIdentity, reaper: set.reaperIdentity, proxy: set.proxyIdentity },
         5_000,
       ),
     ).rejects.toThrow(/different provider-root set/u);
+
+    // A refused commit must reopen both staging gates.
+    const { jointContainmentReceipt } = await stage(set);
+    expect(jointContainmentReceipt).toEqual(expect.any(String));
+    await expect(
+      strictTestExchange(
+        set.reaperChannel,
+        'reaper.register-provider-root.v1',
+        { providerRoot: { pid: 8_888, incarnation: testIncarnation(2) } },
+        5_000,
+      ),
+    ).resolves.toMatchObject({ state: 'root-recorded' });
   });
 
-  it('refuses a teardown that names a different reaper than this one', async () => {
-    const set = await startSet();
-    // Reach the reaper directly so its own identity check is the one under test.
-    const reaperControl = await connectControlClient(set.reaperIdentity.canonicalControlEndpoint, timer, 5_000);
-    cleanups.push(() => reaperControl.close());
-    const opened = (await strictTestExchange(
-      reaperControl,
-      'reaper.open.v1',
-      {
-        bootstrapNonce: NONCE,
-        coordinator: {
-          instanceId: randomUUID(),
-          pid: 4_000,
-          incarnation: testIncarnation(700),
-          generation: 'gen2',
-          flavor: 'prod',
-          buildSetId: set.reaperIdentity.buildSetId,
+  it(
+    'a provider-root registration racing the containment-commit gate is either drained into both cumulative ' +
+      'snapshots or refused outright — never recorded on one side and not the other',
+    async () => {
+      const set = await startSet();
+      const operation = set.operationFor();
+      const reservation = randomUUID();
+
+      // Either processing order must preserve the same exhaustive outcomes.
+      const registration = strictTestExchange(
+        set.proxyChannel,
+        'guardian.register-provider-root.v1',
+        {
+          proxy: set.proxyIdentity,
+          operation,
+          reservation,
+          providerPid: ROOT.pid,
+          providerIncarnation: ROOT.incarnation,
         },
-        guardian: set.guardianIdentity,
-        proxy: set.proxyIdentity,
-        containment: CONTAINMENT,
-      },
-      5_000,
-    )) as { controlEpoch: number; heartbeatChallenge: string };
-    await strictTestExchange(
-      reaperControl,
-      'reaper.heartbeat.v1',
-      { controlEpoch: opened.controlEpoch, heartbeatChallenge: opened.heartbeatChallenge },
-      5_000,
-    );
+        5_000,
+      );
+      const commit = strictTestExchange(
+        set.control,
+        'guardian.containment-commit.v1',
+        { guardian: set.guardianIdentity, reaper: set.reaperIdentity, proxy: set.proxyIdentity },
+        5_000,
+      );
+
+      const [registrationOutcome, commitOutcome] = await Promise.allSettled([registration, commit]);
+
+      if (registrationOutcome.status === 'fulfilled') {
+        // A registration admitted before the staging gate closes must belong to the committed containment.
+        expect(registrationOutcome.value).toMatchObject({ state: 'staged-contained' });
+        expect(commitOutcome.status).toBe('fulfilled');
+        if (commitOutcome.status !== 'fulfilled') {
+          throw new Error('a drained registration must not accompany a refused commit');
+        }
+        expect((commitOutcome.value as { disappearanceReceipt: string }).disappearanceReceipt).toContain(
+          `root:${ROOT.pid}@${ROOT.incarnation}`,
+        );
+      } else {
+        // A registration arriving after the staging gate closes must be refused and excluded from containment.
+        const reason = registrationOutcome.reason as { message?: string; remoteFailure?: { protocolCode?: string } };
+        expect(reason.remoteFailure?.protocolCode).toBe('invalid_state');
+        expect(reason.message).toMatch(/staging is closed/u);
+        expect(commitOutcome.status).toBe('fulfilled');
+        if (commitOutcome.status !== 'fulfilled') {
+          throw new Error('a refused registration must not accompany a refused commit');
+        }
+        expect((commitOutcome.value as { disappearanceReceipt: string }).disappearanceReceipt).not.toContain(
+          `root:${ROOT.pid}@${ROOT.incarnation}`,
+        );
+      }
+    },
+  );
+
+  it('refuses guardian.containment-commit.v1 from a lease-lapsed predecessor still on its own connection', async () => {
+    const set = await startSet();
+    // Active-tier authority requires a live lease, not merely an open socket.
+    set.lapseControl();
 
     await expect(
       strictTestExchange(
-        reaperControl,
-        'reaper.stop-and-reap.v1',
-        {
-          reaper: { ...set.reaperIdentity, pid: set.reaperIdentity.pid + 1 },
-          proxy: set.proxyIdentity,
-          providerRoots: [],
-        },
+        set.control,
+        'guardian.containment-commit.v1',
+        { guardian: set.guardianIdentity, reaper: set.reaperIdentity, proxy: set.proxyIdentity },
         5_000,
       ),
-    ).rejects.toThrow(/different reaper than this one/u);
+    ).rejects.toMatchObject({ remoteFailure: { protocolCode: 'unauthorized_control' } });
   });
 
-  it('replies containment-absent when reaper.stop-and-reap.v1 succeeds directly on its own control', async () => {
-    // Every other direct call to this method above asserts a refusal; `guardian.stop-and-reap.v1`'s own
-    // success path (`armed.stopAndReap` on the guardian's own enforcer) never reaches this reaper's handler
-    // at all — the two roles hold separate enforcers over the same containment — so this is the only place
-    // the reaper's own success reply is exercised.
-    const set = await startSet();
+  async function installHolderStatusCredential(
+    set: SetUnderTest,
+  ): Promise<{ credential: Record<string, unknown>; reaperControl: ControlClient }> {
+    const grantId = randomUUID();
+    const installParams = {
+      grantId,
+      secretSha256: createHash('sha256').update(GRANT_SECRET, 'utf8').digest('hex'),
+      successor: set.coordinatorIdentity,
+      operations: [],
+      orphanTimeoutMs: 30_000,
+      teardownReserveMs: 14_000,
+    };
+    await strictTestExchange(set.control, 'guardian.handoff-install.v1', installParams, 5_000);
     const reaperControl = await openReaperControl(set);
-
-    const reaped = (await strictTestExchange(
+    await strictTestExchange(reaperControl, 'reaper.handoff-install.v1', installParams, 5_000);
+    return {
       reaperControl,
-      'reaper.stop-and-reap.v1',
-      { reaper: set.reaperIdentity, proxy: set.proxyIdentity, providerRoots: [] },
-      5_000,
-    )) as { state: string; disappearanceReceipt: string };
+      credential: {
+        grantId,
+        secret: GRANT_SECRET,
+        generation: set.guardianIdentity.generation,
+        flavor: set.guardianIdentity.flavor,
+        buildSetId: set.guardianIdentity.buildSetId,
+        hostFingerprint: set.guardianIdentity.hostFingerprint,
+        guardianInstanceId: set.guardianIdentity.guardianInstanceId,
+        reaperInstanceId: set.reaperIdentity.reaperInstanceId,
+        proxyInstanceId: set.proxyIdentity.proxyInstanceId,
+      },
+    };
+  }
 
-    expect(reaped.state).toBe('containment-absent');
-    expect(reaped.disappearanceReceipt).toContain(`group:${CONTAINMENT.processGroupId}`);
-    expect(set.alive.has(CONTAINMENT.pid)).toBe(false);
+  it(
+    'guardian.holder-status.v1/reaper.holder-status.v1 report the current disposition/phase/holder/epoch and ' +
+      'refuse a credential that does not match the installed grant',
+    async () => {
+      const set = await startSet();
+      const { credential, reaperControl } = await installHolderStatusCredential(set);
+
+      const guardianStatus = (await strictTestExchange(
+        set.control,
+        'guardian.holder-status.v1',
+        credential,
+        5_000,
+      )) as {
+        disposition: string;
+        phase: string;
+        controlEpoch: number;
+        transitionSequence: number;
+        changedAtMs: number;
+        holder: { instanceId: string; pid: number; incarnation: string };
+      };
+      // Admission must seed unobservable status without inheriting earlier evidence.
+      expect(guardianStatus).toMatchObject({
+        disposition: 'unobservable',
+        phase: 'acquisition-provisional',
+        controlEpoch: 1,
+        transitionSequence: 1,
+        holder: { instanceId: set.coordinatorIdentity.instanceId },
+      });
+      expect(guardianStatus.changedAtMs).toEqual(expect.any(Number));
+
+      const reaperStatus = (await strictTestExchange(reaperControl, 'reaper.holder-status.v1', credential, 5_000)) as {
+        disposition: string;
+        phase: string;
+      };
+      expect(reaperStatus).toMatchObject({ disposition: 'unobservable', phase: 'acquisition-provisional' });
+
+      // A well-formed but wrong secret answers no status at all — never absence, never containment authority.
+      const wrongSecret = `e${GRANT_SECRET.slice(1)}`;
+      await expect(
+        strictTestExchange(set.control, 'guardian.holder-status.v1', { ...credential, secret: wrongSecret }, 5_000),
+      ).rejects.toThrow(/did not present the installed grant/u);
+      await expect(
+        strictTestExchange(reaperControl, 'reaper.holder-status.v1', { ...credential, secret: wrongSecret }, 5_000),
+      ).rejects.toThrow(/did not present the installed grant/u);
+    },
+  );
+
+  it('guardian.holder-status.v1/reaper.holder-status.v1 refuse before any grant is installed', async () => {
+    const set = await startSet();
+    const credential = {
+      grantId: randomUUID(),
+      secret: GRANT_SECRET,
+      generation: set.guardianIdentity.generation,
+      flavor: set.guardianIdentity.flavor,
+      buildSetId: set.guardianIdentity.buildSetId,
+      hostFingerprint: set.guardianIdentity.hostFingerprint,
+      guardianInstanceId: set.guardianIdentity.guardianInstanceId,
+      reaperInstanceId: set.reaperIdentity.reaperInstanceId,
+      proxyInstanceId: set.proxyIdentity.proxyInstanceId,
+    };
+    await expect(strictTestExchange(set.control, 'guardian.holder-status.v1', credential, 5_000)).rejects.toThrow(
+      /did not present the installed grant/u,
+    );
   });
+
+  it(
+    "guardian.acquisition-publish.v1 publishes both roles idempotently through the reaper's own paired " +
+      'channel, and guardian.acquisition-abort.v1 reports which side of that publish it observed',
+    async () => {
+      const set = await startSet();
+      const { credential, reaperControl } = await installHolderStatusCredential(set);
+      const publishRequest = { guardian: set.guardianIdentity, reaper: set.reaperIdentity, proxy: set.proxyIdentity };
+
+      const beforePublish = (await strictTestExchange(
+        set.control,
+        'guardian.acquisition-abort.v1',
+        publishRequest,
+        5_000,
+      )) as { state: string };
+      expect(beforePublish.state).toBe('acquisition-aborted');
+
+      const first = (await strictTestExchange(
+        set.control,
+        'guardian.acquisition-publish.v1',
+        publishRequest,
+        5_000,
+      )) as { state: string; certificate: string };
+      expect(first.state).toBe('acquisition-published');
+
+      // Idempotent: a retry gets back the identical certificate rather than minting a fresh one.
+      const second = (await strictTestExchange(
+        set.control,
+        'guardian.acquisition-publish.v1',
+        publishRequest,
+        5_000,
+      )) as { certificate: string };
+      expect(second.certificate).toBe(first.certificate);
+
+      const guardianStatus = (await strictTestExchange(
+        set.control,
+        'guardian.holder-status.v1',
+        credential,
+        5_000,
+      )) as {
+        phase: string;
+      };
+      expect(guardianStatus.phase).toBe('published');
+      const reaperStatus = (await strictTestExchange(reaperControl, 'reaper.holder-status.v1', credential, 5_000)) as {
+        phase: string;
+      };
+      expect(reaperStatus.phase).toBe('published');
+
+      const afterPublish = (await strictTestExchange(
+        set.control,
+        'guardian.acquisition-abort.v1',
+        publishRequest,
+        5_000,
+      )) as { state: string };
+      expect(afterPublish.state).toBe('already-published');
+    },
+  );
 
   it('installs a dormant grant and lets exactly one successor redeem it into control', async () => {
     const set = await startSet();
@@ -1518,11 +1679,10 @@ describe('provider-proxy guardian and reaper', () => {
     );
 
     const other = { ...set.coordinatorIdentity, instanceId: randomUUID() };
-    // The endpoint answers a foreign successor by destroying the channel, so the caller sees a transport
-    // death; which errno reaches it first depends on whether the write or the read loses the race.
-    await expect(redeemOn({ ...request, successor: other })).rejects.toThrow(
-      /control channel closed|EPIPE|ECONNRESET/u,
-    );
+    // A foreign successor refused during provisional admission must receive the retryable control-active reason.
+    await expect(redeemOn({ ...request, successor: other })).rejects.toMatchObject({
+      remoteFailure: { protocolCode: 'invalid_state', admissionReason: 'control-active' },
+    });
   });
 
   it('refuses a redemption request that still names an operation set — the field no longer exists on the wire', async () => {
@@ -1979,18 +2139,25 @@ describe('provider-proxy guardian and reaper', () => {
         latchTeardown: () => {},
         markContainmentAbsent: () => {},
         markExited: () => {},
+        renewHolderCheck: () => {},
         bounds: () => ({
           lastRoundTripEvidenceAt: clock.now(),
           eofAt: null,
           controlLossAt: clock.now(),
           adoptionDeadline: clock.shiftMilliseconds(clock.now(), 60_000),
           exitDeadline: clock.shiftMilliseconds(clock.now(), 74_000),
+          holderCheckAt: clock.shiftMilliseconds(clock.now(), 60_000),
+          holderCheckAccelerated: false,
         }),
         state: () => 'accepting-control' as const,
       },
       containmentEnvironment: {
         clock,
-        process: { kill: () => true, observeLiveness: () => 'absent' as const },
+        process: {
+          kill: () => true,
+          observeLiveness: () => 'absent' as const,
+          observeRecordedProcessAsync: async () => 'absent' as const,
+        },
         platform: 'linux' as const,
         maxRecordedRoots: 128,
         readProcessIncarnation: () => null,
@@ -1999,6 +2166,9 @@ describe('provider-proxy guardian and reaper', () => {
       timer,
       mintReceipt: () => randomUUID(),
       self: { pid: 5_101, incarnation: testIncarnation(901) },
+      holderAuthority: createControlHolderAuthority(),
+      observeHolder: (): Promise<ProcessLiveness> => Promise.resolve('unknown' as const),
+      abandonUnattributable: () => false,
       onOutcome: () => {},
       onProgressViolation: () => {},
     });
@@ -2117,9 +2287,13 @@ describe('provider-proxy guardian and reaper', () => {
       },
     });
     const configuration = resolveProviderProxyDeadlineConfiguration({ get: () => undefined });
-    const deadlines = createEnforcerDeadlineStateMachine(clock, configuration, {
-      mintChallenge: () => randomUUID(),
-    });
+    const holderAuthority = createControlHolderAuthority();
+    const deadlines = createEnforcerDeadlineStateMachine(
+      clock,
+      configuration,
+      { mintChallenge: () => randomUUID() },
+      holderAuthority,
+    );
     let teardownLatchedAt: bigint | null = null;
     const watchedDeadlines = {
       ...deadlines,
@@ -2163,6 +2337,8 @@ describe('provider-proxy guardian and reaper', () => {
         },
         observeLiveness: (pid: number) =>
           ((pid < 0 ? alive.has(-pid) : alive.has(pid)) ? 'alive' : 'absent') as ProcessLiveness,
+        observeRecordedProcessAsync: async (identity: RecordedProcessIdentity) =>
+          alive.has(identity.pid) && identity.incarnation === CONTAINMENT.incarnation ? 'alive' : 'absent',
       },
       platform: 'linux' as const,
       maxRecordedRoots: MAX_PROXY_RECORDED_PROVIDER_ROOTS,
@@ -2213,6 +2389,9 @@ describe('provider-proxy guardian and reaper', () => {
       },
       self: { pid: 5_102, incarnation: testIncarnation(902) },
       reaperSelf: { pid: reaperIdentity.pid, incarnation: reaperIdentity.incarnation },
+      holderAuthority,
+      observeHolder: (): Promise<ProcessLiveness> => Promise.resolve('unknown' as const),
+      abandonUnattributable: () => false,
       onOutcome: () => {},
       onProgressViolation: () => {},
     });
@@ -2319,10 +2498,12 @@ describe('provider-proxy guardian and reaper', () => {
     cleanups.push(() => rmSync(directory, { recursive: true, force: true }));
     const shared = bareSharedIdentity();
     const clock = createMonotonicClock(Symbol('pairing-loss'), { readMilliseconds: () => 0n });
+    const holderAuthority = createControlHolderAuthority();
     const deadlines = createEnforcerDeadlineStateMachine(
       clock,
       resolveProviderProxyDeadlineConfiguration({ get: () => undefined }),
       { mintChallenge: () => randomUUID() },
+      holderAuthority,
     );
     // Whichever of these two the reaper's pairing-close observer actually calls resolves this — the
     // assertions below are what tell the fixed wiring apart from the defect, so the synchronization itself
@@ -2343,7 +2524,13 @@ describe('provider-proxy guardian and reaper', () => {
       },
     };
 
-    const { reaperEndpoint, reaper } = await startBareReaper(directory, shared, clock, watchedDeadlines);
+    const { reaperEndpoint, reaper } = await startBareReaper(
+      directory,
+      shared,
+      clock,
+      watchedDeadlines,
+      holderAuthority,
+    );
     cleanups.push(() => reaper.close());
 
     const pairing = await connectControlClient(reaperEndpoint, timer, 5_000);
@@ -2446,145 +2633,5 @@ describe('provider-proxy guardian and reaper', () => {
     await expect(
       strictTestExchange(pairing, 'reaper.record-containment.v1', { ...CONTAINMENT, processGroupId: 9_999 }, 5_000),
     ).rejects.toThrow(/already holds a containment/u);
-  });
-});
-
-describe('provider-proxy/set-authority: stopAndReap against a real guardian', () => {
-  /** `stopAndReap`'s own `proxyClient` is never touched by it. */
-  function unreachableClient(): ControlClient {
-    return {
-      exchange: () => {
-        throw new Error('unreachable: this client was not expected to exchange');
-      },
-      faulted: new Promise<never>(() => undefined),
-      onFault: () => () => undefined,
-      close: () => {},
-    };
-  }
-
-  it('supplies the coordinator’s own recorded provider roots, not the empty claim the guardian refuses', async () => {
-    const set = await startSet();
-    const reaperControl = await openReaperControl(set);
-    // Stages ROOT with the real guardian's own enforcer (`guardian.register-provider-root.v1`), exactly as
-    // `operation.prepare.v1` does in production — this is the fact `providerRoots: []` disagreed with.
-    await stage(set);
-
-    const authority = createProviderProxySetAuthority({
-      proxyInstanceId: set.proxyIdentity.proxyInstanceId,
-      guardianClient: set.control,
-      proxyClient: unreachableClient(),
-      reaperClient: reaperControl,
-      guardianIdentity: set.guardianIdentity,
-      reaperIdentity: set.reaperIdentity,
-      proxyIdentityFields: set.proxyIdentity,
-      heartbeats: {
-        proxy: { stop: () => undefined },
-        guardian: { stop: () => undefined },
-        reaper: { stop: () => undefined },
-      },
-      coordinatorIdentity: set.coordinatorIdentity,
-      handoffCapsulePath: '/dev/null/unused-handoff-capsule.json',
-      runtime: { ids: undefined, env: { get: () => undefined }, storage: undefined } as unknown as Runtime,
-      operationRegistry: { operationsFor: () => [], providerRootsFor: () => [ROOT] },
-    });
-
-    const result = await authority.stopAndReap(new AbortController().signal);
-
-    // The real, driving proof: `guardian.stop-and-reap.v1`'s own `assertRecordedSetAgreement` accepted this
-    // call and reaped for real — a hardcoded `providerRoots: []` would instead have come back `unconfirmed`
-    // with "different provider-root set" (see the raw-wire coverage above proving that refusal directly).
-    expect(result).toEqual({
-      disappearanceReceipt: expect.stringMatching(
-        new RegExp(
-          `guardian:.*root:${ROOT.pid}@${ROOT.incarnation}.*reaper:.*root:${ROOT.pid}@${ROOT.incarnation}`,
-          'u',
-        ),
-      ),
-    });
-    expect(set.alive.has(CONTAINMENT.pid)).toBe(false);
-  });
-
-  it('threads an attached operation’s real provider root through stopAndReap on the recovery registry shape', async () => {
-    const set = await startSet();
-    const reaperControl = await openReaperControl(set);
-    await stage(set);
-
-    // Use a real `LocalOperationRegistry`, because a successor's attachment must retain the provider root
-    // needed for exact set disappearance. This proves `attach()` populates `providerRootsFor` correctly,
-    // not merely that a caller can hand-supply the right value.
-    const operationRegistry = new LocalOperationRegistry();
-    const operation = {
-      jobId: randomUUID(),
-      operationId: randomUUID(),
-      buildSetId: set.coordinatorIdentity.buildSetId,
-      proxyInstanceId: set.proxyIdentity.proxyInstanceId,
-    };
-    const executing = providerOperationRecord('executing', {
-      operation,
-      locator: {
-        hostFingerprint: FINGERPRINT,
-        guardian: {
-          instanceId: set.guardianIdentity.guardianInstanceId,
-          pid: set.guardianIdentity.pid,
-          incarnation: set.guardianIdentity.incarnation,
-          controlEndpoint: set.guardianIdentity.canonicalControlEndpoint,
-        },
-        proxy: {
-          instanceId: set.proxyIdentity.proxyInstanceId,
-          pid: set.proxyIdentity.pid,
-          incarnation: set.proxyIdentity.incarnation,
-          controlEndpoint: set.proxyIdentity.canonicalEndpoint,
-        },
-        reaper: {
-          instanceId: set.reaperIdentity.reaperInstanceId,
-          pid: set.reaperIdentity.pid,
-          incarnation: set.reaperIdentity.incarnation,
-          controlEndpoint: set.reaperIdentity.canonicalControlEndpoint,
-        },
-        containment: {
-          pid: set.proxyIdentity.pid,
-          incarnation: set.proxyIdentity.incarnation,
-          processGroupId: set.proxyIdentity.processGroupId,
-          kind: set.reaperIdentity.containmentKind,
-        },
-      },
-    });
-    const record = providerOperationRecordSchema.parse({ ...executing, providerRoot: ROOT });
-    if (record.phase !== 'executing') throw new Error('expected executing provider operation');
-    operationRegistry.attach(record, { stop: async () => {} }, { jobId: record.operation.jobId, pool: 'default' });
-
-    const authority = createProviderProxySetAuthority({
-      proxyInstanceId: set.proxyIdentity.proxyInstanceId,
-      guardianClient: set.control,
-      proxyClient: unreachableClient(),
-      reaperClient: reaperControl,
-      guardianIdentity: set.guardianIdentity,
-      reaperIdentity: set.reaperIdentity,
-      proxyIdentityFields: set.proxyIdentity,
-      heartbeats: {
-        proxy: { stop: () => undefined },
-        guardian: { stop: () => undefined },
-        reaper: { stop: () => undefined },
-      },
-      coordinatorIdentity: set.coordinatorIdentity,
-      handoffCapsulePath: '/dev/null/unused-handoff-capsule.json',
-      runtime: { ids: undefined, env: { get: () => undefined }, storage: undefined } as unknown as Runtime,
-      operationRegistry,
-    });
-
-    const result = await authority.stopAndReap(new AbortController().signal);
-
-    // Same real, driving proof as the acquisition-path test above, reached through the inheritance path's
-    // own write instead of a hand-supplied closure: the guardian's `assertRecordedSetAgreement` accepted
-    // this call and reaped for real.
-    expect(result).toEqual({
-      disappearanceReceipt: expect.stringMatching(
-        new RegExp(
-          `guardian:.*root:${ROOT.pid}@${ROOT.incarnation}.*reaper:.*root:${ROOT.pid}@${ROOT.incarnation}`,
-          'u',
-        ),
-      ),
-    });
-    expect(set.alive.has(CONTAINMENT.pid)).toBe(false);
   });
 });

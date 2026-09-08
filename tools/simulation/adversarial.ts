@@ -1,13 +1,17 @@
 import { join } from 'node:path';
 import { SessionManager } from '../../src/sessions/shell.js';
-import type { CoordinatorServerInfo, LifecycleState } from '../../src/coordinator/lifecycle.js';
+import type {
+  CoordinatorServerInfo,
+  LifecycleShutdownDisposition,
+  LifecycleState,
+} from '../../src/coordinator/lifecycle.js';
 import {
   createSimulationBackend,
   type SimulationBackend,
   type SimulationHookLog,
   type SimulationWorldCarryOver,
 } from './core/backend.js';
-import { DEFAULT_EPOCH_MS } from './core/virtual-time.js';
+import { DEFAULT_EPOCH_MS, flushMicrotasks } from './core/virtual-time.js';
 import {
   acquireNoRealIoMonitor,
   cloneNoRealIoReport,
@@ -25,6 +29,8 @@ import type { ProviderSession } from '../../src/sessions/entry.js';
 import { providerLookupPortFromCatalog } from '../../src/providers/catalog.js';
 
 const RESULT_FILE = 'result.md';
+const LIFECYCLE_SETTLEMENT_STEP_MS = 25;
+const LIFECYCLE_SETTLEMENT_MAX_STEPS = 1_000;
 
 export type LaunchJobOptions = {
   provider?: string;
@@ -155,13 +161,17 @@ export class SimulationWorld {
    * because a job can only be adopted from durable state that outlived the coordinator that wrote it.
    * Without it the next generation starts on a fresh machine and has nothing to adopt.
    */
-  async cycle(options?: { preserveWorld?: boolean }): Promise<CoordinatorServerInfo> {
+  async cycle(options?: { preserveWorld?: boolean }): Promise<CoordinatorServerInfo | LifecycleShutdownDisposition> {
     this.assertUsable();
     this.elapsedOffsetMs = this.getVirtualElapsedMs();
     const carryOver = options?.preserveWorld === true ? this.current.backend.carryOver : undefined;
     // A restart that keeps its world is a replacement, not a crash.
-    await this.current.backend.backend.shutdown(carryOver === undefined ? 'cycle' : 'replaced');
-    await this.current.backend.backend.waitForShutdown();
+    const shutdownDisposition = await this.settleLifecycleOperation(
+      this.current.backend.backend.shutdown(carryOver === undefined ? 'cycle' : 'replaced'),
+    );
+    if (shutdownDisposition.disposition === 'held') return shutdownDisposition;
+    const settledDisposition = await this.settleLifecycleOperation(this.current.backend.backend.waitForShutdown());
+    if (settledDisposition.disposition === 'held') return settledDisposition;
     this.generationIndex += 1;
     this.current = this.createGenerationState(carryOver);
     return this.boot();
@@ -186,14 +196,14 @@ export class SimulationWorld {
     return row.seq;
   }
 
-  async shutdown(reason = 'simulation-shutdown'): Promise<void> {
+  async shutdown(reason = 'simulation-shutdown'): Promise<LifecycleShutdownDisposition> {
     this.assertUsable();
-    await this.current.backend.backend.shutdown(reason);
+    return this.settleLifecycleOperation(this.current.backend.backend.shutdown(reason));
   }
 
-  async waitForShutdown(): Promise<void> {
+  async waitForShutdown(): Promise<LifecycleShutdownDisposition> {
     this.assertUsable();
-    await this.current.backend.backend.waitForShutdown();
+    return this.settleLifecycleOperation(this.current.backend.backend.waitForShutdown());
   }
 
   async launchJob(prompt: string, opts?: LaunchJobOptions): Promise<LaunchDecision>;
@@ -517,17 +527,25 @@ export class SimulationWorld {
     return this.current.backend.runtime.process.observeLiveness(pid) === 'alive';
   }
 
-  async teardown(): Promise<void> {
+  async teardown(): Promise<LifecycleShutdownDisposition> {
     try {
       const lifecycle = this.current.backend.backend.getLifecycle();
-      if (lifecycle === 'starting' || lifecycle === 'running') {
-        await this.current.backend.backend.shutdown('teardown');
+      if (lifecycle === 'stopped') {
+        this.dispose();
+        return { disposition: 'finalized' };
       }
-      if (lifecycle !== 'stopped') {
-        await this.current.backend.backend.waitForShutdown();
-      }
-    } finally {
+      const disposition =
+        lifecycle === 'draining'
+          ? await this.settleLifecycleOperation(this.current.backend.backend.waitForShutdown())
+          : await this.settleLifecycleOperation(this.current.backend.backend.shutdown('teardown'));
+      if (disposition.disposition === 'held') return disposition;
+      const settledDisposition = await this.settleLifecycleOperation(this.current.backend.backend.waitForShutdown());
+      if (settledDisposition.disposition === 'held') return settledDisposition;
       this.dispose();
+      return settledDisposition;
+    } catch (error: unknown) {
+      this.dispose();
+      throw error;
     }
   }
 
@@ -543,6 +561,39 @@ export class SimulationWorld {
     if (this.disposed) {
       throw new Error('SimulationWorld has been disposed');
     }
+  }
+
+  private async settleLifecycleOperation(
+    operation: Promise<LifecycleShutdownDisposition>,
+  ): Promise<LifecycleShutdownDisposition> {
+    let settled = false;
+    const outcome: {
+      value:
+        | Readonly<{ kind: 'settled'; disposition: LifecycleShutdownDisposition }>
+        | Readonly<{ kind: 'failed'; error: unknown }>
+        | null;
+    } = { value: null };
+    const observed = operation.then(
+      (disposition) => {
+        settled = true;
+        outcome.value = { kind: 'settled', disposition };
+      },
+      (error: unknown) => {
+        settled = true;
+        outcome.value = { kind: 'failed', error };
+      },
+    );
+    await flushMicrotasks(200);
+    for (let step = 0; !settled && step < LIFECYCLE_SETTLEMENT_MAX_STEPS; step += 1) {
+      await this.current.backend.advance(LIFECYCLE_SETTLEMENT_STEP_MS);
+    }
+    if (!settled) {
+      throw new Error('Simulation lifecycle operation did not settle within its virtual-time budget.');
+    }
+    await observed;
+    if (outcome.value === null) throw new Error('Simulation lifecycle operation settled without an outcome.');
+    if (outcome.value.kind === 'failed') throw outcome.value.error;
+    return outcome.value.disposition;
   }
 
   private assertBooted(action: 'launch' | 'wait' | 'abort' | 'kill'): void {

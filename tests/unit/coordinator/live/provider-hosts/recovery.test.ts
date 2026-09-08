@@ -28,6 +28,7 @@ describe('provider host recovery', () => {
       attachHostNotificationListener: vi.fn(),
       createInstanceId: () => 'unused-instance',
       observeRetired: vi.fn(),
+      abandonUninstalled: vi.fn(),
     }).catch((error: unknown) => error);
 
     expect(spawnProviderServer).not.toHaveBeenCalled();
@@ -158,6 +159,7 @@ describe('provider host recovery', () => {
       }),
       expect.any(Function),
       expect.any(Number),
+      expect.any(Function),
       expect.any(Function),
     );
     lease.close();

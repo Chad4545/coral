@@ -1,4 +1,20 @@
 import type { ProviderProxyOperationAuthority } from './operation-route.js';
+import type { PublicationReceipt } from './set-publication.js';
+import type { RecordedContainmentIdentity } from '../../../infra/process-containment.js';
+import type { TimePort } from '../../../infra/port-types.js';
+import type {
+  GuardianSpawnUndoRecoverySubject,
+  GuardianSpawnUndoRecoveryProof,
+  PreIdentityRoleSpawnRecoverySubject,
+  ProviderProxyAcquisitionAbsenceEvidence,
+} from './spawn-undo.js';
+import {
+  handOverProviderProxyAcquisitionControlSession,
+  providerProxyControlSessionOwner,
+  type ProviderProxyAcquisitionSessionClosed,
+  type ProviderProxyAcquisitionSessionEstablished,
+  type ProviderProxyAcquisitionSessionHandedOver,
+} from './control-session.js';
 
 /**
  * Acquiring one guardian/reaper/proxy set.
@@ -10,25 +26,107 @@ import type { ProviderProxyOperationAuthority } from './operation-route.js';
  * that record.
  */
 
-/** A step that produced something needing removal if a later step fails. */
-export type AcquisitionUndo = Readonly<{
-  /** Named so a cleanup failure says which artifact outlived the attempt. */
-  label: string;
-  run(): Promise<void> | void;
+type AcquisitionUndoAction = Readonly<{ label: string; run(): Promise<void> | void }>;
+type ProviderProxyAcquisitionSetAddress = Pick<
+  ProviderProxyOperationAuthority['setIdentity'],
+  'buildSetId' | 'hostFingerprint' | 'proxyInstanceId'
+>;
+
+export type AcquisitionUndo =
+  | (AcquisitionUndoAction & Readonly<{ kind?: 'ordinary' }>)
+  | (AcquisitionUndoAction &
+      Readonly<{
+        kind: 'guardian-containment';
+        setAddress: ProviderProxyAcquisitionSetAddress;
+        guardianIdentity: RecordedContainmentIdentity;
+        captureRecoveryProof(): GuardianSpawnUndoRecoveryProof;
+      }>)
+  | (AcquisitionUndoAction & Readonly<{ kind: 'recovery-capability' }>);
+
+export type ProviderProxyAcquisitionRecoveryOutcome =
+  | Readonly<{
+      kind: 'absence-confirmed';
+      evidence: ProviderProxyAcquisitionAbsenceEvidence;
+      strandedArtifacts: readonly string[];
+    }>
+  | Readonly<{ kind: 'held'; reason: string }>;
+
+export type ProviderProxyAcquisitionRecoveryCapability = Readonly<{
+  retry(signal: AbortSignal): Promise<ProviderProxyAcquisitionRecoveryOutcome>;
 }>;
 
 export type ProviderProxyAcquisitionFailure = Readonly<{
   kind: 'provider_proxy_acquisition_failed';
-  /** Which cut failed. The set is never partially published, so this is the whole outcome. */
   cut: string;
   reason: string;
-  /** Cleanup actions that themselves failed. Non-empty means something was left behind. */
   strandedArtifacts: readonly string[];
 }>;
 
+export type ProviderProxyAcquisitionOperatorAbandonment = Readonly<{
+  kind: 'operator-abandoned';
+  recoverySubject: PreIdentityRoleSpawnRecoverySubject;
+  processAbsenceProven: false;
+  successor: Readonly<{ owner: 'operator-command'; acceptance: 'accepted' }>;
+}>;
+
+export type ProviderProxyAcquisitionOperatorExit = Readonly<{
+  kind: 'abandon-provider-proxy-acquisition';
+  abandon(): ProviderProxyAcquisitionOperatorAbandonment;
+}>;
+
+export type ProviderProxyAcquisitionHeld<Owner extends string> = Readonly<{
+  kind: 'provider_proxy_acquisition_held';
+  owner: Owner;
+  cut: string;
+  reason: string;
+  strandedArtifacts: readonly string[];
+  setAddress: ProviderProxyAcquisitionSetAddress;
+  recoveryCapability: ProviderProxyAcquisitionRecoveryCapability;
+}> &
+  (
+    | Readonly<{
+        guardianIdentity: RecordedContainmentIdentity;
+        recoverySubject: GuardianSpawnUndoRecoverySubject;
+      }>
+    | Readonly<{
+        recoverySubject: PreIdentityRoleSpawnRecoverySubject;
+        operatorExit: ProviderProxyAcquisitionOperatorExit;
+      }>
+  );
+
+export type ProviderProxyRoleSpawnHeld = Readonly<{
+  kind: 'provider_proxy_role_spawn_held';
+  reason: string;
+  setAddress: ProviderProxyAcquisitionSetAddress;
+  recoverySubject: PreIdentityRoleSpawnRecoverySubject;
+  operatorExit: ProviderProxyAcquisitionOperatorExit;
+  recoveryCapability: ProviderProxyAcquisitionRecoveryCapability;
+}>;
+
+export type ProviderProxyAcquisitionHoldAcceptance =
+  | Readonly<{ kind: 'accepted'; owner: 'durable-provider-proxy-acquisition-hold-store' }>
+  | Readonly<{
+      kind: 'held';
+      owner: 'provider-host-acquisition';
+      reason: string;
+      waitingFor: 'store-repair';
+      exit: 'provider-proxy-set-operator-disposition-store-retry';
+    }>;
+
 export type ProviderProxyAcquisitionResult =
-  | Readonly<{ kind: 'acquired'; set: ProviderProxyOperationAuthority }>
-  | ProviderProxyAcquisitionFailure;
+  | Readonly<{
+      kind: 'acquired';
+      set: ProviderProxyOperationAuthority;
+      publicationReceipt: PublicationReceipt;
+    }>
+  | ProviderProxyAcquisitionFailure
+  | ProviderProxyAcquisitionHeld<'provider-host-acquisition'>
+  | ProviderProxyAcquisitionSessionHandedOver<'provider-host-acquisition'>;
+
+export type ProviderProxyControlEstablishmentDisposition =
+  | (ProviderProxyAcquisitionSessionEstablished & Readonly<{ undo: AcquisitionUndo }>)
+  | ProviderProxyAcquisitionSessionHandedOver<'acquisition'>
+  | ProviderProxyAcquisitionSessionClosed;
 
 /**
  * One acquisition attempt's steps, in order. Each returns the undo for what it created, so the record is
@@ -38,25 +136,31 @@ export interface ProviderProxyAcquisitionSteps {
   /** Writes the three one-use capsules. */
   createCapsules(): Promise<AcquisitionUndo>;
   /** Spawns the detached guardian, which in turn spawns the reaper and then the proxy. */
-  spawnGuardian(): Promise<AcquisitionUndo>;
+  spawnGuardian(): Promise<AcquisitionUndo | ProviderProxyRoleSpawnHeld>;
   /**
    * Opens and activates control on all three endpoints, checks the strict backend identities, and confirms
    * the containment the guardian recorded. Returns the authority only once every check has passed.
    */
-  establishControl(): Promise<Readonly<{ set: ProviderProxyOperationAuthority; undo: AcquisitionUndo }>>;
+  establishControl(
+    registerUndo: (undo: AcquisitionUndo) => void,
+    assertPublicationMayBegin: () => void,
+  ): Promise<ProviderProxyControlEstablishmentDisposition>;
 }
 
 export type ProviderProxyAcquisitionOptions = Readonly<{
   steps: ProviderProxyAcquisitionSteps;
-  /**
-   * The one absolute budget the whole attempt — including its cleanup — is bounded by. An acquisition that
-   * hung would hold the caller's single-flight slot forever, and the set it was building reaps itself on a
-   * deadline nobody is watching. `unwind` races every undo against this same signal, so a hung cleanup
-   * action cannot hold the slot open past it either.
-   */
+  time: Pick<TimePort, 'sleep'>;
+  acceptHold(
+    hold: ProviderProxyAcquisitionHeld<'provider-host-acquisition'>,
+  ): Promise<ProviderProxyAcquisitionHoldAcceptance> | ProviderProxyAcquisitionHoldAcceptance;
+  /** Expiry must not discharge an unresolved guardian; ownership transfers through a recovery capability. */
   deadlineSignal: AbortSignal;
   onCleanupFailure?(label: string, error: unknown): void;
 }>;
+
+class PublicationDeadlineElapsedError extends Error {}
+
+const undoAttempts = new WeakMap<AcquisitionUndo, Promise<void>>();
 
 function failureReason(error: unknown): string {
   return error instanceof Error ? error.message : 'unknown error';
@@ -71,94 +175,231 @@ function deadlineElapsed(deadlineSignal: AbortSignal): Promise<never> {
   });
 }
 
-/**
- * Runs one undo, bounded by the same deadline the whole acquisition attempt is bounded by.
- *
- * `run()` is invoked eagerly here, before the race — a hung close still gets triggered — but this call site
- * never waits on it past the deadline: a cleanup that could hold the caller's single-flight slot forever is
- * exactly the failure a bounded attempt exists to rule out. What the hung action eventually does is no longer
- * this attempt's concern, so its rejection is swallowed here instead of surfacing as unhandled later.
- */
+/** Deadline expiry must not be treated as proof that an undo stopped or completed. */
 function boundedUndo(undo: AcquisitionUndo, deadlineSignal: AbortSignal): Promise<void> {
-  let attempt: Promise<void>;
-  try {
-    attempt = Promise.resolve(undo.run());
-  } catch (error: unknown) {
-    attempt = Promise.reject(error instanceof Error ? error : new Error(String(error)));
+  let attempt = undoAttempts.get(undo);
+  if (attempt === undefined) {
+    try {
+      attempt = Promise.resolve(undo.run());
+    } catch (error: unknown) {
+      attempt = Promise.reject(error instanceof Error ? error : new Error(String(error)));
+    }
+    undoAttempts.set(undo, attempt);
+    void attempt.then(
+      () => {
+        if (undoAttempts.get(undo) === attempt) undoAttempts.delete(undo);
+      },
+      () => {
+        if (undoAttempts.get(undo) === attempt) undoAttempts.delete(undo);
+      },
+    );
   }
   void attempt.catch(() => {});
   return Promise.race([attempt, deadlineElapsed(deadlineSignal)]);
 }
 
-/**
- * Runs every undo, newest first, without short-circuiting.
- *
- * Order matters: the later a thing was created, the more it depends on the earlier ones, and closing a
- * control before removing the capsule that authorised it keeps the window in which a stale capsule is
- * redeemable as short as it can be. Failures are collected rather than thrown, because a cleanup that
- * abandoned the rest on its first error is how the abandoned set keeps its endpoint.
- */
+/** Recovery capabilities must remain owned until guardian absence; one undo failure must not skip later undos. */
 async function unwind(
   undos: readonly AcquisitionUndo[],
   deadlineSignal: AbortSignal,
   onCleanupFailure: ((label: string, error: unknown) => void) | undefined,
-): Promise<string[]> {
+): Promise<
+  Readonly<{
+    strandedArtifacts: readonly string[];
+    hold: Readonly<{
+      setAddress: ProviderProxyAcquisitionSetAddress;
+      guardianIdentity: RecordedContainmentIdentity;
+      recoverySubject: GuardianSpawnUndoRecoverySubject;
+      recoveryCapability: ProviderProxyAcquisitionRecoveryCapability;
+    }> | null;
+  }>
+> {
   const stranded: string[] = [];
-  for (const undo of [...undos].reverse()) {
+  const recoveryUndos = undos.filter((undo) => undo.kind === 'recovery-capability');
+  const cleanupUndos = undos.filter((undo) => undo.kind !== 'recovery-capability');
+  let guardianHold: Extract<AcquisitionUndo, { kind: 'guardian-containment' }> | null = null;
+  for (const undo of [...cleanupUndos].reverse()) {
     try {
       await boundedUndo(undo, deadlineSignal);
     } catch (error: unknown) {
       stranded.push(undo.label);
       onCleanupFailure?.(undo.label, error);
+      if (undo.kind === 'guardian-containment') guardianHold = undo;
     }
   }
-  return stranded;
+  if (guardianHold === null) {
+    for (const undo of [...recoveryUndos].reverse()) {
+      try {
+        await boundedUndo(undo, deadlineSignal);
+      } catch (error: unknown) {
+        stranded.push(undo.label);
+        onCleanupFailure?.(undo.label, error);
+      }
+    }
+    return { strandedArtifacts: stranded, hold: null };
+  }
+
+  const guardianUndo = guardianHold;
+  const recoveryProof = guardianUndo.captureRecoveryProof();
+  let retrying: Promise<ProviderProxyAcquisitionRecoveryOutcome> | null = null;
+  const recoveryCapability: ProviderProxyAcquisitionRecoveryCapability = {
+    retry(signal) {
+      if (retrying !== null) return retrying;
+      retrying = (async (): Promise<ProviderProxyAcquisitionRecoveryOutcome> => {
+        try {
+          await boundedUndo(guardianUndo, signal);
+        } catch (error: unknown) {
+          return { kind: 'held', reason: failureReason(error) };
+        }
+        const recoveryStranded: string[] = [];
+        for (const undo of [...recoveryUndos].reverse()) {
+          try {
+            await boundedUndo(undo, signal);
+          } catch {
+            recoveryStranded.push(undo.label);
+          }
+        }
+        return {
+          kind: 'absence-confirmed',
+          evidence: recoveryProof.absenceEvidence(),
+          strandedArtifacts: recoveryStranded,
+        };
+      })().finally(() => {
+        retrying = null;
+      });
+      return retrying;
+    },
+  };
+  return {
+    strandedArtifacts: stranded,
+    hold: {
+      setAddress: guardianUndo.setAddress,
+      guardianIdentity: guardianUndo.guardianIdentity,
+      recoverySubject: recoveryProof.subject,
+      recoveryCapability,
+    },
+  };
 }
 
-/**
- * Acquires one set, or leaves nothing behind trying.
- *
- * There is no partial success: the caller receives either a set whose three controls are all active and all
- * agree on the same identities, or a typed failure. An abandoned set has no published recovery authority and
- * self-expires from its own guardian-start deadline even if this cleanup could not reach it.
- */
+/** A publication-unknown outcome must retain the exact recovery capsule and must not unwind its controls. */
 export async function acquireProviderProxySet(
   options: ProviderProxyAcquisitionOptions,
 ): Promise<ProviderProxyAcquisitionResult> {
   const undos: AcquisitionUndo[] = [];
 
-  const fail = async (cut: string, reason: string): Promise<ProviderProxyAcquisitionFailure> => ({
-    kind: 'provider_proxy_acquisition_failed',
-    cut,
-    reason,
-    strandedArtifacts: await unwind(undos, options.deadlineSignal, options.onCleanupFailure),
-  });
+  const acceptHeld = async (
+    hold: ProviderProxyAcquisitionHeld<'provider-host-acquisition'>,
+  ): Promise<ProviderProxyAcquisitionHeld<'provider-host-acquisition'>> => {
+    for (;;) {
+      try {
+        const acceptance = await options.acceptHold(hold);
+        if (acceptance.kind !== 'accepted' || acceptance.owner !== 'durable-provider-proxy-acquisition-hold-store') {
+          options.onCleanupFailure?.('durable acquisition hold', new Error(acceptance.reason));
+          await options.time.sleep(1_000);
+          continue;
+        }
+        return hold;
+      } catch (error: unknown) {
+        try {
+          options.onCleanupFailure?.('durable acquisition hold', error);
+        } catch {
+          // A reporting failure cannot release the recovery obligation retained by this loop.
+        }
+        await options.time.sleep(1_000);
+      }
+    }
+  };
 
-  const runCut = async <T>(cut: string, step: () => Promise<T>): Promise<T | ProviderProxyAcquisitionFailure> => {
+  const fail = async (
+    cut: string,
+    reason: string,
+  ): Promise<ProviderProxyAcquisitionFailure | ProviderProxyAcquisitionHeld<'provider-host-acquisition'>> => {
+    const cleanup = await unwind(undos, options.deadlineSignal, options.onCleanupFailure);
+    if (cleanup.hold !== null) {
+      const hold: ProviderProxyAcquisitionHeld<'provider-host-acquisition'> = {
+        kind: 'provider_proxy_acquisition_held',
+        owner: 'provider-host-acquisition',
+        cut,
+        reason,
+        strandedArtifacts: cleanup.strandedArtifacts,
+        ...cleanup.hold,
+      };
+      return acceptHeld(hold);
+    }
+    return {
+      kind: 'provider_proxy_acquisition_failed',
+      cut,
+      reason,
+      strandedArtifacts: cleanup.strandedArtifacts,
+    };
+  };
+
+  const runCut = async <T>(
+    cut: string,
+    step: () => Promise<T>,
+  ): Promise<T | ProviderProxyAcquisitionFailure | ProviderProxyAcquisitionHeld<'provider-host-acquisition'>> => {
     if (options.deadlineSignal.aborted) return fail(cut, 'the acquisition deadline elapsed');
     try {
       return await step();
     } catch (error: unknown) {
-      return fail(cut, failureReason(error));
+      return fail(
+        error instanceof PublicationDeadlineElapsedError ? 'readiness publication' : cut,
+        failureReason(error),
+      );
     }
   };
 
+  const isFailedCut = <T>(
+    value: T | ProviderProxyAcquisitionFailure | ProviderProxyAcquisitionHeld<'provider-host-acquisition'>,
+  ): value is ProviderProxyAcquisitionFailure | ProviderProxyAcquisitionHeld<'provider-host-acquisition'> =>
+    typeof value === 'object' &&
+    value !== null &&
+    'kind' in value &&
+    (value.kind === 'provider_proxy_acquisition_failed' || value.kind === 'provider_proxy_acquisition_held');
+
   const capsules = await runCut('capsule creation', () => options.steps.createCapsules());
-  if ('kind' in capsules) return capsules;
+  if (isFailedCut(capsules)) return capsules;
   undos.push(capsules);
 
   const spawned = await runCut('guardian spawn', () => options.steps.spawnGuardian());
-  if ('kind' in spawned) return spawned;
+  if (isFailedCut(spawned)) return spawned;
+  if (spawned.kind === 'provider_proxy_role_spawn_held') {
+    const cleanup = await unwind(undos, options.deadlineSignal, options.onCleanupFailure);
+    return acceptHeld({
+      kind: 'provider_proxy_acquisition_held',
+      owner: 'provider-host-acquisition',
+      cut: 'guardian spawn',
+      reason: spawned.reason,
+      strandedArtifacts: cleanup.strandedArtifacts,
+      setAddress: spawned.setAddress,
+      recoverySubject: spawned.recoverySubject,
+      operatorExit: spawned.operatorExit,
+      recoveryCapability: spawned.recoveryCapability,
+    });
+  }
   undos.push(spawned);
 
-  const control = await runCut('control establishment', () => options.steps.establishControl());
-  if ('kind' in control) return control;
-  undos.push(control.undo);
-
-  // Last check before publishing: a deadline that elapsed while the final handshake was in flight means the
-  // caller has already given up, and publishing here would hand out a set nobody is holding.
-  if (options.deadlineSignal.aborted) {
-    return fail('readiness publication', 'the acquisition deadline elapsed before the set was published');
+  const control = await runCut('control establishment', () =>
+    options.steps.establishControl(
+      (undo) => undos.push(undo),
+      () => {
+        if (options.deadlineSignal.aborted) {
+          throw new PublicationDeadlineElapsedError('the acquisition deadline elapsed before the set was published');
+        }
+      },
+    ),
+  );
+  if (control.kind === 'provider_proxy_acquisition_failed' || control.kind === 'provider_proxy_acquisition_held') {
+    return control;
   }
-  return { kind: 'acquired', set: control.set };
+  if (control.kind === 'closed') return fail('control establishment', control.reason);
+  if (control.kind === 'handed-over') {
+    return handOverProviderProxyAcquisitionControlSession(
+      control.session,
+      providerProxyControlSessionOwner.providerHostAcquisition,
+      control.incident,
+    );
+  }
+  undos.push(control.undo);
+  return { kind: 'acquired', set: control.set, publicationReceipt: control.publicationReceipt };
 }

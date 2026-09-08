@@ -1,7 +1,21 @@
-import { describe, expect, it } from 'vitest';
+import { describe, expect, expectTypeOf, it } from 'vitest';
 
 import { parseBackendHealth, type BackendHealth } from '#src/transport/http/backend/health.js';
+import type {
+  AssertDispositionCausesCoverIncident,
+  AssertIncidentCoversDispositionCauses,
+} from '#src/coordinator/services/provider-proxy-authority-fault.js';
 import { encodeProviderProxySetAddress } from '#src/provider-proxy/set-address.js';
+import {
+  PROVIDER_PROXY_SET_OPERATOR_DISPOSITIONS,
+  PROVIDER_PROXY_SET_OPERATOR_DISPOSITION_CAUSES,
+  PROVIDER_PROXY_SET_OPERATOR_DISPOSITION_WAITING_FOR,
+} from '#src/provider-proxy/operator-disposition-vocabulary.js';
+
+it('enumerates exactly the disposition causes an incident can produce', () => {
+  expectTypeOf<AssertDispositionCausesCoverIncident>().toEqualTypeOf<never>();
+  expectTypeOf<AssertIncidentCoversDispositionCauses>().toEqualTypeOf<never>();
+});
 
 const HEALTHY_BASE: BackendHealth = {
   status: 'ok',
@@ -20,6 +34,16 @@ const HEALTHY_BASE: BackendHealth = {
   components: [{ id: 'kb', phase: 'online' }],
 };
 
+const PROVIDER_PROXY_SET_HOLD = {
+  disposition: 'held',
+  cause: 'closed',
+  attempts: 2,
+  elapsedMs: 500,
+  boundMs: 23_000,
+  incidentReason: 'control_channel_closed',
+  waitingFor: 'control-reattachment',
+} as const;
+
 const PROVIDER_PROXY_SET = {
   setIdentity: {
     buildSetId: '11111111-1111-4111-8111-111111111111',
@@ -31,14 +55,15 @@ const PROVIDER_PROXY_SET = {
     hostFingerprint: 'a'.repeat(64),
     proxyInstanceId: '22222222-2222-4222-8222-222222222222',
   }),
-  disposition: 'held',
-  cause: 'closed',
-  attempts: 2,
-  elapsedMs: 500,
-  boundMs: 23_000,
   liveClaims: 0,
-  incidentReason: 'control_channel_closed',
-  waitingFor: 'control-reattachment',
+  operatorExit: { kind: 'contain' },
+  holds: [PROVIDER_PROXY_SET_HOLD],
+} as const;
+
+const UNSUPPORTED_PROVIDER_PROXY_SET_ROW = {
+  reason: 'unsupported-row',
+  setToken: PROVIDER_PROXY_SET.setToken,
+  setIdentity: PROVIDER_PROXY_SET.setIdentity,
 } as const;
 
 function isBackendHealth(value: unknown): boolean {
@@ -172,25 +197,47 @@ describe('/health typed shape (AC10a)', () => {
   });
 
   it.each([
-    ['a malformed token', 'pps2.future'],
-    [
-      'a token for a different identity',
-      encodeProviderProxySetAddress({
+    { label: 'a malformed token', setToken: 'pps2.future', reason: 'invalid-token' as const },
+    {
+      label: 'a token for a different identity',
+      setToken: encodeProviderProxySetAddress({
         ...PROVIDER_PROXY_SET.setIdentity,
         proxyInstanceId: '33333333-3333-4333-8333-333333333333',
       }),
-    ],
-  ])('skips %s without publishing it as an actionable command token', (_label, setToken) => {
+      reason: 'token-identity-disagreement' as const,
+    },
+  ])('preserves raw candidate identity when it skips $label', ({ setToken, reason }) => {
     const parsed = parseBackendHealth({
       ...HEALTHY_BASE,
       diagnostics: { providerProxySets: [{ ...PROVIDER_PROXY_SET, setToken }] },
     });
 
     expect(parsed).toEqual({
-      health: { ...HEALTHY_BASE, diagnostics: { providerProxySets: [] } },
+      health: {
+        ...HEALTHY_BASE,
+        diagnostics: {
+          providerProxySets: [],
+          providerProxySetRowSkips: [{ reason, setToken, setIdentity: PROVIDER_PROXY_SET.setIdentity }],
+        },
+      },
       skippedProviderProxySetRows: 1,
-      skippedProviderProxySetTokens: [],
+      skippedProviderProxySetTokens: [setToken],
     });
+  });
+
+  it('preserves keyed durable disposition skips and their unavailable action', () => {
+    const skip = {
+      key: `provider-proxy-set-operator-disposition.v2:${PROVIDER_PROXY_SET.setToken}:future`,
+      setToken: PROVIDER_PROXY_SET.setToken,
+      unavailableAction: 'reconciliation-and-retirement' as const,
+    };
+
+    expect(
+      parseBackendHealth({
+        ...HEALTHY_BASE,
+        diagnostics: { providerProxyDispositionSkips: [skip] },
+      })?.health.diagnostics?.providerProxyDispositionSkips,
+    ).toEqual([skip]);
   });
 
   it.each([
@@ -410,36 +457,138 @@ describe('/health typed shape (AC10a)', () => {
     ['cause', 'peer-generation-changed'],
     ['waitingFor', 'successor-acknowledgement'],
   ] as const)('skips a well-formed provider proxy set row with an unknown %s', (field, value) => {
+    const invalid = { ...PROVIDER_PROXY_SET_HOLD, [field]: value };
     const parsed = parseBackendHealth({
       ...HEALTHY_BASE,
       diagnostics: {
-        providerProxySets: [PROVIDER_PROXY_SET, { ...PROVIDER_PROXY_SET, [field]: value }],
+        providerProxySets: [PROVIDER_PROXY_SET, { ...PROVIDER_PROXY_SET, holds: [invalid] }],
       },
     });
 
     expect(parsed).toEqual({
-      health: { ...HEALTHY_BASE, diagnostics: { providerProxySets: [PROVIDER_PROXY_SET] } },
+      health: {
+        ...HEALTHY_BASE,
+        diagnostics: {
+          providerProxySets: [PROVIDER_PROXY_SET],
+          providerProxySetRowSkips: [UNSUPPORTED_PROVIDER_PROXY_SET_ROW],
+        },
+      },
+      skippedProviderProxySetRows: 1,
+      skippedProviderProxySetTokens: [PROVIDER_PROXY_SET.setToken],
+    });
+  });
+
+  it.each(PROVIDER_PROXY_SET_OPERATOR_DISPOSITIONS.map((disposition) => [disposition] as const))(
+    'accepts every disposition the vocabulary currently defines: %s',
+    (disposition) => {
+      const parsed = parseBackendHealth({
+        ...HEALTHY_BASE,
+        diagnostics: {
+          providerProxySets: [{ ...PROVIDER_PROXY_SET, holds: [{ ...PROVIDER_PROXY_SET_HOLD, disposition }] }],
+        },
+      });
+
+      expect(parsed?.skippedProviderProxySetRows).toBe(0);
+      expect(parsed?.health.diagnostics?.providerProxySets).toHaveLength(1);
+    },
+  );
+
+  it.each(PROVIDER_PROXY_SET_OPERATOR_DISPOSITION_CAUSES.map((cause) => [cause] as const))(
+    'accepts every cause the vocabulary currently defines: %s',
+    (cause) => {
+      const parsed = parseBackendHealth({
+        ...HEALTHY_BASE,
+        diagnostics: {
+          providerProxySets: [{ ...PROVIDER_PROXY_SET, holds: [{ ...PROVIDER_PROXY_SET_HOLD, cause }] }],
+        },
+      });
+
+      expect(parsed?.skippedProviderProxySetRows).toBe(0);
+      expect(parsed?.health.diagnostics?.providerProxySets).toHaveLength(1);
+    },
+  );
+
+  it.each(PROVIDER_PROXY_SET_OPERATOR_DISPOSITION_WAITING_FOR.map((waitingFor) => [waitingFor] as const))(
+    'accepts every waitingFor the vocabulary currently defines: %s',
+    (waitingFor) => {
+      const parsed = parseBackendHealth({
+        ...HEALTHY_BASE,
+        diagnostics: {
+          providerProxySets: [{ ...PROVIDER_PROXY_SET, holds: [{ ...PROVIDER_PROXY_SET_HOLD, waitingFor }] }],
+        },
+      });
+
+      expect(parsed?.skippedProviderProxySetRows).toBe(0);
+      expect(parsed?.health.diagnostics?.providerProxySets).toHaveLength(1);
+    },
+  );
+
+  it.each([
+    { kind: 'none' },
+    { kind: 'gated', remainingMs: 1250 },
+    { kind: 'contain' },
+    { kind: 'refused', ground: 'enforcer-alive' },
+    { kind: 'refused', ground: 'enforcer-unobservable' },
+    { kind: 'refused', ground: 'recorded-group-unattributable' },
+    { kind: 'refused', ground: 'signal-authorization-refused' },
+    { kind: 'refused', ground: 'identity-unobservable' },
+    { kind: 'refused', ground: 'store-unreadable' },
+    { kind: 'refused', ground: 'representation-release-fatal' },
+  ] as const)('accepts an asserted operator exit: $kind', (operatorExit) => {
+    const parsed = parseBackendHealth({
+      ...HEALTHY_BASE,
+      diagnostics: { providerProxySets: [{ ...PROVIDER_PROXY_SET, operatorExit }] },
+    });
+
+    expect(parsed?.skippedProviderProxySetRows).toBe(0);
+    expect(parsed?.health.diagnostics?.providerProxySets).toHaveLength(1);
+  });
+
+  it('skips a set without an asserted operator exit and reports its token', () => {
+    const { operatorExit: _operatorExit, ...exitlessSet } = PROVIDER_PROXY_SET;
+    const parsed = parseBackendHealth({
+      ...HEALTHY_BASE,
+      diagnostics: { providerProxySets: [exitlessSet] },
+    });
+
+    expect(parsed).toEqual({
+      health: {
+        ...HEALTHY_BASE,
+        diagnostics: { providerProxySets: [], providerProxySetRowSkips: [UNSUPPORTED_PROVIDER_PROXY_SET_ROW] },
+      },
+      skippedProviderProxySetRows: 1,
+      skippedProviderProxySetTokens: [PROVIDER_PROXY_SET.setToken],
+    });
+  });
+
+  it('skips a set with an unknown operator exit', () => {
+    const parsed = parseBackendHealth({
+      ...HEALTHY_BASE,
+      diagnostics: { providerProxySets: [{ ...PROVIDER_PROXY_SET, operatorExit: { kind: 'terminate' } }] },
+    });
+
+    expect(parsed).toEqual({
+      health: {
+        ...HEALTHY_BASE,
+        diagnostics: { providerProxySets: [], providerProxySetRowSkips: [UNSUPPORTED_PROVIDER_PROXY_SET_ROW] },
+      },
       skippedProviderProxySetRows: 1,
       skippedProviderProxySetTokens: [PROVIDER_PROXY_SET.setToken],
     });
   });
 
   it("skips an unknown cause that does not carry this build's companion fields", () => {
-    const future = {
-      setIdentity: PROVIDER_PROXY_SET.setIdentity,
-      setToken: PROVIDER_PROXY_SET.setToken,
-      disposition: PROVIDER_PROXY_SET.disposition,
-      cause: 'successor-adopted',
-      incidentReason: PROVIDER_PROXY_SET.incidentReason,
-      waitingFor: PROVIDER_PROXY_SET.waitingFor,
-    };
+    const future = { ...PROVIDER_PROXY_SET_HOLD, cause: 'successor-adopted' };
     const parsed = parseBackendHealth({
       ...HEALTHY_BASE,
-      diagnostics: { providerProxySets: [future] },
+      diagnostics: { providerProxySets: [{ ...PROVIDER_PROXY_SET, holds: [future] }] },
     });
 
     expect(parsed).toEqual({
-      health: { ...HEALTHY_BASE, diagnostics: { providerProxySets: [] } },
+      health: {
+        ...HEALTHY_BASE,
+        diagnostics: { providerProxySets: [], providerProxySetRowSkips: [UNSUPPORTED_PROVIDER_PROXY_SET_ROW] },
+      },
       skippedProviderProxySetRows: 1,
       skippedProviderProxySetTokens: [PROVIDER_PROXY_SET.setToken],
     });
@@ -452,9 +601,14 @@ describe('/health typed shape (AC10a)', () => {
         providerProxySets: [
           {
             ...PROVIDER_PROXY_SET,
-            enforcerObservations: [
-              { role: 'guardian', observation: 'paused' },
-              { role: 'reaper', observation: 'absent' },
+            holds: [
+              {
+                ...PROVIDER_PROXY_SET_HOLD,
+                enforcerObservations: [
+                  { role: 'guardian', observation: 'paused' },
+                  { role: 'reaper', observation: 'absent' },
+                ],
+              },
             ],
           },
         ],
@@ -462,7 +616,10 @@ describe('/health typed shape (AC10a)', () => {
     });
 
     expect(parsed).toEqual({
-      health: { ...HEALTHY_BASE, diagnostics: { providerProxySets: [] } },
+      health: {
+        ...HEALTHY_BASE,
+        diagnostics: { providerProxySets: [], providerProxySetRowSkips: [UNSUPPORTED_PROVIDER_PROXY_SET_ROW] },
+      },
       skippedProviderProxySetRows: 1,
       skippedProviderProxySetTokens: [PROVIDER_PROXY_SET.setToken],
     });
@@ -474,17 +631,62 @@ describe('/health typed shape (AC10a)', () => {
 
     expect(parseWith('not-an-array')).toBeNull();
     expect(parseWith([{ ...PROVIDER_PROXY_SET, setIdentity: undefined }])).toEqual({
-      health: { ...HEALTHY_BASE, diagnostics: { providerProxySets: [] } },
-      skippedProviderProxySetRows: 1,
-      skippedProviderProxySetTokens: [],
-    });
-    expect(parseWith([{ ...PROVIDER_PROXY_SET, attempts: '2' }])).toEqual({
-      health: { ...HEALTHY_BASE, diagnostics: { providerProxySets: [] } },
+      health: {
+        ...HEALTHY_BASE,
+        diagnostics: {
+          providerProxySets: [],
+          providerProxySetRowSkips: [
+            { reason: 'malformed-row', setToken: PROVIDER_PROXY_SET.setToken, setIdentity: null },
+          ],
+        },
+      },
       skippedProviderProxySetRows: 1,
       skippedProviderProxySetTokens: [PROVIDER_PROXY_SET.setToken],
     });
-    expect(parseWith([{ ...PROVIDER_PROXY_SET, disposition: 'released-by-successor', attempts: '2' }])).toEqual({
-      health: { ...HEALTHY_BASE, diagnostics: { providerProxySets: [] } },
+    expect(parseWith([{ ...PROVIDER_PROXY_SET, setToken: undefined }])).toEqual({
+      health: {
+        ...HEALTHY_BASE,
+        diagnostics: {
+          providerProxySets: [],
+          providerProxySetRowSkips: [
+            { reason: 'malformed-row', setToken: null, setIdentity: PROVIDER_PROXY_SET.setIdentity },
+          ],
+        },
+      },
+      skippedProviderProxySetRows: 1,
+      skippedProviderProxySetTokens: [],
+    });
+    expect(parseWith([null])).toEqual({
+      health: {
+        ...HEALTHY_BASE,
+        diagnostics: {
+          providerProxySets: [],
+          providerProxySetRowSkips: [{ reason: 'malformed-row', setToken: null, setIdentity: null }],
+        },
+      },
+      skippedProviderProxySetRows: 1,
+      skippedProviderProxySetTokens: [],
+    });
+    expect(parseWith([{ ...PROVIDER_PROXY_SET, holds: [{ ...PROVIDER_PROXY_SET_HOLD, attempts: '2' }] }])).toEqual({
+      health: {
+        ...HEALTHY_BASE,
+        diagnostics: { providerProxySets: [], providerProxySetRowSkips: [UNSUPPORTED_PROVIDER_PROXY_SET_ROW] },
+      },
+      skippedProviderProxySetRows: 1,
+      skippedProviderProxySetTokens: [PROVIDER_PROXY_SET.setToken],
+    });
+    expect(
+      parseWith([
+        {
+          ...PROVIDER_PROXY_SET,
+          holds: [{ ...PROVIDER_PROXY_SET_HOLD, disposition: 'released-by-successor', attempts: '2' }],
+        },
+      ]),
+    ).toEqual({
+      health: {
+        ...HEALTHY_BASE,
+        diagnostics: { providerProxySets: [], providerProxySetRowSkips: [UNSUPPORTED_PROVIDER_PROXY_SET_ROW] },
+      },
       skippedProviderProxySetRows: 1,
       skippedProviderProxySetTokens: [PROVIDER_PROXY_SET.setToken],
     });

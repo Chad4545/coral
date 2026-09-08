@@ -1,5 +1,6 @@
 import type { ControlClient, ControlClientError } from '../../provider-proxy/control-client.js';
 import type { HeartbeatObservation } from '../../provider-proxy/heartbeat-observation.js';
+import type { ProviderProxySetOperatorDispositionCause } from '../../provider-proxy/operator-disposition-vocabulary.js';
 import type { ProxyControlProtocolErrorCode } from '../../provider-proxy/protocol.js';
 
 export type ProviderOperationSagaPhase =
@@ -45,6 +46,16 @@ export type ProviderProxyControlChannelIncident = Readonly<{
   cause: ProviderProxyControlChannelCause;
   error: ControlClientError;
 }>;
+
+type AssertNever<Value extends never> = Value;
+/** Every admitted incident cause must belong to the wire vocabulary. */
+export type AssertDispositionCausesCoverIncident = AssertNever<
+  Exclude<ProviderProxyControlChannelIncident['cause'], ProviderProxySetOperatorDispositionCause>
+>;
+/** Every wire-vocabulary cause must be producible by an admitted incident. */
+export type AssertIncidentCoversDispositionCauses = AssertNever<
+  Exclude<ProviderProxySetOperatorDispositionCause, ProviderProxyControlChannelIncident['cause']>
+>;
 
 export type ProviderProxyAuthorityFault =
   | Readonly<{

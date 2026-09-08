@@ -1,4 +1,4 @@
-import { processIncarnationSchema } from '../infra/node-process.js';
+import { MAX_PROCESS_INCARNATION_LENGTH, type ProcessIncarnation } from '../infra/node-process.js';
 import { createHash, timingSafeEqual } from 'node:crypto';
 import { isAbsolute, normalize } from 'node:path';
 
@@ -11,10 +11,10 @@ import {
   type ProviderProxyEndpointIdentity,
 } from '../infra/path/index.js';
 import type { StorageBigIntStat, StoragePort } from '../infra/port-types.js';
+import { sameControlTenancyHolder, type ControlTenancyHolder } from './control-endpoint.js';
 import {
   PERMISSION_BITS_MASK,
   ProxyControlProtocolError,
-  canonicalEndpointSchema,
   canonicalUuidSchema,
   coordinatorIdentitySchema,
   flavorSchema,
@@ -143,6 +143,21 @@ export const proxyHandoffRedeemParamsSchema = z
   })
   .strict();
 
+/** Holder-status checks must verify the installed grant without consuming it. */
+export const holderStatusParamsSchema = z
+  .object({
+    grantId: canonicalUuidSchema,
+    secret: grantSecretSchema,
+    generation: generationSchema,
+    flavor: flavorSchema,
+    buildSetId: canonicalUuidSchema,
+    hostFingerprint: hostFingerprintSchema,
+    guardianInstanceId: canonicalUuidSchema,
+    reaperInstanceId: canonicalUuidSchema,
+    proxyInstanceId: canonicalUuidSchema,
+  })
+  .strict();
+
 /** A strict full-tuple boundary prevents succession membership from degrading to operation-id authority. */
 export const successionOperationRegisterParamsSchema = z.object({ operation: operationIdentitySchema }).strict();
 
@@ -210,24 +225,43 @@ export const guardianHandoffRedeemParamsSchema = z
 export const handoffCapsuleV1Schema = z
   .object({
     version: z.literal(1),
-    grantId: canonicalUuidSchema,
+    grantId: z.string().regex(/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/),
     secret: grantSecretSchema,
-    generation: generationSchema,
-    flavor: flavorSchema,
-    buildSetId: canonicalUuidSchema,
-    hostFingerprint: hostFingerprintSchema,
-    guardianInstanceId: canonicalUuidSchema,
-    reaperInstanceId: canonicalUuidSchema,
-    proxyInstanceId: canonicalUuidSchema,
-    guardianControlEndpoint: canonicalEndpointSchema,
-    reaperControlEndpoint: canonicalEndpointSchema,
-    proxyEndpoint: canonicalEndpointSchema,
+    generation: z.literal('gen2'),
+    flavor: z.enum(['prod', 'dev']),
+    buildSetId: z.string().regex(/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/),
+    hostFingerprint: z
+      .string()
+      .length(64)
+      .regex(/^[0-9a-f]{64}$/),
+    guardianInstanceId: z.string().regex(/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/),
+    reaperInstanceId: z.string().regex(/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/),
+    proxyInstanceId: z.string().regex(/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/),
+    guardianControlEndpoint: z
+      .string()
+      .min(1)
+      .max(4096)
+      .refine((value) => isAbsolute(value) && normalize(value) === value),
+    reaperControlEndpoint: z
+      .string()
+      .min(1)
+      .max(4096)
+      .refine((value) => isAbsolute(value) && normalize(value) === value),
+    proxyEndpoint: z
+      .string()
+      .min(1)
+      .max(4096)
+      .refine((value) => isAbsolute(value) && normalize(value) === value),
     orphanTimeoutMs: z.number().int().positive(),
     teardownReserveMs: z.number().int().positive(),
   })
   .strict();
 
 const nonNegativeSafeIntegerSchema = z.number().int().nonnegative().safe();
+
+function durableProcessIncarnation() {
+  return z.string().min(1).max(MAX_PROCESS_INCARNATION_LENGTH) as unknown as z.ZodType<ProcessIncarnation>;
+}
 
 /**
  * Shipped in v0.10.6 through v0.10.8, and read-only from here on: nothing writes a V2 again.
@@ -267,12 +301,12 @@ export const handoffCapsuleV3Schema = handoffCapsuleV1Schema
   .extend({
     version: z.literal(3),
     guardianPid: nonNegativeSafeIntegerSchema,
-    guardianIncarnation: processIncarnationSchema,
+    guardianIncarnation: durableProcessIncarnation(),
     proxyPid: nonNegativeSafeIntegerSchema,
     reaperPid: nonNegativeSafeIntegerSchema,
-    reaperIncarnation: processIncarnationSchema,
+    reaperIncarnation: durableProcessIncarnation(),
     containmentKind: z.string().min(1).max(64),
-    proxyIncarnation: processIncarnationSchema,
+    proxyIncarnation: durableProcessIncarnation(),
     proxyProcessGroupId: nonNegativeSafeIntegerSchema,
   })
   .strict();
@@ -534,7 +568,7 @@ function digestsMatch(left: string, right: string): boolean {
 export type GrantRedemption = Readonly<{
   grant: InstalledGrant;
   redemptionReceipt: string;
-  successorInstanceId: string;
+  successor: ControlTenancyHolder;
 }>;
 
 /**
@@ -606,11 +640,14 @@ export interface GrantRegistry {
   redeem(input: {
     grantId: string;
     secret: string;
-    /** Identifies same-epoch retries; a different value requires the replacement policy to admit it. */
-    successorInstanceId: string;
+    /** Identifies same-epoch retries; a different complete identity requires the replacement policy to
+     *  admit it — the same instance id under a different pid or incarnation is a different process. */
+    successor: ControlTenancyHolder;
     binding: GrantBinding;
   }): GrantRedemption;
   redemption(): GrantRedemption | null;
+  /** Holder-status verification must not spend or mutate the installed grant. */
+  verifyInstalledGrant(input: { grantId: string; secret: string; binding: GrantBinding }): boolean;
 }
 
 export function createGrantRegistry(
@@ -686,7 +723,7 @@ export function createGrantRegistry(
       return { state: 'succession-registered', operation };
     },
 
-    redeem({ grantId, secret, successorInstanceId, binding }): GrantRedemption {
+    redeem({ grantId, secret, successor, binding }): GrantRedemption {
       if (installed === null)
         throw new ProxyControlProtocolError('grant_invalid', 'No grant is installed for this set.');
       if (installed.grantId !== grantId || !digestsMatch(installed.secretSha256, handoffSecretDigest(secret))) {
@@ -700,7 +737,7 @@ export function createGrantRegistry(
         );
       }
       if (redemption !== null) {
-        if (redemption.successorInstanceId !== successorInstanceId) {
+        if (!sameControlTenancyHolder(redemption.successor, successor)) {
           if (policy.mayReplaceRedemption?.() !== true) {
             throw new ProxyControlProtocolError(
               'grant_replayed',
@@ -710,17 +747,25 @@ export function createGrantRegistry(
           redemption = Object.freeze({
             grant: installed,
             redemptionReceipt: mintReceipt(),
-            successorInstanceId,
+            successor,
           });
         }
         return redemption;
       }
-      redemption = Object.freeze({ grant: installed, redemptionReceipt: mintReceipt(), successorInstanceId });
+      redemption = Object.freeze({ grant: installed, redemptionReceipt: mintReceipt(), successor });
       return redemption;
     },
 
     redemption(): GrantRedemption | null {
       return redemption;
+    },
+
+    verifyInstalledGrant({ grantId, secret, binding }): boolean {
+      if (installed === null) return false;
+      if (installed.grantId !== grantId || !digestsMatch(installed.secretSha256, handoffSecretDigest(secret))) {
+        return false;
+      }
+      return sameBinding(installed, { ...installed, ...binding });
     },
   };
 }

@@ -1,11 +1,13 @@
 import type { ProcessIncarnation } from '#src/infra/node-process.js';
 import { testIncarnation } from '#tests/helpers/process-incarnation.js';
 import { strictControlExchangeResult as strictTestExchange } from '#tests/support/control-exchange.js';
+import { EventEmitter } from 'node:events';
 import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { isAbsolute, join, normalize, resolve } from 'node:path';
 
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import { z } from 'zod';
 
 vi.mock('#src/providers/app-server-transport.js', async (importOriginal) => {
   const actual = await importOriginal<object>();
@@ -21,10 +23,18 @@ vi.mock('#src/infra/node-process.js', async (importOriginal) => {
 });
 
 import { createProviderProxySetAuthority } from '#src/coordinator/live/provider-proxy/set-authority.js';
+import {
+  ProviderHostAdministrationService,
+  type ProviderHostAdministrationOwner,
+} from '#src/coordinator/services/provider-host-administration.js';
 import { createMonotonicClock } from '#src/infra/monotonic-clock.js';
 import { createRealRuntime } from '#src/runtime/real.js';
 import type { Runtime } from '#src/runtime/ports.js';
-import { spawnProviderServerTransport, type ProviderServerHandle } from '#src/providers/app-server-transport.js';
+import {
+  spawnProviderServerTransport,
+  type ProviderServerFailedSpawnCleanupDisposition,
+  type ProviderServerHandle,
+} from '#src/providers/app-server-transport.js';
 import type { HostRef, ProviderServerSpec } from '#src/providers/contract.js';
 import type { ProviderResponseDiagnosticFact } from '#src/providers/host-diagnostics.js';
 import type { ControlClient } from '#src/provider-proxy/control-client.js';
@@ -65,10 +75,161 @@ const providerSpec: ProviderServerSpec = {
   idleRetirement: 'never',
 };
 
+const releasedV0109NonNegativeSafeIntegerSchema = z.number().int().nonnegative().safe();
+const releasedV0109PositiveSafeIntegerSchema = z.number().int().positive().safe();
+const releasedV0109CanonicalWorkDirWireSchema = z
+  .string()
+  .refine(
+    (value) => isAbsolute(value) && normalize(value) === value && resolve(value) === value,
+    'Work directory must be absolute and normalized',
+  )
+  .describe('canonical-work-dir-wire')
+  .brand<'CanonicalWorkDir'>();
+const releasedV0109HostRefIdentitySchema = z
+  .object({
+    provider: z.string().regex(/^[a-z][a-z0-9]*(?:[._-][a-z0-9]+)*$/),
+    fingerprint: z
+      .string()
+      .length(64)
+      .regex(/^[0-9a-f]{64}$/),
+    instanceId: z.string().min(1).max(1024),
+  })
+  .strict();
+const releasedV0109HostRefSchema = z.discriminatedUnion('leaseMode', [
+  z.object({ ...releasedV0109HostRefIdentitySchema.shape, leaseMode: z.literal('shared') }).strict(),
+  z
+    .object({
+      ...releasedV0109HostRefIdentitySchema.shape,
+      leaseMode: z.literal('job-exclusive'),
+      ownerJobId: z.string().min(1).max(1024),
+    })
+    .strict(),
+]);
+const releasedV0109LogEntrySchema = z
+  .object({
+    seq: releasedV0109NonNegativeSafeIntegerSchema,
+    observedAt: z.number(),
+    stream: z.literal('stderr'),
+    text: z.string(),
+    startTruncated: z.literal(true).optional(),
+  })
+  .strict();
+const releasedV0109LogSpanSchema = z
+  .object({
+    startSeq: releasedV0109NonNegativeSafeIntegerSchema,
+    endSeq: releasedV0109NonNegativeSafeIntegerSchema,
+    truncated: z.boolean(),
+    historical: z.array(releasedV0109LogEntrySchema),
+    during: z.array(releasedV0109LogEntrySchema),
+    after: z.array(releasedV0109LogEntrySchema),
+  })
+  .strict();
+const releasedV0109ResponseSchema = z.discriminatedUnion('kind', [
+  z.object({ kind: z.literal('success') }).strict(),
+  z
+    .object({
+      kind: z.literal('failure'),
+      rpcCode: z.number().optional(),
+      providerMessage: z.string().optional(),
+      providerData: z.unknown().optional(),
+    })
+    .strict(),
+]);
+const releasedV0109DiagnosticFactSchema = z
+  .object({
+    factSeq: releasedV0109NonNegativeSafeIntegerSchema,
+    generation: releasedV0109NonNegativeSafeIntegerSchema,
+    requestId: releasedV0109NonNegativeSafeIntegerSchema,
+    method: z.string(),
+    response: releasedV0109ResponseSchema,
+    hostLog: releasedV0109LogSpanSchema,
+  })
+  .strict();
+const releasedV0109CommonShape = {
+  ref: releasedV0109HostRefSchema,
+  spec: z
+    .object({
+      provider: z.string().min(1),
+      command: z.string().min(1),
+      args: z.array(z.string()),
+      cwd: releasedV0109CanonicalWorkDirWireSchema.nullable(),
+      leaseMode: z.enum(['shared', 'job-exclusive']),
+      idleRetirement: z.enum(['unleased', 'unleased-and-host-idle', 'never']).nullable(),
+    })
+    .strict(),
+  diagnostics: z
+    .object({
+      hostLog: z
+        .object({
+          entries: z.array(releasedV0109LogEntrySchema),
+          retainedBytes: releasedV0109NonNegativeSafeIntegerSchema,
+          truncatedBeforeSeq: releasedV0109NonNegativeSafeIntegerSchema,
+        })
+        .strict(),
+      completedObservations: z.array(releasedV0109DiagnosticFactSchema),
+      factsTruncatedBeforeSeq: releasedV0109NonNegativeSafeIntegerSchema,
+    })
+    .strict(),
+  diagnosticsRetention: z.object({ ownerBudgetTruncated: z.boolean() }).strict(),
+};
+const releasedV0109ReclamationFailureShape = {
+  owner: z.literal('coordinator'),
+  hostKey: z.string(),
+  identityKey: z.string(),
+  ownerJobId: z.string().nullable(),
+  reclamationAttempts: releasedV0109PositiveSafeIntegerSchema,
+  reclamationFailure: z.string(),
+  reclamationRetryable: z.boolean(),
+};
+const releasedV0109ProviderHostInventoryRecordSchema = z.discriminatedUnion('status', [
+  z
+    .object({
+      ...releasedV0109CommonShape,
+      status: z.literal('live'),
+      host: z.record(z.union([z.string(), z.number(), z.boolean(), z.null()])),
+    })
+    .strict(),
+  z
+    .object({
+      ...releasedV0109CommonShape,
+      status: z.literal('retired-blocked'),
+      host: z.record(z.union([z.string(), z.number(), z.boolean(), z.null()])),
+    })
+    .strict(),
+  z
+    .object({
+      ...releasedV0109CommonShape,
+      status: z.literal('reclamation-failed'),
+      host: z.union([
+        z.object(releasedV0109ReclamationFailureShape).strict(),
+        z
+          .object({
+            ...releasedV0109ReclamationFailureShape,
+            pid: releasedV0109PositiveSafeIntegerSchema,
+            processGroupId: releasedV0109PositiveSafeIntegerSchema,
+          })
+          .strict()
+          .refine(({ pid, processGroupId }) => processGroupId === pid, {
+            message: 'processGroupId must equal pid for a coordinator-owned provider host',
+            path: ['processGroupId'],
+          }),
+      ]),
+    })
+    .strict(),
+]);
+const releasedV0109ProviderHostListResultSchema = z
+  .object({ hosts: z.array(releasedV0109ProviderHostInventoryRecordSchema) })
+  .strict();
+const releasedV0109ProviderHostInspectResultSchema = z.discriminatedUnion('state', [
+  z.object({ state: z.literal('matched'), host: releasedV0109ProviderHostInventoryRecordSchema }).strict(),
+  z.object({ state: z.literal('stale') }).strict(),
+]);
+
 let cleanup: (() => Promise<void>) | undefined;
 let authority: ReturnType<typeof createProviderProxySetAuthority>;
 let providerHosts: ReturnType<typeof createProxyAppServerHostAuthority>;
 let providerServer: ReturnType<typeof fakeProviderServerHandle>;
+let control: ControlClient;
 
 beforeEach(async () => {
   vi.mocked(spawnProviderServerTransport).mockReset();
@@ -143,7 +304,7 @@ beforeEach(async () => {
     },
   });
   await proxy.listen();
-  const control = await connectControlClient(endpoint, timer, 5_000);
+  control = await connectControlClient(endpoint, timer, 5_000);
   const coordinatorIdentity: CoordinatorIdentity = {
     instanceId: '55555555-5555-4555-8555-555555555555',
     pid: 1,
@@ -195,6 +356,133 @@ afterEach(async () => {
 });
 
 describe('provider-host proxy controls', () => {
+  it('emits list and inspect v1 payloads accepted by the released v0.10.9 schemas', async () => {
+    const assertReleasedPayloads = async (): Promise<void> => {
+      const list = await strictTestExchange(control, 'provider-host.list.v1', {}, 5_000);
+      const inspect = await strictTestExchange(control, 'provider-host.inspect.v1', { hostRef }, 5_000);
+
+      expect(releasedV0109ProviderHostListResultSchema.parse(list)).toEqual(list);
+      expect(releasedV0109ProviderHostInspectResultSchema.parse(inspect)).toEqual(inspect);
+    };
+
+    await assertReleasedPayloads();
+
+    const spawnOptions = vi.mocked(spawnProviderServerTransport).mock.calls[0]?.[0];
+    if (spawnOptions === undefined) throw new Error('provider-host transport was not spawned');
+    spawnOptions.observeProviderResponse(rejectedConfigRead(0));
+    providerServer.resolveClosed();
+    await vi.waitFor(() => expect(providerHosts.admissionSnapshot().tombstones).toHaveLength(1));
+
+    await assertReleasedPayloads();
+  });
+
+  it('refuses v1 list and inspect payloads that only v2 can represent', async () => {
+    const live = providerHosts.listProviderHosts()[0];
+    if (live === undefined) throw new Error('provider-host fixture did not open a live host');
+    const v2OnlyRecords = [
+      {
+        ...live,
+        status: 'reclamation-failed',
+        host: {
+          owner: 'provider-proxy',
+          hostKey: 'provider-proxy-host',
+          ownerJobId: 'job-1',
+          pid: process.pid,
+          reclamationAttempts: 1,
+          reclamationFailure: 'cleanup held',
+          reclamationRetryable: true,
+        },
+      },
+      {
+        ...live,
+        status: 'shutdown-held',
+        host: {
+          owner: 'provider-proxy',
+          hostKey: 'provider-proxy-host',
+          ownerJobId: 'job-1',
+          pid: process.pid,
+          observation: 'unobservable',
+          successorOwner: null,
+          operatorExit: 'retry-provider-shutdown',
+        },
+      },
+    ] as const;
+
+    for (const record of v2OnlyRecords) {
+      const list = vi.spyOn(providerHosts, 'listProviderHosts').mockReturnValue([record as never]);
+      const inspect = vi.spyOn(providerHosts, 'inspectProviderHost').mockReturnValue(record as never);
+      try {
+        await expect(strictTestExchange(control, 'provider-host.list.v2', {}, 5_000)).resolves.toEqual({
+          hosts: [record],
+        });
+        await expect(strictTestExchange(control, 'provider-host.inspect.v2', { hostRef }, 5_000)).resolves.toEqual({
+          state: 'matched',
+          host: record,
+        });
+        await expect(strictTestExchange(control, 'provider-host.list.v1', {}, 5_000)).rejects.toThrow(
+          'Provider-host inventory requires provider-host.list.v2.',
+        );
+        await expect(strictTestExchange(control, 'provider-host.inspect.v1', { hostRef }, 5_000)).rejects.toThrow(
+          'Provider-host inventory requires provider-host.inspect.v2.',
+        );
+      } finally {
+        list.mockRestore();
+        inspect.mockRestore();
+      }
+    }
+  });
+
+  it('preserves a held eviction in v2 and refuses to fold it through v1', async () => {
+    const eviction = vi.spyOn(providerHosts, 'evictHost').mockResolvedValue({
+      kind: 'held',
+      observation: 'alive',
+      successorOwner: 'broker-session-pool',
+      operatorExit: 'retry-broker-shutdown',
+    });
+    try {
+      await expect(strictTestExchange(control, 'provider-host.evict.v2', { hostRef }, 5_000)).resolves.toEqual({
+        kind: 'held',
+        observation: 'alive',
+        successorOwner: 'broker-session-pool',
+        operatorExit: 'retry-broker-shutdown',
+      });
+      await expect(strictTestExchange(control, 'provider-host.evict.v1', { hostRef }, 5_000)).rejects.toThrow(
+        'Provider-host eviction requires provider-host.evict.v2.',
+      );
+      expect(eviction).toHaveBeenCalledOnce();
+      expect(providerServer.closeMock).not.toHaveBeenCalled();
+    } finally {
+      eviction.mockRestore();
+    }
+  });
+
+  it('preserves operator abandonment in v2 and refuses to fold it through v1', async () => {
+    const abandonment = {
+      kind: 'operator-abandoned' as const,
+      subject: { kind: 'unattributable-process-group' as const, processGroupId: 4_242 },
+      processAbsenceProven: false as const,
+      successor: { owner: 'operator-command' as const, acceptance: 'accepted' as const },
+    };
+    const eviction = vi.spyOn(providerHosts, 'evictHost').mockResolvedValue(abandonment);
+    const terminal = vi.spyOn(providerHosts, 'terminalEviction').mockReturnValue(abandonment);
+    try {
+      await expect(
+        strictTestExchange(control, 'provider-host.terminal-eviction.v2', { hostRef }, 5_000),
+      ).resolves.toEqual({ state: 'matched', disposition: abandonment });
+      await expect(strictTestExchange(control, 'provider-host.evict.v2', { hostRef }, 5_000)).resolves.toEqual(
+        abandonment,
+      );
+      await expect(strictTestExchange(control, 'provider-host.evict.v1', { hostRef }, 5_000)).rejects.toThrow(
+        'Provider-host eviction requires provider-host.evict.v2.',
+      );
+      expect(eviction).toHaveBeenCalledOnce();
+      expect(providerServer.closeMock).not.toHaveBeenCalled();
+    } finally {
+      eviction.mockRestore();
+      terminal.mockRestore();
+    }
+  });
+
   it('passes actual live and retained-tombstone records through the real strict list and inspect handlers', async () => {
     const controls = authority.providerHosts;
     if (controls === undefined) throw new Error('provider-host controls were not composed');
@@ -218,12 +506,107 @@ describe('provider-host proxy controls', () => {
     await expect(controls.inspect(hostRef)).resolves.toEqual(tombstoneRecords[0]);
   });
 
+  it('evicts and replays a process-absent tombstone through v1 without another physical close', async () => {
+    const spawnOptions = vi.mocked(spawnProviderServerTransport).mock.calls[0]?.[0];
+    if (spawnOptions === undefined) throw new Error('provider-host transport was not spawned');
+    spawnOptions.observeProviderResponse(rejectedConfigRead(0));
+    providerServer.resolveClosed();
+    await vi.waitFor(() => expect(providerHosts.admissionSnapshot().tombstones).toHaveLength(1));
+
+    await expect(strictTestExchange(control, 'provider-host.evict.v1', { hostRef }, 5_000)).resolves.toEqual({
+      state: 'evicted',
+    });
+    await expect(strictTestExchange(control, 'provider-host.evict.v1', { hostRef }, 5_000)).resolves.toEqual({
+      state: 'evicted',
+    });
+    expect(providerServer.closeMock).not.toHaveBeenCalled();
+  });
+
   it('drives the real evict sender through the real strict receiver and handler', async () => {
     const controls = authority.providerHosts;
     if (controls === undefined) throw new Error('provider-host controls were not composed');
 
-    await expect(controls.evict(hostRef)).resolves.toBe(true);
+    await expect(controls.terminalEviction(hostRef)).resolves.toBeNull();
+    await expect(controls.evict(hostRef)).resolves.toEqual({ kind: 'evicted' });
+    await expect(controls.terminalEviction(hostRef)).resolves.toEqual({ kind: 'evicted' });
+    await expect(controls.evict(hostRef)).resolves.toEqual({ kind: 'evicted' });
     expect(providerServer.closeMock).toHaveBeenCalledOnce();
+    expect(providerHosts.listProviderHosts()).toEqual([]);
+  });
+
+  it('recovers a lost terminal reply through a second administration service and the surviving proxy', async () => {
+    const controls = authority.providerHosts;
+    if (controls === undefined) throw new Error('provider-host controls were not composed');
+    const subject = { kind: 'process' as const, pid: process.pid };
+    const abandonment = {
+      kind: 'operator-abandoned' as const,
+      subject,
+      processAbsenceProven: false as const,
+      successor: { owner: 'operator-command' as const, acceptance: 'accepted' as const },
+    };
+    const settled = new Promise<void>(() => undefined);
+    const operatorExit = {
+      kind: 'abandon-provider-host-acquisition' as const,
+      abandon: vi.fn(async () => abandonment),
+    };
+    const retry = vi.fn<() => Promise<ProviderServerFailedSpawnCleanupDisposition>>();
+    retry.mockImplementation(async () => ({
+      kind: 'held-alive',
+      subject,
+      observation: 'alive',
+      operatorExit,
+      settled,
+      retry,
+    }));
+    providerServer.closeMock.mockImplementationOnce(
+      async (acceptCleanupHold: Parameters<ProviderServerHandle['close']>[0]) => {
+        const hold = {
+          kind: 'held-alive' as const,
+          subject,
+          observation: 'alive' as const,
+          operatorExit,
+          settled,
+          retry,
+        };
+        return { ...hold, successor: acceptCleanupHold(hold) };
+      },
+    );
+    let loseReply = true;
+    const proxyOwner: ProviderHostAdministrationOwner = {
+      ownerId: `provider-proxy:${proxyInstanceId}`,
+      listProviderHosts: () => controls.list(),
+      inspectProviderHost: (ref) => controls.inspect(ref),
+      terminalEviction: (ref) => controls.terminalEviction(ref),
+      evictProviderHost: async (ref) => {
+        const disposition = await controls.evict(ref);
+        if (disposition.kind === 'operator-abandoned' && loseReply) {
+          loseReply = false;
+          throw new Error('terminal reply was lost');
+        }
+        return disposition;
+      },
+    };
+    // A lost reply must not be treated as proof that accepted abandonment did not occur.
+    const firstService = new ProviderHostAdministrationService({ owners: () => [proxyOwner] });
+    await expect(firstService.evict({ hostRef })).rejects.toMatchObject({
+      code: 'provider_host_inventory_unavailable',
+      ownerIds: [`provider-proxy:${proxyInstanceId}`],
+    });
+
+    const secondService = new ProviderHostAdministrationService({ owners: () => [proxyOwner] });
+    const recovered = await secondService.evict({ hostRef }).catch((error: unknown) => error);
+    expect(recovered).toMatchObject({
+      code: 'provider_host_operator_abandoned',
+      ownerIds: [`provider-proxy:${proxyInstanceId}`],
+      matches: [hostRef],
+      abandonment: {
+        kind: 'operator-abandoned',
+        subject,
+        processAbsenceProven: false,
+        successor: { owner: 'operator-command', acceptance: 'accepted' },
+      },
+    });
+    expect((recovered as { abandonment: unknown }).abandonment).toEqual(abandonment);
     expect(providerHosts.listProviderHosts()).toEqual([]);
   });
 
@@ -248,22 +631,42 @@ describe('provider-host proxy controls', () => {
 
 function fakeProviderServerHandle(): {
   handle: ProviderServerHandle;
-  closeMock: ReturnType<typeof vi.fn>;
+  closeMock: ReturnType<typeof vi.fn<ProviderServerHandle['close']>>;
   resolveClosed(): void;
 } {
   let resolveClosed!: () => void;
   let closed = false;
+  const child = Object.assign(new EventEmitter(), {
+    pid: process.pid,
+    exitCode: null as number | null,
+    signalCode: null as NodeJS.Signals | null,
+    stdin: null,
+    stdout: null,
+    stderr: null,
+    kill: () => true,
+  });
   const closePromise = new Promise<void>((resolve) => {
     resolveClosed = resolve;
   });
-  const closeMock = vi.fn(async () => {
+  const observeClosed = (): void => {
+    if (closed) return;
     closed = true;
+    child.exitCode = 0;
+    child.emit('exit', child.exitCode, child.signalCode);
+    child.emit('close', child.exitCode, child.signalCode);
     resolveClosed();
+  };
+  const closeMock = vi.fn(async () => {
+    observeClosed();
+    return {
+      kind: 'observed-absent' as const,
+      evidence: { subject: { kind: 'process' as const, pid: process.pid } },
+    };
   });
   return {
     handle: {
       pid: process.pid,
-      child: {} as never,
+      child,
       generation: 0,
       rpc: {
         request: vi.fn(async () => ({})) as unknown as ProviderServerHandle['rpc']['request'],
@@ -297,10 +700,7 @@ function fakeProviderServerHandle(): {
       close: closeMock,
     },
     closeMock,
-    resolveClosed: () => {
-      closed = true;
-      resolveClosed();
-    },
+    resolveClosed: observeClosed,
   };
 }
 

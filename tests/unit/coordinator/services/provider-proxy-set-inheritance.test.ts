@@ -39,6 +39,7 @@ import {
   type ControlExchange,
 } from '#src/provider-proxy/control-client.js';
 import { createControlEndpoint, type ControlChallengeAuthority } from '#src/provider-proxy/control-endpoint.js';
+import { createControlHolderAuthority } from '#src/provider-proxy/holder-lifecycle.js';
 import { ControlLeaseEvidence } from '#src/provider-proxy/control-lease.js';
 import {
   PROXY_CONTROL_HEARTBEAT_MS,
@@ -46,7 +47,7 @@ import {
   providerProxyHeartbeatHoldBound,
 } from '#src/provider-proxy/orphan-deadline.js';
 import { createProxy } from '#src/provider-proxy/proxy.js';
-import { providerProxyDisappearanceReceipt } from '#src/provider-proxy/enforcement.js';
+import { providerProxyDisappearanceReceipt } from '#src/provider-proxy/protocol.js';
 import { connectRoleControlWithRetry, runtimeControlTimer } from '#src/provider-proxy/role-spawn.js';
 import { applyBundledStoreSchema, type Database } from '#src/store/db.js';
 import { insertProviderOperation } from '#src/store/provider-operation-journal.js';
@@ -73,6 +74,7 @@ import {
   subscribeProviderProxyControlEstablished,
   type ProviderProxyOperationAuthority,
 } from '#src/coordinator/live/provider-proxy/operation-route.js';
+import type { PublicationReceipt } from '#src/coordinator/live/provider-proxy/set-publication.js';
 import { ProviderProxySetClaimMirror } from '#src/coordinator/services/provider-proxy-set/claim-mirror.js';
 import { providerProxySetIdentityFromRecord } from '#src/coordinator/services/provider-proxy-set/identity.js';
 import { ProviderProxySetLifecycle } from '#src/coordinator/services/provider-proxy-set/index.js';
@@ -83,6 +85,7 @@ import {
   createTestProviderProxyContainmentProofProducer,
   createTestProviderProxyRecoveryDispatcher,
 } from '#tests/helpers/provider-proxy-recovery-dispatcher.js';
+import { testProviderProxySetLifecycleDurability } from '#tests/helpers/provider-proxy-set-lifecycle-durability.js';
 
 /** The build this fixture lifecycle belongs to — the same one `providerOperationRecord` stamps on its identities, so a discovered capsule is inheritable rather than foreign. */
 const FIXTURE_BUILD_SET_ID = '00000000-0000-4000-8000-000000000004';
@@ -94,10 +97,14 @@ const mockedReadCapsule = vi.mocked(readHandoffCapsuleFile);
 const mockedConnect = vi.mocked(connectRoleControlWithRetry);
 const mockedProbe = vi.mocked(probeProcessIncarnation);
 
-// Call history, not implementations, so `mockedProbe`'s default `1_700_000_000` (set in the `vi.mock` factory
-// above) survives — only each test's own explicit `.mockReturnValueOnce`/`.mockResolvedValueOnce` setup and
-// this shared `.not.toHaveBeenCalled()`-style assertions must not see a sibling test's earlier calls.
-const runtime = createRealRuntime('prod');
+const realRuntime = createRealRuntime('prod');
+const runtime = {
+  ...realRuntime,
+  process: {
+    ...realRuntime.process,
+    readProcessIncarnation: (pid: number, platform: NodeJS.Platform) => mockedProbe(pid, platform),
+  },
+};
 const unusedDb = newRawDatabase(':memory:');
 applyBundledStoreSchema(unusedDb, currentCoralStoreFormat());
 const defaultContainmentProver = createProviderProxySetContainmentProver({
@@ -475,13 +482,20 @@ async function guardianLeaseClient(
       methods: new Map([
         [
           'role.open.v1',
-          { authority: 'establishes-control' as const, handle: async () => ({ holder: 'coordinator', fields: {} }) },
+          {
+            authority: 'establishes-control' as const,
+            handle: async () => ({
+              holder: { instanceId: 'coordinator', pid: 1, incarnation: testIncarnation(1) },
+              fields: {},
+            }),
+          },
         ],
       ]),
     },
     challenges,
     observer: { onControlLost: () => undefined },
     timer: time,
+    holderAuthority: createControlHolderAuthority(),
     requestTimeoutMs: 5_000,
   });
   await endpoint.listen();
@@ -510,7 +524,22 @@ async function guardianLeaseClient(
               },
             }),
           )
-        : realClient.exchange(method, params, timeoutMs),
+        : method === 'guardian.acquisition-publish.v1'
+          ? Promise.resolve(
+              controlExchangeForTest({
+                kind: 'response',
+                response: {
+                  kind: 'result',
+                  value: {
+                    state: 'acquisition-published',
+                    certificate: 'publication-certificate',
+                    guardian: openResponse.guardian,
+                    reaper: openResponse.reaper,
+                  },
+                },
+              }),
+            )
+          : realClient.exchange(method, params, timeoutMs),
     faulted: realClient.faulted,
     onFault: (listener) => realClient.onFault(listener),
     close: () => realClient.close(),
@@ -659,6 +688,13 @@ function redemptionResponses(
       operations: operationSets.proxy,
     },
     'control.heartbeat.v1': { state: 'active', nextHeartbeatChallenge: 'p2' },
+    'guardian.acquisition-publish.v1': {
+      state: 'acquisition-published',
+      certificate: 'publication-certificate',
+      guardian: guardianIdentityFor(loc),
+      reaper: reaperIdentityFor(loc),
+    },
+    'proxy.acquisition-publish.v1': { state: 'acquisition-published' },
     'guardian.handoff-install.v1': installAck,
     'reaper.handoff-install.v1': installAck,
     'handoff.install.v1': installAck,
@@ -835,16 +871,15 @@ describe('attemptProviderProxySetInheritance', () => {
   it('reaps exact containment evidence instead of treating a missing credential as authority to proceed', async () => {
     mockedReadCapsule.mockReturnValueOnce(null);
     const loc = locator();
-    const collectContainmentProof = vi.fn(
-      createProviderProxySetContainmentProver({
-        ...runtime,
-        process: {
-          ...runtime.process,
-          readProcessIncarnation: () => null,
-          observeLiveness: () => 'absent',
-        },
-      }).collectContainmentProof,
-    );
+    const containmentProver = createProviderProxySetContainmentProver({
+      ...runtime,
+      process: {
+        ...runtime.process,
+        readProcessIncarnation: () => null,
+        observeLiveness: () => 'absent',
+      },
+    });
+    const collectContainmentProof = vi.spyOn(containmentProver, 'collectContainmentProof');
     const reapRecordedContainment = vi.fn(async () => ({
       kind: 'containment-absent' as const,
       disappearanceReceipt: 'group:200,leader:200@linux:00000000-0000-4000-8000-000000000000:3',
@@ -857,7 +892,7 @@ describe('attemptProviderProxySetInheritance', () => {
         runtime,
         coordinatorIdentity: COORDINATOR_IDENTITY,
         operationRegistry: { operationsFor: () => [], providerRootsFor: () => [] },
-        collectContainmentProof,
+        collectContainmentProof: containmentProver.collectContainmentProof,
         reapRecordedContainment,
       },
       neverAborts,
@@ -881,16 +916,14 @@ describe('attemptProviderProxySetInheritance', () => {
   it('keeps a missing-credential set held when its recorded group is unattributable', async () => {
     mockedReadCapsule.mockReturnValueOnce(null);
     const loc = locator();
-    const collectContainmentProof = vi.fn(
-      createProviderProxySetContainmentProver({
-        ...runtime,
-        process: {
-          ...runtime.process,
-          readProcessIncarnation: () => null,
-          observeLiveness: () => 'absent',
-        },
-      }).collectContainmentProof,
-    );
+    const containmentProver = createProviderProxySetContainmentProver({
+      ...runtime,
+      process: {
+        ...runtime.process,
+        readProcessIncarnation: () => null,
+        observeLiveness: () => 'absent',
+      },
+    });
     const reapRecordedContainment = vi.fn(async () => ({ kind: 'recorded-group-unattributable' as const }));
 
     const outcome = await attemptProviderProxySetInheritance(
@@ -900,13 +933,76 @@ describe('attemptProviderProxySetInheritance', () => {
         runtime,
         coordinatorIdentity: COORDINATOR_IDENTITY,
         operationRegistry: { operationsFor: () => [], providerRootsFor: () => [] },
-        collectContainmentProof,
+        collectContainmentProof: containmentProver.collectContainmentProof,
         reapRecordedContainment,
       },
       neverAborts,
     );
 
     expect(outcome).toEqual({ kind: 'recorded-group-unattributable' });
+    expect(mockedConnect).not.toHaveBeenCalled();
+  });
+
+  it('keeps a missing-credential set held when signal authorization is refused', async () => {
+    mockedReadCapsule.mockReturnValueOnce(null);
+    const loc = locator();
+    const containmentProver = createProviderProxySetContainmentProver({
+      ...runtime,
+      process: {
+        ...runtime.process,
+        readProcessIncarnation: () => null,
+        observeLiveness: () => 'absent',
+      },
+    });
+    const reapRecordedContainment = vi.fn(async () => ({ kind: 'signal-authorization-refused' as const }));
+
+    const outcome = await attemptProviderProxySetInheritance(
+      loc,
+      unusedDb,
+      {
+        runtime,
+        coordinatorIdentity: COORDINATOR_IDENTITY,
+        operationRegistry: { operationsFor: () => [], providerRootsFor: () => [] },
+        collectContainmentProof: containmentProver.collectContainmentProof,
+        reapRecordedContainment,
+      },
+      neverAborts,
+    );
+
+    expect(outcome).toEqual({ kind: 'signal-authorization-refused' });
+    expect(mockedConnect).not.toHaveBeenCalled();
+  });
+
+  it('keeps a missing-credential set held with identity-observation effects intact', async () => {
+    mockedReadCapsule.mockReturnValueOnce(null);
+    const loc = locator();
+    const containmentProver = createProviderProxySetContainmentProver({
+      ...runtime,
+      process: {
+        ...runtime.process,
+        readProcessIncarnation: () => null,
+        observeLiveness: () => 'absent',
+      },
+    });
+    const reapRecordedContainment = vi.fn(async () => ({
+      kind: 'identity-unobservable' as const,
+      signalDelivered: true,
+    }));
+
+    const outcome = await attemptProviderProxySetInheritance(
+      loc,
+      unusedDb,
+      {
+        runtime,
+        coordinatorIdentity: COORDINATOR_IDENTITY,
+        operationRegistry: { operationsFor: () => [], providerRootsFor: () => [] },
+        collectContainmentProof: containmentProver.collectContainmentProof,
+        reapRecordedContainment,
+      },
+      neverAborts,
+    );
+
+    expect(outcome).toEqual({ kind: 'identity-unobservable', signalDelivered: true });
     expect(mockedConnect).not.toHaveBeenCalled();
   });
 
@@ -1754,11 +1850,12 @@ describe('createProviderProxySetInheritance', () => {
     expect(registerInheritedSet).not.toHaveBeenCalled();
   });
 
-  it('announces once when a claim-backed discovered capsule is later registered from its durable row', async () => {
+  it('re-publishes an already-published redeemed set as a no-op before registering it', async () => {
     const loc = locator();
     const capsule = capsuleFor(loc);
     mockedReadCapsule.mockReturnValueOnce(capsule);
-    const client = fakeClient(redemptionResponses(loc, matchingOperationSets([])), []);
+    const calls: { method: string; params: unknown }[] = [];
+    const client = fakeClient(redemptionResponses(loc, matchingOperationSets([])), calls);
     stubConnect(client);
     const established = vi.fn();
     const unsubscribe = subscribeProviderProxyControlEstablished(established);
@@ -1769,22 +1866,26 @@ describe('createProviderProxySetInheritance', () => {
       claims,
       controlEstablished: notifyProviderProxyControlEstablished,
       time: runtime.time,
+      ...testProviderProxySetLifecycleDurability(runtime.storage, runtime.time),
       recoveryDispatcher: createTestProviderProxyRecoveryDispatcher({
         'containment-proof': createTestProviderProxyContainmentProofProducer(runtime, unusedDb),
       }),
       reapRecordedContainment: unexpectedLifecycleRecordedContainmentReap,
       reportLifecycle: () => undefined,
     });
+    lifecycle.activateDurableOperatorDispositions();
     lifecycle.initializeClaimSlots();
     lifecycle.installDiscoveredCapsules(
       [{ path: '/capsules/claim-backed.handoff.json', capsule }],
       retainsEveryCapsule,
     );
     expect(established).not.toHaveBeenCalled();
-    const registerInheritedSet = vi.fn((set: ProviderProxyOperationAuthority) => {
-      if (!isProviderProxyOperationAuthority(set)) throw new Error('expected durable authority');
-      lifecycle.registerInheritedSet(set);
-    });
+    const registerInheritedSet = vi.fn(
+      (set: ProviderProxyOperationAuthority, publicationReceipt: PublicationReceipt) => {
+        if (!isProviderProxyOperationAuthority(set)) throw new Error('expected durable authority');
+        lifecycle.registerInheritedSet(set, publicationReceipt);
+      },
+    );
 
     const inheritance = createProviderProxySetInheritance({
       runtime,
@@ -1802,9 +1903,9 @@ describe('createProviderProxySetInheritance', () => {
     expect(established).toHaveBeenCalledTimes(1);
     expect(registerInheritedSet.mock.invocationCallOrder[0]).toBeLessThan(established.mock.invocationCallOrder[0]);
     expect(mockedConnect).toHaveBeenCalledTimes(3);
-    if (outcome.kind === 'inherited') {
-      expect(registerInheritedSet).toHaveBeenCalledWith(outcome.set);
-    }
+    expect(calls.map(({ method }) => method)).toEqual(
+      expect.arrayContaining(['guardian.acquisition-publish.v1', 'proxy.acquisition-publish.v1']),
+    );
   });
 
   it('keeps guardian control live while reaper and proxy each consume 8500ms', async () => {
@@ -1838,12 +1939,14 @@ describe('createProviderProxySetInheritance', () => {
       claims,
       controlEstablished: established,
       time,
+      ...testProviderProxySetLifecycleDurability(runtime.storage, time),
       recoveryDispatcher: createTestProviderProxyRecoveryDispatcher({
         'containment-proof': createTestProviderProxyContainmentProofProducer({ ...runtime, time }, unusedDb),
       }),
       reapRecordedContainment: unexpectedLifecycleRecordedContainmentReap,
       reportLifecycle: () => undefined,
     });
+    lifecycle.activateDurableOperatorDispositions();
     lifecycle.initializeClaimSlots();
     lifecycle.completeStartupDiscovery();
     const inheritance = createProviderProxySetInheritance({
@@ -1852,9 +1955,9 @@ describe('createProviderProxySetInheritance', () => {
       reapRecordedContainment: reapRecordedEvidence,
       identity,
       operationRegistry: { operationsFor: () => [], providerRootsFor: () => [] },
-      registerInheritedSet: (set) => {
+      registerInheritedSet: (set, publicationReceipt) => {
         if (!isProviderProxyOperationAuthority(set)) throw new Error('expected durable authority');
-        lifecycle.registerInheritedSet(set);
+        lifecycle.registerInheritedSet(set, publicationReceipt);
       },
     });
 
@@ -1912,6 +2015,7 @@ describe('createProviderProxySetInheritance', () => {
       claims,
       controlEstablished: () => undefined,
       time,
+      ...testProviderProxySetLifecycleDurability(runtime.storage, time),
       recoveryDispatcher: createTestProviderProxyRecoveryDispatcher({
         'containment-proof': createTestProviderProxyContainmentProofProducer(inheritedRuntime, unusedDb),
         'disappearance-consumer': async ({ notice }) => ({
@@ -1922,6 +2026,7 @@ describe('createProviderProxySetInheritance', () => {
       reapRecordedContainment: unexpectedLifecycleRecordedContainmentReap,
       reportLifecycle: () => undefined,
     });
+    lifecycle.activateDurableOperatorDispositions();
     lifecycle.initializeClaimSlots();
     lifecycle.completeStartupDiscovery();
 
@@ -1931,9 +2036,9 @@ describe('createProviderProxySetInheritance', () => {
       reapRecordedContainment: reapRecordedEvidence,
       identity,
       operationRegistry: { operationsFor: () => [], providerRootsFor: () => [] },
-      registerInheritedSet: (set) => {
+      registerInheritedSet: (set, publicationReceipt) => {
         if (!isProviderProxyOperationAuthority(set)) throw new Error('expected durable authority');
-        lifecycle.registerInheritedSet(set);
+        lifecycle.registerInheritedSet(set, publicationReceipt);
       },
     });
     const outcome = await inheritance.inheritProviderProxySet(loc, unusedDb, neverAborts);

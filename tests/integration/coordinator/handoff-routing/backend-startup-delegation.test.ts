@@ -11,10 +11,15 @@ import {
   type HandoffRoutingInvocationStatus,
 } from '#src/coordinator/handoff-routing/status.js';
 import { observeProcessLiveness } from '#src/infra/node-process.js';
+import { CURRENT_STRICT_BUNDLE_MANIFEST_FILE } from '#src/infra/bundle-manifest-address.js';
 import { handoffRoutingStatusPathForRunDir } from '#src/infra/path/coordinator.js';
 import { pluginRootNamespace } from '#src/infra/plugin-identity.js';
 import { createRealRuntime } from '#src/runtime/real.js';
-import { encodeActiveStoreSelection, resolveActiveStoreRecordPaths } from '#src/store/active-store-selection.js';
+import {
+  ACTIVE_STORE_SELECTION_VERSION,
+  encodeActiveStoreSelection,
+  resolveActiveStoreRecordPaths,
+} from '#src/store/active-store-selection.js';
 import { handoffRoutingStatusGeneration } from '#src/store/handoff-routing-status-store/index.js';
 import {
   assertBuildArtifactsAvailable,
@@ -51,6 +56,7 @@ type FixtureManifest = Readonly<{
   bundleHash: string;
   cliBundleHash: string;
   claudeAppserverBundleHash: string;
+  durableWrapperBundleHash: string;
   flavor: 'prod';
   storeFormatFingerprint: string;
 }>;
@@ -74,13 +80,15 @@ function nextPatchVersion(version: string): string {
 function installBundle(version: string, bundleHashMarker: string): InstalledBundle {
   const fixture = createPluginFixture(roots, { flavor: 'prod', version, bundleHash: bundleHashMarker });
   const bundleDir = join(fixture.root, 'bridge');
-  const manifest = JSON.parse(readFileSync(join(bundleDir, 'manifest.json'), 'utf-8')) as FixtureManifest;
+  const manifest = JSON.parse(
+    readFileSync(join(bundleDir, CURRENT_STRICT_BUNDLE_MANIFEST_FILE), 'utf-8'),
+  ) as FixtureManifest;
   return { bundleDir, manifest };
 }
 
 function encodedSelection(bundle: InstalledBundle): Uint8Array {
   return encodeActiveStoreSelection({
-    version: 1,
+    version: ACTIVE_STORE_SELECTION_VERSION,
     manifest: bundle.manifest,
     bundleDir: bundle.bundleDir,
     activeStoreFingerprint: bundle.manifest.storeFormatFingerprint,

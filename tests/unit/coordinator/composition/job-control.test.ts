@@ -1,4 +1,4 @@
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
 
 import { createCoordinatorControl } from '#src/coordinator/composition/job-control.js';
 import type { CoordinatorWorld } from '#src/coordinator/composition/world.js';
@@ -26,6 +26,94 @@ function createControlHarness(): {
 }
 
 describe('createCoordinatorControl.abortJobs', () => {
+  it('reports the first unresolved cleanup as held and uses a later abort as explicit abandonment', () => {
+    const runtime = new SimulationRuntime();
+    const registry = new AbortRegistry(runtime.ids);
+    const abandon = vi.fn(() => ({
+      kind: 'abandoned' as const,
+      reason: 'job ownership was released without proof of process absence',
+      nextStep: 'Inspect the recorded process because it may still be live.',
+    }));
+    const jobId = registry.register('held-job');
+    registry.getSignal(jobId)?.addEventListener(
+      'abort',
+      () => {
+        registry.hold(
+          jobId,
+          'process absence is not yet proven',
+          `Run coral-cli abort jobs ${jobId} again to abandon without another signal.`,
+          abandon,
+        );
+      },
+      { once: true },
+    );
+
+    expect(registry.abort([jobId])).toEqual({
+      aborted: [],
+      notFound: [],
+      refused: [
+        {
+          jobId,
+          reason: 'process absence is not yet proven',
+          nextStep: `Run coral-cli abort jobs ${jobId} again to abandon without another signal.`,
+        },
+      ],
+    });
+    expect(abandon).not.toHaveBeenCalled();
+
+    expect(registry.abort([jobId])).toEqual({
+      aborted: [],
+      notFound: [],
+      abandoned: [
+        {
+          jobId,
+          reason: 'job ownership was released without proof of process absence',
+          nextStep: 'Inspect the recorded process because it may still be live.',
+        },
+      ],
+    });
+    expect(abandon).toHaveBeenCalledOnce();
+    expect(registry.has(jobId)).toBe(true);
+    expect(registry.abort([jobId])).toEqual({
+      aborted: [],
+      notFound: [],
+      abandoned: [
+        {
+          jobId,
+          reason: 'job ownership was released without proof of process absence',
+          nextStep: 'Inspect the recorded process because it may still be live.',
+        },
+      ],
+    });
+    expect(abandon).toHaveBeenCalledOnce();
+  });
+
+  it('keeps reporting a hold when durable abandonment is not accepted', () => {
+    const runtime = new SimulationRuntime();
+    const registry = new AbortRegistry(runtime.ids);
+    const abandon = vi.fn(() => ({
+      kind: 'retained' as const,
+      reason: 'durable containment status could not be persisted',
+      nextStep: 'Retry durable abandonment.',
+    }));
+    const jobId = registry.register('held-job');
+    registry.hold(jobId, 'process absence is not yet proven', 'Retry durable abandonment.', abandon);
+    registry.abort([jobId]);
+
+    expect(registry.abort([jobId])).toEqual({
+      aborted: [],
+      notFound: [],
+      refused: [
+        {
+          jobId,
+          reason: 'durable containment status could not be persisted',
+          nextStep: 'Retry durable abandonment.',
+        },
+      ],
+    });
+    expect(abandon).toHaveBeenCalledOnce();
+  });
+
   it('consults the internal-job abort registry before returning notFound', () => {
     const { control, internalJobAbortRegistry } = createControlHarness();
     const jobId = internalJobAbortRegistry.register('kb-reindex-1');
@@ -44,6 +132,71 @@ describe('createCoordinatorControl.abortJobs', () => {
 
     expect(result.aborted).toEqual([]);
     expect(result.notFound).toEqual(['absent-job']);
+  });
+
+  it('preserves a recovery abort refusal without trying another owner', () => {
+    const runtime = new SimulationRuntime();
+    const internalJobAbortRegistry = new AbortRegistry(runtime.ids);
+    const internalAbort = vi.spyOn(internalJobAbortRegistry, 'abort');
+    const executionAbort = vi.fn();
+    const refusal = {
+      jobId: 'recovered-job',
+      reason: 'the recorded durable process containment is unavailable',
+      nextStep:
+        'Run coral-cli jobs detail recovered-job; Coral retains ownership until the recorded containment is observed absent.',
+    };
+    const recoveryRegistry = {
+      size: 1,
+      has: (jobId: string) => jobId === refusal.jobId,
+      abort: () => ({ aborted: [], notFound: [], refused: [refusal] }),
+    };
+    const control = createCoordinatorControl({
+      world: { idleTimer: { requestDrain() {} } } as unknown as CoordinatorWorld,
+      listExecutionServices: () => [{ abort: executionAbort }] as never,
+      getLifecycleController: () => ({ getRecoveryRegistry: () => recoveryRegistry }) as never,
+      getProgressStore: () => ({}) as never,
+      internalJobAbortRegistry,
+    });
+
+    expect(control.abortJobs([refusal.jobId])).toEqual({
+      aborted: [],
+      notFound: [],
+      refused: [refusal],
+    });
+    expect(executionAbort).not.toHaveBeenCalled();
+    expect(internalAbort).not.toHaveBeenCalled();
+  });
+
+  it('preserves an asynchronous recovery abort hold without trying another owner', () => {
+    const runtime = new SimulationRuntime();
+    const internalJobAbortRegistry = new AbortRegistry(runtime.ids);
+    const internalAbort = vi.spyOn(internalJobAbortRegistry, 'abort');
+    const executionAbort = vi.fn();
+    const hold = {
+      jobId: 'recovered-job',
+      reason: 'identity-safe reaping is awaiting confirmed absence',
+      nextStep: 'Wait for cleanup, then inspect the job.',
+    };
+    const recoveryRegistry = {
+      size: 1,
+      has: (jobId: string) => jobId === hold.jobId,
+      abort: () => ({ aborted: [], notFound: [], held: [hold] }),
+    };
+    const control = createCoordinatorControl({
+      world: { idleTimer: { requestDrain() {} } } as unknown as CoordinatorWorld,
+      listExecutionServices: () => [{ abort: executionAbort }] as never,
+      getLifecycleController: () => ({ getRecoveryRegistry: () => recoveryRegistry }) as never,
+      getProgressStore: () => ({}) as never,
+      internalJobAbortRegistry,
+    });
+
+    expect(control.abortJobs([hold.jobId])).toEqual({
+      aborted: [],
+      notFound: [],
+      held: [hold],
+    });
+    expect(executionAbort).not.toHaveBeenCalled();
+    expect(internalAbort).not.toHaveBeenCalled();
   });
 });
 

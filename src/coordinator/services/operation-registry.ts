@@ -174,17 +174,7 @@ export class LocalOperationRegistry {
     return found;
   }
 
-  /**
-   * Every distinct provider root this coordinator's own live operations hold against one proxy set —
-   * `guardian.stop-and-reap.v1`/`reaper.stop-and-reap.v1`'s own `providerRoots` argument
-   * (`provider-proxy/set-authority.ts`'s `stopAndReap`): both enforcers refuse a teardown that claims a root
-   * they never recorded (`assertRecordedSetAgreement`), so this is the coordinator's own half of that
-   * agreement. An empty (or partial) claim against an enforcer that has actually staged a root is not itself a
-   * disagreement — `settled()` drops an operation's root from here the moment its terminal commits, which can
-   * race a concurrent teardown reading the enforcer's own, still-recorded set, and `assertRecordedSetAgreement`
-   * accepts exactly that undershoot. Deduped by process identity, mirroring `ArmedEnforcer.recordedRoots()`: a
-   * shared host serving more than one activated operation is one teardown target, not one per operation.
-   */
+  /** Provider-root snapshots must include only live operations for the set and deduplicate process identity. */
   providerRootsFor(proxyInstanceId: string): readonly Readonly<{ pid: number; incarnation: ProcessIncarnation }>[] {
     const seen = new Map<string, Readonly<{ pid: number; incarnation: ProcessIncarnation }>>();
     for (const entry of this.entries.values()) {
@@ -196,9 +186,5 @@ export class LocalOperationRegistry {
   }
 }
 
-/**
- * What a set authority needs from the live registry for `stopAndReap`. `operationsFor` remains optional for
- * callers that also expose the diagnostic live view; handoff membership never reads it.
- */
 export type ProviderProxyOperationSnapshot = Pick<LocalOperationRegistry, 'providerRootsFor'> &
   Partial<Pick<LocalOperationRegistry, 'operationsFor'>>;

@@ -1,4 +1,6 @@
 import { InvalidArgumentError, type Command } from 'commander';
+import { dirname } from 'node:path';
+import type { z } from 'zod';
 
 import {
   decodeProviderProxySetAddress,
@@ -14,6 +16,10 @@ import {
   type LiveHandoffResult,
   type NonEmptyReadonlyArray,
 } from '../../coordinator/handoff-routing/runner.js';
+import {
+  readShutdownAbandonmentStatus,
+  type ShutdownAbandonmentStatusRead,
+} from '../../coordinator/shutdown-abandonment.js';
 import {
   parseHandoffRoutingInvocationId,
   type HandoffRepairOperation,
@@ -34,12 +40,40 @@ import type {
   HandoffRoutingStatusQuarantineClearResult,
 } from '../../coordinator/handoff-routing/status-operator.js';
 import { resolveBuildFlavor, type BuildFlavor } from '../../infra/build-flavor.js';
+import { readBackendInfo } from '../../infra/backend-discovery.js';
 import { readBuildFlavor } from '../../infra/bundle-manifest.js';
-import { assertNever } from '../../infra/error-format.js';
+import { assertNever, errorMessage } from '../../infra/error-format.js';
+import { isNoEntryError } from '../../infra/fs-errors.js';
 import { BackendUnreachableError } from '../../infra/http-errors.js';
 import { isRecord } from '../../infra/json.js';
-import { handoffRoutingStatusPathForRunDir } from '../../infra/path/index.js';
+import { incarnationMayAuthorizeSignal, type ProcessIncarnation } from '../../infra/node-process.js';
+import { handoffRoutingStatusPathForRunDir, providerHandoffCapsulePath } from '../../infra/path/index.js';
+import { isCoralChildEnvironment } from '../../security/child-principal-env.js';
 import { isSafeKbCommitId } from '../../kb/commit-quarantine.js';
+import {
+  connectControlClient,
+  type ControlClient,
+  type ControlClientTimer,
+} from '../../provider-proxy/control-client.js';
+import {
+  HandoffCapsuleError,
+  holderStatusParamsSchema,
+  type HandoffCapsule,
+  type HandoffCapsuleV1,
+  type HandoffCapsuleV2,
+  type HandoffCapsuleV3,
+} from '../../provider-proxy/handoff-capsule.js';
+import {
+  providerHandoffCapsuleCandidatePaths,
+  readProviderHandoffCapsuleCandidate,
+} from '../../provider-proxy/handoff-capsule-discovery.js';
+import {
+  holderStatusResultSchema,
+  providerProxyRoleAbandonmentParamsSchema,
+  providerProxyRoleAbandonmentResultSchema,
+  type ProviderProxyRoleIdentity,
+} from '../../provider-proxy/protocol.js';
+import { runtimeControlTimer } from '../../provider-proxy/role-spawn.js';
 import {
   decodeRecoveryQuarantineKey,
   encodeRecoveryQuarantineKey,
@@ -74,11 +108,16 @@ import {
 } from '../../store/handoff-routing-status-store/index.js';
 import { getBackendStatusFull, type BackendStatusFull } from '../../transport/http/backend/status.js';
 import { shutdownBackend, type ShutdownReason } from '../../transport/http/backend/shutdown.js';
-
+import {
+  shutdownObligationAbandonMethod,
+  shutdownObligationAbandonResultSchema,
+  shutdownObligationSubjectSchema,
+  type ShutdownObligationAbandonResult,
+  type ShutdownObligationSubject,
+} from '../../obligation/shutdown-abandonment.js';
 import { TOOL_TIMEOUT_MS } from '../../transport/http/sse.js';
 import { childPrincipalAuthFromEnv, childPrincipalAuthOptions } from '../../transport/ipc/child-principal-auth.js';
-import { IpcRpcError } from '../../transport/ipc/client.js';
-import type { IpcClient } from '../../transport/ipc/client.js';
+import { createIpcClient, IpcRpcError, type IpcClient } from '../../transport/ipc/client.js';
 import { ensure } from '../../transport/ipc/ensure.js';
 import {
   recoveryQuarantineClearRequestSchema,
@@ -88,6 +127,10 @@ import {
   providerHostListRequestSchema,
   providerHostListResponseSchema,
   providerHostSelectorRequestSchema,
+  providerProxySetContainBooleanRpcSpec,
+  providerProxySetContainBooleanRequestSchema,
+  providerProxySetContainBooleanResponseSchema,
+  providerProxySetContainRpcSpec,
   providerProxySetContainRequestSchema,
   providerProxySetContainResponseSchema,
   unreadableProviderOperationDiscardRequestSchema,
@@ -96,6 +139,7 @@ import {
   type ProviderHostInspectResponse,
   type ProviderHostListResponse,
   type ProviderHostSelectorRequest,
+  type ProviderProxySetContainBooleanResponse,
   type ProviderProxySetContainRequest,
   type ProviderProxySetContainResponse,
 } from '../../transport/rpc/catalog.js';
@@ -115,12 +159,23 @@ import {
   formatRecoveryQuarantineList,
   formatUnreadableProviderOperationDiscard,
   formatProviderProxySetContainResult,
+  formatProviderProxySetOperatorExit,
+  formatProviderProxySetRowSkips,
   formatShutdown,
   RECOVERY_REVISION_FINGERPRINT_PREFIX,
   RECOVERY_REVISION_UNTIL_CLEARED,
 } from '../format/backend.js';
 import { formatStoreResetList, formatStoreResetReport } from '../format/store-reset.js';
 import { clearHandoffRoutingStatusQuarantine, discardHandoffRoutingStatus } from '../routing-status-discard.js';
+import {
+  createProviderProxyRoleTerminationCommandOperations,
+  formatProviderProxyRoleReapRetryCommand,
+  formatProviderProxyRoleTerminationCommand,
+  registerProviderProxyRoleTerminationCommand,
+  type ProviderProxyRoleAbandonmentAttempt,
+  type ProviderProxyRoleReapRetryAttempt,
+  type ProviderProxyRoleTerminationCommandOperations,
+} from './provider-proxy-role-termination.js';
 
 /**
  * What each `backend shutdown` refusal means to a script, as an exit code.
@@ -214,7 +269,8 @@ export const PROVIDER_PROXY_SET_CONTAIN_EXIT_CODES: Readonly<
 > = {
   contained: 0,
   abandoned: 0,
-  'unattributable-group-abandoned': 0,
+  'representation-release-abandoned': 0,
+  'representation-release-abandonment-required': 75,
   'set-not-found': 1,
   'not-held': 1,
   'deadline-pending': 75,
@@ -222,7 +278,10 @@ export const PROVIDER_PROXY_SET_CONTAIN_EXIT_CODES: Readonly<
   'enforcer-alive': 75,
   'enforcer-unobservable': 75,
   'recorded-group-unattributable': 75,
+  'signal-authorization-refused': 75,
+  'identity-unobservable': 75,
   'store-unreadable': 75,
+  'containment-unconfirmed': 75,
 };
 
 export const UNREADABLE_PROVIDER_OPERATION_DISCARD_EXIT_CODES: Readonly<
@@ -236,26 +295,40 @@ export const UNREADABLE_PROVIDER_OPERATION_DISCARD_EXIT_CODES: Readonly<
   owned: 75,
 };
 
-function providerProxySetContainExitCode(result: ProviderProxySetContainResponse): 0 | 1 | 75 {
-  if (
-    (result.kind === 'contained' || result.kind === 'abandoned' || result.kind === 'unattributable-group-abandoned') &&
-    result.claimDischarge.kind !== 'completed'
-  ) {
-    return 75;
+function providerProxySetContainExitCode(
+  result: ProviderProxySetContainResponse | ProviderProxySetContainBooleanResponse,
+): 0 | 1 | 75 {
+  switch (result.kind) {
+    case 'contained':
+    case 'abandoned':
+    case 'unattributable-group-abandoned':
+      return result.claimDischarge.kind === 'completed' ? 0 : 75;
+    default:
+      return PROVIDER_PROXY_SET_CONTAIN_EXIT_CODES[result.kind];
   }
-  return PROVIDER_PROXY_SET_CONTAIN_EXIT_CODES[result.kind];
+}
+
+function providerProxySetContainResultMatchesAddress(
+  result: Pick<ProviderProxySetContainResponse, 'setIdentity'>,
+  requested: ProviderProxySetAddress,
+): boolean {
+  return (
+    result.setIdentity.buildSetId === requested.buildSetId &&
+    result.setIdentity.hostFingerprint === requested.hostFingerprint &&
+    result.setIdentity.proxyInstanceId === requested.proxyInstanceId
+  );
 }
 
 function formatProviderProxySetContainNoVerdict(
-  result: Exclude<ProviderProxySetContainCommandResult, ProviderProxySetContainResponse>,
+  result: Readonly<{ kind: ProviderProxySetContainNoVerdictKind; setIdentity: ProviderProxySetAddress }>,
 ): string {
   const token = encodeProviderProxySetAddress(result.setIdentity);
   const kind = result.kind;
   switch (kind) {
     case 'unsupported-coordinator':
       return [
-        `No containment verdict for ${token}: this coordinator does not support coordinator.provider_proxy_set.contain.`,
-        'Observed: the coordinator rejected the method before accepting a containment operation.',
+        `No containment verdict for ${token}: this coordinator does not support the requested containment operation.`,
+        'Observed: the coordinator rejected the request before accepting a containment operation.',
         'Not observed: enforcer state or recorded-target state.',
         'Effect: no process signal was sent and no representation release was started.',
         'Next step: upgrade or restart into this Coral build, then run coral-cli backend status before retrying the exact token.',
@@ -393,9 +466,22 @@ import {
 function providerProxySetNoVerdictExitContribution(status: BackendStatusFull): 0 | 75 {
   if (status.status !== 'ok') return 0;
   return status.health.skippedProviderProxySetRows > 0 ||
-    (status.health.diagnostics?.providerProxySets?.length ?? 0) > 0
+    (status.health.diagnostics?.providerProxySets?.length ?? 0) > 0 ||
+    (status.health.diagnostics?.providerProxyDispositionSkips?.length ?? 0) > 0
     ? 75
     : 0;
+}
+
+function hasUsableCoordinatorDiagnostics(
+  status: BackendStatusFull,
+): status is Extract<BackendStatusFull, { status: 'ok' }> {
+  return 'health' in status;
+}
+
+function directProviderProxySetHolderStatusExitContribution(
+  readings: readonly DirectProviderProxySetHolderStatusRow[],
+): 0 | 75 {
+  return readings.length === 0 ? 0 : 75;
 }
 
 const OFFLINE_OPERATOR_FLAVOR_HELP =
@@ -421,6 +507,7 @@ export interface BackendStatusCommandOperations {
   getStatus(): Promise<BackendStatusFull>;
   getLiveHandoffResult(): LiveHandoffResult | null;
   getRoutingStatus(): Promise<HandoffRoutingStatusReadResult>;
+  readProviderProxySetHolderStatusDirect?(): Promise<readonly DirectProviderProxySetHolderStatusRow[]>;
 }
 
 export interface HandoffRoutingStatusCommandOperations {
@@ -471,6 +558,7 @@ const PROVIDER_PROXY_SET_CONTAIN_NO_VERDICT_KINDS: ReadonlySet<string> = new Set
 /** A decoded containment verdict or a named reason this CLI cannot establish one. */
 export type ProviderProxySetContainCommandResult =
   | ProviderProxySetContainResponse
+  | ProviderProxySetContainBooleanResponse
   | Readonly<{ kind: ProviderProxySetContainNoVerdictKind; setIdentity: ProviderProxySetAddress }>;
 
 /** Narrows the CLI-only outcomes, whose shared union discriminant the compiler cannot exclude member-wise. */
@@ -484,6 +572,11 @@ export interface ProviderProxySetCommandOperations {
   contain(request: ProviderProxySetContainRequest): Promise<ProviderProxySetContainCommandResult>;
 }
 
+export interface ShutdownRecoveryCommandOperations {
+  abandon(subject: ShutdownObligationSubject): Promise<ShutdownObligationAbandonResult>;
+  status(): ShutdownAbandonmentStatusRead;
+}
+
 export type BackendCommandOperations = Readonly<{
   storeReset?: StoreResetCommandOperations;
   kbCommit?: KbCommitCommandOperations;
@@ -493,6 +586,8 @@ export type BackendCommandOperations = Readonly<{
   recoveryQuarantine?: RecoveryQuarantineCommandOperations;
   providerHosts?: ProviderHostCommandOperations;
   providerProxySets?: ProviderProxySetCommandOperations;
+  shutdownRecovery?: ShutdownRecoveryCommandOperations;
+  providerProxyRoleTermination?: ProviderProxyRoleTerminationCommandOperations;
 }>;
 
 function routingStatusPath(runtime: Runtime): string {
@@ -500,6 +595,387 @@ function routingStatusPath(runtime: Runtime): string {
     runtime.paths.coral.coordinator.runDir,
     handoffRoutingStatusGeneration(handoffRoutingStatusStoreSchema()),
   );
+}
+
+/** A starved and unreachable role must not hang the fallback read. */
+const DIRECT_HOLDER_STATUS_CONNECT_TIMEOUT_MS = 3_000;
+
+export type DirectHolderStatusReading =
+  | Readonly<{ kind: 'answered'; status: z.infer<typeof holderStatusResultSchema> }>
+  | Readonly<{ kind: 'holder-status-unavailable'; reason: string }>
+  | Readonly<{ kind: 'unreachable'; reason: string }>;
+
+export type DirectProviderProxySetHolderStatus = Readonly<{
+  buildSetId: string;
+  hostFingerprint: string;
+  proxyInstanceId: string;
+  guardian: DirectHolderStatusReading;
+  reaper: DirectHolderStatusReading;
+}>;
+
+export type DirectProviderProxySetHolderStatusRow =
+  | DirectProviderProxySetHolderStatus
+  | Readonly<{
+      kind: 'legacy-capsule';
+      path: string;
+      capsule: HandoffCapsuleV1 | HandoffCapsuleV2;
+    }>
+  | Readonly<{ kind: 'unreadable-capsule'; path: string; reason: string }>
+  | Readonly<{ kind: 'unreadable-run-directory'; path: string; reason: string }>;
+
+type DiagnosticProviderHandoffCapsule =
+  | Readonly<{ kind: 'readable'; capsule: HandoffCapsule }>
+  | Extract<DirectProviderProxySetHolderStatusRow, { kind: 'unreadable-capsule' }>
+  | Extract<DirectProviderProxySetHolderStatusRow, { kind: 'unreadable-run-directory' }>;
+
+function readProviderHandoffCapsulesForDiagnostics(runtime: Runtime): readonly DiagnosticProviderHandoffCapsule[] {
+  const runDir = runtime.paths.coral.coordinator.runDir;
+  const uid = process.getuid?.() ?? 0;
+  let candidates: readonly string[];
+  try {
+    candidates = providerHandoffCapsuleCandidatePaths(runDir, runtime.storage);
+  } catch (error: unknown) {
+    // A missing run directory must be treated as nothing to discover.
+    if (isNoEntryError(error)) return [];
+    return [{ kind: 'unreadable-run-directory', path: runDir, reason: errorMessage(error) }];
+  }
+
+  return candidates.map((path) => {
+    try {
+      const candidate = readProviderHandoffCapsuleCandidate(path, runtime.paths.coral.generation.root, {
+        storage: runtime.storage,
+        uid,
+      });
+      return candidate.kind === 'readable'
+        ? { kind: 'readable', capsule: candidate.capsule }
+        : { kind: 'unreadable-capsule', path, reason: candidate.reason };
+    } catch (error: unknown) {
+      const reason = error instanceof HandoffCapsuleError ? `${error.code}: ${error.message}` : errorMessage(error);
+      return { kind: 'unreadable-capsule', path, reason };
+    }
+  });
+}
+
+async function readDirectHolderStatus(
+  endpoint: string,
+  method: 'guardian.holder-status.v1' | 'reaper.holder-status.v1',
+  capsule: HandoffCapsuleV3,
+  timer: ControlClientTimer,
+): Promise<DirectHolderStatusReading> {
+  let client: ControlClient;
+  try {
+    client = await connectControlClient(endpoint, timer, DIRECT_HOLDER_STATUS_CONNECT_TIMEOUT_MS);
+  } catch (error: unknown) {
+    return { kind: 'unreachable', reason: errorMessage(error) };
+  }
+  try {
+    const params = holderStatusCredential(capsule);
+    const exchange = await client.exchange(method, params, DIRECT_HOLDER_STATUS_CONNECT_TIMEOUT_MS);
+    if (exchange.kind === 'response') {
+      if (exchange.response.kind === 'result') {
+        // An undecodable display result must render as unreachable without suppressing other roles.
+        const parsed = holderStatusResultSchema.safeParse(exchange.response.value);
+        if (!parsed.success) {
+          return { kind: 'unreachable', reason: `undecodable result: ${parsed.error.message}` };
+        }
+        return { kind: 'answered', status: parsed.data };
+      }
+      const failure = exchange.response.failure;
+      if (failure.kind === 'json-rpc-error' && failure.protocolCode === 'method_not_found') {
+        return { kind: 'holder-status-unavailable', reason: 'method_not_found' };
+      }
+      return { kind: 'unreachable', reason: `${failure.kind}: ${exchange.response.error.message}` };
+    }
+    return { kind: 'unreachable', reason: `${exchange.cause}: ${errorMessage(exchange.error)}` };
+  } finally {
+    client.close();
+  }
+}
+
+function holderStatusCredential(capsule: HandoffCapsuleV3): z.infer<typeof holderStatusParamsSchema> {
+  return holderStatusParamsSchema.parse({
+    grantId: capsule.grantId,
+    secret: capsule.secret,
+    generation: capsule.generation,
+    flavor: capsule.flavor,
+    buildSetId: capsule.buildSetId,
+    hostFingerprint: capsule.hostFingerprint,
+    guardianInstanceId: capsule.guardianInstanceId,
+    reaperInstanceId: capsule.reaperInstanceId,
+    proxyInstanceId: capsule.proxyInstanceId,
+  });
+}
+
+type ProviderProxyRoleCapsuleLookup =
+  | Readonly<{ kind: 'found'; capsule: HandoffCapsuleV3 }>
+  | Readonly<{ kind: 'unreachable'; reason: string }>;
+
+function findProviderProxyRoleCapsule(
+  runtime: Runtime,
+  roleIdentity: ProviderProxyRoleIdentity,
+): ProviderProxyRoleCapsuleLookup {
+  const discovered = readProviderHandoffCapsulesForDiagnostics(runtime);
+  const capsules = discovered.flatMap((entry) => {
+    if (entry.kind !== 'readable' || entry.capsule.version !== 3) return [];
+    const capsule = entry.capsule;
+    const recorded =
+      roleIdentity.role === 'guardian'
+        ? { pid: capsule.guardianPid, incarnation: capsule.guardianIncarnation }
+        : { pid: capsule.reaperPid, incarnation: capsule.reaperIncarnation };
+    return recorded.pid === roleIdentity.pid && recorded.incarnation === roleIdentity.incarnation ? [capsule] : [];
+  });
+  if (capsules.length !== 1) {
+    const unreadable = discovered.filter((entry) => entry.kind !== 'readable').length;
+    const reason =
+      capsules.length === 0
+        ? `no readable current handoff capsule names this role identity${unreadable === 0 ? '' : '; unreadable capsule evidence remains'}`
+        : 'more than one handoff capsule names this role identity';
+    return { kind: 'unreachable', reason };
+  }
+
+  const capsule = capsules[0];
+  if (capsule === undefined) return { kind: 'unreachable', reason: 'the matched handoff capsule disappeared' };
+  return { kind: 'found', capsule };
+}
+
+export async function abandonProviderProxyRoleDirect(
+  runtime: Runtime,
+  roleIdentity: ProviderProxyRoleIdentity,
+): Promise<ProviderProxyRoleAbandonmentAttempt> {
+  if (isCoralChildEnvironment(runtime.env.fullSnapshot())) {
+    return {
+      kind: 'refused',
+      reason: 'Provider-proxy role operator actions are unavailable from Coral-managed child processes.',
+    };
+  }
+  const lookup = findProviderProxyRoleCapsule(runtime, roleIdentity);
+  if (lookup.kind === 'unreachable') return lookup;
+  const { capsule } = lookup;
+  const endpoint = roleIdentity.role === 'guardian' ? capsule.guardianControlEndpoint : capsule.reaperControlEndpoint;
+  const method =
+    roleIdentity.role === 'guardian' ? 'guardian.abandon-unattributable.v1' : 'reaper.abandon-unattributable.v1';
+  let client: ControlClient;
+  try {
+    client = await connectControlClient(
+      endpoint,
+      runtimeControlTimer(runtime),
+      DIRECT_HOLDER_STATUS_CONNECT_TIMEOUT_MS,
+    );
+  } catch (error: unknown) {
+    return { kind: 'unreachable', reason: errorMessage(error) };
+  }
+  try {
+    const exchange = await client.exchange(
+      method,
+      providerProxyRoleAbandonmentParamsSchema.parse({
+        credential: holderStatusCredential(capsule),
+        roleIdentity,
+      }),
+      DIRECT_HOLDER_STATUS_CONNECT_TIMEOUT_MS,
+    );
+    if (exchange.kind !== 'response') {
+      return { kind: 'unreachable', reason: `${exchange.cause}: ${errorMessage(exchange.error)}` };
+    }
+    if (exchange.response.kind === 'refusal') {
+      return { kind: 'refused', reason: exchange.response.error.message };
+    }
+    const parsed = providerProxyRoleAbandonmentResultSchema.safeParse(exchange.response.value);
+    return parsed.success
+      ? { kind: 'abandoned' }
+      : { kind: 'unreachable', reason: `undecodable result: ${parsed.error.message}` };
+  } finally {
+    client.close();
+  }
+}
+
+export async function retryProviderProxyRoleReapDirect(
+  runtime: Runtime,
+  roleIdentity: ProviderProxyRoleIdentity,
+): Promise<ProviderProxyRoleReapRetryAttempt> {
+  if (isCoralChildEnvironment(runtime.env.fullSnapshot())) {
+    return {
+      kind: 'refused',
+      reason: 'Provider-proxy role operator actions are unavailable from Coral-managed child processes.',
+    };
+  }
+  const lookup = findProviderProxyRoleCapsule(runtime, roleIdentity);
+  if (lookup.kind === 'unreachable') return lookup;
+  const { capsule } = lookup;
+  const endpoint = roleIdentity.role === 'guardian' ? capsule.guardianControlEndpoint : capsule.reaperControlEndpoint;
+  const method = roleIdentity.role === 'guardian' ? 'guardian.holder-status.v1' : 'reaper.holder-status.v1';
+  const status = await readDirectHolderStatus(endpoint, method, capsule, runtimeControlTimer(runtime));
+  if (status.kind !== 'answered') {
+    return {
+      kind: 'unreachable',
+      reason: `holder status ${status.kind === 'unreachable' ? status.reason : `is unavailable: ${status.reason}`}`,
+    };
+  }
+  const hold = status.status.enforcementHold;
+  if (
+    hold?.kind !== 'reap-failed' ||
+    hold.retry.state !== 'operator-action-required' ||
+    hold.roleIdentity.role !== roleIdentity.role ||
+    hold.roleIdentity.pid !== roleIdentity.pid ||
+    hold.roleIdentity.incarnation !== roleIdentity.incarnation
+  ) {
+    return { kind: 'refused', reason: 'the role does not report this exact reap-failed operator hold' };
+  }
+  const platform = runtime.env.platform() as NodeJS.Platform;
+  if (!incarnationMayAuthorizeSignal(platform)) {
+    return { kind: 'refused', reason: 'this platform cannot bind a process signal to the recorded incarnation' };
+  }
+  let observedIncarnation: ProcessIncarnation | null;
+  try {
+    observedIncarnation = runtime.process.readProcessIncarnation(roleIdentity.pid, platform);
+  } catch {
+    observedIncarnation = null;
+  }
+  if (observedIncarnation === null) {
+    return { kind: 'refused', reason: 'the role incarnation became unobservable before SIGTERM' };
+  }
+  if (observedIncarnation !== roleIdentity.incarnation) {
+    return { kind: 'refused', reason: 'the role incarnation changed before SIGTERM' };
+  }
+  try {
+    if (!runtime.process.kill(roleIdentity.pid, 'SIGTERM')) {
+      return { kind: 'unreachable', reason: 'the role process did not accept SIGTERM' };
+    }
+  } catch (error: unknown) {
+    return { kind: 'unreachable', reason: errorMessage(error) };
+  }
+  return { kind: 'reap-retry-requested' };
+}
+
+function createDirectProviderProxyRoleTerminationCommandOperations(): ProviderProxyRoleTerminationCommandOperations {
+  const runtime = createRealRuntime(resolveBuildFlavor(process.env));
+  return createProviderProxyRoleTerminationCommandOperations({
+    platform: runtime.env.platform() as NodeJS.Platform,
+    readProcessIncarnation: runtime.process.readProcessIncarnation,
+    abandon: (roleIdentity) => abandonProviderProxyRoleDirect(runtime, roleIdentity),
+    retryReap: (roleIdentity) => retryProviderProxyRoleReapDirect(runtime, roleIdentity),
+  });
+}
+
+export async function readProviderProxySetHolderStatusDirect(
+  runtime: Runtime,
+): Promise<readonly DirectProviderProxySetHolderStatusRow[]> {
+  const discovered = readProviderHandoffCapsulesForDiagnostics(runtime);
+  const timer = runtimeControlTimer(runtime);
+  const readings: DirectProviderProxySetHolderStatusRow[] = [];
+  for (const discoveredCapsule of discovered) {
+    if (discoveredCapsule.kind === 'unreadable-capsule' || discoveredCapsule.kind === 'unreadable-run-directory') {
+      readings.push(discoveredCapsule);
+      continue;
+    }
+    const { capsule } = discoveredCapsule;
+    if (capsule.version !== 3) {
+      readings.push({
+        kind: 'legacy-capsule',
+        path: providerHandoffCapsulePath(capsule, capsule.version, {
+          baseDir: dirname(runtime.paths.coral.generation.root),
+        }),
+        capsule,
+      });
+      continue;
+    }
+    const [guardian, reaper] = await Promise.all([
+      readDirectHolderStatus(capsule.guardianControlEndpoint, 'guardian.holder-status.v1', capsule, timer),
+      readDirectHolderStatus(capsule.reaperControlEndpoint, 'reaper.holder-status.v1', capsule, timer),
+    ]);
+    readings.push({
+      buildSetId: capsule.buildSetId,
+      hostFingerprint: capsule.hostFingerprint,
+      proxyInstanceId: capsule.proxyInstanceId,
+      guardian,
+      reaper,
+    });
+  }
+  return readings;
+}
+
+function formatDirectHolderStatusReading(reading: DirectHolderStatusReading): string {
+  switch (reading.kind) {
+    case 'answered': {
+      const summary = `${reading.status.disposition} (phase=${reading.status.phase}, epoch=${reading.status.controlEpoch})`;
+      const hold = reading.status.enforcementHold;
+      if (hold === null) return summary;
+      const retry =
+        hold.retry.state === 'scheduled'
+          ? `nextProbeAt=${new Date(hold.retry.nextProbeAtMs).toISOString()}`
+          : hold.retry.state === 'in-progress'
+            ? 'nextProbe=in-progress'
+            : 'nextProbe=none, operator-action-required';
+      const reason = hold.kind === 'reap-failed' ? ` reason=${hold.reason}` : '';
+      return `${summary}; hold=${hold.kind}${reason} attempts=${hold.attempts} role=${hold.roleIdentity.role}:${hold.roleIdentity.pid}@${hold.roleIdentity.incarnation} ${retry}`;
+    }
+    case 'holder-status-unavailable':
+      return `unavailable (${reading.reason})`;
+    case 'unreachable':
+      return `unreachable (${reading.reason})`;
+  }
+}
+
+export function formatProviderProxySetHolderStatusDirect(
+  readings: readonly DirectProviderProxySetHolderStatusRow[],
+): string {
+  if (readings.length === 0) return 'No provider proxy sets discovered on disk.';
+  return readings
+    .map((reading) => {
+      if ('kind' in reading) {
+        if (reading.kind === 'unreadable-run-directory') {
+          return `unreadable run directory path=${reading.path}\n  reason: ${reading.reason}`;
+        }
+        if (reading.kind === 'unreadable-capsule') {
+          return `unreadable capsule path=${reading.path}\n  reason: ${reading.reason}`;
+        }
+        const processIdentity =
+          reading.capsule.version === 1
+            ? ''
+            : `\n  recorded pids (non-authorizing): guardian=${reading.capsule.guardianPid} reaper=${reading.capsule.reaperPid} proxy=${reading.capsule.proxyPid}; process incarnation unavailable`;
+        return (
+          `legacy capsule version=${reading.capsule.version} path=${reading.path}\n` +
+          `  identity: build=${reading.capsule.buildSetId} host=${reading.capsule.hostFingerprint} ` +
+          `guardian=${reading.capsule.guardianInstanceId} reaper=${reading.capsule.reaperInstanceId} ` +
+          `proxy=${reading.capsule.proxyInstanceId}${processIdentity}\n` +
+          '  direct holder status: unsupported for this capsule version; no role was dialed'
+        );
+      }
+      const holds = [reading.guardian, reading.reaper]
+        .filter((role): role is Extract<DirectHolderStatusReading, { kind: 'answered' }> => role.kind === 'answered')
+        .flatMap((role) => {
+          const hold = role.status.enforcementHold;
+          return hold?.retry.state === 'operator-action-required' ? [hold] : [];
+        });
+      const setAbandonment = holds.some((hold) => hold.kind === 'recorded-group-unattributable')
+        ? `    coral-cli backend provider-proxy-set abandon ${encodeProviderProxySetAddress({
+            buildSetId: reading.buildSetId,
+            hostFingerprint: reading.hostFingerprint,
+            proxyInstanceId: reading.proxyInstanceId,
+          })}\n`
+        : '';
+      const operatorActions =
+        holds.length === 0
+          ? ''
+          : `\n  operator actions:\n` +
+            setAbandonment +
+            holds
+              .map(
+                (hold) =>
+                  `    ${
+                    hold.kind === 'recorded-group-unattributable'
+                      ? formatProviderProxyRoleTerminationCommand(hold.roleIdentity)
+                      : formatProviderProxyRoleReapRetryCommand(hold.roleIdentity)
+                  }`,
+              )
+              .join('\n');
+      return (
+        `set proxy=${reading.proxyInstanceId} build=${reading.buildSetId} host=${reading.hostFingerprint}\n` +
+        `  guardian: ${formatDirectHolderStatusReading(reading.guardian)}\n` +
+        `  reaper:   ${formatDirectHolderStatusReading(reading.reaper)}` +
+        operatorActions
+      );
+    })
+    .join('\n');
 }
 
 export function createBackendStatusCommandOperations(
@@ -512,6 +988,7 @@ export function createBackendStatusCommandOperations(
     getStatus: () => getBackendStatusFull(getPluginRoot()),
     getLiveHandoffResult,
     getRoutingStatus: () => readHandoffRoutingStatusWithOwnerObservations(runtime, statusPath),
+    readProviderProxySetHolderStatusDirect: () => readProviderProxySetHolderStatusDirect(runtime),
   };
 }
 
@@ -859,20 +1336,33 @@ export function createProviderProxySetCommandOperations(
       const request = providerProxySetContainRequestSchema.parse(input);
       try {
         const client = await getClient();
-        const response = await client.request('coordinator.provider_proxy_set.contain', request, {
+        const requestOptions = {
           timeoutMs: TOOL_TIMEOUT_MS,
           ...childPrincipalAuthOptions(childPrincipalAuthFromEnv()),
-        });
+        };
+        let response: unknown;
+        let booleanContract = false;
+        try {
+          response = await client.request(providerProxySetContainRpcSpec.name, request, requestOptions);
+        } catch (error: unknown) {
+          if (!(error instanceof IpcRpcError) || error.rpcCode !== -32601) throw error;
+          booleanContract = true;
+          response = await client.request(
+            providerProxySetContainBooleanRpcSpec.name,
+            providerProxySetContainBooleanRequestSchema.parse({
+              setIdentity: request.setIdentity,
+              abandonWithoutAbsence: request.mode === 'abandon',
+            }),
+            requestOptions,
+          );
+        }
         if (isRecord(response) && response.code === 'backend_shutting_down') {
           return { kind: 'coordinator-draining', setIdentity: request.setIdentity };
         }
-        const parsed = providerProxySetContainResponseSchema.safeParse(response);
-        if (
-          parsed.success &&
-          parsed.data.setIdentity.buildSetId === request.setIdentity.buildSetId &&
-          parsed.data.setIdentity.hostFingerprint === request.setIdentity.hostFingerprint &&
-          parsed.data.setIdentity.proxyInstanceId === request.setIdentity.proxyInstanceId
-        ) {
+        const parsed = booleanContract
+          ? providerProxySetContainBooleanResponseSchema.safeParse(response)
+          : providerProxySetContainResponseSchema.safeParse(response);
+        if (parsed.success && providerProxySetContainResultMatchesAddress(parsed.data, request.setIdentity)) {
           return parsed.data;
         }
         return { kind: 'unsupported-coordinator-result', setIdentity: request.setIdentity };
@@ -887,6 +1377,94 @@ export function createProviderProxySetCommandOperations(
       }
     },
   };
+}
+
+export function createShutdownRecoveryCommandOperations(
+  options: {
+    getClient?: () => Promise<Pick<IpcClient, 'request'>>;
+    runtime?: Runtime;
+    createClient?: typeof createIpcClient;
+  } = {},
+): ShutdownRecoveryCommandOperations {
+  const runtime = options.runtime ?? createRealRuntime(resolveBuildFlavor(process.env));
+  const createClient = options.createClient ?? createIpcClient;
+  const getClient =
+    options.getClient ??
+    (async () => {
+      const incumbent = readBackendInfo(runtime);
+      if (incumbent === null) {
+        throw new BackendUnreachableError(
+          'Shutdown recovery requires a readable coordinator discovery record; no coordinator was started or replaced.',
+        );
+      }
+      return createClient(incumbent.socketPath, runtime.time, {
+        kind: 'boot',
+        token: incumbent.bootToken,
+      });
+    });
+  return {
+    abandon: async (subject) => {
+      const client = await getClient();
+      const response = await client.request(
+        shutdownObligationAbandonMethod,
+        { subject },
+        {
+          timeoutMs: TOOL_TIMEOUT_MS,
+          ...childPrincipalAuthOptions(childPrincipalAuthFromEnv()),
+        },
+      );
+      return shutdownObligationAbandonResultSchema.parse(response);
+    },
+    status: () =>
+      readShutdownAbandonmentStatus({
+        storage: runtime.storage,
+        runDir: runtime.paths.coral.coordinator.runDir,
+      }),
+  };
+}
+
+export function formatShutdownRecoveryStatus(status: ShutdownAbandonmentStatusRead): string {
+  switch (status.kind) {
+    case 'absent':
+      return `No durable shutdown-obligation abandonment status at ${status.path}.`;
+    case 'unreadable':
+      return `Shutdown-obligation abandonment status is unreadable at ${status.path}: ${status.detail}`;
+    case 'available':
+      return [
+        `Shutdown-obligation abandonment status: ${status.path}`,
+        ...status.status.entries.map(
+          (entry) =>
+            `${entry.recordedAt} instance=${entry.instanceId} subject=${entry.subject} disposition=${entry.disposition}\n` +
+            `  ${entry.detail}\n` +
+            '  This is not evidence of completion or absence.',
+        ),
+      ].join('\n');
+  }
+}
+
+export function formatShutdownObligationAbandonResult(result: ShutdownObligationAbandonResult): string {
+  switch (result.kind) {
+    case 'accepted':
+      return [
+        `Recorded operator abandonment for ${result.receipt.subject}.`,
+        `Disposition: ${result.receipt.disposition}`,
+        result.receipt.detail,
+        `Durable status: ${result.receipt.statusPath}`,
+        'This is not evidence of completion or absence.',
+      ].join('\n');
+    case 'not-held':
+      return `Refusing to abandon ${result.subject}: no held shutdown currently owns that obligation.`;
+    case 'not-offered':
+      return `Refusing to abandon ${result.subject}: the current held shutdown did not offer that exact action.`;
+    case 'status-write-refused':
+      return `Refusing to abandon ${result.subject}: durable status was not confirmed (${result.detail}).`;
+  }
+}
+
+function parseShutdownObligationSubject(value: string): ShutdownObligationSubject {
+  const parsed = shutdownObligationSubjectSchema.safeParse(value);
+  if (parsed.success) return parsed.data;
+  throw new InvalidArgumentError(`Unknown shutdown obligation subject: ${value}`);
 }
 
 export function registerBackendCommands(program: Command, operations: BackendCommandOperations = {}): void {
@@ -905,6 +1483,8 @@ export function registerBackendCommands(program: Command, operations: BackendCom
     recoveryQuarantine = createRecoveryQuarantineCommandOperations(),
     providerHosts = createProviderHostCommandOperations(),
     providerProxySets = createProviderProxySetCommandOperations(),
+    shutdownRecovery = createShutdownRecoveryCommandOperations(),
+    providerProxyRoleTermination = createDirectProviderProxyRoleTerminationCommandOperations(),
   } = operations;
   const backend = program.command('backend').description('Backend administration and local incident inspection');
 
@@ -927,14 +1507,24 @@ export function registerBackendCommands(program: Command, operations: BackendCom
         backendStatus.getRoutingStatus(),
       ]);
       const liveHandoffResult = backendStatus.getLiveHandoffResult();
-      const liveHandoffObligation = liveHandoffResultObligation(liveHandoffResult);
       process.stdout.write(`${formatBackendStatus(status, routingStatusRead, liveHandoffResult)}\n`);
+      let directHolderStatusExitContribution: BackendStatusLocalExitContribution = 0;
+      if (!hasUsableCoordinatorDiagnostics(status)) {
+        const direct = await (backendStatus.readProviderProxySetHolderStatusDirect?.() ??
+          readProviderProxySetHolderStatusDirect(createRealRuntime(resolveBuildFlavor(process.env))));
+        if (direct.length > 0) {
+          process.stdout.write(`\n${formatProviderProxySetHolderStatusDirect(direct)}\n`);
+        }
+        directHolderStatusExitContribution = directProviderProxySetHolderStatusExitContribution(direct);
+      }
+      const liveHandoffObligation = liveHandoffResultObligation(liveHandoffResult);
       const localExitContributions: NonEmptyReadonlyArray<BackendStatusLocalExitContribution> = [
         BACKEND_STATUS_EXIT_CODES[status.status],
         liveHandoffObligation.exitContribution,
         handoffRoutingStatusExitContribution(routingStatusRead),
         handoffPublicationIncidentsExitContribution(liveHandoffResult?.publicationIncidents ?? []),
         providerProxySetNoVerdictExitContribution(status),
+        directHolderStatusExitContribution,
       ];
       process.exitCode = combineBackendStatusLocalExitContributions(localExitContributions);
     } catch (error) {
@@ -1058,21 +1648,53 @@ export function registerBackendCommands(program: Command, operations: BackendCom
       }
     });
 
+  const shutdownRecoveryCommand = backend
+    .command('shutdown-recovery')
+    .description('Inspect or explicitly abandon a currently held shutdown obligation');
+  shutdownRecoveryCommand
+    .command('status')
+    .description('Show durable shutdown-obligation abandonment status')
+    .action(() => {
+      const status = shutdownRecovery.status();
+      const output = formatShutdownRecoveryStatus(status);
+      (status.kind === 'unreadable' ? process.stderr : process.stdout).write(`${output}\n`);
+      process.exitCode = status.kind === 'unreadable' ? 75 : 0;
+    });
+  shutdownRecoveryCommand
+    .command('abandon')
+    .description('Durably abandon one exact obligation offered by the current held shutdown')
+    .argument('<subject>', 'Exact subject shown by the held shutdown', parseShutdownObligationSubject)
+    .action(async (subject: ShutdownObligationSubject) => {
+      try {
+        const result = await shutdownRecovery.abandon(subject);
+        const accepted = result.kind === 'accepted';
+        (accepted ? process.stdout : process.stderr).write(`${formatShutdownObligationAbandonResult(result)}\n`);
+        process.exitCode = accepted ? 0 : result.kind === 'status-write-refused' ? 75 : 1;
+      } catch (error: unknown) {
+        emitError(error);
+      }
+    });
+
   const shutdownCommand = backend.command('shutdown');
   shutdownCommand.description('Gracefully shut down backend daemon').action(async () => {
     try {
-      let preservedSetRead: Readonly<{ tokens: readonly string[]; skippedRows: number }> | null = null;
+      let preservedSetRead: Readonly<{
+        operatorExits: readonly string[];
+        skippedRows: number;
+        skippedIdentities: readonly string[];
+      }> | null = null;
       try {
         const statusBeforeShutdown = await backendStatus.getStatus();
         if (statusBeforeShutdown.status === 'ok') {
+          const providerProxySets = statusBeforeShutdown.health.diagnostics?.providerProxySets ?? [];
           preservedSetRead = {
-            tokens: [
-              ...new Set([
-                ...(statusBeforeShutdown.health.diagnostics?.providerProxySets ?? []).map((set) => set.setToken),
-                ...(statusBeforeShutdown.health.skippedProviderProxySetTokens ?? []),
-              ]),
-            ],
+            operatorExits: providerProxySets.map(formatProviderProxySetOperatorExit),
             skippedRows: statusBeforeShutdown.health.skippedProviderProxySetRows ?? 0,
+            skippedIdentities: formatProviderProxySetRowSkips(
+              statusBeforeShutdown.health.skippedProviderProxySetRows ?? 0,
+              statusBeforeShutdown.health.skippedProviderProxySetTokens,
+              statusBeforeShutdown.health.diagnostics?.providerProxySetRowSkips,
+            ),
           };
         }
       } catch {
@@ -1086,18 +1708,22 @@ export function registerBackendCommands(program: Command, operations: BackendCom
           if (preservedSetRead === null) {
             return 'Held provider proxy sets could not be inspected before shutdown; run backend status after the successor starts.';
           }
-          if (preservedSetRead.tokens.length === 0 && preservedSetRead.skippedRows === 0) {
+          if (preservedSetRead.operatorExits.length === 0 && preservedSetRead.skippedRows === 0) {
             return 'No held provider proxy sets were reported before shutdown.';
           }
-          const lines = preservedSetRead.tokens.length
+          const lines = preservedSetRead.operatorExits.length
             ? [
-                'Provider proxy set tokens reported before shutdown:',
-                ...preservedSetRead.tokens.map((token) => `  coral-cli backend provider-proxy-set contain ${token}`),
+                'Provider proxy set exits reported before shutdown:',
+                ...preservedSetRead.operatorExits.map((operatorExit) => `  ${operatorExit}`),
               ]
             : [];
           if (preservedSetRead.skippedRows > 0) {
             lines.push(
               `The pre-shutdown status read could not interpret ${preservedSetRead.skippedRows} provider proxy set row(s), so it could not confirm that every preserved set was named.`,
+            );
+            lines.push(...preservedSetRead.skippedIdentities.map((identity) => `  ${identity}`));
+            lines.push(
+              '  No containment or abandonment command is offered for a skipped set because this build cannot verify that the backend will authorize it. Run coral-cli backend status from a build that understands the row.',
             );
           }
           return lines.join('\n');
@@ -1130,7 +1756,7 @@ export function registerBackendCommands(program: Command, operations: BackendCom
   const providerHostCommand = backend.command('provider-host').description('Inspect and evict provider hosts');
   providerHostCommand
     .command('list')
-    .description('List live, retained-blocked, and reclamation-failed provider hosts')
+    .description('List live, retained-blocked, shutdown-held, and reclamation-failed provider hosts')
     .action(async () => {
       try {
         process.stdout.write(`${formatProviderHostList(await providerHosts.list())}\n`);
@@ -1140,7 +1766,7 @@ export function registerBackendCommands(program: Command, operations: BackendCom
     });
   providerHostCommand
     .command('inspect')
-    .description('Inspect one exact live, retained-blocked, or reclamation-failed provider host')
+    .description('Inspect one exact live, retained-blocked, shutdown-held, or reclamation-failed provider host')
     .argument('[host-ref]', 'Canonical ph1 provider-host reference')
     .option('--work-dir <path>', 'Resolve exactly one provider host by work directory')
     .action(async (hostRef: string | undefined, options: { workDir?: string }) => {
@@ -1155,7 +1781,7 @@ export function registerBackendCommands(program: Command, operations: BackendCom
     .command('evict')
     .description('Evict one exact provider host; may end work already attached to that host')
     .argument('[host-ref]', 'Canonical ph1 reference copied from `coral-cli backend provider-host list`')
-    .option('--work-dir <path>', 'Resolve relative to the current directory; refuses on ambiguity')
+    .option('--work-dir <path>', 'Refused for eviction; use it with inspect to obtain an exact reference')
     .action(async (hostRef: string | undefined, options: { workDir?: string }) => {
       try {
         const request = parseProviderHostSelector(hostRef, options.workDir);
@@ -1167,39 +1793,49 @@ export function registerBackendCommands(program: Command, operations: BackendCom
     });
   const providerProxySetCommand = backend
     .command('provider-proxy-set')
-    .description('Contain or abandon one exact held provider-proxy set');
+    .description('Contain or abandon one exact held provider-proxy set, or act on one exact enforcer role');
+  registerProviderProxyRoleTerminationCommand(providerProxySetCommand, providerProxyRoleTermination);
   const containProviderProxySetCommand = providerProxySetCommand
     .command('contain')
     .description('Resolve one exact held provider-proxy set after its state-specific operator-exit gate')
     .argument('<set-token>', 'Canonical pps1 token copied from `coral-cli backend status`', parseProviderProxySetToken)
-    .option(
-      '--abandon-without-absence',
-      'After external verification, release Coral representation for a live/unobservable enforcer or unattributable recorded group',
-    )
     .addHelpText(
       'after',
       [
         '',
-        'Default mode requires guardian and reaper absence, then reaps the recorded proxy process group and every recorded provider root.',
-        '--abandon-without-absence signals no process and releases Coral representation despite observed life, unknown observation, or an unattributable recorded group.',
-        'Neither mode signals the guardian or reaper.',
+        'Containment requires guardian and reaper absence, then reaps the recorded proxy process group and every recorded provider root.',
+        'Containment does not signal the guardian or reaper.',
         'A reattachment hold is gated by its control-adoption deadline; containing and containment-wait are gated by their current containment-attempt deadline.',
       ].join('\n'),
     );
-  let abandonWithoutAbsenceSeen = false;
-  containProviderProxySetCommand.on('option:abandon-without-absence', () => {
-    if (abandonWithoutAbsenceSeen) {
-      throw new InvalidArgumentError('Option --abandon-without-absence may only be specified once.');
+  containProviderProxySetCommand.action(async (setIdentity: ProviderProxySetAddress) => {
+    try {
+      const result = await providerProxySets.contain({ setIdentity, mode: 'contain' });
+      if (isProviderProxySetContainNoVerdict(result)) {
+        process.stderr.write(`${formatProviderProxySetContainNoVerdict(result)}\n`);
+        process.exitCode = 75;
+        return;
+      }
+      const exitCode = providerProxySetContainExitCode(result);
+      (exitCode === 0 ? process.stdout : process.stderr).write(`${formatProviderProxySetContainResult(result)}\n`);
+      process.exitCode = exitCode;
+    } catch (error: unknown) {
+      emitError(error);
     }
-    abandonWithoutAbsenceSeen = true;
   });
-  containProviderProxySetCommand.action(
-    async (setIdentity: ProviderProxySetAddress, options: { abandonWithoutAbsence?: boolean }) => {
+  providerProxySetCommand
+    .command('abandon')
+    .description(
+      'Release one exact held provider-proxy set without absence proof, including an unattributable recorded group, or accept its fatal representation-release remainder; signals no process and performs no reap',
+    )
+    .argument('<set-token>', 'Canonical pps1 token copied from `coral-cli backend status`', parseProviderProxySetToken)
+    .addHelpText(
+      'after',
+      '\nAfter external verification, abandonment releases Coral representation despite observed life, unknown observation, an unattributable recorded group, or a fatal representation release. It cannot override an unreadable-store fence before representation release starts.',
+    )
+    .action(async (setIdentity: ProviderProxySetAddress) => {
       try {
-        const result = await providerProxySets.contain({
-          setIdentity,
-          abandonWithoutAbsence: options.abandonWithoutAbsence ?? false,
-        });
+        const result = await providerProxySets.contain({ setIdentity, mode: 'abandon' });
         if (isProviderProxySetContainNoVerdict(result)) {
           process.stderr.write(`${formatProviderProxySetContainNoVerdict(result)}\n`);
           process.exitCode = 75;
@@ -1211,8 +1847,7 @@ export function registerBackendCommands(program: Command, operations: BackendCom
       } catch (error: unknown) {
         emitError(error);
       }
-    },
-  );
+    });
   recoveryQuarantineCommand
     .command('clear')
     .description('Retry one exact retained recovery failure through the canonical coordinator')

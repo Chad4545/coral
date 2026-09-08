@@ -18,11 +18,13 @@ import { DatabaseSync } from 'node:sqlite';
 import { afterEach, describe, expect, it } from 'vitest';
 
 import { acquireStoreResetSocketGuard } from '#src/cli/store-reset-socket.js';
+import { CURRENT_STRICT_BUNDLE_MANIFEST_FILE } from '#src/infra/bundle-manifest-address.js';
 import type { StrictBundleManifest } from '#src/infra/bundle-manifest.js';
 import { acquireDirectoryLockSync } from '#src/infra/fs-lock.js';
 import { createForeignTargetValidator } from '#src/infra/handoff-target.js';
 import { createRealRuntime } from '#src/runtime/real.js';
 import {
+  ACTIVE_STORE_SELECTION_VERSION,
   encodeActiveStoreSelection,
   readActiveStoreSelection,
   readActiveStoreTransition,
@@ -46,6 +48,7 @@ const BUILD: StrictBundleManifest = {
   bundleHash: '0123456789abcdef',
   cliBundleHash: '123456789abcdef0',
   claudeAppserverBundleHash: '23456789abcdef01',
+  durableWrapperBundleHash: '3456789abcdef012',
   flavor: 'prod',
   storeFormatFingerprint: STORE_FORMAT.fingerprint,
 };
@@ -53,6 +56,7 @@ const roots: string[] = [];
 const backendBundle = 'operator routing backend';
 const cliBundle = 'operator routing cli';
 const claudeAppserverBundle = 'operator routing claude appserver';
+const durableWrapperBundle = 'operator routing durable wrapper';
 
 function root(): string {
   const value = mkdtempSync(join(tmpdir(), 'coral-store-reset-operator-'));
@@ -81,6 +85,7 @@ function routedManifest(version: string, buildSetId: string): StrictBundleManife
     bundleHash: createHash('sha256').update(backendBundle).digest('hex').slice(0, 16),
     cliBundleHash: createHash('sha256').update(cliBundle).digest('hex').slice(0, 16),
     claudeAppserverBundleHash: createHash('sha256').update(claudeAppserverBundle).digest('hex').slice(0, 16),
+    durableWrapperBundleHash: createHash('sha256').update(durableWrapperBundle).digest('hex').slice(0, 16),
     flavor: 'prod',
     storeFormatFingerprint: STORE_FORMAT.fingerprint,
   };
@@ -88,7 +93,7 @@ function routedManifest(version: string, buildSetId: string): StrictBundleManife
 
 function selection(manifest: StrictBundleManifest, bundleDir: string): ActiveStoreSelection {
   return {
-    version: 1,
+    version: ACTIVE_STORE_SELECTION_VERSION,
     manifest,
     bundleDir,
     activeStoreFingerprint: manifest.storeFormatFingerprint,
@@ -101,7 +106,8 @@ function createBundle(parent: string, manifest: StrictBundleManifest): string {
   writeFileSync(join(bundleDir, 'coral-backend.cjs'), backendBundle);
   writeFileSync(join(bundleDir, 'coral-cli.cjs'), cliBundle);
   writeFileSync(join(bundleDir, 'coral-claude-appserver.cjs'), claudeAppserverBundle);
-  writeFileSync(join(bundleDir, 'manifest.json'), JSON.stringify(manifest));
+  writeFileSync(join(bundleDir, 'coral-durable-wrapper.cjs'), durableWrapperBundle);
+  writeFileSync(join(bundleDir, CURRENT_STRICT_BUNDLE_MANIFEST_FILE), JSON.stringify(manifest));
   return bundleDir;
 }
 

@@ -13,7 +13,6 @@ import {
 } from '../../../provider-proxy/handoff-capsule.js';
 import type { ProviderProxyOperationSnapshot } from '../../services/operation-registry.js';
 import {
-  PROXY_TEARDOWN_RESERVE_MS,
   providerProxyAdoptionWindowMs,
   providerProxyHeartbeatHoldBound,
   resolveProviderProxyDeadlineConfiguration,
@@ -22,16 +21,15 @@ import {
   PROXY_CONTROL_RPC_TIMEOUT_MS,
   PROXY_STATUS_RPC_TIMEOUT_MS,
   canonicalUuidSchema,
-  guardianStopAndReapParamsSchema,
-  guardianStopAndReapResultSchema,
   providerHostEvictParamsSchema,
-  providerHostEvictResultSchema,
+  providerHostEvictResultV2Schema,
   providerHostInspectParamsSchema,
-  providerHostInspectResultSchema,
+  providerHostInspectResultV1Schema,
+  providerHostInspectResultV2Schema,
   providerHostListParamsSchema,
-  providerHostListResultSchema,
-  reaperStopAndReapParamsSchema,
-  reaperStopAndReapResultSchema,
+  providerHostListResultV1Schema,
+  providerHostListResultV2Schema,
+  providerHostTerminalEvictionResultV2Schema,
   type CoordinatorIdentity,
   type GuardianIdentity,
   type OperationIdentity,
@@ -49,7 +47,13 @@ import {
   type RedeemedProviderProxyControl,
 } from './control-redemption.js';
 import type { ProviderProxyRoleHeartbeats } from './heartbeat.js';
-import type { ProviderProxyAutonomousDeadline, ProviderProxySetAuthority } from './authority.js';
+import type { AcquisitionUndo } from './index.js';
+import type {
+  ContainmentCommitOutcome,
+  ProviderProxyAutonomousDeadline,
+  ProviderProxySetAuthority,
+} from './authority.js';
+import { commitProviderProxyGuardianContainment } from './authority.js';
 
 const handoffInstallAckSchema = z
   .object({ state: z.literal('installed-dormant'), grantId: canonicalUuidSchema })
@@ -143,20 +147,18 @@ function requireControlResult(method: string, exchange: ControlExchange): unknow
   throw new Error(`${method} could not be sent.`, { cause: exchange.error });
 }
 
-/** Lets `signal` cut a pending exchange short without requiring `ControlClient.exchange` itself to understand
- *  `AbortSignal` — it only ever takes a millisecond budget. If the signal wins the race the pending exchange is
- *  left to settle on its own; `stopAndReap`'s caller treats a lost race and a refused exchange identically
- *  (both become `{ unconfirmed }`), so there is nothing further to do with it either way. */
-function raceAgainstAbort<T>(pending: Promise<T>, signal: AbortSignal): Promise<T> {
-  return new Promise<T>((resolve, reject) => {
-    const onAbort = (): void => reject(new Error('the caller deadline elapsed before stop-and-reap confirmed absence'));
-    if (signal.aborted) {
-      onAbort();
-      return;
-    }
-    pending.then(resolve, reject);
-    signal.addEventListener('abort', onAbort, { once: true });
-  });
+/** A method-not-found reply must not classify any other exchange. */
+type ControlMethodAvailability =
+  | Readonly<{ kind: 'answered'; exchange: ControlExchange }>
+  | Readonly<{ kind: 'method-absent' }>;
+
+function controlMethodAvailability(exchange: ControlExchange): ControlMethodAvailability {
+  return exchange.kind === 'response' &&
+    exchange.response.kind === 'refusal' &&
+    exchange.response.failure.kind === 'json-rpc-error' &&
+    exchange.response.failure.protocolCode === 'method_not_found'
+    ? { kind: 'method-absent' }
+    : { kind: 'answered', exchange };
 }
 
 type ProviderProxySetAuthorityCommonDependencies = Readonly<{
@@ -178,8 +180,9 @@ type ProviderProxySetAuthorityCommonDependencies = Readonly<{
   /** Kept outside SQLite so the credential secret never enters durable domain records. */
   runtime: Runtime;
   onProviderEvent?(): ProviderEventHandler;
-  /** `stopAndReap`'s source for provider roots this generation can still name in set agreement. */
   operationRegistry: ProviderProxyOperationSnapshot;
+  /** Fresh acquisition must transfer cleanup ownership in the same turn that writes the capsule. */
+  registerAcquisitionUndo?(undo: AcquisitionUndo): void;
 }>;
 
 export type ProviderProxySetAuthorityDependencies = ProviderProxySetAuthorityCommonDependencies &
@@ -333,6 +336,11 @@ export function createProviderProxySetAuthority(
         storage: runtime.storage,
         uid: process.getuid?.() ?? 0,
       });
+      deps.registerAcquisitionUndo?.({
+        kind: 'recovery-capability',
+        label: 'handoff capsule',
+        run: () => runtime.storage.rmSync(handoffCapsulePath, { force: true }),
+      });
     }
     const receipt = Object.freeze({
       kind: 'installed-recovery-credential',
@@ -444,6 +452,19 @@ export function createProviderProxySetAuthority(
     },
   };
 
+  const commitContainment = (signal: AbortSignal): Promise<ContainmentCommitOutcome> => {
+    // Containment roots must come from the guardian's cumulative enforcer state, never coordinator claims.
+    return commitProviderProxyGuardianContainment(
+      {
+        client: guardianClient,
+        guardian: guardianIdentity,
+        reaper: reaperIdentity,
+        proxy: proxyIdentityFields,
+      },
+      signal,
+    );
+  };
+
   return {
     proxyInstanceId,
     get autonomousDeadline() {
@@ -453,84 +474,63 @@ export function createProviderProxySetAuthority(
     providerHosts: Object.freeze({
       list: async () => {
         const params = providerHostListParamsSchema.parse({});
-        const raw = requireControlResult(
-          'provider-host.list.v1',
-          await proxyClient.exchange('provider-host.list.v1', params, PROXY_STATUS_RPC_TIMEOUT_MS),
+        const current = controlMethodAvailability(
+          await proxyClient.exchange('provider-host.list.v2', params, PROXY_STATUS_RPC_TIMEOUT_MS),
         );
-        return providerHostListResultSchema.parse(raw).hosts;
+        if (current.kind === 'answered') {
+          return providerHostListResultV2Schema.parse(requireControlResult('provider-host.list.v2', current.exchange))
+            .hosts;
+        }
+        const legacy = await proxyClient.exchange('provider-host.list.v1', params, PROXY_STATUS_RPC_TIMEOUT_MS);
+        return providerHostListResultV1Schema.parse(requireControlResult('provider-host.list.v1', legacy)).hosts;
       },
       inspect: async (hostRef) => {
         const params = providerHostInspectParamsSchema.parse({ hostRef });
-        const raw = requireControlResult(
-          'provider-host.inspect.v1',
-          await proxyClient.exchange('provider-host.inspect.v1', params, PROXY_STATUS_RPC_TIMEOUT_MS),
+        const current = controlMethodAvailability(
+          await proxyClient.exchange('provider-host.inspect.v2', params, PROXY_STATUS_RPC_TIMEOUT_MS),
         );
-        const result = providerHostInspectResultSchema.parse(raw);
+        if (current.kind === 'answered') {
+          const result = providerHostInspectResultV2Schema.parse(
+            requireControlResult('provider-host.inspect.v2', current.exchange),
+          );
+          return result.state === 'matched' ? result.host : null;
+        }
+        const legacy = await proxyClient.exchange('provider-host.inspect.v1', params, PROXY_STATUS_RPC_TIMEOUT_MS);
+        const result = providerHostInspectResultV1Schema.parse(
+          requireControlResult('provider-host.inspect.v1', legacy),
+        );
         return result.state === 'matched' ? result.host : null;
+      },
+      terminalEviction: async (hostRef) => {
+        const params = providerHostEvictParamsSchema.parse({ hostRef });
+        const current = controlMethodAvailability(
+          await proxyClient.exchange('provider-host.terminal-eviction.v2', params, PROXY_STATUS_RPC_TIMEOUT_MS),
+        );
+        if (current.kind === 'method-absent') return null;
+        const result = providerHostTerminalEvictionResultV2Schema.parse(
+          requireControlResult('provider-host.terminal-eviction.v2', current.exchange),
+        );
+        return result.state === 'matched' ? result.disposition : null;
       },
       evict: async (hostRef) => {
         const params = providerHostEvictParamsSchema.parse({ hostRef });
-        const raw = requireControlResult(
-          'provider-host.evict.v1',
-          await proxyClient.exchange('provider-host.evict.v1', params, PROXY_CONTROL_RPC_TIMEOUT_MS),
+        return providerHostEvictResultV2Schema.parse(
+          requireControlResult(
+            'provider-host.evict.v2',
+            await proxyClient.exchange('provider-host.evict.v2', params, PROXY_CONTROL_RPC_TIMEOUT_MS),
+          ),
         );
-        return providerHostEvictResultSchema.parse(raw).state === 'evicted';
       },
     }),
     installRecoveryCredential,
     registerSuccessionOperation,
+    commitContainment,
+    // The coarse compatibility result must not translate either unresolved outcome into completion.
     stopAndReap: async (signal) => {
-      try {
-        // The coordinator's own half of the set-agreement both enforcers check
-        // (`assertRecordedSetAgreement`): every provider root this coordinator's own live operations still
-        // hold against this proxy. Claiming fewer
-        // than the enforcer recorded is legitimate and expected — an operation that settled released its
-        // registry entry and may still be releasing its guardian membership — so the check is a subset test.
-        // What it refuses is a root this coordinator names that the enforcer never staged, which means the
-        // two are reasoning about different containments.
-        const providerRoots = operationRegistry.providerRootsFor(proxyInstanceId);
-        // Parsed against the exact schema `guardian.ts` parses this request with on receipt, so a malformed
-        // payload fails at this sender rather than at the guardian's own `.strict()` refusal. It does not
-        // check the set itself — an undershooting claim is legitimate, and only the enforcer holds what it
-        // would have to be checked against.
-        const guardianStopAndReapPayload = guardianStopAndReapParamsSchema.parse({
-          guardian: guardianIdentity,
-          reaper: reaperIdentity,
-          proxy: proxyIdentityFields,
-          providerRoots,
-        });
-        const reaperStopAndReapPayload = reaperStopAndReapParamsSchema.parse({
-          reaper: reaperIdentity,
-          proxy: proxyIdentityFields,
-          providerRoots,
-        });
-        const [rawGuardian, rawReaper] = await Promise.all([
-          raceAgainstAbort(
-            guardianClient.exchange(
-              'guardian.stop-and-reap.v1',
-              guardianStopAndReapPayload,
-              // Both role methods are declared `budgetMs: 'caller-deadline'`: a legitimate hard reap can
-              // spend the TERM and KILL graces plus disappearance confirmation. The caller signal remains
-              // the actual bound on the joined proof.
-              PROXY_TEARDOWN_RESERVE_MS,
-            ),
-            signal,
-          ),
-          raceAgainstAbort(
-            reaperClient.exchange('reaper.stop-and-reap.v1', reaperStopAndReapPayload, PROXY_TEARDOWN_RESERVE_MS),
-            signal,
-          ),
-        ]);
-        const guardianReceipt = guardianStopAndReapResultSchema.parse(
-          requireControlResult('guardian.stop-and-reap.v1', rawGuardian),
-        ).disappearanceReceipt;
-        const reaperReceipt = reaperStopAndReapResultSchema.parse(
-          requireControlResult('reaper.stop-and-reap.v1', rawReaper),
-        ).disappearanceReceipt;
-        return { disappearanceReceipt: `guardian:${guardianReceipt};reaper:${reaperReceipt}` };
-      } catch (error: unknown) {
-        return { unconfirmed: error instanceof Error ? error.message : 'stop-and-reap did not confirm absence' };
-      }
+      const outcome = await commitContainment(signal);
+      return outcome.kind === 'containment-absent'
+        ? { disappearanceReceipt: outcome.disappearanceReceipt }
+        : { unconfirmed: outcome.error };
     },
     stopHeartbeats: () => {
       heartbeats.proxy.stop();

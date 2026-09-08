@@ -2,25 +2,18 @@ import { testIncarnation } from '#tests/helpers/process-incarnation.js';
 import type { ProcessIncarnation } from '#src/infra/node-process.js';
 import { EventEmitter } from 'node:events';
 import { join } from 'node:path';
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
 
 import type { ChildProcessLike } from '#src/infra/port-types.js';
 import {
+  requireSpawnedRole,
   RoleSpawnError,
   spawnRoleProcess,
   type RoleSpawnOptions,
   type RoleSpawnPorts,
 } from '#src/provider-proxy/role-spawn.js';
 import { createRealRuntime } from '#src/runtime/real.js';
-import type { RuntimeSpawnOptions } from '#src/runtime/ports.js';
-
-/**
- * `spawnRoleProcess` has no dedicated coverage anywhere else: `process-topology.integration.test.ts` drives
- * it only through the full role-main topology, which never exercises the failure branches (`role_spawn_no_pid`,
- * an unreadable incarnation), the two `resolveBackendArtifact` branches, or the exact shape of the spawn call
- * itself. A regression dropping `envAdditions` — the flavor env a spawned peer needs to find the right
- * capsule — would pass every existing test.
- */
+import type { Runtime, RuntimeSpawnOptions } from '#src/runtime/ports.js';
 
 /** A minimal `ChildProcessLike` built on a real `EventEmitter`, so `.on('error', ...)`/emitting `'error'`
  *  behave exactly as they do on a genuine Node child: no listener at emit time would throw. `ChildProcessLike`
@@ -28,25 +21,48 @@ import type { RuntimeSpawnOptions } from '#src/runtime/ports.js';
 function createFakeChild(pid: number | undefined): {
   child: ChildProcessLike;
   killSignals: NodeJS.Signals[];
+  unref: ReturnType<typeof vi.fn>;
+  emitClose(): void;
   emitError(error: Error): void;
 } {
   const killSignals: NodeJS.Signals[] = [];
   const emitter = new EventEmitter();
+  const unref = vi.fn();
+  const exitCode: number | null = null;
+  let signalCode: NodeJS.Signals | null = null;
   const child = Object.assign(emitter, {
     pid,
+    get exitCode() {
+      return exitCode;
+    },
+    get signalCode() {
+      return signalCode;
+    },
     stdin: null,
     stdout: null,
     stderr: null,
+    unref,
     kill: (signal?: NodeJS.Signals) => {
       killSignals.push(signal ?? 'SIGTERM');
       return true;
     },
   }) as unknown as ChildProcessLike;
-  return { child, killSignals, emitError: (error) => emitter.emit('error', error) };
+  return {
+    child,
+    killSignals,
+    unref,
+    emitClose: () => {
+      signalCode = 'SIGTERM';
+      emitter.emit('exit', exitCode, signalCode);
+      emitter.emit('close', exitCode, signalCode);
+    },
+    emitError: (error) => emitter.emit('error', error),
+  };
 }
 
 type FakePortsOptions = Readonly<{
   spawn(options: RuntimeSpawnOptions): ChildProcessLike;
+  runtime?: Runtime;
   readProcessIncarnation?(pid: number, platform: NodeJS.Platform): ProcessIncarnation | null;
 }>;
 
@@ -57,7 +73,7 @@ const realRuntime = createRealRuntime('prod');
 function fakePorts(options: FakePortsOptions): RoleSpawnPorts {
   return {
     process: { spawn: options.spawn },
-    runtime: realRuntime,
+    runtime: options.runtime ?? realRuntime,
     platform: 'linux',
     ...(options.readProcessIncarnation === undefined ? {} : { readProcessIncarnation: options.readProcessIncarnation }),
   };
@@ -68,30 +84,242 @@ function baseOptions(overrides: Partial<RoleSpawnOptions> = {}): RoleSpawnOption
 }
 
 describe('spawnRoleProcess', () => {
-  it('kills the child and throws role_spawn_no_pid when spawn returns no pid', () => {
-    const { child, killSignals } = createFakeChild(undefined);
+  it('returns a pid-less child hold without hiding its close-backed settlement', async () => {
+    const { child, killSignals, unref, emitClose } = createFakeChild(undefined);
     const ports = fakePorts({ spawn: () => child });
 
-    expect(() => spawnRoleProcess('proxy', '/capsule.json', ports, baseOptions())).toThrow(RoleSpawnError);
-    try {
-      spawnRoleProcess('proxy', '/capsule.json', ports, baseOptions());
-    } catch (error: unknown) {
-      expect(error).toMatchObject({ code: 'role_spawn_no_pid', role: 'proxy' });
-    }
-    expect(killSignals).toContain('SIGTERM');
+    const disposition = spawnRoleProcess('proxy', '/capsule.json', ports, baseOptions());
+    expect(disposition).toMatchObject({
+      kind: 'held',
+      error: expect.objectContaining({ code: 'role_spawn_no_pid', role: 'proxy' }),
+      settled: expect.any(Promise),
+      retry: expect.any(Function),
+    });
+    if (disposition.kind !== 'held') throw new Error('Expected pid-less role spawn to be held');
+    expect(unref).not.toHaveBeenCalled();
+    expect(disposition.error).toBeInstanceOf(RoleSpawnError);
+    expect(killSignals).toEqual([]);
+
+    await expect(disposition.retry()).resolves.toMatchObject({
+      kind: 'held-unobservable',
+      subject: { kind: 'process', pid: null },
+      observation: 'unobservable',
+      operatorExit: { kind: 'abandon-provider-proxy-acquisition' },
+      settled: disposition.settled,
+      retry: expect.any(Function),
+    });
+    await expect(disposition.retry()).resolves.toMatchObject({ kind: 'held-unobservable' });
+    expect(killSignals).toEqual(['SIGTERM']);
+    let closeSettled = false;
+    void disposition.settled.then(() => {
+      closeSettled = true;
+    });
+    await Promise.resolve();
+    expect(closeSettled).toBe(false);
+
+    emitClose();
+    await disposition.settled;
+    await expect(disposition.retry()).resolves.toMatchObject({
+      kind: 'observed-absent',
+      evidence: { subject: { kind: 'process', pid: null } },
+    });
   });
 
-  it('kills the child and throws role_spawn_incarnation_unavailable when the incarnation cannot be read', () => {
-    const { child, killSignals } = createFakeChild(6_000);
-    const ports = fakePorts({ spawn: () => child, readProcessIncarnation: () => null });
+  it('preserves observed close when a later retry is already aborted', async () => {
+    const { child, killSignals, emitClose } = createFakeChild(undefined);
+    const disposition = spawnRoleProcess('proxy', '/capsule.json', fakePorts({ spawn: () => child }), baseOptions());
+    if (disposition.kind !== 'held') throw new Error('Expected pid-less role spawn to be held');
+    emitClose();
+    const controller = new AbortController();
+    controller.abort();
 
-    expect(() => spawnRoleProcess('reaper', '/capsule.json', ports, baseOptions())).toThrow(RoleSpawnError);
-    try {
-      spawnRoleProcess('reaper', '/capsule.json', ports, baseOptions());
-    } catch (error: unknown) {
-      expect(error).toMatchObject({ code: 'role_spawn_incarnation_unavailable', role: 'reaper' });
-    }
+    await expect(disposition.retry(controller.signal)).resolves.toMatchObject({
+      kind: 'observed-absent',
+      evidence: { subject: { kind: 'process', pid: null } },
+    });
+    expect(killSignals).toEqual([]);
+  });
+
+  it('returns an alive hold without blocking role-spawn classification', async () => {
+    const { child, killSignals, unref, emitClose } = createFakeChild(6_000);
+    const runtime = {
+      ...realRuntime,
+      process: { ...realRuntime.process, observeLiveness: () => 'alive' as const },
+    };
+    const ports = fakePorts({ spawn: () => child, runtime, readProcessIncarnation: () => null });
+
+    const disposition = spawnRoleProcess('reaper', '/capsule.json', ports, baseOptions());
+    expect(disposition).toMatchObject({
+      kind: 'held',
+      child,
+      error: expect.objectContaining({ code: 'role_spawn_incarnation_unavailable', role: 'reaper' }),
+      settled: expect.any(Promise),
+      retry: expect.any(Function),
+    });
+    if (disposition.kind !== 'held') throw new Error('Expected unreadable role spawn to be held');
+    expect(unref).not.toHaveBeenCalled();
+    expect(disposition.error).toBeInstanceOf(RoleSpawnError);
+    expect(killSignals).toEqual([]);
+
+    await expect(disposition.retry()).resolves.toMatchObject({
+      kind: 'held-alive',
+      subject: { kind: 'process', pid: 6_000 },
+      observation: 'alive',
+      operatorExit: { kind: 'abandon-provider-proxy-acquisition' },
+      settled: disposition.settled,
+      retry: expect.any(Function),
+    });
     expect(killSignals).toContain('SIGTERM');
+    await expect(requireSpawnedRole(disposition)).resolves.toBe(disposition);
+
+    emitClose();
+    await expect(disposition.retry()).resolves.toMatchObject({
+      kind: 'observed-absent',
+      evidence: { subject: { kind: 'process', pid: 6_000 } },
+    });
+  });
+
+  it('returns an unobservable hold when the process probe cannot answer', async () => {
+    const { child, killSignals, unref, emitClose } = createFakeChild(6_001);
+    const runtime = {
+      ...realRuntime,
+      process: {
+        ...realRuntime.process,
+        observeLiveness: () => 'unknown' as const,
+      },
+    };
+    const ports = fakePorts({
+      spawn: () => child,
+      runtime,
+      readProcessIncarnation: () => {
+        throw new Error('synthetic process probe failure');
+      },
+    });
+
+    const disposition = spawnRoleProcess('guardian', '/capsule.json', ports, baseOptions());
+    expect(disposition).toMatchObject({
+      kind: 'held',
+      child,
+      error: expect.objectContaining({ code: 'role_spawn_incarnation_unavailable', role: 'guardian' }),
+      settled: expect.any(Promise),
+      retry: expect.any(Function),
+    });
+    if (disposition.kind !== 'held') throw new Error('Expected throwing role probe to be held');
+    expect(unref).not.toHaveBeenCalled();
+    expect(disposition.error).toBeInstanceOf(RoleSpawnError);
+    expect(killSignals).toEqual([]);
+
+    await expect(disposition.retry()).resolves.toMatchObject({
+      kind: 'held-unobservable',
+      subject: { kind: 'process', pid: 6_001 },
+      observation: 'unobservable',
+      operatorExit: { kind: 'abandon-provider-proxy-acquisition' },
+      settled: disposition.settled,
+      retry: expect.any(Function),
+    });
+    expect(killSignals).toContain('SIGTERM');
+
+    emitClose();
+    await expect(disposition.retry()).resolves.toMatchObject({
+      kind: 'observed-absent',
+      evidence: { subject: { kind: 'process', pid: 6_001 } },
+    });
+  });
+
+  it('never signals a detached failed spawn without identity and accepts only independent group absence', async () => {
+    const { child, emitClose, unref } = createFakeChild(6_002);
+    let groupLiveness: 'alive' | 'absent' = 'alive';
+    const observeLiveness = vi.fn((pid: number) => (pid === -6_002 ? groupLiveness : 'absent'));
+    const kill = vi.fn(() => true);
+    const runtime: Runtime = {
+      ...realRuntime,
+      time: { ...realRuntime.time, sleep: vi.fn(async () => {}) },
+      process: { ...realRuntime.process, kill, observeLiveness },
+    };
+    const ports = fakePorts({ spawn: () => child, runtime, readProcessIncarnation: () => null });
+
+    const disposition = spawnRoleProcess('guardian', '/capsule.json', ports, baseOptions({ detached: true }));
+    if (disposition.kind !== 'held') throw new Error('Expected unreadable detached role spawn to be held');
+    let settled = false;
+    void disposition.settled.then(() => {
+      settled = true;
+    });
+    emitClose();
+    await Promise.resolve();
+    expect(settled).toBe(false);
+
+    const firstCleanup = await disposition.retry();
+    expect(firstCleanup).toMatchObject({
+      kind: 'held-unobservable',
+      subject: { kind: 'unattributable-process-group', processGroupId: 6_002 },
+      observation: 'unobservable',
+      operatorExit: { kind: 'abandon-provider-proxy-acquisition' },
+      retry: expect.any(Function),
+    });
+    expect(observeLiveness).toHaveBeenCalledWith(-6_002);
+    expect(kill).not.toHaveBeenCalled();
+    expect(unref).not.toHaveBeenCalled();
+
+    if (firstCleanup.kind !== 'held-unobservable') throw new Error('Expected the surviving group to remain held');
+    groupLiveness = 'absent';
+    await expect(firstCleanup.retry()).resolves.toMatchObject({
+      kind: 'observed-absent',
+      evidence: {
+        subject: { kind: 'unattributable-process-group', processGroupId: 6_002 },
+        processGroupEvidence: {
+          subject: { kind: 'process-group', processGroupId: 6_002 },
+        },
+      },
+    });
+    await expect(disposition.settled).resolves.toBeUndefined();
+  });
+
+  it('surfaces an unattributable detached spawn hold and its acquisition-abandonment exit', async () => {
+    const { child, emitClose } = createFakeChild(undefined);
+    const disposition = spawnRoleProcess(
+      'guardian',
+      '/capsule.json',
+      fakePorts({ spawn: () => child }),
+      baseOptions({ detached: true }),
+    );
+    if (disposition.kind !== 'held') throw new Error('Expected pid-less detached role spawn to be held');
+    emitClose();
+
+    const cleanup = await disposition.retry();
+    expect(cleanup).toMatchObject({
+      kind: 'held-unobservable',
+      subject: { kind: 'unattributable-process-group', processGroupId: null },
+      observation: 'unobservable',
+      operatorExit: { kind: 'abandon-provider-proxy-acquisition' },
+      retry: expect.any(Function),
+    });
+    expect(disposition.operatorExit.abandon()).toEqual({
+      kind: 'operator-abandoned',
+      subject: { kind: 'unattributable-process-group', processGroupId: null },
+      processAbsenceProven: false,
+      successor: { owner: 'operator-command', acceptance: 'accepted' },
+    });
+    await expect(disposition.settled).resolves.toBeUndefined();
+    await expect(requireSpawnedRole(disposition)).resolves.toMatchObject({
+      kind: 'held',
+      operatorExit: { kind: 'abandon-provider-proxy-acquisition' },
+      retry: expect.any(Function),
+    });
+  });
+
+  it('reads the spawned identity through the runtime process port by default', () => {
+    const { child, unref } = createFakeChild(6_001);
+    const readProcessIncarnation = vi.fn(() => testIncarnation(1_001));
+    const runtime = {
+      ...realRuntime,
+      process: { ...realRuntime.process, readProcessIncarnation },
+    };
+
+    expect(
+      spawnRoleProcess('reaper', '/capsule.json', fakePorts({ spawn: () => child, runtime }), baseOptions()),
+    ).toMatchObject({ pid: 6_001, incarnation: testIncarnation(1_001) });
+    expect(readProcessIncarnation).toHaveBeenCalledWith(6_001, 'linux');
+    expect(unref).toHaveBeenCalledOnce();
   });
 
   it('reuses the current entrypoint when it is already coral-backend.cjs', () => {
@@ -162,6 +390,7 @@ describe('spawnRoleProcess', () => {
     const ports = fakePorts({ spawn: () => child, readProcessIncarnation: () => testIncarnation(1_000) });
 
     const spawned = spawnRoleProcess('reaper', '/capsule.json', ports, baseOptions());
+    if (spawned.kind !== 'spawned') throw new Error('Expected readable role spawn to succeed');
     const failure = new Error('ENOENT: spawn failed');
     // Reaching this line at all is part of what the test proves: Node's EventEmitter re-throws an 'error'
     // emitted with no listener, so if `spawnRoleProcess` had not already attached one, this call itself would

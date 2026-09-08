@@ -4,11 +4,21 @@ import { PassThrough } from 'node:stream';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { createRealRuntime } from '#src/runtime/real.js';
 import { LaunchCoordinator } from '#src/coordinator/live/admission.js';
+import type { DurableProcessCleanup } from '#src/coordinator/live/durable-transport.js';
+import type { DurableContainmentOperatorControl } from '#src/providers/cli-runner.js';
 import { DefaultProviderHostManager } from '#src/coordinator/live/provider-hosts/index.js';
 import type { LaunchPool } from '#src/jobs/contracts/admission.js';
 import { canProbeProcessIncarnation, type ProcessIncarnation } from '#src/infra/node-process.js';
 import type { ChildProcessLike } from '#src/infra/port-types.js';
-import type { ProcessPort, Runtime, RuntimeSpawnOptions } from '#src/runtime/ports.js';
+import { liveChildAuthority } from '#src/infra/process-supervision.js';
+import type {
+  DurableCliProcessSubject,
+  DurableContainmentStatus,
+  DurableProvisionalProcessSubject,
+  ProcessPort,
+  Runtime,
+  RuntimeSpawnOptions,
+} from '#src/runtime/ports.js';
 import {
   canSignalProviderHostProcessGroup,
   ProviderHostUnsupportedPlatformError,
@@ -21,22 +31,42 @@ const TEST_PROVIDER_PID = 20_000;
 const TEST_PROVIDER_INCARNATION = testIncarnation(1_700_000_000);
 
 const PLATFORM_CAPABILITIES = {
-  aix: { canProbeStartTime: false, canSignalProcessGroup: true },
-  android: { canProbeStartTime: false, canSignalProcessGroup: true },
-  cygwin: { canProbeStartTime: false, canSignalProcessGroup: true },
-  darwin: { canProbeStartTime: true, canSignalProcessGroup: true },
-  freebsd: { canProbeStartTime: false, canSignalProcessGroup: true },
-  haiku: { canProbeStartTime: false, canSignalProcessGroup: true },
+  aix: { canProbeStartTime: false, canSignalProcessGroup: false },
+  android: { canProbeStartTime: false, canSignalProcessGroup: false },
+  cygwin: { canProbeStartTime: false, canSignalProcessGroup: false },
+  darwin: { canProbeStartTime: true, canSignalProcessGroup: false },
+  freebsd: { canProbeStartTime: false, canSignalProcessGroup: false },
+  haiku: { canProbeStartTime: false, canSignalProcessGroup: false },
   linux: { canProbeStartTime: true, canSignalProcessGroup: true },
-  netbsd: { canProbeStartTime: false, canSignalProcessGroup: true },
-  openbsd: { canProbeStartTime: false, canSignalProcessGroup: true },
-  sunos: { canProbeStartTime: false, canSignalProcessGroup: true },
+  netbsd: { canProbeStartTime: false, canSignalProcessGroup: false },
+  openbsd: { canProbeStartTime: false, canSignalProcessGroup: false },
+  sunos: { canProbeStartTime: false, canSignalProcessGroup: false },
   win32: { canProbeStartTime: true, canSignalProcessGroup: false },
 } satisfies Record<NodeJS.Platform, { readonly canProbeStartTime: boolean; readonly canSignalProcessGroup: boolean }>;
 
 function restoreEnv(name: 'CORAL_MAX_WORKERS' | 'CORAL_DISCUSS_MAX_WORKERS', value: string | undefined): void {
   if (value === undefined) delete process.env[name];
   else process.env[name] = value;
+}
+
+function testSignalAuthority(pid: number, hasExited: () => boolean, requestTermination?: () => void) {
+  const child: ChildProcessLike = {
+    pid,
+    get exitCode() {
+      return hasExited() ? 0 : null;
+    },
+    signalCode: null,
+    stdin: null,
+    stdout: null,
+    stderr: null,
+    on() {
+      return this;
+    },
+    kill: () => true,
+  };
+  const authority = liveChildAuthority(child);
+  if (authority === undefined) throw new Error('Expected test child authority.');
+  return requestTermination === undefined ? authority : Object.freeze({ ...authority, requestTermination });
 }
 
 function createCoordinator(): LaunchCoordinator {
@@ -53,19 +83,34 @@ function createProviderProcessRuntime(
   spawn: ReturnType<typeof vi.fn<ProcessPort['spawn']>>;
   childKill: ReturnType<typeof vi.fn<(signal?: NodeJS.Signals) => boolean>>;
   processKill: ReturnType<typeof vi.fn<ProcessPort['kill']>>;
+  observeLiveness: ReturnType<typeof vi.fn<ProcessPort['observeLiveness']>>;
   platform: ReturnType<typeof vi.fn<() => string>>;
 } {
   const events = new EventEmitter();
   let processAlive = true;
   let groupAlive = groupProbeResult;
+  let exitCode: number | null = null;
+  let signalCode: NodeJS.Signals | null = null;
+  const collectChild = (signal: NodeJS.Signals): void => {
+    exitCode = null;
+    signalCode = signal;
+    events.emit('exit', exitCode, signalCode);
+    events.emit('close', exitCode, signalCode);
+  };
   const childKill = vi.fn<(signal?: NodeJS.Signals) => boolean>((signal) => {
     processAlive = false;
     groupAlive = false;
-    queueMicrotask(() => events.emit('close', 0, signal ?? null));
+    queueMicrotask(() => collectChild(signal ?? 'SIGTERM'));
     return true;
   });
   const child = {
     pid,
+    get exitCode() {
+      return exitCode;
+    },
+    get signalCode() {
+      return signalCode;
+    },
     stdin: new PassThrough(),
     stdout: new PassThrough(),
     stderr: new PassThrough(),
@@ -78,7 +123,7 @@ function createProviderProcessRuntime(
     if (signal === 0) return _pid < 0 ? groupAlive : processAlive;
     processAlive = false;
     groupAlive = false;
-    queueMicrotask(() => events.emit('close', 0, signal));
+    queueMicrotask(() => collectChild(signal));
     return true;
   });
   const observeLiveness = vi.fn<ProcessPort['observeLiveness']>((targetPid) => {
@@ -88,16 +133,41 @@ function createProviderProcessRuntime(
   const readProcessIncarnation = vi.fn<ProcessPort['readProcessIncarnation']>((targetPid) =>
     targetPid === pid && processAlive ? incarnation : null,
   );
+  const observeProcessIdentities: ProcessPort['observeProcessIdentities'] = async (owners) =>
+    owners.map((owner) => {
+      if (observeLiveness(owner.pid) === 'absent') {
+        return { owner, evidence: { kind: 'pid-absent' as const } };
+      }
+      const observed = readProcessIncarnation(owner.pid, platform as NodeJS.Platform);
+      return observed === null
+        ? { owner, evidence: { kind: 'unobservable' as const, cause: 'incarnation-unavailable' as const } }
+        : { owner, evidence: { kind: 'incarnation' as const, incarnation: observed } };
+    });
+  const observeRecordedProcessAsync: ProcessPort['observeRecordedProcessAsync'] = async (owner) => {
+    const liveness = observeLiveness(owner.pid);
+    if (liveness !== 'alive') return liveness;
+    const observed = readProcessIncarnation(owner.pid, platform as NodeJS.Platform);
+    return observed === owner.incarnation ? 'alive' : observed === null ? 'unknown' : 'absent';
+  };
   const readPlatform = vi.fn(() => platform);
   return {
     runtime: {
       ...base,
       env: { ...base.env, platform: readPlatform },
-      process: { ...base.process, spawn, kill: processKill, observeLiveness, readProcessIncarnation },
+      process: {
+        ...base.process,
+        spawn,
+        kill: processKill,
+        observeLiveness,
+        readProcessIncarnation,
+        observeRecordedProcessAsync,
+        observeProcessIdentities,
+      },
     },
     spawn,
     childKill,
     processKill,
+    observeLiveness,
     platform: readPlatform,
   };
 }
@@ -125,11 +195,18 @@ describe('launch admission', () => {
     const fake = createProviderProcessRuntime(TEST_PROVIDER_PID);
     const localCoordinator = new LaunchCoordinator({ runtime: fake.runtime });
 
-    const handle = await localCoordinator.spawnProviderServer({
-      provider: 'codex',
-      command: 'fake-codex',
-      args: ['app-server'],
-    });
+    const handle = await localCoordinator.spawnProviderServer(
+      {
+        provider: 'codex',
+        command: 'fake-codex',
+        args: ['app-server'],
+      },
+      undefined,
+      undefined,
+      undefined,
+      (hold) => ({ kind: 'accepted', owner: 'provider-host-manager', settlement: hold.settled }),
+    );
+    if ('kind' in handle) throw new Error('Expected a contained provider server handle.');
 
     expect(fake.spawn).toHaveBeenCalledWith(
       expect.objectContaining({ command: 'fake-codex', args: ['app-server'], detached: true }),
@@ -139,11 +216,16 @@ describe('launch admission', () => {
       incarnation: TEST_PROVIDER_INCARNATION,
       processGroupId: TEST_PROVIDER_PID,
     });
-    expect(fake.processKill).toHaveBeenCalledWith(-TEST_PROVIDER_PID, 0);
+    expect(fake.observeLiveness).toHaveBeenCalledWith(-TEST_PROVIDER_PID);
+    expect(fake.processKill).not.toHaveBeenCalled();
     expect(fake.platform).toHaveBeenCalled();
     expect(handle.containmentIdentity.processGroupId).toBe(handle.containmentIdentity.pid);
 
-    await handle.close();
+    await handle.close((hold) => ({
+      kind: 'accepted',
+      owner: 'provider-host-manager',
+      settlement: hold.settled,
+    }));
   });
 
   it.each(Object.entries(PLATFORM_CAPABILITIES))(
@@ -183,7 +265,7 @@ describe('launch admission', () => {
     },
   );
 
-  it('kills a coordinator-local provider spawn whose incarnation cannot be read', async () => {
+  it('signals an owned coordinator-local provider group when its durable incarnation cannot be read', async () => {
     const fake = createProviderProcessRuntime(TEST_PROVIDER_PID, true, 'linux', null);
     const localCoordinator = new LaunchCoordinator({ runtime: fake.runtime });
     const manager = new DefaultProviderHostManager({
@@ -192,21 +274,23 @@ describe('launch admission', () => {
       carrierBlocksRetirement: () => false,
     });
 
-    await expect(
-      manager.openSession(createExclusiveSpec({ command: 'fake-codex', args: ['app-server'] }), { jobId: 'job-a' }),
-    ).rejects.toMatchObject({
+    const admission = manager
+      .openSession(createExclusiveSpec({ command: 'fake-codex', args: ['app-server'] }), { jobId: 'job-a' })
+      .catch((error: unknown) => error);
+
+    await expect(admission).resolves.toMatchObject({
       code: 'process_identity_unverified',
       context: { provider: 'codex', pid: TEST_PROVIDER_PID },
     });
-    expect(fake.processKill).not.toHaveBeenCalled();
-    expect(fake.childKill).toHaveBeenCalledWith('SIGTERM');
+    expect(fake.processKill).toHaveBeenCalledWith(-TEST_PROVIDER_PID, 'SIGTERM');
+    expect(fake.childKill).not.toHaveBeenCalled();
     expect((manager as unknown as { entries: Map<string, unknown> }).entries.size).toBe(0);
     expect([...manager.admissionSnapshot().state.values()].some((entry) => entry.phase === 'live')).toBe(false);
     expect(manager.listProviderHosts().some((entry) => entry.status === 'live')).toBe(false);
     await manager.shutdown();
-  });
+  }, 30_000);
 
-  it('kills a coordinator-local provider spawn when reading its incarnation throws', async () => {
+  it('signals an owned coordinator-local provider group when reading its durable incarnation throws', async () => {
     const fake = createProviderProcessRuntime(TEST_PROVIDER_PID);
     const runtime: Runtime = {
       ...fake.runtime,
@@ -224,21 +308,23 @@ describe('launch admission', () => {
       carrierBlocksRetirement: () => false,
     });
 
-    await expect(
-      manager.openSession(createExclusiveSpec({ command: 'fake-codex', args: ['app-server'] }), { jobId: 'job-a' }),
-    ).rejects.toMatchObject({
+    const admission = manager
+      .openSession(createExclusiveSpec({ command: 'fake-codex', args: ['app-server'] }), { jobId: 'job-a' })
+      .catch((error: unknown) => error);
+
+    await expect(admission).resolves.toMatchObject({
       code: 'process_identity_unverified',
       context: { provider: 'codex', pid: TEST_PROVIDER_PID },
     });
-    expect(fake.processKill).not.toHaveBeenCalled();
-    expect(fake.childKill).toHaveBeenCalledWith('SIGTERM');
+    expect(fake.processKill).toHaveBeenCalledWith(-TEST_PROVIDER_PID, 'SIGTERM');
+    expect(fake.childKill).not.toHaveBeenCalled();
     expect((manager as unknown as { entries: Map<string, unknown> }).entries.size).toBe(0);
     expect([...manager.admissionSnapshot().state.values()].some((entry) => entry.phase === 'live')).toBe(false);
     expect(manager.listProviderHosts().some((entry) => entry.status === 'live')).toBe(false);
     await manager.shutdown();
-  });
+  }, 30_000);
 
-  it('kills a coordinator-local provider spawn whose process-group probe fails', async () => {
+  it('accepts observed group absence when a coordinator-local provider process-group probe fails', async () => {
     const fake = createProviderProcessRuntime(TEST_PROVIDER_PID, false);
     const localCoordinator = new LaunchCoordinator({ runtime: fake.runtime });
     const manager = new DefaultProviderHostManager({
@@ -251,11 +337,12 @@ describe('launch admission', () => {
       manager.openSession(createExclusiveSpec({ command: 'fake-codex', args: ['app-server'] }), { jobId: 'job-a' }),
     ).rejects.toMatchObject({
       code: 'process_identity_unverified',
-      message: expect.stringContaining('is not a process-group leader'),
+      message: expect.stringContaining('has no attributable live process group'),
       context: { provider: 'codex', pid: TEST_PROVIDER_PID },
     });
-    expect(fake.processKill).toHaveBeenCalledWith(-TEST_PROVIDER_PID, 0);
-    expect(fake.childKill).toHaveBeenCalledWith('SIGTERM');
+    expect(fake.observeLiveness).toHaveBeenCalledWith(-TEST_PROVIDER_PID);
+    expect(fake.processKill).not.toHaveBeenCalled();
+    expect(fake.childKill).not.toHaveBeenCalled();
     expect((manager as unknown as { entries: Map<string, unknown> }).entries.size).toBe(0);
     expect([...manager.admissionSnapshot().state.values()].some((entry) => entry.phase === 'live')).toBe(false);
     expect(manager.listProviderHosts().some((entry) => entry.status === 'live')).toBe(false);
@@ -374,7 +461,7 @@ describe('launch admission', () => {
     expect(coordinator.getActiveJobIds('discuss')).toEqual(['discuss-2']);
   });
 
-  it('returns queue_full when the internal queue limit is reached', () => {
+  it('returns queue_full when the internal queue limit is reached', async () => {
     expect(coordinator.requestLaunch('job-1', 'codex', providerOwner('session-1'))).toMatchObject({
       type: 'immediate',
     });
@@ -389,7 +476,7 @@ describe('launch admission', () => {
 
     expect(coordinator.queueDepth()).toBe(20);
     expect(coordinator.requestLaunch('job-22', 'codex', providerOwner('session-22'))).toBe('queue_full');
-    coordinator.terminateAll();
+    await coordinator.terminateAll();
   });
 
   it('admits queued jobs in strict FIFO order when a launch is released', async () => {
@@ -482,5 +569,864 @@ describe('launch admission', () => {
     coordinator.releaseLaunch('default-1');
     await permit;
     expect(coordinator.getActiveJobIds('default')).toContain('queued-1');
+  });
+
+  it('confirms termination when a refused attempt is followed by observed absence', async () => {
+    const cleanupHandles = (coordinator as unknown as { readonly cleanupHandles: Map<symbol, DurableProcessCleanup> })
+      .cleanupHandles;
+    const cleanupKey = Symbol('refused-child');
+    let attempts = 0;
+    cleanupHandles.set(cleanupKey, async () => {
+      attempts += 1;
+      return attempts === 1
+        ? {
+            kind: 'signal-refused' as const,
+            pid: TEST_PROVIDER_PID,
+            reason: 'recorded-incarnation-unavailable' as const,
+          }
+        : { kind: 'observed-absent' as const, pid: TEST_PROVIDER_PID };
+    });
+
+    const termination = coordinator.terminateAll();
+    await new Promise((resolve) => setTimeout(resolve, 75));
+
+    await expect(termination).resolves.toEqual({ kind: 'all-observed-absent' });
+    expect(cleanupHandles.has(cleanupKey)).toBe(false);
+  });
+
+  it('retains and identifies a child that is still alive at the deadline', async () => {
+    const cleanupHandles = (coordinator as unknown as { readonly cleanupHandles: Map<symbol, DurableProcessCleanup> })
+      .cleanupHandles;
+    const cleanupKey = Symbol('alive-child');
+    cleanupHandles.set(cleanupKey, async () => ({
+      kind: 'target-alive',
+      pid: TEST_PROVIDER_PID,
+      stage: 'after-sigkill',
+    }));
+    const controller = new AbortController();
+    const termination = coordinator.terminateAll(controller.signal);
+
+    await new Promise((resolve) => setTimeout(resolve, 10));
+    controller.abort();
+
+    await expect(termination).resolves.toEqual({
+      kind: 'unresolved-at-deadline',
+      processes: [{ kind: 'target-alive', pid: TEST_PROVIDER_PID, stage: 'after-sigkill' }],
+      pendingLaunches: 0,
+      retainedLaunches: [],
+      cleanupHandles: 1,
+      retainedProcesses: [],
+      cleanupFailures: 0,
+      owner: 'launch-coordinator',
+    });
+    expect(cleanupHandles.has(cleanupKey)).toBe(true);
+  });
+
+  it('joins a cleanup attempt that outlives the caller deadline', async () => {
+    const cleanupHandles = (coordinator as unknown as { readonly cleanupHandles: Map<symbol, DurableProcessCleanup> })
+      .cleanupHandles;
+    let settleCleanup!: (outcome: { kind: 'observed-absent'; pid: number }) => void;
+    const cleanupSettlement = new Promise<{ kind: 'observed-absent'; pid: number }>((resolve) => {
+      settleCleanup = resolve;
+    });
+    const cleanup = vi.fn(() => cleanupSettlement);
+    cleanupHandles.set(Symbol('deferred-child'), cleanup);
+    const controller = new AbortController();
+
+    const initial = coordinator.terminateAll(controller.signal);
+    controller.abort();
+    await expect(initial).resolves.toMatchObject({ kind: 'unresolved-at-deadline' });
+
+    const retry = coordinator.terminateAll();
+    expect(cleanup).toHaveBeenCalledOnce();
+    settleCleanup({ kind: 'observed-absent', pid: TEST_PROVIDER_PID });
+    await expect(retry).resolves.toEqual({ kind: 'all-observed-absent' });
+    expect(cleanup).toHaveBeenCalledOnce();
+  });
+
+  it('starts a fresh cleanup immediately when a timed-out attempt later settles without absence', async () => {
+    const cleanupHandles = (coordinator as unknown as { readonly cleanupHandles: Map<symbol, DurableProcessCleanup> })
+      .cleanupHandles;
+    let settleCleanup!: (outcome: { kind: 'target-unobservable'; pid: number; stage: 'after-sigkill' }) => void;
+    const firstSettlement = new Promise<{ kind: 'target-unobservable'; pid: number; stage: 'after-sigkill' }>(
+      (resolve) => {
+        settleCleanup = resolve;
+      },
+    );
+    const cleanup = vi
+      .fn<DurableProcessCleanup>()
+      .mockImplementationOnce(() => firstSettlement)
+      .mockResolvedValueOnce({ kind: 'observed-absent', pid: TEST_PROVIDER_PID });
+    cleanupHandles.set(Symbol('deferred-child'), cleanup);
+    const controller = new AbortController();
+
+    const initial = coordinator.terminateAll(controller.signal);
+    controller.abort();
+    await expect(initial).resolves.toMatchObject({ kind: 'unresolved-at-deadline' });
+    expect(cleanup).toHaveBeenCalledOnce();
+
+    settleCleanup({ kind: 'target-unobservable', pid: TEST_PROVIDER_PID, stage: 'after-sigkill' });
+    await firstSettlement;
+    const retry = coordinator.terminateAll();
+
+    expect(cleanup).toHaveBeenCalledTimes(2);
+    await expect(retry).resolves.toEqual({ kind: 'all-observed-absent' });
+  });
+
+  it('returns unresolved ownership when its abort signal bounds an unobservable child', async () => {
+    const cleanupHandles = (coordinator as unknown as { readonly cleanupHandles: Map<symbol, DurableProcessCleanup> })
+      .cleanupHandles;
+    const cleanupKey = Symbol('unobservable-child');
+    cleanupHandles.set(cleanupKey, async () => ({
+      kind: 'target-unobservable',
+      pid: TEST_PROVIDER_PID,
+      stage: 'after-sigkill',
+    }));
+    const controller = new AbortController();
+    const termination = coordinator.terminateAll(controller.signal);
+
+    await new Promise((resolve) => setTimeout(resolve, 10));
+    controller.abort();
+
+    await expect(termination).resolves.toEqual({
+      kind: 'unresolved-at-deadline',
+      processes: [
+        {
+          kind: 'target-unobservable',
+          pid: TEST_PROVIDER_PID,
+          stage: 'after-sigkill',
+        },
+      ],
+      pendingLaunches: 0,
+      retainedLaunches: [],
+      cleanupHandles: 1,
+      retainedProcesses: [],
+      cleanupFailures: 0,
+      owner: 'launch-coordinator',
+    });
+    expect(cleanupHandles.has(cleanupKey)).toBe(true);
+  });
+
+  it('bounds a pending wrapper join and reports the retained launch identity', async () => {
+    const base = createRealRuntime('prod');
+    const runtime: Runtime = {
+      ...base,
+      process: {
+        ...base.process,
+        durable: {
+          ...base.process.durable,
+          launch: () => new Promise<never>(() => undefined),
+        },
+      },
+    };
+    const localCoordinator = new LaunchCoordinator({ runtime });
+    void localCoordinator.spawnDurableJob({
+      provider: 'codex',
+      command: 'codex',
+      args: ['exec'],
+      jobDir: '/tmp/pending-wrapper',
+      permitGranted: true,
+    });
+    const controller = new AbortController();
+    const termination = localCoordinator.terminateAll(controller.signal);
+
+    controller.abort();
+
+    await expect(termination).resolves.toEqual({
+      kind: 'unresolved-at-deadline',
+      processes: [],
+      pendingLaunches: 1,
+      retainedLaunches: [{ kind: 'awaiting-wrapper-identity', provider: 'codex', jobDir: '/tmp/pending-wrapper' }],
+      cleanupHandles: 0,
+      retainedProcesses: [],
+      cleanupFailures: 0,
+      owner: 'launch-coordinator',
+    });
+  });
+
+  it('retains a held durable launch until its join settles before propagating failure', async () => {
+    const base = createRealRuntime('prod');
+    let observeLaunch!: () => void;
+    const launchObserved = new Promise<void>((resolve) => {
+      observeLaunch = resolve;
+    });
+    let settleRetry!: () => void;
+    const retryAfter = new Promise<void>((resolve) => {
+      settleRetry = resolve;
+    });
+    const retry = vi.fn(async () => ({ disposition: 'settled' as const }));
+    const launch = vi.fn(async () => {
+      observeLaunch();
+      return {
+        disposition: 'held' as const,
+        owner: 'launch-caller' as const,
+        pid: TEST_PROVIDER_PID,
+        reason: 'synthetic held launch',
+        retryAfter,
+        retry,
+      };
+    });
+    const runtime: Runtime = {
+      ...base,
+      process: {
+        ...base.process,
+        durable: { ...base.process.durable, launch },
+      },
+    };
+    const localCoordinator = new LaunchCoordinator({ runtime });
+    const spawn = localCoordinator.spawnDurableJob({
+      provider: 'codex',
+      command: 'codex',
+      args: ['exec'],
+      jobDir: '/tmp/held-durable-launch',
+      permitGranted: true,
+    });
+    await launchObserved;
+
+    let terminationSettled = false;
+    const termination = localCoordinator.terminateAll().then((result) => {
+      terminationSettled = true;
+      return result;
+    });
+    await Promise.resolve();
+    expect(terminationSettled).toBe(false);
+    expect(retry).not.toHaveBeenCalled();
+
+    settleRetry();
+
+    await expect(spawn).rejects.toThrow('synthetic held launch');
+    expect(retry).toHaveBeenCalledOnce();
+    await expect(termination).resolves.toEqual({ kind: 'all-observed-absent' });
+  });
+
+  it('terminates an accepted wrapper aborted before identification and retains it until settlement', async () => {
+    const base = createRealRuntime('prod');
+    const controller = new AbortController();
+    const requestTermination = vi.fn();
+    let acceptWrapper!: () => void;
+    const wrapperAccepted = new Promise<void>((resolve) => {
+      acceptWrapper = resolve;
+    });
+    let settleWrapper!: () => void;
+    const wrapperSettlement = new Promise<void>((resolve) => {
+      settleWrapper = resolve;
+    });
+    const launch = vi.fn((options: Parameters<Runtime['process']['durable']['launch']>[0]) => {
+      options.onWrapperSpawned?.({
+        pid: TEST_PROVIDER_PID,
+        settled: wrapperSettlement,
+        requestTermination,
+      });
+      acceptWrapper();
+      return new Promise<never>(() => undefined);
+    });
+    const runtime: Runtime = {
+      ...base,
+      process: {
+        ...base.process,
+        durable: { ...base.process.durable, launch },
+      },
+    };
+    const localCoordinator = new LaunchCoordinator({ runtime });
+    void localCoordinator.spawnDurableJob({
+      provider: 'codex',
+      command: 'codex',
+      args: ['exec'],
+      jobDir: '/tmp/accepted-pending-wrapper',
+      permitGranted: true,
+      signal: controller.signal,
+    });
+    await wrapperAccepted;
+
+    controller.abort();
+
+    expect(requestTermination).toHaveBeenCalledOnce();
+    let terminationSettled = false;
+    const termination = localCoordinator.terminateAll().then((result) => {
+      terminationSettled = true;
+      return result;
+    });
+    await Promise.resolve();
+    expect(terminationSettled).toBe(false);
+
+    settleWrapper();
+
+    await expect(termination).resolves.toEqual({ kind: 'all-observed-absent' });
+  });
+
+  it('reaps a live Darwin wrapper before propagating a readiness rejection', async () => {
+    const base = createRealRuntime('prod');
+    const incarnation = testIncarnation(7_001);
+    let elapsedMs = 0n;
+    let exited = false;
+    let settleWrapper!: () => void;
+    const wrapperSettlement = new Promise<void>((resolve) => {
+      settleWrapper = resolve;
+    });
+    const launch = vi.fn(async (options: Parameters<Runtime['process']['durable']['launch']>[0]) => {
+      options.onWrapperSpawned?.({
+        pid: TEST_PROVIDER_PID,
+        settled: wrapperSettlement,
+        requestTermination: () => ({
+          kind: 'signal-failed',
+          pid: null,
+          signal: 'SIGTERM',
+          reason: 'kill-port-returned-false',
+        }),
+      });
+      options.onWrapperIdentified?.({
+        runtimeRecord: {
+          transport: 'durable-cli',
+          pid: TEST_PROVIDER_PID,
+          stdoutPath: '/tmp/readiness-rejection/stdout',
+          stderrPath: '/tmp/readiness-rejection/stderr',
+          startTime: new Date(0).toISOString(),
+        },
+        pid: TEST_PROVIDER_PID,
+        leaderIncarnation: incarnation,
+        signalAuthority: testSignalAuthority(TEST_PROVIDER_PID, () => exited),
+      });
+      throw new Error('synthetic readiness rejection');
+    });
+    const kill = vi.fn<ProcessPort['kill']>((pid, signal) => {
+      if (signal === 0) return !exited;
+      expect(pid).toBe(-TEST_PROVIDER_PID);
+      exited = true;
+      settleWrapper();
+      return true;
+    });
+    const runtime: Runtime = {
+      ...base,
+      env: { ...base.env, platform: () => 'darwin' },
+      time: {
+        ...base.time,
+        monotonicNow: () => elapsedMs,
+        sleep: async (milliseconds) => {
+          elapsedMs += BigInt(milliseconds);
+        },
+      },
+      process: {
+        ...base.process,
+        kill,
+        observeLiveness: () => (exited ? 'absent' : 'alive'),
+        readProcessIncarnation: () => (exited ? null : incarnation),
+        observeRecordedProcessAsync: async () => (exited ? 'absent' : 'alive'),
+        durable: { ...base.process.durable, launch },
+      },
+    };
+    const localCoordinator = new LaunchCoordinator({ runtime });
+
+    await expect(
+      localCoordinator.spawnDurableJob({
+        provider: 'codex',
+        command: 'codex',
+        args: ['exec'],
+        jobDir: '/tmp/readiness-rejection',
+        permitGranted: true,
+      }),
+    ).rejects.toThrow('synthetic readiness rejection');
+
+    await expect(localCoordinator.terminateAll()).resolves.toEqual({ kind: 'all-observed-absent' });
+    expect(kill).toHaveBeenCalledWith(-TEST_PROVIDER_PID, 'SIGTERM');
+  });
+
+  it('publishes and abandons an incarnation-bound wrapper hold after readiness rejects', async () => {
+    const base = createRealRuntime('prod');
+    const incarnation = testIncarnation(7_002);
+    let elapsedMs = 0n;
+    const requestTermination = vi.fn();
+    let settleWrapper!: () => void;
+    const wrapperSettlement = new Promise<void>((resolve) => {
+      settleWrapper = resolve;
+    });
+    const launch = vi.fn(async (options: Parameters<Runtime['process']['durable']['launch']>[0]) => {
+      options.onWrapperSpawned?.({
+        pid: TEST_PROVIDER_PID,
+        settled: wrapperSettlement,
+        requestTermination,
+      });
+      options.onWrapperIdentified?.({
+        runtimeRecord: {
+          transport: 'durable-cli',
+          pid: TEST_PROVIDER_PID,
+          stdoutPath: '/tmp/provisional-readiness-rejection/stdout',
+          stderrPath: '/tmp/provisional-readiness-rejection/stderr',
+          startTime: new Date(0).toISOString(),
+        },
+        pid: TEST_PROVIDER_PID,
+        leaderIncarnation: incarnation,
+        signalAuthority: testSignalAuthority(TEST_PROVIDER_PID, () => false, requestTermination),
+      });
+      throw new Error('synthetic provisional readiness rejection');
+    });
+    const runtime: Runtime = {
+      ...base,
+      env: { ...base.env, platform: () => 'darwin' },
+      time: {
+        ...base.time,
+        monotonicNow: () => elapsedMs,
+        sleep: async (milliseconds) => {
+          elapsedMs += BigInt(milliseconds);
+        },
+      },
+      process: {
+        ...base.process,
+        observeLiveness: () => 'alive',
+        readProcessIncarnation: () => null,
+        durable: { ...base.process.durable, launch },
+      },
+    };
+    const localCoordinator = new LaunchCoordinator({ runtime });
+    const observations = vi.fn(
+      (
+        identity: DurableCliProcessSubject | DurableProvisionalProcessSubject,
+        status?: DurableContainmentStatus,
+        control?: DurableContainmentOperatorControl,
+      ) => {
+        if (status?.kind === 'held') {
+          expect(identity).toEqual({
+            kind: 'provisional-wrapper',
+            pid: TEST_PROVIDER_PID,
+            incarnation,
+            processGroupId: TEST_PROVIDER_PID,
+            provider: 'codex',
+            jobDir: '/tmp/provisional-readiness-rejection',
+          });
+          const abandonment = control?.abandon();
+          expect(abandonment).toEqual({
+            kind: 'abandoned',
+            reason: 'job ownership was released without proof of process absence',
+            nextStep: 'Inspect the recorded process because it may still be live.',
+          });
+          if (abandonment?.kind === 'abandoned') settleWrapper();
+        }
+        return { kind: 'published' as const };
+      },
+    );
+
+    await expect(
+      localCoordinator.spawnDurableJob({
+        provider: 'codex',
+        command: 'codex',
+        args: ['exec'],
+        jobDir: '/tmp/provisional-readiness-rejection',
+        permitGranted: true,
+        onDurableProcessIdentity: observations,
+      }),
+    ).rejects.toThrow('synthetic provisional readiness rejection');
+
+    expect(requestTermination).not.toHaveBeenCalled();
+    expect(
+      observations.mock.calls.some(([identity, status]) => 'kind' in identity && status?.kind === 'operator-abandoned'),
+    ).toBe(true);
+    await expect(localCoordinator.terminateAll()).resolves.toEqual({ kind: 'all-observed-absent' });
+  });
+
+  it('does not mint absence from an abruptly dead wrapper while its recorded child remains alive', async () => {
+    const base = createRealRuntime('prod');
+    let rejectLaunch!: (error: Error) => void;
+    const incarnation = testIncarnation(7_001);
+    const childPid = TEST_PROVIDER_PID + 1;
+    const launch = vi.fn((options: Parameters<Runtime['process']['durable']['launch']>[0]) => {
+      options.onSpawned?.({
+        runtimeRecord: {
+          transport: 'durable-cli',
+          pid: TEST_PROVIDER_PID,
+          stdoutPath: '/tmp/unpublished-launch/stdout',
+          stderrPath: '/tmp/unpublished-launch/stderr',
+          startTime: new Date(0).toISOString(),
+        },
+        leaderIncarnation: incarnation,
+        childRoot: { pid: childPid, incarnation },
+      });
+      return new Promise<never>((_resolve, reject) => {
+        rejectLaunch = reject;
+      });
+    });
+    const runtime: Runtime = {
+      ...base,
+      time: {
+        ...base.time,
+        sleep: () => new Promise<never>(() => undefined),
+      },
+      process: {
+        ...base.process,
+        kill: vi.fn(() => true),
+        observeLiveness: (pid) => (pid === TEST_PROVIDER_PID ? 'absent' : 'alive'),
+        readProcessIncarnation: (pid) => (pid === TEST_PROVIDER_PID ? null : incarnation),
+        durable: { ...base.process.durable, launch },
+      },
+    };
+    const localCoordinator = new LaunchCoordinator({ runtime });
+    const onRuntimeRecord = vi.fn();
+    const onDurableProcessIdentity = vi.fn();
+    const spawn = localCoordinator.spawnDurableJob({
+      provider: 'codex',
+      command: 'codex',
+      args: ['exec'],
+      jobDir: '/tmp/unpublished-launch',
+      permitGranted: true,
+      onRuntimeRecord,
+      onDurableProcessIdentity,
+    });
+    const controller = new AbortController();
+    const termination = localCoordinator.terminateAll(controller.signal);
+
+    controller.abort();
+
+    await expect(termination).resolves.toEqual({
+      kind: 'unresolved-at-deadline',
+      processes: [],
+      pendingLaunches: 0,
+      retainedLaunches: [],
+      cleanupHandles: 1,
+      retainedProcesses: [
+        {
+          kind: 'recorded-wrapper-group',
+          provider: 'codex',
+          jobDir: '/tmp/unpublished-launch',
+          containment: {
+            pid: TEST_PROVIDER_PID,
+            incarnation,
+            processGroupId: TEST_PROVIDER_PID,
+            childRoot: { pid: childPid, incarnation },
+          },
+        },
+      ],
+      cleanupFailures: 0,
+      owner: 'launch-coordinator',
+    });
+    expect(onRuntimeRecord).toHaveBeenCalledOnce();
+    expect(onDurableProcessIdentity).toHaveBeenCalledWith({
+      pid: TEST_PROVIDER_PID,
+      incarnation,
+      processGroupId: TEST_PROVIDER_PID,
+      childRoot: { pid: childPid, incarnation },
+    });
+    expect(runtime.process.kill).not.toHaveBeenCalled();
+    rejectLaunch(new Error('synthetic launch settlement'));
+    void spawn.catch(() => {});
+    await Promise.resolve();
+    await Promise.resolve();
+    expect(onDurableProcessIdentity.mock.calls.some(([, status]) => status?.kind === 'held')).toBe(true);
+    expect(
+      (localCoordinator as unknown as { readonly cleanupHandles: Map<symbol, DurableProcessCleanup> }).cleanupHandles
+        .size,
+    ).toBe(1);
+  });
+
+  it('releases cleanup ownership before propagating a wrapper crash', async () => {
+    const base = createRealRuntime('prod');
+    const incarnation = testIncarnation(7_002);
+    const childRoot = { pid: TEST_PROVIDER_PID + 1, incarnation };
+    const runtimeRecord = {
+      transport: 'durable-cli' as const,
+      pid: TEST_PROVIDER_PID,
+      stdoutPath: '/tmp/wrapper-crash/stdout',
+      stderrPath: '/tmp/wrapper-crash/stderr',
+      startTime: new Date(0).toISOString(),
+    };
+    const wrapperError = new Error('synthetic wrapper crash');
+    const runtime: Runtime = {
+      ...base,
+      time: {
+        ...base.time,
+        sleep: async () => undefined,
+      },
+      process: {
+        ...base.process,
+        observeLiveness: () => 'absent',
+        readProcessIncarnation: () => null,
+        durable: {
+          launch: async (options) => {
+            options.onSpawned?.({ runtimeRecord, leaderIncarnation: incarnation, childRoot });
+            return {
+              disposition: 'launched',
+              launchHandle: 'wrapper-crash' as never,
+              pid: TEST_PROVIDER_PID,
+              stdoutPath: runtimeRecord.stdoutPath,
+              stderrPath: runtimeRecord.stderrPath,
+              runtimeRecord,
+              processSubject: {
+                pid: TEST_PROVIDER_PID,
+                incarnation,
+                processGroupId: TEST_PROVIDER_PID,
+                childRoot,
+              },
+            };
+          },
+          waitForExit: async () => {
+            throw wrapperError;
+          },
+        },
+      },
+    };
+    const localCoordinator = new LaunchCoordinator({ runtime });
+    const cleanupOwnership = localCoordinator as unknown as {
+      readonly cleanupHandles: Map<symbol, DurableProcessCleanup>;
+      readonly cleanupRetentions: Map<DurableProcessCleanup, unknown>;
+    };
+
+    await expect(
+      localCoordinator.spawnDurableJob({
+        provider: 'codex',
+        command: 'codex',
+        args: ['exec'],
+        jobDir: '/tmp/wrapper-crash',
+        permitGranted: true,
+      }),
+    ).rejects.toBe(wrapperError);
+
+    expect(cleanupOwnership.cleanupHandles.size).toBe(0);
+    expect(cleanupOwnership.cleanupRetentions.size).toBe(0);
+  });
+
+  it('publishes a durable hold and makes abort an explicit abandonment without absence proof', async () => {
+    const base = createRealRuntime('prod');
+    const incarnation = testIncarnation(7_002);
+    const childRoot = { pid: TEST_PROVIDER_PID + 1, incarnation };
+    const runtimeRecord = {
+      transport: 'durable-cli' as const,
+      pid: TEST_PROVIDER_PID,
+      stdoutPath: '/tmp/held-result/stdout',
+      stderrPath: '/tmp/held-result/stderr',
+      startTime: new Date(0).toISOString(),
+    };
+    const runtime: Runtime = {
+      ...base,
+      env: { ...base.env, platform: () => 'darwin' },
+      process: {
+        ...base.process,
+        kill: vi.fn(() => true),
+        observeLiveness: () => 'alive',
+        readProcessIncarnation: () => null,
+        observeRecordedProcessAsync: async () => 'unknown',
+        durable: {
+          launch: async (options) => {
+            options.onSpawned?.({ runtimeRecord, leaderIncarnation: incarnation, childRoot });
+            return {
+              disposition: 'launched',
+              launchHandle: 'held-result' as never,
+              pid: TEST_PROVIDER_PID,
+              stdoutPath: runtimeRecord.stdoutPath,
+              stderrPath: runtimeRecord.stderrPath,
+              runtimeRecord,
+              processSubject: {
+                pid: TEST_PROVIDER_PID,
+                incarnation,
+                processGroupId: TEST_PROVIDER_PID,
+                childRoot,
+              },
+              signalAuthority: testSignalAuthority(TEST_PROVIDER_PID, () => true),
+            };
+          },
+          waitForExit: async () => ({ exitCode: 0, signal: null, endTime: new Date(1).toISOString() }),
+        },
+      },
+    };
+    const localCoordinator = new LaunchCoordinator({ runtime });
+    const abort = new AbortController();
+    const holdControls: DurableContainmentOperatorControl[] = [];
+    const observations = vi.fn(
+      (
+        _identity: DurableCliProcessSubject | DurableProvisionalProcessSubject,
+        _status?: DurableContainmentStatus,
+        control?: DurableContainmentOperatorControl,
+      ) => {
+        if (control !== undefined) holdControls.push(control);
+        return { kind: 'published' as const };
+      },
+    );
+    const spawn = localCoordinator.spawnDurableJob({
+      provider: 'codex',
+      command: 'codex',
+      args: ['exec'],
+      jobDir: '/tmp/held-result',
+      permitGranted: true,
+      signal: abort.signal,
+      onDurableProcessIdentity: observations,
+    });
+
+    await vi.waitFor(() => {
+      expect(
+        observations.mock.calls.some(
+          ([identity, status]) =>
+            identity.pid === TEST_PROVIDER_PID && status?.kind === 'held' && status.abandonment === 'abort-job',
+        ),
+      ).toBe(true);
+    });
+    abort.abort();
+    const holdControl = holdControls.at(-1);
+    if (holdControl === undefined) throw new Error('Expected durable containment abandonment control');
+    // Abandonment refuses while a cleanup attempt is settling; its named exit is repeating the abort.
+    await vi.waitFor(() => expect(holdControl.abandon()).toMatchObject({ kind: 'abandoned' }));
+
+    await expect(spawn).resolves.toMatchObject({ code: 0, aborted: true });
+    expect(
+      observations.mock.calls.some(
+        ([identity, status]) =>
+          identity.pid === TEST_PROVIDER_PID &&
+          status?.kind === 'operator-abandoned' &&
+          status.processAbsenceProven === false,
+      ),
+    ).toBe(true);
+    expect(runtime.process.kill).not.toHaveBeenCalled();
+    await expect(localCoordinator.terminateAll()).resolves.toEqual({ kind: 'all-observed-absent' });
+  });
+
+  it('retains cleanup ownership and settlement when absence publication fails', async () => {
+    const base = createRealRuntime('prod');
+    const incarnation = testIncarnation(7_003);
+    const childRoot = { pid: TEST_PROVIDER_PID + 1, incarnation };
+    const runtimeRecord = {
+      transport: 'durable-cli' as const,
+      pid: TEST_PROVIDER_PID,
+      stdoutPath: '/tmp/failed-absence-publication/stdout',
+      stderrPath: '/tmp/failed-absence-publication/stderr',
+      startTime: new Date(0).toISOString(),
+    };
+    let processAbsent = false;
+    let retryCleanup!: () => void;
+    const retryHandle = {};
+    const clearInterval = vi.fn();
+    const exitRecord = { exitCode: 0, signal: null, endTime: new Date(1).toISOString() } as const;
+    let resolveExit!: (record: typeof exitRecord) => void;
+    const exit = new Promise<typeof exitRecord>((resolve) => {
+      resolveExit = resolve;
+    });
+    const runtime: Runtime = {
+      ...base,
+      env: { ...base.env, platform: () => 'darwin' },
+      time: {
+        ...base.time,
+        setInterval: (callback) => {
+          retryCleanup = callback;
+          return retryHandle;
+        },
+        clearInterval,
+      },
+      process: {
+        ...base.process,
+        kill: vi.fn(() => true),
+        observeLiveness: () => (processAbsent ? 'absent' : 'unknown'),
+        readProcessIncarnation: () => null,
+        durable: {
+          launch: async (options) => {
+            options.onSpawned?.({ runtimeRecord, leaderIncarnation: incarnation, childRoot });
+            return {
+              disposition: 'launched',
+              launchHandle: 'failed-absence-publication' as never,
+              pid: TEST_PROVIDER_PID,
+              stdoutPath: runtimeRecord.stdoutPath,
+              stderrPath: runtimeRecord.stderrPath,
+              runtimeRecord,
+              processSubject: {
+                pid: TEST_PROVIDER_PID,
+                incarnation,
+                processGroupId: TEST_PROVIDER_PID,
+                childRoot,
+              },
+            };
+          },
+          waitForExit: () => exit,
+        },
+      },
+    };
+    const localCoordinator = new LaunchCoordinator({ runtime });
+    const abort = new AbortController();
+    let identityPublished = false;
+    let absencePublicationAttempts = 0;
+    let holdControl: DurableContainmentOperatorControl | undefined;
+    const observations = vi.fn(
+      (
+        _identity: DurableCliProcessSubject | DurableProvisionalProcessSubject,
+        status?: DurableContainmentStatus,
+        control?: DurableContainmentOperatorControl,
+      ) => {
+        if (status === undefined) identityPublished = true;
+        if (status?.kind === 'held') holdControl = control;
+        if (status?.kind === 'absence-confirmed') {
+          absencePublicationAttempts += 1;
+          return { kind: 'retained' as const, reason: 'synthetic absence publication failure' };
+        }
+        return { kind: 'published' as const };
+      },
+    );
+    let settled = false;
+    const spawn = localCoordinator
+      .spawnDurableJob({
+        provider: 'codex',
+        command: 'codex',
+        args: ['exec'],
+        jobDir: '/tmp/failed-absence-publication',
+        permitGranted: true,
+        signal: abort.signal,
+        onDurableProcessIdentity: observations,
+      })
+      .finally(() => {
+        settled = true;
+      });
+
+    await vi.waitFor(() => expect(identityPublished).toBe(true));
+    abort.abort();
+    await vi.waitFor(() => expect(holdControl).toBeDefined());
+    const cleanupOwnership = localCoordinator as unknown as {
+      readonly cleanupHandles: Map<symbol, DurableProcessCleanup>;
+      readonly cleanupRetentions: Map<DurableProcessCleanup, unknown>;
+    };
+    const retainedCleanup = [...cleanupOwnership.cleanupHandles.values()][0];
+    if (retainedCleanup === undefined) throw new Error('Expected retained durable cleanup ownership');
+    await retainedCleanup();
+    processAbsent = true;
+    retryCleanup();
+    expect(holdControl?.abandon()).toEqual({
+      kind: 'retained',
+      reason: 'the active durable containment cleanup attempt is still settling',
+      nextStep: 'Retry the abort after the active cleanup attempt settles.',
+    });
+    expect(cleanupOwnership.cleanupHandles.size).toBe(1);
+    await retainedCleanup();
+
+    expect(absencePublicationAttempts).toBe(1);
+    expect(cleanupOwnership.cleanupHandles.size).toBe(1);
+    expect(cleanupOwnership.cleanupRetentions.size).toBe(1);
+    expect(clearInterval).not.toHaveBeenCalled();
+    expect(settled).toBe(false);
+
+    expect(holdControl?.abandon()).toEqual({
+      kind: 'abandoned',
+      reason: 'job ownership was released without proof of process absence',
+      nextStep: 'Inspect the recorded process because it may still be live.',
+    });
+    resolveExit(exitRecord);
+    await expect(spawn).resolves.toMatchObject({ code: 0, aborted: true });
+    expect(clearInterval).toHaveBeenCalledWith(retryHandle);
+  });
+
+  it('refuses new admission after shutdown begins', async () => {
+    await expect(coordinator.terminateAll()).resolves.toEqual({ kind: 'all-observed-absent' });
+
+    expect(() => coordinator.requestLaunch('late-job', 'codex', providerOwner('late-session'))).toThrow(
+      'Launch rejected because shutdown has begun',
+    );
+    await expect(
+      coordinator.spawnDurableJob({
+        provider: 'codex',
+        command: 'codex',
+        args: ['exec'],
+        jobDir: '/tmp/sim/jobs/late-job',
+        permitGranted: true,
+      }),
+    ).rejects.toThrow('Launch rejected because shutdown has begun');
+  });
+
+  it('releases cleanup ownership only after observed absence', async () => {
+    const cleanupHandles = (coordinator as unknown as { readonly cleanupHandles: Map<symbol, DurableProcessCleanup> })
+      .cleanupHandles;
+    const cleanupKey = Symbol('absent-child');
+    cleanupHandles.set(cleanupKey, async () => ({ kind: 'observed-absent', pid: TEST_PROVIDER_PID }));
+
+    await expect(coordinator.terminateAll()).resolves.toEqual({ kind: 'all-observed-absent' });
+    expect(cleanupHandles.has(cleanupKey)).toBe(false);
   });
 });

@@ -45,10 +45,13 @@ import type {
 } from '#src/coordinator/services/provider-proxy-set/containment-proof.js';
 import type { ProviderProxySetAddress } from '#src/provider-proxy/set-address.js';
 import { createRealRuntime } from '#src/runtime/real.js';
+import type { Principal } from '#src/security/principal.js';
 import { applyBundledStoreSchema, type Database } from '#src/store/db.js';
 import { currentCoralStoreFormat } from '#src/store-format.js';
 import type { JobStore } from '#src/jobs/store.js';
 import type { ProviderProxySetOperatorExitResult } from '#src/coordinator/services/provider-proxy-set/index.js';
+import { executeCatalogRequest } from '#src/transport/dispatch.js';
+import { providerProxySetContainBooleanRpcSpec, providerProxySetContainRpcSpec } from '#src/transport/rpc/catalog.js';
 import { createMockKbDaemonSupervisor } from '#tools/testing/kb-daemon-supervisor.js';
 import { createDeferred } from '#tools/testing/deferred.js';
 import { setStoreServicesForTest } from '#tools/testing/store-services.js';
@@ -67,6 +70,12 @@ const noEffect = {
 const proofAuthorization = {} as ProviderProxySetContainmentProofAuthorization;
 const capability = { setIdentity: address, containmentProofAuthorization: proofAuthorization } as never;
 const opaqueProof = {} as ProviderProxySetContainmentProof;
+const operator: Principal = {
+  subject: 'operator',
+  transport: 'ipc',
+  credential: { kind: 'boot-token', id: 'operator' },
+  binding: { kind: 'unbound' },
+};
 
 function providerHostManager(): ProviderHostManager {
   return {
@@ -74,8 +83,18 @@ function providerHostManager(): ProviderHostManager {
       throw new Error('provider host was not expected');
     },
     attachSession: async () => null,
-    drainForHandoff: async () => undefined,
-    shutdown: async () => undefined,
+    drainForHandoff: async () => ({
+      kind: 'provider-hosts-quiesced',
+      liveProxySets: [],
+      acquisitionCleanupHolds: [],
+      closingHosts: [],
+    }),
+    shutdown: async () => ({
+      kind: 'provider-hosts-quiesced',
+      liveProxySets: [],
+      acquisitionCleanupHolds: [],
+      closingHosts: [],
+    }),
     routeAppServerOperation: () => null,
   };
 }
@@ -125,7 +144,12 @@ function createHarness(): Readonly<{
   if (ports?.providerProxySets === undefined) throw new Error('provider proxy set port was not composed');
   const lifecycle = world.providerProxyLifecycleRef.get();
   if (lifecycle === null) throw new Error('provider proxy lifecycle was not composed');
-  return { contain: ports.providerProxySets.contain, db, lifecycle, prover: world.providerProxySetContainmentProver };
+  return {
+    contain: ports.providerProxySets.contain,
+    db,
+    lifecycle,
+    prover: world.providerProxySetContainmentProver,
+  };
 }
 
 let harness: ReturnType<typeof createHarness>;
@@ -147,12 +171,142 @@ describe('provider proxy set operator RPC composition', () => {
     const proof = vi.spyOn(harness.prover, 'collectContainmentProof');
     const complete = vi.spyOn(harness.lifecycle, 'completeOperatorExit');
 
-    await expect(harness.contain({ setIdentity: address, abandonWithoutAbsence: false })).resolves.toEqual({
+    await expect(harness.contain({ setIdentity: address, mode: 'contain' })).resolves.toEqual({
       kind: 'set-not-found',
       setIdentity: address,
       effect: noEffect,
     });
     expect(authorize).toHaveBeenCalledExactlyOnceWith(address);
+    expect(proof).not.toHaveBeenCalled();
+    expect(complete).not.toHaveBeenCalled();
+  });
+
+  it('answers a boolean abandonment request with its strict response generation', async () => {
+    const authorize = vi
+      .spyOn(harness.lifecycle, 'authorizeBooleanOperatorExit')
+      .mockReturnValue({ kind: 'authorized', capability });
+    vi.spyOn(harness.prover, 'collectContainmentProof').mockResolvedValue(opaqueProof);
+    const complete = vi.spyOn(harness.lifecycle, 'completeBooleanOperatorExit').mockResolvedValue({
+      kind: 'unattributable-group-abandoned',
+      setIdentity: address,
+      claimDischarge: { kind: 'initial-disposition-pending', exit: 'initial-disposition-settlement' },
+      effect: {
+        signalsSent: ['SIGTERM'],
+        containmentAbsent: false,
+        representationAction: 'abandonment-release-started',
+      },
+    });
+
+    const request = providerProxySetContainBooleanRpcSpec.requestSchema.parse({
+      setIdentity: address,
+      abandonWithoutAbsence: true,
+    });
+
+    const ports = captured.ports;
+    if (ports === null) throw new Error('coordinator ports were not captured');
+    await expect(
+      executeCatalogRequest(providerProxySetContainBooleanRpcSpec, request, ports, operator),
+    ).resolves.toEqual({
+      kind: 'unary',
+      body: {
+        kind: 'unattributable-group-abandoned',
+        setIdentity: address,
+        claimDischarge: { kind: 'initial-disposition-retry-owned' },
+        effect: {
+          signalsSent: ['SIGTERM'],
+          containmentAbsent: false,
+          representationAction: 'abandonment-release-started',
+        },
+      },
+    });
+    expect(authorize).toHaveBeenCalledExactlyOnceWith(address);
+    expect(complete).toHaveBeenCalledExactlyOnceWith(capability, opaqueProof, true, undefined);
+  });
+
+  it('returns each RPC contract after current completion observes a fatal release successor', async () => {
+    const effect = {
+      signalsSent: ['SIGTERM'] as const,
+      containmentAbsent: true,
+      representationAction: 'absence-release-started' as const,
+    };
+    vi.spyOn(harness.prover, 'collectContainmentProof').mockResolvedValue(opaqueProof);
+    vi.spyOn(harness.lifecycle, 'authorizeOperatorExit').mockReturnValue({ kind: 'authorized', capability });
+    vi.spyOn(harness.lifecycle, 'completeOperatorExit').mockResolvedValue({
+      kind: 'representation-release-abandonment-required',
+      setIdentity: address,
+      effect,
+    });
+    const ports = captured.ports;
+    if (ports === null) throw new Error('coordinator ports were not captured');
+
+    await expect(
+      executeCatalogRequest(
+        providerProxySetContainRpcSpec,
+        providerProxySetContainRpcSpec.requestSchema.parse({ setIdentity: address, mode: 'contain' }),
+        ports,
+        operator,
+      ),
+    ).resolves.toEqual({
+      kind: 'unary',
+      body: { kind: 'representation-release-abandonment-required', setIdentity: address, effect },
+    });
+
+    vi.spyOn(harness.lifecycle, 'authorizeBooleanOperatorExit').mockReturnValue({ kind: 'authorized', capability });
+    vi.spyOn(harness.lifecycle, 'completeBooleanOperatorExit').mockResolvedValue({
+      kind: 'contained',
+      setIdentity: address,
+      disappearanceReceipt: 'operator-observed-absence',
+      claimDischarge: { kind: 'initial-disposition-pending', exit: 'initial-disposition-settlement' },
+      effect,
+    });
+    await expect(
+      executeCatalogRequest(
+        providerProxySetContainBooleanRpcSpec,
+        providerProxySetContainBooleanRpcSpec.requestSchema.parse({
+          setIdentity: address,
+          abandonWithoutAbsence: false,
+        }),
+        ports,
+        operator,
+      ),
+    ).resolves.toEqual({
+      kind: 'unary',
+      body: {
+        kind: 'contained',
+        setIdentity: address,
+        disappearanceReceipt: 'operator-observed-absence',
+        claimDischarge: { kind: 'initial-disposition-retry-owned' },
+        effect,
+      },
+    });
+  });
+
+  it('refuses a legacy-only state before authorization or containment-proof collection', async () => {
+    const authorizeBoolean = vi
+      .spyOn(harness.lifecycle, 'authorizeBooleanOperatorExit')
+      .mockReturnValue({ kind: 'unsupported-contract' });
+    const authorizeCurrent = vi.spyOn(harness.lifecycle, 'authorizeOperatorExit');
+    const proof = vi.spyOn(harness.prover, 'collectContainmentProof');
+    const complete = vi.spyOn(harness.lifecycle, 'completeBooleanOperatorExit');
+    const request = providerProxySetContainBooleanRpcSpec.requestSchema.parse({
+      setIdentity: address,
+      abandonWithoutAbsence: true,
+    });
+    const ports = captured.ports;
+    if (ports === null) throw new Error('coordinator ports were not captured');
+
+    await expect(
+      executeCatalogRequest(providerProxySetContainBooleanRpcSpec, request, ports, operator),
+    ).resolves.toEqual({
+      kind: 'unsupported-method',
+      statusCode: 404,
+      body: {
+        code: 'unsupported_method',
+        message: 'The legacy containment contract cannot represent this provider-proxy set state.',
+      },
+    });
+    expect(authorizeBoolean).toHaveBeenCalledExactlyOnceWith(address);
+    expect(authorizeCurrent).not.toHaveBeenCalled();
     expect(proof).not.toHaveBeenCalled();
     expect(complete).not.toHaveBeenCalled();
   });
@@ -168,7 +322,7 @@ describe('provider proxy set operator RPC composition', () => {
     });
     const signal = new AbortController().signal;
 
-    const pending = harness.contain({ setIdentity: address, abandonWithoutAbsence: false }, signal);
+    const pending = harness.contain({ setIdentity: address, mode: 'contain' }, signal);
     expect(proof).toHaveBeenCalledExactlyOnceWith(proofAuthorization, harness.db, signal);
     expect(complete).not.toHaveBeenCalled();
     stale = true;
@@ -225,9 +379,7 @@ describe('provider proxy set operator RPC composition', () => {
     const complete = vi.spyOn(harness.lifecycle, 'completeOperatorExit').mockResolvedValue(result);
     const signal = new AbortController().signal;
 
-    await expect(harness.contain({ setIdentity: address, abandonWithoutAbsence: false }, signal)).resolves.toEqual(
-      result,
-    );
+    await expect(harness.contain({ setIdentity: address, mode: 'contain' }, signal)).resolves.toEqual(result);
     expect(proof).toHaveBeenCalledExactlyOnceWith(proofAuthorization, harness.db, signal);
     expect(complete).toHaveBeenCalledExactlyOnceWith(capability, opaqueProof, false, signal);
   });
@@ -256,9 +408,7 @@ describe('provider proxy set operator RPC composition', () => {
     const complete = vi.spyOn(harness.lifecycle, 'completeOperatorExit').mockResolvedValue(result);
     const signal = new AbortController().signal;
 
-    await expect(harness.contain({ setIdentity: address, abandonWithoutAbsence: true }, signal)).resolves.toEqual(
-      result,
-    );
+    await expect(harness.contain({ setIdentity: address, mode: 'abandon' }, signal)).resolves.toEqual(result);
     expect(complete).toHaveBeenCalledExactlyOnceWith(capability, opaqueProof, true, signal);
   });
 });

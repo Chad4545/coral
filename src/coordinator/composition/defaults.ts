@@ -89,7 +89,12 @@ export function resolveCoordinatorDefaults(
   const createExecutionService: NonNullable<CoordinatorCoreOptions['createExecutionService']> =
     options.createExecutionService ?? ((ctx: InvocationContext, deps) => new DefaultExecutionService(ctx, deps));
   const fetchFn: FetchFn = options.fetchFn ?? ((url, init) => globalThis.fetch(url, init));
-  const discoveryRuntime = { storage: runtime.storage, env: runtime.env, paths: runtime.paths };
+  const discoveryRuntime = {
+    storage: runtime.storage,
+    env: runtime.env,
+    paths: runtime.paths,
+    process: runtime.process,
+  };
   const writeBackendInfoFn = options.writeBackendInfoFn ?? ((info) => writeBackendInfo(info, discoveryRuntime));
   const removeBackendInfoIfOwnerFn =
     options.removeBackendInfoIfOwnerFn ?? ((instanceId) => removeBackendInfoIfOwner(instanceId, discoveryRuntime));
@@ -153,7 +158,7 @@ export function resolveCoordinatorDefaults(
           if (progressStore === null) return;
           return markJobsAsError(progressStore, message, runtime.time.now(), signal, (cb) => progressStore.commit(cb));
         });
-      const terminateAllFn = options.terminateAllFn ?? (() => bindings.launchCoordinator.terminateAll());
+      const terminateAllFn = options.terminateAllFn ?? ((signal) => bindings.launchCoordinator.terminateAll(signal));
 
       return {
         ...eager,

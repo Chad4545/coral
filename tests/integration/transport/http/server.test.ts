@@ -629,7 +629,12 @@ describe('execution backend server', () => {
     const pluginRoot = createProjectRoot('backend-info-flavor');
     const namespace = pluginRootNamespace(pluginRoot);
 
-    const discoveryRuntime = { storage: runtime.storage, env: runtime.env, paths: runtime.paths };
+    const discoveryRuntime = {
+      storage: runtime.storage,
+      env: runtime.env,
+      paths: runtime.paths,
+      process: runtime.process,
+    };
     backendInfo.writeBackendInfo(
       {
         pid: process.pid,
@@ -738,7 +743,7 @@ describe('execution backend server', () => {
       expansionRpc: createUnexpectedExpansionRpc(),
       stop: vi.fn(async () => currentHealth),
       restart: vi.fn(async () => currentHealth),
-      dispose: vi.fn(async () => undefined),
+      dispose: vi.fn(async () => ({ kind: 'confirmed-absent' as const, snapshot: daemonHealth })),
     };
     const backend = await startBackendServer({ kbDaemonSupervisor });
     await vi.waitFor(() => {
@@ -787,7 +792,7 @@ describe('execution backend server', () => {
       expansionRpc: createUnexpectedExpansionRpc(),
       stop: vi.fn(async () => daemonHealth),
       restart: vi.fn(async () => daemonHealth),
-      dispose: vi.fn(async () => undefined),
+      dispose: vi.fn(async () => ({ kind: 'confirmed-absent' as const, snapshot: daemonHealth })),
     };
     const backend = await startBackendServer({
       bootSnapshot: { now: () => 2_000 },
@@ -1035,7 +1040,7 @@ describe('execution backend server', () => {
       expansionRpc: createUnexpectedExpansionRpc(),
       stop: vi.fn(async () => daemonHealth),
       restart: vi.fn(async () => daemonHealth),
-      dispose: vi.fn(async () => undefined),
+      dispose: vi.fn(async () => ({ kind: 'confirmed-absent' as const, snapshot: daemonHealth })),
     };
     const backend = await startBackendServer({ kbDaemonSupervisor });
     const projectRoot = ALTERNATE_PROJECT_ROOT;
@@ -1131,7 +1136,7 @@ describe('execution backend server', () => {
       expansionRpc: createUnexpectedExpansionRpc(),
       stop: vi.fn(async () => daemonHealth),
       restart: vi.fn(async () => daemonHealth),
-      dispose: vi.fn(async () => undefined),
+      dispose: vi.fn(async () => ({ kind: 'confirmed-absent' as const, snapshot: daemonHealth })),
     };
     const backend = await startBackendServer({ kbDaemonSupervisor });
     const projectRoot = ALTERNATE_PROJECT_ROOT;
@@ -1184,7 +1189,7 @@ describe('execution backend server', () => {
       expansionRpc: createUnexpectedExpansionRpc(),
       stop: vi.fn(async () => daemonHealth),
       restart: vi.fn(async () => daemonHealth),
-      dispose: vi.fn(async () => undefined),
+      dispose: vi.fn(async () => ({ kind: 'confirmed-absent' as const, snapshot: daemonHealth })),
     };
     const backend = await startBackendServer({ kbDaemonSupervisor });
     const projectRoot = ALTERNATE_PROJECT_ROOT;
@@ -1311,7 +1316,7 @@ describe('execution backend server', () => {
       abortKbJobs: vi.fn(async () => ({ aborted: [], notFound: [] })),
       stop: vi.fn(async () => daemonHealth),
       restart: vi.fn(async () => daemonHealth),
-      dispose: vi.fn(async () => undefined),
+      dispose: vi.fn(async () => ({ kind: 'confirmed-absent' as const, snapshot: daemonHealth })),
     };
     const backend = await startBackendServer({ kbDaemonSupervisor });
     const progressStore = createProgressStore();
@@ -1427,7 +1432,7 @@ describe('execution backend server', () => {
       abortKbJobs: vi.fn(async () => ({ aborted: [], notFound: [] })),
       stop: vi.fn(async () => daemonHealth),
       restart: vi.fn(async () => daemonHealth),
-      dispose: vi.fn(async () => undefined),
+      dispose: vi.fn(async () => ({ kind: 'confirmed-absent' as const, snapshot: daemonHealth })),
     };
     const backend = await startBackendServer({ kbDaemonSupervisor });
     const progressStore = createProgressStore();
@@ -1522,7 +1527,7 @@ describe('execution backend server', () => {
       abortKbJobs,
       stop: vi.fn(async () => daemonHealth),
       restart: vi.fn(async () => daemonHealth),
-      dispose: vi.fn(async () => undefined),
+      dispose: vi.fn(async () => ({ kind: 'confirmed-absent' as const, snapshot: daemonHealth })),
     };
     const backend = await startBackendServer({ eventBus, kbDaemonSupervisor });
     const progressStore = createProgressStore();
@@ -1798,16 +1803,27 @@ describe('execution backend server', () => {
     }
 
     const launchCoordinator = createLaunchCoordinator();
-    const handle = await launchCoordinator.spawnProviderServer({
-      provider: 'codex',
-      command: process.execPath,
-      args: ['-e', createProviderServerScript()],
-    });
+    const handle = await launchCoordinator.spawnProviderServer(
+      {
+        provider: 'codex',
+        command: process.execPath,
+        args: ['-e', createProviderServerScript()],
+      },
+      undefined,
+      undefined,
+      undefined,
+      (hold) => ({ kind: 'accepted', owner: 'provider-host-manager', settlement: hold.settled }),
+    );
+    if ('kind' in handle) throw new Error('Expected a contained provider server handle.');
 
     try {
       expect(checkIdle()).toBe(true);
     } finally {
-      await handle.close();
+      await handle.close((hold) => ({
+        kind: 'accepted',
+        owner: 'provider-host-manager',
+        settlement: hold.settled,
+      }));
       await backend.controller.shutdown('test');
       await backend.controller.waitForShutdown();
     }
@@ -5647,7 +5663,7 @@ describe('execution backend server', () => {
       expansionRpc: createUnexpectedExpansionRpc(),
       stop: vi.fn(async () => daemonHealth),
       restart: vi.fn(async () => daemonHealth),
-      dispose: vi.fn(async () => undefined),
+      dispose: vi.fn(async () => ({ kind: 'confirmed-absent' as const, snapshot: daemonHealth })),
     };
     const backend = await startBackendServer({ kbDaemonSupervisor });
     const warnSpy = vi.spyOn(backendLog, 'warn').mockImplementation(() => undefined);
@@ -5710,7 +5726,7 @@ describe('execution backend server', () => {
       listActiveKbJobs,
       stop: vi.fn(async () => daemonHealth),
       restart,
-      dispose: vi.fn(async () => undefined),
+      dispose: vi.fn(async () => ({ kind: 'confirmed-absent' as const, snapshot: daemonHealth })),
     };
     const backend = await startBackendServer({ kbDaemonSupervisor });
     const progressStore = createProgressStore();
@@ -5982,7 +5998,7 @@ describe('execution backend server', () => {
   describe('shutdown policy', () => {
     it('handoff shutdown preserves children and does not mark jobs as error', async () => {
       const markJobsAsErrorFn = vi.fn();
-      const terminateAllFn = vi.fn();
+      const terminateAllFn = vi.fn(() => ({ kind: 'all-observed-absent' as const }));
 
       const backend = await startBackendServer({
         markJobsAsErrorFn,
@@ -6057,6 +6073,7 @@ describe('execution backend server', () => {
             bundleHash: '0123456789abcdef',
             cliBundleHash: 'testclihash1234',
             claudeAppserverBundleHash: 'testclaudehash12',
+            durableWrapperBundleHash: 'testwrapperhash',
             flavor: 'prod',
             instanceId: 'handoff-instance-1',
             token: 'test-token',
@@ -6093,7 +6110,7 @@ describe('execution backend server', () => {
           removeBackendInfoIfOwnerFn: () => {},
           cleanupStaleJobsFn: () => {},
           markJobsAsErrorFn: vi.fn(),
-          terminateAllFn: vi.fn(),
+          terminateAllFn: vi.fn(() => ({ kind: 'all-observed-absent' as const })),
           providerHostManager: providerHostManager as never,
           kbDaemonSupervisor,
           handoffQuiescePorts: () => [fakeService as never],
@@ -6127,9 +6144,9 @@ describe('execution backend server', () => {
       expect(quiesceOrder ?? Number.POSITIVE_INFINITY).toBeLessThan(drainOrder ?? Number.POSITIVE_INFINITY);
     });
 
-    it('hard shutdown kills children and marks jobs as error', async () => {
+    it('hard shutdown completes after child absence is confirmed and marks jobs as error', async () => {
       const markJobsAsErrorFn = vi.fn();
-      const terminateAllFn = vi.fn();
+      const terminateAllFn = vi.fn(async () => ({ kind: 'all-observed-absent' as const }));
       const providerHostManager = createFakeProviderHostManager();
 
       const backend = await startBackendServer({
@@ -6146,7 +6163,9 @@ describe('execution backend server', () => {
       expect(providerHostManager.shutdown).toHaveBeenCalledTimes(1);
       const hostShutdownOrder = providerHostManager.shutdown.mock.invocationCallOrder.at(0);
       const childKillOrder = terminateAllFn.mock.invocationCallOrder.at(0);
+      const terminalizationOrder = markJobsAsErrorFn.mock.invocationCallOrder.at(0);
       expect(hostShutdownOrder ?? Number.POSITIVE_INFINITY).toBeLessThan(childKillOrder ?? Number.POSITIVE_INFINITY);
+      expect(childKillOrder ?? Number.POSITIVE_INFINITY).toBeLessThan(terminalizationOrder ?? Number.POSITIVE_INFINITY);
     });
 
     it('hard shutdown during blocked startup persists abort markers for persisted-only recovery candidates before restart and skips terminal history', async () => {

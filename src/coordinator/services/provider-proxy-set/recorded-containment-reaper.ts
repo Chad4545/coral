@@ -1,32 +1,92 @@
+import { errorMessage } from '../../../infra/error-format.js';
 import { createMonotonicClock } from '../../../infra/monotonic-clock.js';
 import { reapRecordedContainment } from '../../../infra/process-containment.js';
-import {
-  MAX_PROXY_RECORDED_PROVIDER_ROOTS,
-  providerProxyDisappearanceReceipt,
-} from '../../../provider-proxy/enforcement.js';
+import type { ProviderProxySetContainmentEvidence } from '../../../provider-proxy/containment-proof-contract.js';
+import { MAX_PROXY_RECORDED_PROVIDER_ROOTS } from '../../../provider-proxy/enforcement.js';
+import { providerProxyDisappearanceReceipt } from '../../../provider-proxy/protocol.js';
 import { PROXY_TEARDOWN_RESERVE_MS } from '../../../provider-proxy/orphan-deadline.js';
 import type { Runtime } from '../../../runtime/ports.js';
-import { providerProxySetContainmentEvidenceFor, type ProviderProxySetContainmentProof } from './containment-proof.js';
+import {
+  providerProxySetContainmentEvidenceFor,
+  releaseProviderProxySetContainmentProofFence,
+  verifyProviderProxySetContainmentProofCurrent,
+  type ProviderProxySetFencedContainmentProof,
+} from './containment-proof.js';
 import type { ProviderProxySetIdentity } from './identity.js';
+import type { DurableProviderProxySetContainmentHoldOutcome } from './operator-disposition-store.js';
 
 const providerSetDisappearanceClockScope = Symbol('provider-set-disappearance');
 
 /** Signals the exact recorded containment with one stage of the bounded escalation. */
 export type ProviderProxySetContainmentSignal = 'SIGTERM' | 'SIGKILL';
 
-/** The only terminal observations produced by exact recorded-containment reaping. */
 export type ProviderProxySetRecordedContainmentReapResult =
   | Readonly<{ kind: 'containment-absent'; disappearanceReceipt: string }>
-  | Readonly<{ kind: 'recorded-group-unattributable' }>;
+  | Readonly<{ kind: 'recorded-group-unattributable' }>
+  | Readonly<{ kind: 'signal-authorization-refused' }>
+  | Readonly<{ kind: 'identity-unobservable'; signalDelivered: boolean }>
+  | Readonly<{ kind: 'authorization-missing' }>
+  | Readonly<{ kind: 'authorization-stale' }>
+  | Readonly<{ kind: 'store-unreadable' }>;
 
-/** Destructive owner port that accepts only an identity-bound opaque containment proof. */
+/** The caller retains the proof lease across this port and must release or transfer it from the result. */
 export type ProviderProxySetRecordedContainmentReaper = (
   identity: ProviderProxySetIdentity,
-  proof: ProviderProxySetContainmentProof,
+  proof: ProviderProxySetFencedContainmentProof,
   signal: AbortSignal,
   onSignal: (signal: ProviderProxySetContainmentSignal) => void,
   assertSignalAuthorized?: () => void,
 ) => Promise<ProviderProxySetRecordedContainmentReapResult>;
+
+export type DurableProviderProxySetContainmentReobservation =
+  | Readonly<{ kind: 'retry'; reason: string }>
+  | Readonly<{
+      kind: 'retire';
+      proof: ProviderProxySetFencedContainmentProof;
+      disappearanceReceipt: string;
+    }>
+  | Readonly<{
+      kind: 'publish-hold';
+      evidence: Extract<ProviderProxySetContainmentEvidence, Readonly<{ kind: 'reap-required' }>>;
+      reapOutcome: DurableProviderProxySetContainmentHoldOutcome;
+    }>;
+
+export async function reobserveDurableProviderProxySetContainment(
+  options: Readonly<{
+    identity: ProviderProxySetIdentity;
+    proof: ProviderProxySetFencedContainmentProof;
+    signal: AbortSignal;
+    reapRecordedContainment: ProviderProxySetRecordedContainmentReaper;
+  }>,
+): Promise<DurableProviderProxySetContainmentReobservation> {
+  const evidence = providerProxySetContainmentEvidenceFor(options.proof, options.identity);
+  if (evidence.kind !== 'reap-required') {
+    releaseProviderProxySetContainmentProofFence(options.proof);
+    return { kind: 'retry', reason: `containment evidence was ${evidence.kind}` };
+  }
+  let transferred = false;
+  try {
+    const outcome = await options.reapRecordedContainment(
+      options.identity,
+      options.proof,
+      options.signal,
+      () => undefined,
+    );
+    if (outcome.kind === 'containment-absent') {
+      transferred = true;
+      return {
+        kind: 'retire',
+        proof: options.proof,
+        disappearanceReceipt: outcome.disappearanceReceipt,
+      };
+    }
+    return { kind: 'publish-hold', evidence, reapOutcome: outcome };
+  } catch (error: unknown) {
+    return { kind: 'retry', reason: JSON.stringify(errorMessage(error)).slice(1, -1) };
+  } finally {
+    if (!transferred) releaseProviderProxySetContainmentProofFence(options.proof);
+  }
+}
 
 /** Builds the only reaper that can turn an identity-bound proof into recorded-target signal authority. */
 export function createProviderProxySetRecordedContainmentReaper(
@@ -56,11 +116,12 @@ export function createProviderProxySetRecordedContainmentReaper(
       },
     );
     signal.throwIfAborted();
-    return outcome.kind === 'containment-absent'
-      ? {
-          kind: 'containment-absent',
-          disappearanceReceipt: providerProxyDisappearanceReceipt(evidence.containment, evidence.recordedRoots),
-        }
-      : outcome;
+    if (outcome.kind !== 'containment-absent') return outcome;
+    const currentness = verifyProviderProxySetContainmentProofCurrent(proof, identity);
+    if (currentness.kind !== 'current') return currentness;
+    return {
+      kind: 'containment-absent',
+      disappearanceReceipt: providerProxyDisappearanceReceipt(evidence.containment, evidence.recordedRoots),
+    };
   };
 }

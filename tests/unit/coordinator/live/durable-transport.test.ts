@@ -48,20 +48,22 @@ async function waitForValue<T>(read: () => T | null, timeoutMs = 2_000): Promise
 
 describe('durable transport', () => {
   let coordinator: LaunchCoordinator;
+  let runtime: ReturnType<typeof createRealRuntime>;
   let tmpRoot: string;
 
   beforeEach(() => {
     process.env.CORAL_MAX_WORKERS = '1';
     process.env.CORAL_DISCUSS_MAX_WORKERS = '1';
-    coordinator = new LaunchCoordinator({ runtime: createRealRuntime('prod') });
+    runtime = createRealRuntime('prod');
+    coordinator = new LaunchCoordinator({ runtime });
     tmpRoot = mkdtempSync(join(tmpdir(), 'coral-live-durable-'));
   });
 
-  afterEach(() => {
+  afterEach(async () => {
     rmSync(tmpRoot, { recursive: true, force: true });
     delete process.env.CORAL_MAX_WORKERS;
     delete process.env.CORAL_DISCUSS_MAX_WORKERS;
-    coordinator.terminateAll();
+    await coordinator.terminateAll();
     vi.restoreAllMocks();
   });
 
@@ -106,12 +108,44 @@ describe('durable transport', () => {
     expect(tailWatermark).toBeGreaterThan(0);
   });
 
-  it('spawns a provider server with JSON-RPC transport and stable generation ids', async () => {
-    const handle = await coordinator.spawnProviderServer({
+  it('holds the provider result until an unattributable surviving descendant exits', async () => {
+    const jobDir = join(tmpRoot, 'job-with-descendant');
+    mkdirSync(jobDir, { recursive: true });
+
+    const result = await coordinator.spawnDurableJob({
       provider: 'codex',
       command: process.execPath,
-      args: ['-e', createProviderServerScript()],
+      args: [
+        '-e',
+        [
+          "const { spawn } = require('node:child_process');",
+          "const descendant = spawn(process.execPath, ['-e', 'setTimeout(() => {}, 250)'], { stdio: 'ignore' });",
+          "process.stdout.write(String(descendant.pid) + '\\n');",
+          'descendant.unref();',
+        ].join(''),
+      ],
+      jobDir,
     });
+
+    const descendantPid = Number(result.stdout.trim());
+    expect(result.code).toBe(0);
+    expect(Number.isSafeInteger(descendantPid)).toBe(true);
+    expect(runtime.process.observeLiveness(descendantPid)).toBe('absent');
+  });
+
+  it('spawns a provider server with JSON-RPC transport and stable generation ids', async () => {
+    const handle = await coordinator.spawnProviderServer(
+      {
+        provider: 'codex',
+        command: process.execPath,
+        args: ['-e', createProviderServerScript()],
+      },
+      undefined,
+      undefined,
+      undefined,
+      (hold) => ({ kind: 'accepted', owner: 'provider-host-manager', settlement: hold.settled }),
+    );
+    if ('kind' in handle) throw new Error('Expected a contained provider server handle.');
 
     expect(handle.pid).toBeGreaterThan(0);
     expect(handle.generation).toBe(1);
@@ -130,15 +164,26 @@ describe('durable transport', () => {
     });
 
     unsubscribe();
-    await handle.close();
+    await handle.close((hold) => ({
+      kind: 'accepted',
+      owner: 'provider-host-manager',
+      settlement: hold.settled,
+    }));
   });
 
   it('closes provider servers that emit an oversized JSONL line', async () => {
-    const handle = await coordinator.spawnProviderServer({
-      provider: 'codex',
-      command: process.execPath,
-      args: ['-e', createOversizedProviderServerScript()],
-    });
+    const handle = await coordinator.spawnProviderServer(
+      {
+        provider: 'codex',
+        command: process.execPath,
+        args: ['-e', createOversizedProviderServerScript()],
+      },
+      undefined,
+      undefined,
+      undefined,
+      (hold) => ({ kind: 'accepted', owner: 'provider-host-manager', settlement: hold.settled }),
+    );
+    if ('kind' in handle) throw new Error('Expected a contained provider server handle.');
 
     const outcome = await handle.closePromise;
     expect(outcome).toBeInstanceOf(Error);
@@ -156,17 +201,28 @@ describe('durable transport', () => {
   });
 
   it('terminateAll drains queued launches but does not kill provider servers', async () => {
-    const handle = await coordinator.spawnProviderServer({
-      provider: 'codex',
-      command: process.execPath,
-      args: ['-e', createProviderServerScript()],
-    });
+    const handle = await coordinator.spawnProviderServer(
+      {
+        provider: 'codex',
+        command: process.execPath,
+        args: ['-e', createProviderServerScript()],
+      },
+      undefined,
+      undefined,
+      undefined,
+      (hold) => ({ kind: 'accepted', owner: 'provider-host-manager', settlement: hold.settled }),
+    );
+    if ('kind' in handle) throw new Error('Expected a contained provider server handle.');
 
-    coordinator.terminateAll();
+    await coordinator.terminateAll();
 
     await expect(handle.rpc.request('ping', { value: 'still-live' })).resolves.toEqual({
       pong: 'still-live',
     });
-    await handle.close();
+    await handle.close((hold) => ({
+      kind: 'accepted',
+      owner: 'provider-host-manager',
+      settlement: hold.settled,
+    }));
   });
 });

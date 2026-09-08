@@ -28,6 +28,16 @@ import { testProjectPrincipal } from '#tests/helpers/principal.js';
 import { createBoundIpcLifecycleDeps } from '#tests/helpers/bound-ipc-lifecycle.js';
 import type { WorkflowExecutionPort } from '#src/workflow/execution-contract.js';
 import type { WorkflowFinalizationIntent } from '#src/workflow/finalization.js';
+import type { LifecycleShutdownDisposition } from '#src/coordinator/lifecycle.js';
+import {
+  readDurableCliContainmentStatus,
+  readDurableCliProcessRuntimeEvidence,
+  writeDurableCliContainmentStatus,
+  writeDurableCliProcessRuntimeMeta,
+} from '#src/jobs/runtime-meta-store.js';
+import { testIncarnation } from '#tests/helpers/process-incarnation.js';
+
+const RUNNING_ADOPTION_JOB_ID = '00000000-0000-4000-8000-000000000777';
 
 const mockState = vi.hoisted(() => ({
   tmpHome: '',
@@ -54,6 +64,7 @@ type HarnessOptions = {
   serviceOverrides?: Record<string, unknown>;
   recoverPersistedDiscussImpl?: () => Promise<[]>;
   workflowResumeImpl?: () => Promise<void>;
+  log?: (message: string) => void;
 };
 
 async function loadModules() {
@@ -220,7 +231,7 @@ function createFakeExecutionAndRecoveryService(overrides: Record<string, unknown
     completeRecoveredJob: vi.fn(),
     finalizeInterruptedAppServerJob: vi.fn(async () => {}),
     finalizeInterruptedDurableJob: vi.fn(async () => {}),
-    interruptAppServerJob: vi.fn(async () => {}),
+    interruptAppServerJob: vi.fn(async () => ({ kind: 'acknowledged' as const })),
     ...overrides,
   };
 }
@@ -275,6 +286,22 @@ function stubRuntimeRecord(
     stderrPath: join(jobsDir(runtime.env), options.jobId, 'stderr'),
     startTime: options.startTime ?? '2026-04-17T00:00:00.000Z',
   });
+  if (/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/.test(options.jobId)) {
+    const incarnation =
+      runtime.process.readProcessIncarnation(options.pid, runtime.env.platform() as NodeJS.Platform) ??
+      testIncarnation(options.pid);
+    writeDurableCliProcessRuntimeMeta(progressStore.getDb(), {
+      jobId: options.jobId,
+      pid: options.pid,
+      incarnation,
+      processGroupId: options.pid,
+      childRoot: { pid: options.pid, incarnation },
+    });
+    const readProcessIncarnation = runtime.process.readProcessIncarnation.bind(runtime.process);
+    vi.spyOn(runtime.process, 'readProcessIncarnation').mockImplementation((pid, platform) =>
+      pid === options.pid ? incarnation : readProcessIncarnation(pid, platform),
+    );
+  }
 }
 
 function stubRecoverableWorkflow(
@@ -371,19 +398,49 @@ function stubRecoverableWorkflow(
 }
 
 async function stopLifecycleController(controller: {
-  shutdown: (reason: string) => Promise<void>;
-  waitForShutdown: () => Promise<void>;
-}): Promise<void> {
+  shutdown: (reason: string) => Promise<LifecycleShutdownDisposition>;
+  waitForShutdown: () => Promise<LifecycleShutdownDisposition>;
+}): Promise<LifecycleShutdownDisposition | null> {
+  let disposition: LifecycleShutdownDisposition | null = null;
   try {
-    await controller.shutdown('test-cleanup');
+    disposition = await controller.shutdown('test-cleanup');
   } catch {
     /* best effort */
   }
-  try {
-    await controller.waitForShutdown();
-  } catch {
-    /* best effort */
+
+  if (disposition === null) {
+    try {
+      disposition = await controller.waitForShutdown();
+    } catch {
+      return null;
+    }
   }
+
+  if (disposition.disposition === 'held' && disposition.recovery.automaticRetry.status === 'scheduled') {
+    try {
+      await vi.waitFor(
+        async () => {
+          disposition = await controller.waitForShutdown();
+          if (disposition.disposition === 'held' && disposition.recovery.automaticRetry.status === 'scheduled') {
+            throw new Error('automatic cleanup is still scheduled');
+          }
+        },
+        { timeout: 5_000 },
+      );
+    } catch (error: unknown) {
+      throw new Error('Automatic lifecycle cleanup did not reach finalized or waiting-for-operator within 5s.', {
+        cause: error,
+      });
+    }
+  }
+
+  if (disposition.disposition === 'held') {
+    const { automaticRetry, retainedOwnership } = disposition.recovery;
+    throw new Error(
+      `Test lifecycle cleanup held: status=${automaticRetry.status}; attempts=${automaticRetry.attemptsStarted}/${automaticRetry.attemptLimit}; reason=${disposition.reason}; exit=${disposition.recovery.exit}; cleanupObligations=${JSON.stringify(retainedOwnership.cleanupObligations)}; operatorActions=${JSON.stringify(retainedOwnership.operatorActions)}`,
+    );
+  }
+  return disposition;
 }
 
 function createCoordinatorShutdownHarness(options: HarnessOptions) {
@@ -426,13 +483,14 @@ function createCoordinatorShutdownHarness(options: HarnessOptions) {
         bundleHash: '1111111111111111',
         cliBundleHash: '2222222222222222',
         claudeAppserverBundleHash: '3333333333333333',
+        durableWrapperBundleHash: '4444444444444444',
         flavor: 'prod',
         instanceId: `recovery-shutdown-${Math.random()}`,
         token: 'test-token',
         bootToken: 'test-boot-token',
         shutdownToken: 'test-shutdown-token',
         now: () => 1,
-        log: () => {},
+        log: options.log ?? (() => {}),
       },
       runtime,
       backendPid: 1234,
@@ -461,7 +519,7 @@ function createCoordinatorShutdownHarness(options: HarnessOptions) {
       removeBackendInfoIfOwnerFn: () => {},
       cleanupStaleJobsFn: () => {},
       markJobsAsErrorFn: () => {},
-      terminateAllFn: () => {},
+      terminateAllFn: () => ({ kind: 'all-observed-absent' }),
       providerHostManager: createFakeProviderHostManager() as never,
       kbDaemonSupervisor,
       handoffQuiescePorts: () => [],
@@ -512,7 +570,7 @@ function createCoordinatorShutdownHarness(options: HarnessOptions) {
   );
 
   seedTestJobSession(progressStore, {
-    jobId: 'running-adoption-job',
+    jobId: RUNNING_ADOPTION_JOB_ID,
     sessionId: 'running-adoption-session',
     provider: 'codex',
     projectRoot,
@@ -520,7 +578,7 @@ function createCoordinatorShutdownHarness(options: HarnessOptions) {
     initialPhase: 'running',
   });
   stubLaunchRecord(progressStore, {
-    jobId: 'running-adoption-job',
+    jobId: RUNNING_ADOPTION_JOB_ID,
     sessionId: 'running-adoption-session',
     provider: 'codex',
     projectRoot,
@@ -582,7 +640,7 @@ describe('recovery coordinator shutdown', () => {
     controller = harness.controller;
 
     stubRuntimeRecord(harness.progressStore, runtime, {
-      jobId: 'running-adoption-job',
+      jobId: RUNNING_ADOPTION_JOB_ID,
       pid: process.pid,
       startTime: '2026-03-11T00:00:00.000Z',
     });
@@ -627,7 +685,7 @@ describe('recovery coordinator shutdown', () => {
         captureProviderRecoveryAuthority: vi.fn(async () => captureBlocked),
       },
     });
-    harness.progressStore.appendRuntimeStarted('running-adoption-job', {
+    harness.progressStore.appendRuntimeStarted(RUNNING_ADOPTION_JOB_ID, {
       transport: 'app-server',
       startTime: '2026-04-17T00:00:00.000Z',
       providerMeta: { provider: 'codex', leaseState: 'waiting' },
@@ -640,7 +698,7 @@ describe('recovery coordinator shutdown', () => {
     releaseCapture({ ok: false, failure: { reason: 'subject-mismatch', provider: 'codex' } });
 
     expect(((await startup) as Error).name).toBe('AbortError');
-    expect(harness.progressStore.readStatus('running-adoption-job')?.phase).toBe('running');
+    expect(harness.progressStore.readStatus(RUNNING_ADOPTION_JOB_ID)?.phase).toBe('running');
   });
 
   it('cleans up an adopted running job on shutdown after the recovery poller is live and suppresses late completion', async () => {
@@ -687,7 +745,7 @@ describe('recovery coordinator shutdown', () => {
     controller = harness.controller;
 
     stubRuntimeRecord(harness.progressStore, runtime, {
-      jobId: 'running-adoption-job',
+      jobId: RUNNING_ADOPTION_JOB_ID,
       pid,
     });
 
@@ -719,34 +777,13 @@ describe('recovery coordinator shutdown', () => {
     }
   });
 
-  // The third answer, at the site where reading it as the second would be worst: a probe that cannot answer
-  // adopts rather than finalizing. The failure this rules out is the one the boolean primitive produced —
-  // "could not tell" settling a job whose process may still be running.
-  //
-  // It pins the *adoption* decision only. The poller's own unknown branch is not observable through this
-  // harness — shutdown suppresses the finalization it would otherwise start, so mutating that branch to read
-  // unknown as absent leaves this green. Pinning it needs a harness where the controller stays up across
-  // ticks, and saying so here is the point: a green test read as covering both would be worse than no test.
-  it('keeps an adopted job adopted while its liveness probe cannot answer', async () => {
+  it('keeps an unobservable durable job held instead of reporting ordinary adoption', async () => {
     const modules = await loadModules();
     const virtualRuntime = new SimulationRuntime();
     const runtime: Runtime = { ...createRealRuntime('prod'), time: virtualRuntime.time };
     const pluginRoot = createPluginRoot('plugin-unknown-liveness');
     const projectRoot = createProjectRoot('project-unknown-liveness');
-    const cleanupSpy = vi.fn();
-    const recoveryPollMs = 500;
     const pid = 41_425;
-    let recoveryPollHandle: ReturnType<typeof runtime.time.setInterval> | null = null;
-    // eslint-disable-next-line prefer-const -- circular: the discuss hook reads controller, whose assignment depends on the harness that wires the hook
-    let controller!: ReturnType<LoadedModules['lifecycleModule']['createLifecycle']>;
-
-    const originalSetInterval = runtime.time.setInterval.bind(runtime.time);
-    vi.spyOn(runtime.time, 'setInterval').mockImplementation((fn, ms) => {
-      const handle = originalSetInterval(fn, ms);
-      if (ms === recoveryPollMs && recoveryPollHandle === null) recoveryPollHandle = handle;
-      return handle;
-    });
-    // Never answers, for this pid or any other.
     const observeLiveness = vi.spyOn(runtime.process, 'observeLiveness').mockReturnValue('unknown');
 
     const harness = createCoordinatorShutdownHarness({
@@ -754,36 +791,153 @@ describe('recovery coordinator shutdown', () => {
       runtime,
       pluginRoot,
       projectRoot,
-      serviceOverrides: { adoptRunningJob: vi.fn(() => ({ adopted: true, cleanup: cleanupSpy })) },
-      recoverPersistedDiscussImpl: async () => {
-        expect(recoveryPollHandle).not.toBeNull();
-        void controller.shutdown('test-unknown-liveness');
-        return [];
-      },
     });
-    controller = harness.controller;
 
-    stubRuntimeRecord(harness.progressStore, runtime, { jobId: 'running-adoption-job', pid });
+    stubRuntimeRecord(harness.progressStore, runtime, { jobId: RUNNING_ADOPTION_JOB_ID, pid });
 
     try {
-      await controller.start().catch(() => undefined);
-      await controller.waitForShutdown();
-
-      expect(
-        harness.fakeService.adoptRunningJob,
-        'an unanswerable probe adopts rather than finalizing',
-      ).toHaveBeenCalledTimes(1);
+      await harness.controller.start();
+      expect(harness.fakeService.adoptRunningJob).not.toHaveBeenCalled();
       expect(observeLiveness).toHaveBeenCalled();
-
-      virtualRuntime.time.tick(recoveryPollMs * 3 + 1);
-
-      expect(
-        harness.fakeService.completeRecoveredJob,
-        'nothing may be completed on evidence nobody has',
-      ).not.toHaveBeenCalled();
-      expect(cleanupSpy, 'and the adoption is not released either').toHaveBeenCalledTimes(1);
+      expect(readDurableCliContainmentStatus(harness.progressStore.getDb(), RUNNING_ADOPTION_JOB_ID)).toMatchObject({
+        kind: 'valid',
+        status: { disposition: { kind: 'held', abandonment: 'abort-job' } },
+      });
+      expect(harness.controller.getRecoveryRegistry()?.has(RUNNING_ADOPTION_JOB_ID)).toBe(true);
+      expect(harness.progressStore.readStatus(RUNNING_ADOPTION_JOB_ID)?.phase).toBe('running');
     } finally {
-      await stopLifecycleController(controller);
+      await stopLifecycleController(harness.controller);
+    }
+  });
+
+  it('quarantines a corrupt durable containment status and lets operator abort resolve it without adoption', async () => {
+    const modules = await loadModules();
+    const runtime = createRealRuntime('prod');
+    const pluginRoot = createPluginRoot('plugin-corrupt-containment-status');
+    const projectRoot = createProjectRoot('project-corrupt-containment-status');
+    const killSpy = vi.spyOn(runtime.process, 'kill');
+    const harness = createCoordinatorShutdownHarness({ modules, runtime, pluginRoot, projectRoot });
+
+    stubRuntimeRecord(harness.progressStore, runtime, {
+      jobId: RUNNING_ADOPTION_JOB_ID,
+      pid: process.pid,
+    });
+    harness.progressStore
+      .getDb()
+      .prepare('INSERT INTO meta (key, value) VALUES (?, ?)')
+      .run(`durable_cli_containment_status.v1:${RUNNING_ADOPTION_JOB_ID}`, '{not-json');
+
+    try {
+      await harness.controller.start();
+
+      expect(harness.fakeService.adoptRunningJob).not.toHaveBeenCalled();
+      expect(readDurableCliContainmentStatus(harness.progressStore.getDb(), RUNNING_ADOPTION_JOB_ID)).toEqual({
+        kind: 'corrupt',
+        jobId: RUNNING_ADOPTION_JOB_ID,
+      });
+      expect(
+        harness.progressStore
+          .getDb()
+          .prepare('SELECT state, stage FROM recovery_quarantine WHERE boundary_id = ? AND subject_key = ?')
+          .get('coordinator-job-recovery', RUNNING_ADOPTION_JOB_ID),
+      ).toEqual({ state: 'active', stage: 'settle' });
+
+      expect(harness.controller.getRecoveryRegistry()?.abort([RUNNING_ADOPTION_JOB_ID])).toEqual({
+        aborted: [],
+        notFound: [],
+        abandoned: [
+          {
+            jobId: RUNNING_ADOPTION_JOB_ID,
+            reason: 'recovery ownership was released without proof of recorded containment absence',
+            nextStep:
+              `Run coral-cli jobs detail ${RUNNING_ADOPTION_JOB_ID}; the recorded containment may still be live ` +
+              'and is no longer owned by recovery.',
+          },
+        ],
+      });
+      await vi.waitFor(() => {
+        expect(harness.fakeService.finalizeInterruptedDurableJob).toHaveBeenCalledWith(
+          expect.objectContaining({ launchRecord: expect.objectContaining({ jobId: RUNNING_ADOPTION_JOB_ID }) }),
+          expect.objectContaining({ pid: process.pid }),
+          expect.objectContaining({ cancelled: true }),
+          expect.any(Object),
+        );
+      });
+      expect(readDurableCliContainmentStatus(harness.progressStore.getDb(), RUNNING_ADOPTION_JOB_ID)).toMatchObject({
+        kind: 'valid',
+        status: { disposition: { kind: 'operator-abandoned', processAbsenceProven: false } },
+      });
+      expect(
+        harness.progressStore
+          .getDb()
+          .prepare('SELECT state FROM recovery_quarantine WHERE boundary_id = ? AND subject_key = ?')
+          .get('coordinator-job-recovery', RUNNING_ADOPTION_JOB_ID),
+      ).toBeUndefined();
+      expect(killSpy).not.toHaveBeenCalled();
+    } finally {
+      await stopLifecycleController(harness.controller);
+    }
+  });
+
+  it('registers an operator exit before reporting a terminal job durable hold', async () => {
+    const modules = await loadModules();
+    const runtime = createRealRuntime('prod');
+    const pluginRoot = createPluginRoot('plugin-terminal-containment-hold');
+    const projectRoot = createProjectRoot('project-terminal-containment-hold');
+    const recoveryLog = vi.fn<(message: string) => void>();
+    const harness = createCoordinatorShutdownHarness({ modules, runtime, pluginRoot, projectRoot, log: recoveryLog });
+
+    stubRuntimeRecord(harness.progressStore, runtime, {
+      jobId: RUNNING_ADOPTION_JOB_ID,
+      pid: process.pid,
+    });
+    writeDurableCliContainmentStatus(harness.progressStore.getDb(), {
+      jobId: RUNNING_ADOPTION_JOB_ID,
+      evidence: readDurableCliProcessRuntimeEvidence(
+        harness.progressStore.getDb(),
+        RUNNING_ADOPTION_JOB_ID,
+        process.pid,
+      ),
+      disposition: {
+        kind: 'held',
+        reason: 'synthetic terminal containment hold',
+        retryIntervalMs: 500,
+        abandonment: 'abort-job',
+      },
+    });
+    commitJobTerminal(harness.progressStore, RUNNING_ADOPTION_JOB_ID, 'running-adoption-session', {
+      content: 'already terminal',
+      outcome: { kind: 'completed' },
+      durationMs: 0,
+    });
+
+    try {
+      await harness.controller.start();
+
+      const recoveryRegistry = harness.controller.getRecoveryRegistry();
+      expect(recoveryRegistry?.has(RUNNING_ADOPTION_JOB_ID)).toBe(true);
+      expect(recoveryLog).toHaveBeenCalledWith(
+        'Recovery reconciliation completed with durable containment held for repair or operator abandonment. Launch fence lifted.\n',
+      );
+      expect(recoveryRegistry?.abort([RUNNING_ADOPTION_JOB_ID])).toEqual({
+        aborted: [],
+        notFound: [],
+        abandoned: [
+          {
+            jobId: RUNNING_ADOPTION_JOB_ID,
+            reason: 'recovery ownership was released without proof of recorded containment absence',
+            nextStep:
+              `Run coral-cli jobs detail ${RUNNING_ADOPTION_JOB_ID}; the recorded containment may still be live ` +
+              'and is no longer owned by recovery.',
+          },
+        ],
+      });
+      expect(readDurableCliContainmentStatus(harness.progressStore.getDb(), RUNNING_ADOPTION_JOB_ID)).toMatchObject({
+        kind: 'valid',
+        status: { disposition: { kind: 'operator-abandoned', processAbsenceProven: false } },
+      });
+    } finally {
+      await stopLifecycleController(harness.controller);
     }
   });
 
@@ -887,9 +1041,13 @@ describe('recovery coordinator shutdown', () => {
       },
     });
     stubRuntimeRecord(harness.progressStore, runtime, {
-      jobId: 'running-adoption-job',
+      jobId: RUNNING_ADOPTION_JOB_ID,
       pid,
     });
+    const incarnation = testIncarnation(pid);
+    vi.spyOn(runtime.process, 'readProcessIncarnation').mockImplementation((candidatePid) =>
+      candidatePid === pid && pidAlive ? incarnation : null,
+    );
 
     try {
       await harness.controller.start();
@@ -900,7 +1058,7 @@ describe('recovery coordinator shutdown', () => {
 
       await vi.waitFor(() => {
         expect(harness.fakeService.finalizeInterruptedDurableJob).toHaveBeenCalledTimes(1);
-        expect(harness.progressStore.readStatus('running-adoption-job')?.phase).toBe('error');
+        expect(harness.progressStore.readStatus(RUNNING_ADOPTION_JOB_ID)?.phase).toBe('error');
         expect(cleanupSpy).toHaveBeenCalledTimes(1);
       });
       const recoveredSession = modules.sessionQueriesModule
@@ -942,9 +1100,13 @@ describe('recovery coordinator shutdown', () => {
       },
     });
     stubRuntimeRecord(harness.progressStore, runtime, {
-      jobId: 'running-adoption-job',
+      jobId: RUNNING_ADOPTION_JOB_ID,
       pid,
     });
+    const incarnation = testIncarnation(pid);
+    vi.spyOn(runtime.process, 'readProcessIncarnation').mockImplementation((candidatePid) =>
+      candidatePid === pid && pidAlive ? incarnation : null,
+    );
 
     await harness.controller.start();
     pidAlive = false;
@@ -987,9 +1149,13 @@ describe('recovery coordinator shutdown', () => {
       },
     });
     stubRuntimeRecord(harness.progressStore, runtime, {
-      jobId: 'running-adoption-job',
+      jobId: RUNNING_ADOPTION_JOB_ID,
       pid,
     });
+    const incarnation = testIncarnation(pid);
+    vi.spyOn(runtime.process, 'readProcessIncarnation').mockImplementation((candidatePid) =>
+      candidatePid === pid && pidAlive ? incarnation : null,
+    );
 
     await harness.controller.start();
     pidAlive = false;
@@ -1030,7 +1196,7 @@ describe('recovery coordinator shutdown', () => {
         }),
       },
     });
-    harness.progressStore.appendRuntimeStarted('running-adoption-job', {
+    harness.progressStore.appendRuntimeStarted(RUNNING_ADOPTION_JOB_ID, {
       transport: 'app-server',
       startTime: '2026-04-17T00:00:00.000Z',
       providerMeta: {

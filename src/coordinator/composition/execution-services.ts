@@ -12,6 +12,7 @@ import { createAppServerProxyRoute } from '../services/provider-proxy-launch-rou
 import {
   ProviderOperationReconciler,
   type ProviderOperationReconcilerFatalError,
+  type ProviderOperationReconcilerStopDisposition,
   StartupSetRecoveryProducer,
   type StartupReconciliationReport,
 } from '../services/provider-operation-reconciler.js';
@@ -19,6 +20,7 @@ import {
   notifyProviderProxyControlEstablished,
   subscribeProviderProxyControlEstablished,
 } from '../live/provider-proxy/operation-route.js';
+import { reobserveDurableProviderProxyAcquisitionContainment } from '../live/provider-proxy/spawn-undo.js';
 import { backendLog } from '../../infra/backend-log.js';
 import { createRecordedProcessObserver } from '../../infra/node-process.js';
 import { assertNever } from '../../infra/error-format.js';
@@ -35,6 +37,7 @@ import {
 } from '../services/recovery/index.js';
 import {
   attributeUnreadableProviderOperations,
+  providerOperationMutationAdmission,
   readProviderOperation,
   readProviderOperations,
   subscribeProviderOperationMutations,
@@ -45,7 +48,11 @@ import {
   providerProxySetIdentityFromRecord,
 } from '../services/provider-proxy-set/identity.js';
 import { ProviderProxySetLifecycle } from '../services/provider-proxy-set/index.js';
-import { authorizeProviderProxySetContainmentProof } from '../services/provider-proxy-set/containment-proof.js';
+import { ProviderProxySetOperatorDispositionStore } from '../services/provider-proxy-set/operator-disposition-store.js';
+import {
+  authorizeProviderProxySetContainmentProof,
+  runProviderProxySetContainmentProofMutation,
+} from '../services/provider-proxy-set/containment-proof.js';
 import type { ProviderProxySetLifecycleFatalError } from '../services/provider-proxy-recovery-policy.js';
 import {
   discoverProviderHandoffCapsules,
@@ -92,7 +99,7 @@ export function createExecutionServices({
   connectProviderOperationRecovery: (recoveryCoordinator: RecoveryCoordinator) => void;
   reconcileProviderOperationsAtStartup: (signal: AbortSignal) => Promise<StartupReconciliationReport>;
   startProviderOperationReconciler: () => void;
-  stopProviderOperationReconciler: () => void;
+  stopProviderOperationReconciler: () => ProviderOperationReconcilerStopDisposition;
 } {
   const services = new Map<string, ProjectRequestPort>();
   let providerOperationRecovery: RecoveryCoordinator | null = null;
@@ -122,16 +129,43 @@ export function createExecutionServices({
         }
         return providerProxyInheritance.redeemDiscoveredCapsule(capsule, capsulePath, signal);
       },
-      'containment-proof': ({ identity, signal }) =>
-        world.providerProxySetContainmentProver.collectContainmentProof(
-          authorizeProviderProxySetContainmentProof(identity),
-          getProgressStore().getDb(),
+      'containment-proof': ({ identity, signal }) => {
+        const db = getProgressStore().getDb();
+        const mutationFence = providerOperationMutationAdmission(db).closeSet(identity);
+        return world.providerProxySetContainmentProver.collectContainmentProof(
+          authorizeProviderProxySetContainmentProof(identity, {
+            mutationFence,
+            closeAdmission: async () => {
+              if (mutationFence.kind === 'holding') await mutationFence.retryAfter;
+            },
+          }),
+          db,
           signal,
-        ),
+        );
+      },
       'capsule-retirement': ({ path }) => retireProviderHandoffCapsule(runtime.storage, path),
-      'disappearance-consumer': ({ notice }) => providerOperationReconciler.containmentDisappeared(notice),
-      'representation-abandonment-consumer': ({ notice }) =>
-        providerOperationReconciler.representationAbandoned(notice),
+      'disappearance-consumer': ({ notice, mutationProof }) => {
+        const consumeDisappearance = () => providerOperationReconciler.containmentDisappeared(notice);
+        return mutationProof === undefined
+          ? consumeDisappearance()
+          : runProviderProxySetContainmentProofMutation(
+              mutationProof,
+              notice.setIdentity,
+              'provider-containment-disappearance-fenced-release',
+              consumeDisappearance,
+            );
+      },
+      'representation-abandonment-consumer': ({ notice, mutationProof }) => {
+        const consumeAbandonment = () => providerOperationReconciler.representationAbandoned(notice);
+        return mutationProof === undefined
+          ? consumeAbandonment()
+          : runProviderProxySetContainmentProofMutation(
+              mutationProof,
+              notice.setIdentity,
+              'provider-representation-abandonment-fenced-release',
+              consumeAbandonment,
+            );
+      },
     },
     fatalSink: { fatal: onProviderProxyLifecycleFatal },
   });
@@ -176,6 +210,20 @@ export function createExecutionServices({
           reason: 'The recorded leader identity is gone, but the surviving process group cannot be attributed.',
           nextAttemptAtMs: runtime.time.now() + 25,
         };
+      case 'signal-authorization-refused':
+        return {
+          kind: 'retry-scheduled',
+          reason: 'Signal authorization could not be established for every recorded-containment target.',
+          nextAttemptAtMs: runtime.time.now() + 25,
+        };
+      case 'identity-unobservable':
+        return {
+          kind: 'retry-scheduled',
+          reason: outcome.signalDelivered
+            ? 'Process identity became unobservable after a recorded-containment signal was delivered.'
+            : 'Process identity could not be observed before recorded-containment signal authorization.',
+          nextAttemptAtMs: runtime.time.now() + 25,
+        };
       case 'not-bequeathed':
         return {
           kind: 'retry-scheduled',
@@ -218,6 +266,18 @@ export function createExecutionServices({
           return {
             kind: 'temporarily-unavailable',
             reason: 'The recorded leader identity is gone, but the surviving process group cannot be attributed.',
+          };
+        case 'signal-authorization-refused':
+          return {
+            kind: 'temporarily-unavailable',
+            reason: 'Signal authorization could not be established for every recorded-containment target.',
+          };
+        case 'identity-unobservable':
+          return {
+            kind: 'temporarily-unavailable',
+            reason: outcome.signalDelivered
+              ? 'Process identity became unobservable after a recorded-containment signal was delivered.'
+              : 'Process identity could not be observed before recorded-containment signal authorization.',
           };
         case 'containment-disappeared':
           providerProxyLifecycle.containmentAbsent(
@@ -268,6 +328,29 @@ export function createExecutionServices({
     time: runtime.time,
     recoveryDispatcher: providerProxyRecovery,
     reapRecordedContainment: world.reapRecordedContainment,
+    operatorDispositionStore: new ProviderProxySetOperatorDispositionStore(
+      runtime.storage,
+      runtime.paths.coral.coordinator.runDir,
+    ),
+    writerIncarnation: world.identity.instanceId,
+    collectOperatorDispositionContainmentProof: (identity, signal) => {
+      const db = getProgressStore().getDb();
+      const mutationFence = providerOperationMutationAdmission(db).closeSet(identity);
+      return world.providerProxySetContainmentProver.collectContainmentProof(
+        authorizeProviderProxySetContainmentProof(identity, {
+          mutationFence,
+          closeAdmission: async () => {
+            if (mutationFence.kind === 'holding') await mutationFence.retryAfter;
+          },
+        }),
+        db,
+        signal,
+      );
+    },
+    reobserveAcquisitionContainment: (subject, signal) =>
+      reobserveDurableProviderProxyAcquisitionContainment(runtime, subject, signal),
+    fenceProviderOperationMutations: (identity) =>
+      providerOperationMutationAdmission(getProgressStore().getDb()).closeSet(identity),
     onProgressPremiseViolation: (violation) =>
       backendLog.warn(
         `Provider proxy lifecycle ${violation.stage} woke ${violation.latenessMs}ms after its requested time.`,
@@ -327,8 +410,14 @@ export function createExecutionServices({
     }
   };
 
-  const initializeProviderProxyLifecycle = (): void => {
+  const initializeProviderProxyLifecycle = async (): Promise<void> => {
     if (providerProxyLifecycleInitialized) return;
+    const activation = providerProxyLifecycle.activateDurableOperatorDispositions();
+    if (activation.kind === 'held') {
+      backendLog.warn(
+        `Durable provider proxy disposition activation remains held pending store repair: ${activation.reason}`,
+      );
+    }
     providerProxyLifecycle.initializeClaimSlots();
     if (world.providerProxyInheritance === undefined) {
       providerProxyLifecycle.completeStartupDiscovery();
@@ -350,6 +439,10 @@ export function createExecutionServices({
       );
     }
     providerProxyLifecycleInitialized = true;
+    const durableReconciliation = await providerProxyLifecycle.reconcileDurableOperatorDispositions();
+    if (durableReconciliation.kind !== 'completed') {
+      backendLog.warn(`Durable provider proxy set disposition reconciliation failed: ${durableReconciliation.reason}`);
+    }
   };
 
   function getExecutionService(ctx: InvocationContext): ProjectRequestPort {
@@ -428,15 +521,18 @@ export function createExecutionServices({
     },
     reconcileProviderOperationsAtStartup: async (signal) => {
       await initializeProviderProxyClaims();
-      initializeProviderProxyLifecycle();
+      await initializeProviderProxyLifecycle();
       return providerOperationReconciler.reconcileAtStartup(signal);
     },
     startProviderOperationReconciler: () => providerOperationReconciler.start(),
     stopProviderOperationReconciler: () => {
+      const disposition = providerOperationReconciler.stop();
       unsubscribeProviderProxyControlEstablished();
-      unsubscribeProviderOperationMutations?.();
-      unsubscribeProviderOperationMutations = null;
-      providerOperationReconciler.stop();
+      if (disposition.kind === 'drained') {
+        unsubscribeProviderOperationMutations?.();
+        unsubscribeProviderOperationMutations = null;
+      }
+      return disposition;
     },
   };
 }

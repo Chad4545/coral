@@ -21,6 +21,9 @@ export class JobAbortService {
   abort(jobIds: string[]): AbortResult {
     const aborted: string[] = [];
     const notFound: string[] = [];
+    const refused: NonNullable<AbortResult['refused']> = [];
+    const held: NonNullable<AbortResult['held']> = [];
+    const abandoned: NonNullable<AbortResult['abandoned']> = [];
 
     for (const jobId of jobIds) {
       if (!this.deps.abortRegistry.has(jobId)) {
@@ -40,14 +43,21 @@ export class JobAbortService {
         continue;
       }
 
-      // The bound provider runtime observes this signal and interrupts with its
-      // live lease/key. Durable recovery intentionally has no access to those
-      // epoch-local credentials.
-      this.deps.abortRegistry.abort([jobId]);
-      aborted.push(jobId);
+      const result = this.deps.abortRegistry.abort([jobId]);
+      aborted.push(...result.aborted);
+      notFound.push(...result.notFound);
+      refused.push(...(result.refused ?? []));
+      held.push(...(result.held ?? []));
+      abandoned.push(...(result.abandoned ?? []));
     }
 
-    return { aborted, notFound };
+    return {
+      aborted,
+      notFound,
+      ...(refused.length === 0 ? {} : { refused }),
+      ...(held.length === 0 ? {} : { held }),
+      ...(abandoned.length === 0 ? {} : { abandoned }),
+    };
   }
 
   finishQueuedAbort(jobId: string, sessionId: string, reason: AbortReason): void {

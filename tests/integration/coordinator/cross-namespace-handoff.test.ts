@@ -99,8 +99,18 @@ function createHostManager(exactHostReachable: boolean): {
     manager: {
       attachSession,
       openSession,
-      drainForHandoff: async () => {},
-      shutdown: async () => {},
+      drainForHandoff: async () => ({
+        kind: 'provider-hosts-quiesced',
+        liveProxySets: [],
+        acquisitionCleanupHolds: [],
+        closingHosts: [],
+      }),
+      shutdown: async () => ({
+        kind: 'provider-hosts-quiesced',
+        liveProxySets: [],
+        acquisitionCleanupHolds: [],
+        closingHosts: [],
+      }),
       routeAppServerOperation: () => null,
     },
     attachSession,
