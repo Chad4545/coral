@@ -18,7 +18,13 @@ import {
   streamProviderEvents,
   type ProviderTerminalInput,
 } from '#src/providers/stream.js';
-import type { AppServerTransport, HostRef, ProviderEventBody, ProviderRequest } from '#src/providers/contract.js';
+import type {
+  AppServerTransport,
+  HostRef,
+  ProviderEventBody,
+  ProviderPreflightOutcome,
+  ProviderRequest,
+} from '#src/providers/contract.js';
 import type { AppServerHostAuthority } from '#src/providers/internal/app-server-host.js';
 import { ProviderHostUnserviceableError } from '#src/providers/host-admission.js';
 import { encodeHostRef } from '#src/providers/host-ref-codec.js';
@@ -1425,14 +1431,83 @@ describe('ExecutionService launch', () => {
     const decision = await service.start('missing', { prompt: 'hello' }, ctx);
 
     expect(decision).toEqual({
-      status: 'rejected',
-      phase: 'preflight',
+      status: 'refused',
       code: 'unknown_provider',
       message: 'Unknown provider: missing',
     });
   });
 
-  it('start rejects when preflight throws', async () => {
+  // A provider-returned `undetermined` is re-asked until the answer budget is spent, so a fence test that
+  // waits on the clock instead of driving it waits 27 seconds.
+  function driveClockThroughPreflightBudget(): void {
+    let elapsedMs = 0;
+    const base = runtime.time.monotonicNow();
+    vi.spyOn(runtime.time, 'monotonicNow').mockImplementation(() => base + BigInt(elapsedMs));
+    vi.spyOn(runtime.time, 'sleep').mockImplementation(async (ms: number) => {
+      elapsedMs += ms;
+    });
+  }
+
+  it('returns an undetermined start without creating a session or job', async () => {
+    const message = 'Provider readiness could not be determined';
+    const { provider, execute, preflight } = makeProvider({
+      preflight: async () => ({ kind: 'undetermined', message }),
+    });
+    mockState.getNewProvider.mockReturnValue(provider);
+    const service = createService(ctx);
+    const { progressStore, sessionManager } = getInternals(service);
+    const prepareSession = vi.spyOn(sessionManager, 'prepare');
+    driveClockThroughPreflightBudget();
+
+    const decision = await service.start('codex', { prompt: 'hello' }, ctx);
+
+    expect(decision).toEqual({
+      status: 'undetermined',
+      code: 'provider_preflight_undetermined',
+      message,
+    });
+    expect(preflight).toHaveBeenCalled();
+    expect(execute).not.toHaveBeenCalled();
+    expect(prepareSession).not.toHaveBeenCalled();
+    expect(sessionManager.list('codex')).toEqual([]);
+    expect(progressStore.listJobIds()).toEqual([]);
+  });
+
+  it('returns an undetermined resume without creating another session or a job', async () => {
+    const message = 'Provider readiness could not be determined';
+    const { provider, execute, preflight } = makeProvider({
+      preflight: async () => ({ kind: 'undetermined', message }),
+    });
+    mockState.getNewProvider.mockReturnValue(provider);
+    const service = createService(ctx);
+    const { progressStore, sessionManager } = getInternals(service);
+    const session = allocateTestSession(
+      sessionManager,
+      'codex',
+      'resume-preflight',
+      'test-model',
+      ctx.projectRoot,
+      ctx.projectRoot,
+    );
+    const sessionsBefore = sessionManager.list('codex');
+    const prepareSession = vi.spyOn(sessionManager, 'prepare');
+    driveClockThroughPreflightBudget();
+
+    const decision = await service.resume('codex', { sessionId: session.sessionId, prompt: 'continue' }, ctx);
+
+    expect(decision).toEqual({
+      status: 'undetermined',
+      code: 'provider_preflight_undetermined',
+      message,
+    });
+    expect(preflight).toHaveBeenCalled();
+    expect(execute).not.toHaveBeenCalled();
+    expect(prepareSession).not.toHaveBeenCalled();
+    expect(sessionManager.list('codex')).toEqual(sessionsBefore);
+    expect(progressStore.listJobIds()).toEqual([]);
+  });
+
+  it('faults the launch when preflight throws instead of offering a retry', async () => {
     const { provider, preflight } = makeProvider({
       preflight: async (_preflightRuntime) => {
         throw new Error('not ready');
@@ -1441,16 +1516,34 @@ describe('ExecutionService launch', () => {
     mockState.getNewProvider.mockReturnValue(provider);
     const service = createService(ctx);
 
-    const decision = await service.start('codex', { prompt: 'hello' }, ctx);
+    await expect(service.start('codex', { prompt: 'hello' }, ctx)).rejects.toMatchObject({
+      code: 'provider_preflight_faulted',
+      context: { provider: 'codex', cause: 'not ready' },
+    });
 
     expect(preflight).toHaveBeenCalledTimes(1);
     expectRuntimePreflightArg(preflight!);
-    expect(decision).toEqual({
-      status: 'rejected',
-      phase: 'preflight',
-      code: 'provider_preflight_failed',
-      message: 'not ready',
+  });
+
+  it('creates no session or job when preflight returns an invalid outcome object', async () => {
+    const { provider, execute, preflight } = makeProvider({
+      preflight: async () => ({ kind: 'skipped' }) as unknown as ProviderPreflightOutcome,
     });
+    mockState.getNewProvider.mockReturnValue(provider);
+    const service = createService(ctx);
+    const { progressStore } = getInternals(service);
+    const sessionsBefore = service.list('codex').sessions;
+    const jobsBefore = progressStore.listJobIds();
+
+    await expect(service.start('codex', { prompt: 'hello' }, ctx)).rejects.toMatchObject({
+      code: 'provider_preflight_faulted',
+      context: { provider: 'codex', cause: expect.stringMatching(/skipped/iu) },
+    });
+
+    expect(preflight).toHaveBeenCalledOnce();
+    expect(execute).not.toHaveBeenCalled();
+    expect(service.list('codex').sessions).toEqual(sessionsBefore);
+    expect(progressStore.listJobIds()).toEqual(jobsBefore);
   });
 
   it('start rejects invalid agent refs from the resolver', async () => {
@@ -1464,8 +1557,7 @@ describe('ExecutionService launch', () => {
     const decision = await service.start('codex', { prompt: 'hello', agent: 'architect' }, ctx);
 
     expect(decision).toEqual({
-      status: 'rejected',
-      phase: 'preflight',
+      status: 'refused',
       code: 'invalid_agent',
       message: 'Invalid mocked agent ref',
     });
@@ -1482,8 +1574,7 @@ describe('ExecutionService launch', () => {
     const decision = await service.start('codex', { prompt: 'hello', agent: 'architect' }, ctx);
 
     expect(decision).toEqual({
-      status: 'rejected',
-      phase: 'preflight',
+      status: 'refused',
       code: 'agent_not_found',
       message: 'Agent "architect" not found',
     });
@@ -1500,8 +1591,7 @@ describe('ExecutionService launch', () => {
     const decision = await service.start('codex', { prompt: 'hello', agent: 'architect' }, ctx);
 
     expect(decision).toEqual({
-      status: 'rejected',
-      phase: 'preflight',
+      status: 'refused',
       code: 'agent_namespace_not_found',
       message: 'Plugin namespace "other" not found',
     });
@@ -1698,7 +1788,7 @@ describe('ExecutionService launch', () => {
     const rejectedJobId = `full-queue-${randomUUID()}`;
     const rejected = await service.start('codex', { prompt: 'must reject', jobId: rejectedJobId }, ctx);
 
-    expect(rejected).toMatchObject({ status: 'rejected', code: 'busy' });
+    expect(rejected).toMatchObject({ status: 'refused', code: 'busy' });
     expect(service.list('codex').sessions).toEqual(sessionsBeforeRejection);
     expect(sessionsBeforeRejection.every((session) => session.activeJobId !== undefined)).toBe(true);
     expect(getInternals(service).progressStore.readStatus(rejectedJobId)).toBeNull();
@@ -1846,8 +1936,7 @@ describe('ExecutionService launch', () => {
     const decision = await service.coralDispatch('codex', 'sample', { prompt: 'hello', sessionId: '' }, ctx);
 
     expect(decision).toMatchObject({
-      status: 'rejected',
-      phase: 'preflight',
+      status: 'refused',
       code: 'invalid_request',
       message: 'Session ID is required when provided.',
     });

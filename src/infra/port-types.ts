@@ -1,4 +1,4 @@
-import { STANDING_PROBE_ERRNOS } from './process-constants.js';
+import { STANDING_PROBE_ERRNOS, type StandingProbeErrno } from './process-constants.js';
 import type { ProcessIncarnation } from './node-process.js';
 import type { RecordedProcessIdentity } from './process-containment.js';
 
@@ -67,8 +67,20 @@ export type StorageBigIntStat = {
 /** What a non-following observation reports about a path, without describing what it may resolve to. */
 export type StorageEntryKind = { isDirectory(): boolean; isFile(): boolean; isSymbolicLink(): boolean };
 
+/**
+ * Whether this process may traverse a directory — the permission a child's `chdir` needs, which neither
+ * existence nor readability implies: measured on Node v26.3.1, `statSync` succeeds on a `chmod 000`
+ * directory and `readdirSync` fails on an execute-only one that `spawn` enters without complaint.
+ *
+ * `denied` answers only the question asked, which an absent path answers the same way as an unsearchable
+ * one: neither may be traversed. A caller that must tell those apart observes existence separately.
+ * `unobserved` must never be treated as evidence that permission was granted or denied.
+ */
+export type DirectoryTraversability = 'traversable' | 'denied' | 'unobserved';
+
 export interface StoragePort {
   assertReadableSync(path: string): void;
+  observeDirectoryTraversabilitySync(path: string): DirectoryTraversability;
   readFile(path: string, encoding: 'utf-8'): Promise<string>;
   readFileSync(path: string, encoding: 'utf-8'): string;
   writeFileSync(
@@ -186,8 +198,27 @@ export type ExecResult = {
  */
 export type ExecOutcome =
   | Readonly<{ kind: 'answered'; status: number }>
-  | Readonly<{ kind: 'launch-refused'; code: string }>
+  | Readonly<{ kind: 'launch-refused'; code: StandingProbeErrno }>
   | Readonly<{ kind: 'no-answer'; detail: string }>;
+
+/**
+ * Adapters must not infer a command or working-directory condition beyond these evidence variants;
+ * `command-could-not-start` is not evidence that the command is absent. Measured on Node v26.3.1: an
+ * executable script whose shebang interpreter was missing and a genuinely absent executable path both
+ * produced ENOENT with `error.path` naming the selected executable, while an executable file with a bogus ELF
+ * header exited 127 instead of producing a launch failure.
+ */
+export type SpawnFailureEvidence =
+  | Readonly<{ kind: 'command-could-not-start' }>
+  | Readonly<{ kind: 'command-not-executable'; code: Exclude<StandingProbeErrno, 'ENOENT'> }>
+  | Readonly<{ kind: 'working-directory-missing' }>
+  | Readonly<{ kind: 'working-directory-not-directory' }>
+  | Readonly<{ kind: 'working-directory-not-traversable' }>
+  | Readonly<{ kind: 'unresolved'; code: StandingProbeErrno }>;
+
+function isStandingProbeErrno(code: string): code is StandingProbeErrno {
+  return STANDING_PROBE_ERRNOS.has(code);
+}
 
 /**
  * The same three answers for the throwing shape, so a caller that reaches `node:child_process` directly is not
@@ -207,7 +238,7 @@ export function classifyThrownExecOutcome(error: unknown): ExecOutcome {
   if (typeof errno.status === 'number') {
     return { kind: 'answered', status: errno.status };
   }
-  if (typeof errno.code === 'string' && STANDING_PROBE_ERRNOS.has(errno.code)) {
+  if (typeof errno.code === 'string' && isStandingProbeErrno(errno.code)) {
     return { kind: 'launch-refused', code: errno.code };
   }
   return { kind: 'no-answer', detail: errno.code ?? errno.message ?? 'unknown error' };
@@ -216,7 +247,7 @@ export function classifyThrownExecOutcome(error: unknown): ExecOutcome {
 export function classifyExecOutcome(result: ExecResult): ExecOutcome {
   if (result.error !== undefined) {
     const code = (result.error as NodeJS.ErrnoException).code;
-    if (typeof code === 'string' && STANDING_PROBE_ERRNOS.has(code)) {
+    if (typeof code === 'string' && isStandingProbeErrno(code)) {
       return { kind: 'launch-refused', code };
     }
     return { kind: 'no-answer', detail: code ?? result.error.message };
@@ -229,4 +260,38 @@ export function classifyExecOutcome(result: ExecResult): ExecOutcome {
     return { kind: 'no-answer', detail: 'killed before it exited' };
   }
   return { kind: 'answered', status: result.status };
+}
+
+/**
+ * A standing spawn errno cannot establish a command condition until the cwd ambiguity is resolved. Measured
+ * on Node v26.3.1: `spawn` reports ENOENT for a missing command and a missing cwd, ENOTDIR when cwd is a file,
+ * and EACCES for a cwd without search permission. `statSync` still succeeds without search permission, while
+ * `readdirSync` rejects an execute-only directory; only `accessSync(path, X_OK)` matched the child's `chdir`.
+ */
+export function classifySpawnFailure(
+  storage: Pick<StoragePort, 'observeDirectoryTraversabilitySync' | 'statSync'>,
+  cwd: string,
+  code: StandingProbeErrno,
+): SpawnFailureEvidence {
+  let directoryObserved = false;
+  try {
+    if (!storage.statSync(cwd).isDirectory()) return { kind: 'working-directory-not-directory' };
+    directoryObserved = true;
+  } catch (error: unknown) {
+    const cwdCode = (error as NodeJS.ErrnoException | undefined)?.code;
+    if (cwdCode === 'ENOENT') return { kind: 'working-directory-missing' };
+    if (cwdCode === 'ENOTDIR') return { kind: 'working-directory-not-directory' };
+  }
+
+  if (code === 'ENOENT') {
+    return directoryObserved ? { kind: 'command-could-not-start' } : { kind: 'unresolved', code };
+  }
+  if (code === 'ENOTDIR') {
+    return directoryObserved ? { kind: 'command-not-executable', code } : { kind: 'unresolved', code };
+  }
+
+  const traversability = storage.observeDirectoryTraversabilitySync(cwd);
+  if (traversability === 'denied') return { kind: 'working-directory-not-traversable' };
+  if (traversability === 'unobserved' || !directoryObserved) return { kind: 'unresolved', code };
+  return { kind: 'command-not-executable', code };
 }

@@ -34,15 +34,12 @@ entry is half closed and its remainder wants an observed flake, so it cannot lea
 put first was what 0.10.10 cannot ship without, followed by what the 0.10.9..main diff has made cheap
 while that code is still warm.
 
-**Top priority, set 2026-09-03: [`preflight-cannot-defer`](./preflight-cannot-defer.md).** The entry that
-held this rank from 2026-09-02 — a coordinator starved for 60 seconds losing its own work — closed as six
-commits that reversed exactly one collapse: unanswered heartbeat silence read as proof the provider was gone,
-the third answer standing in for the second. `preflight-cannot-defer` is the same defect one boundary over, and
-it is now demonstrated rather than argued: a preflight that could not check terminalizes the job it could not
-check, so the job dies carrying a sentence that is not true. Both providers already observe the third answer;
-carrying it across one boundary is a change to a contract every provider implements. It ranks above the
-compatibility policy because that policy decides what two builds may say to each other, while this decides
-whether a job survives a check that never ran.
+**Top priority, set 2026-09-09: the compatibility policy, then `build-identity-and-upgrade`.** The two entries
+that held this rank before it both closed on the same collapse, one boundary apart — a coordinator starved for
+60 seconds reading heartbeat silence as proof the provider was gone, and then a preflight that could not check
+terminalizing the job it could not check. Both are now three answers where there were two. What is left at the
+top is the policy that decides what two builds may say to each other, and 0.10.10 is the release that exercises
+it: the store DDL changed, so this build ships a new format fingerprint.
 
 **One decision blocks four documents.** `build-identity-and-upgrade`, `jobs-read-contract-schema-first`
 and `result-artifact-availability` are the same transition — an older and a newer build reading each
@@ -55,12 +52,12 @@ and may be a consumer of that policy rather than its driver. Deciding it is not 
 are the two halves G3 left open and they do **not** close together: one is an evidence problem, where no
 observation this build can take retires anything, and the other a durability problem, where a retirement
 already happened on decisive evidence and left no proof of itself.
-`preflight-cannot-defer` should be read after `provider-operation-admission-hold`, not blocked on it. Both need
-a name for "this could not be established, ask again", and settling that twice is how Coral would end up with
-two vocabularies for one disposition — but the two gates are not in series: admission-hold is a startup-wide
-gate that returns `backend_admission_held` before a launch reaches preflight at all, so a single job meets at
-most one of them. The entry's own start condition also allows an independent unblock ("or a launch-level retry
-is chosen"), which an earlier version of this paragraph dropped.
+`provider-operation-admission-hold` no longer shares a vocabulary question with anything open. It was held
+behind the launch boundary's need for a name for "this could not be established, ask again", because settling
+that twice would have left Coral with two vocabularies for one disposition. The launch decision now carries
+`undetermined`, and the two gates were never in series anyway: admission-hold is a startup-wide gate that
+returns `backend_admission_held` before a launch reaches preflight at all, so a single job meets at most one
+of them.
 `provider-operation-admission-hold` and `coordinator-process-disposition` are adjacent, not joint.
 `darwin-signal-authority` does **not** close with
 `kb-daemon-independent-containment` or `wedged-coordinator-self-drain`: it is about the authority to
@@ -82,14 +79,13 @@ settling first, but not because the schema change is unsafe.
 
 | Order | Entry                                                       | Why here                                                                                                                                                  |
 | ----- | ----------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| 1     | [`preflight-cannot-defer`](./preflight-cannot-defer.md)     | **Promoted 2026-09-03.** A preflight that could not check terminalizes the job it could not check, so the job dies carrying a sentence that is not true — the third answer collapsing into the second, exactly what `#silenceHoldExhaustedDecision` was doing before the branch that just closed `overload-tolerance-floor` reversed it there. That collapse is now demonstrated, not just argued. Both providers already observe the third answer; carrying it across one boundary is a change to a contract every provider implements. |
-| 2     | the compatibility policy, then `build-identity-and-upgrade` | Unblocks three others, and 0.10.10 is the release that exercises it: the store DDL changed, so this build ships a new format fingerprint. The routing-reason step is closed; this entry still carries the record direction and the independent output direction. |
-| 3     | [`comment-sweep-bug-ledger`](./comment-sweep-bug-ledger.md) | A ledger of defects the sweeps deliberately did not fix. Draining it is cheapest immediately after the sweep that filled it, which has just landed.        |
-| 4     | [`exec-result-overclaim`](./exec-result-overclaim.md)       | Two small independent members, each with a correct sibling in the same file, both found in the branch that became the build-identity work.                 |
-| 5     | [`unit-suite-concurrency-and-real-time-tests`](./unit-suite-concurrency-and-real-time-tests.md) | **Half closed**, and the reason it used to lead still holds: a suite run saturates the one filesystem the repo, `~/.coral` and `/tmp` share, and a coordinator blocked mid-fsync holds the store lock and misses its heartbeat. What remains is the cap itself and 22 real sleeps totalling 1.4 s — under 1% of wall time — so the case for them is flake, and it wants an observed flake to start from. |
-| 6     | `provider-operation-admission-hold`                         | Design complete and recorded; ships as one unit or not at all.                                                                                            |
-| 7     | `coordinator-process-disposition`                           | After `provider-operation-admission-hold` has settled the recovery boundary the custody transfer has to attach to.                                                                          |
-| 8     | `foreign-capsule-retirement-terminal-recovery`              | After `provider-operation-admission-hold` or `coordinator-process-disposition`, and only if one of them lands: it wants a recovery boundary that nothing about its own residue justifies introducing.                       |
+| 1     | the compatibility policy, then `build-identity-and-upgrade` | Unblocks three others, and 0.10.10 is the release that exercises it: the store DDL changed, so this build ships a new format fingerprint. The routing-reason step is closed; this entry still carries the record direction and the independent output direction. |
+| 2     | [`comment-sweep-bug-ledger`](./comment-sweep-bug-ledger.md) | A ledger of defects the sweeps deliberately did not fix. Draining it is cheapest immediately after the sweep that filled it, which has just landed.        |
+| 3     | [`exec-result-overclaim`](./exec-result-overclaim.md)       | Two small independent members, each with a correct sibling in the same file, both found in the branch that became the build-identity work.                 |
+| 4     | [`unit-suite-concurrency-and-real-time-tests`](./unit-suite-concurrency-and-real-time-tests.md) | **Half closed**, and the reason it used to lead still holds: a suite run saturates the one filesystem the repo, `~/.coral` and `/tmp` share, and a coordinator blocked mid-fsync holds the store lock and misses its heartbeat. What remains is the cap itself and 22 real sleeps totalling 1.4 s — under 1% of wall time — so the case for them is flake. Two flakes have now been observed and neither is a sleep: both raced a real subprocess against a wall-clock budget, so that class is what the entry now asks to be settled first. |
+| 5     | `provider-operation-admission-hold`                         | Design complete and recorded; ships as one unit or not at all.                                                                                            |
+| 6     | `coordinator-process-disposition`                           | After `provider-operation-admission-hold` has settled the recovery boundary the custody transfer has to attach to.                                                                          |
+| 7     | `foreign-capsule-retirement-terminal-recovery`              | After `provider-operation-admission-hold` or `coordinator-process-disposition`, and only if one of them lands: it wants a recovery boundary that nothing about its own residue justifies introducing.                       |
 
 **Not yet, and why it is not laziness.** `wedged-coordinator-self-drain` **was observed on 2026-08-23** and
 its start condition is met — a coordinator held in uninterruptible sleep on an ext4 journal commit, long
@@ -165,9 +161,8 @@ landing does not unblock it — that was the record direction.
 | [`proxy-set-acquisition.md`](./proxy-set-acquisition.md)                                   | **The same defect as build-identity, closed the same way.** Acquisition compared a start time the parent derived against one the child derived; measured disagreements of 2 to 670 seconds were the incumbent's age, not spawn latency. #324 closed that on this pair too, the same fix that closed the coordinator's own paths; what remains is whether the comparison should stop being cross-process at all, a design choice rather than a bug.                                                                                                                                                       |
 | [`provider-operation-shutdown-quiescence.md`](./provider-operation-shutdown-quiescence.md) | Shutdown fences only part of the mutation surface.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                       |
 | [`provider-operation-admission-hold.md`](./provider-operation-admission-hold.md)           | **Written once, rejected, and taken back out — the whole unit is here.** A row nobody can attribute must stop the coordinator finishing startup, but the first attempt returned that refusal through the success value, so shutdown terminalized the very jobs it protected and no command could ever end it. A held coordinator is one whose `start()` has not resolved, whose blockers are ordinary quarantine subjects, and whose clear/abandon commands ship in the same change.                                                                                                                     |
-| [`launch-slot-released-into-the-wrong-pool.md`](./launch-slot-released-into-the-wrong-pool.md) | **Observed twice; attribution remains open.** On 2026-08-23 and 2026-08-24, active launch reservations exceeded live jobs by 2 and 13 respectively; the later gap persisted across reads. `releaseLaunch` silently returns when a caller names the wrong pool, and its pool defaults to `default`, but the measurements do not distinguish a wrong-pool release from no release. Expose held identities before choosing a cause. |
+| [`launch-slot-released-into-the-wrong-pool.md`](./launch-slot-released-into-the-wrong-pool.md) | **Observed three times; the third names a death path.** On 2026-08-23 and 2026-08-24, active launch reservations exceeded live jobs by 2 and 13; the later gap persisted across reads. On 2026-09-09 a job stopped by an exhausted provider usage limit left its slot held — the first observation that names which path was running. `releaseLaunch` silently returns when a caller names the wrong pool, and the release also sits behind two gates that keep a slot on purpose, expecting a successor that recovery never names. Expose held identities before choosing between them. |
 | [`provider-proxy-persistent-challenge-mismatch.md`](./provider-proxy-persistent-challenge-mismatch.md) | Repeated current-tenancy challenge mismatches are answers, not silence, but a faulty peer could answer forever without accepting an echo. Give that distinct subject a bounded disposition if it becomes reachable against a correct endpoint. |
-| [`preflight-cannot-defer.md`](./preflight-cannot-defer.md)                                 | **The provider observed the third answer; one hop later it is gone.** Both preflights now distinguish a check that established something from one that never completed, and say which in the message — but `preflight` returns `Promise<void>`, `runProviderPreflight` flattens any rejection to a string, and `job-launch` makes any string terminal. So a job dies on an observation nobody made. The reachable half (a verdict cached across jobs) is closed; what remains needs a decision on what "ask again later" means at launch, which is the question its neighbour above is already weighing. |
 
 ---
 
@@ -221,6 +216,31 @@ not about what the probe claims.
 
 ---
 
+## A disposition reaches its consumer and the consumer erases it
+
+Added 2026-09-09 from a tier-1 panel on `fix/preflight-cannot-defer`. The mirror of the section above: there,
+a caller infers more than its evidence carries; here the evidence arrives correctly typed and the owner below
+flattens it into a vocabulary that predates it. Both members are pre-existing — the same paths received
+`rejected` before the third answer existed and did the same thing with it — so neither is a regression, and
+each is a behaviour change rather than a correction.
+
+|                                                                                                                              |                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                    |
+| ---------------------------------------------------------------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| [`launch-disposition-flattened-below-the-boundary.md`](./launch-disposition-flattened-below-the-boundary.md)                 | **Four independent members; the first needs no new type at all, and the last two are why the first two exist.** `executeAgentAttempt` already distinguishes a launch that never started (`consumedAttempt: false`) from a failure after a job ran, and nothing in `src/` reads the field — so discuss expels required participants, appends a `speech.timed_out` transcript entry that later prompts render, and commits a launch diagnostic as `follow_up.answered`, all for a participant nobody ran. The second: every workflow launch failure becomes `wrapper_crashed`, so the same non-answer exits 75 under `codex` and 1 under `workflow`. |
+
+---
+
+## Nothing is wrong, and the next reader pays for it
+
+Added 2026-09-10 from a tier-3 review. Entries here have no defect behind them: the code is correct and
+covered, and what it costs is the effort of the next person to change it safely.
+
+|                                                                                    |                                                                                                                                                                                                                                                                                                                                                              |
+| ---------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| [`hand-rolled-timeout-latches.md`](./hand-rolled-timeout-latches.md)               | **One shape written three ways, and the latch is where it went wrong once already.** `runPreflightWithTimeout`, `withDiscussLaunchTimeout` and `raceTimeout` each settle from two callbacks behind a `settled` boolean where `Promise.race` with a `finally` would say it structurally. Carries a second member: the Claude settings scan does four things in one loop, and the read-error precedence that matters is hidden in a `??=`. |
+
+---
+
 ## Durable state with no lifecycle owner
 
 |                                                                        |                                                                                                                                                                                                                                                                                                                                                                                                                                      |
@@ -260,7 +280,7 @@ guard stayed where it was.
 
 |                                                                                |                                                                                                                                                                                                              |
 | ------------------------------------------------------------------------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
-| [`unit-suite-concurrency-and-real-time-tests.md`](./unit-suite-concurrency-and-real-time-tests.md) | **Store half closed and removed; the real-time half is what is left.** The concurrent tier no longer opens a file-backed store — the doors decide from the opened handle and an invariant keeps them the only way in — so the load that justified converting real sleeps is smaller than when this was written. Its start condition is a flake observed under current conditions, naming which of the 22 remaining sites produced it. |
+| [`unit-suite-concurrency-and-real-time-tests.md`](./unit-suite-concurrency-and-real-time-tests.md) | **Store half closed and removed; the real-time half is what is left.** The concurrent tier no longer opens a file-backed store — the doors decide from the opened handle and an invariant keeps them the only way in — so the load that justified converting real sleeps is smaller than when this was written. Its original start condition asked for a flake among the 22 remaining sleep sites; the two since observed belong to a different class — a real subprocess raced against a wall-clock budget — and the entry's corrected condition starts there instead. |
 | [`source-import-converter-cohesion.md`](./source-import-converter-cohesion.md) | **Startable now.** Five concerns at one layer in a 1058-line file; four converter classes are the documented subdivision trigger. A local fix improved its functions and grew the file — that is the datum.  |
 | [`invariant-path-literals-go-stale-silently.md`](./invariant-path-literals-go-stale-silently.md) | **Startable now; reproduced.** An equality-matched store path survived the store's move, matched no import edge, and left the layering invariant green; an injected forbidden import proved the guard was a no-op. The open choice is shared path-existence checks, local component-prefix rules, or graph-derived targets. This is about a literal inside a scan, not the scan-root gap in the next row. |
 | [`invariant-scans-stop-at-src.md`](./invariant-scans-stop-at-src.md)           | **Startable now.** One of two scans extended to `clients/hooks/` and found nothing; the other needs its detector taught a second idiom first. Measurement already done: three files, one alternate spelling. |

@@ -1,20 +1,12 @@
-import type { EnvPort } from '../infra/port-types.js';
-import { classifyExecOutcome } from '../infra/port-types.js';
+import type { EnvPort, SpawnFailureEvidence, StoragePort } from '../infra/port-types.js';
+import { classifyExecOutcome, classifySpawnFailure } from '../infra/port-types.js';
+import { assertNever } from '../infra/error-format.js';
 import type { ProcessPort } from '../runtime/ports.js';
 
-/**
- * Three answers about the binary, not two. `not-found` is a probe that ran and settled the question; the CLI
- * is absent, or present and unable to report a version. `undetermined` is a probe that never got an answer —
- * the 10s bound elapsed, or the system had no process slot to fork with — which says nothing about whether the
- * CLI is installed.
- *
- * The split is in the type rather than only in the caching because this value becomes a sentence an operator
- * reads. Collapsed, a timeout under load surfaced the configured `notFoundMessage`, which by its nature tells
- * someone to install the binary — instructing them to fix software they already have, and naming a cause that
- * was never observed. `authState` had modelled its own third answer from the beginning; availability had not.
- */
+/** Only command-scoped unavailability may be cached across probes. */
 export type CliInfo =
-  | { available: false; reason: 'not-found'; error: string }
+  | { available: false; reason: 'cacheable-command-failure'; error: string }
+  | { available: false; reason: 'invalid-working-directory'; error: string }
   | { available: false; reason: 'undetermined'; error: string }
   | { available: true; version: string; authState: 'authenticated' }
   | { available: true; version: string; authState: 'unknown' }
@@ -25,13 +17,15 @@ export type AuthProbeResult =
   | { authState: 'unknown' }
   | { authState: 'unauthenticated'; authError: string };
 
-export type CliDetectorProcessPort = Pick<ProcessPort, 'exec'>;
+export type CliDetectorProcessPort = Pick<ProcessPort, 'exec'> & {
+  cwd: string;
+  storage: Pick<StoragePort, 'observeDirectoryTraversabilitySync' | 'statSync'>;
+};
 export type CliDetectorEnvPort = Pick<EnvPort, 'get'>;
 
 export type CliDetectorConfig = {
   binaryName: string;
   versionArgs: readonly string[];
-  notFoundMessage: string;
   authEnvVar: string;
   authCommand: readonly string[];
   authErrorPattern: RegExp;
@@ -39,14 +33,67 @@ export type CliDetectorConfig = {
   parseAuthOutput?: (stdout: string) => AuthProbeResult | null;
 };
 
+function cliInfoFromSpawnFailure(
+  processPort: CliDetectorProcessPort,
+  config: CliDetectorConfig,
+  command: string,
+  evidence: SpawnFailureEvidence,
+): CliInfo {
+  switch (evidence.kind) {
+    case 'command-could-not-start':
+      return {
+        available: false,
+        reason: 'cacheable-command-failure',
+        error: `Could not start \`${command}\` using the Coral daemon's PATH (ENOENT); ensure \`${config.binaryName}\` is installed and runnable at a location on that PATH, and restart the Coral backend after changing that PATH before retrying.`,
+      };
+    case 'command-not-executable':
+      if (evidence.code === 'ENOTDIR') {
+        return {
+          available: false,
+          reason: 'cacheable-command-failure',
+          error: `Could not run \`${command}\` because the Coral daemon's PATH resolves \`${config.binaryName}\` through a component that is not a directory (${evidence.code}); correct that PATH, restart the Coral backend, then retry.`,
+        };
+      }
+      return {
+        available: false,
+        reason: 'cacheable-command-failure',
+        error: `Could not run \`${command}\` because the executable selected by the Coral daemon's PATH may not be executed by the daemon user (${evidence.code}); fix that executable's permissions, or correct the daemon's PATH and restart the Coral backend, then retry.`,
+      };
+    case 'working-directory-missing':
+      return {
+        available: false,
+        reason: 'invalid-working-directory',
+        error: `Could not run \`${command}\` because working directory \`${processPort.cwd}\` does not exist; restore it or choose another working directory, then retry.`,
+      };
+    case 'working-directory-not-directory':
+      return {
+        available: false,
+        reason: 'invalid-working-directory',
+        error: `Could not run \`${command}\` because working directory \`${processPort.cwd}\` is not a directory; choose a directory, then retry.`,
+      };
+    case 'working-directory-not-traversable':
+      return {
+        available: false,
+        reason: 'invalid-working-directory',
+        error: `Could not run \`${command}\` because working directory \`${processPort.cwd}\` is not traversable by the user running the Coral daemon; grant that user search permission or choose another working directory, then retry.`,
+      };
+    case 'unresolved':
+      return {
+        available: false,
+        reason: 'undetermined',
+        error: `Could not determine whether \`${command}\` failed because of the command or working directory \`${processPort.cwd}\` (${evidence.code}); verify that the directory exists and is traversable by the user running the Coral daemon, then retry.`,
+      };
+    default:
+      return assertNever(evidence);
+  }
+}
+
 export function createCliDetector(
   processPort: CliDetectorProcessPort,
   envPort: CliDetectorEnvPort,
   config: CliDetectorConfig,
 ): { detect: () => Promise<CliInfo>; resetCache: () => void } {
-  /**
-   * Answers only. A probe that could not be answered is not remembered at all, and deliberately so.
-   */
+  /** Command-scoped answers only; request-scoped and unobserved outcomes must be re-probed. */
   let cachedCli: CliInfo | null = null;
   let inFlightProbe: Promise<CliInfo> | null = null;
   let confirmedAuth = false;
@@ -70,9 +117,8 @@ export function createCliDetector(
 
   async function runProbe(): Promise<CliInfo> {
     const cli = cachedCli ?? (await queryCliVersion());
-    // A non-answer is returned and forgotten: caching it would let one unobserved fork failure answer for
-    // every later call, which is the collapse the `reason` split above exists to end.
-    if (!cli.available && cli.reason === 'undetermined') return cli;
+    // Request-scoped and unobserved failures must not survive into a later request through this cache.
+    if (!cli.available && cli.reason !== 'cacheable-command-failure') return cli;
     cachedCli = cli;
     if (!cli.available) return cli;
 
@@ -105,18 +151,23 @@ export function createCliDetector(
         return {
           available: false,
           reason: 'undetermined',
-          error: `could not run \`${command}\` to check (${outcome.detail}); this does not mean ${config.binaryName} is missing — retry the command in a moment`,
+          error: `Could not run \`${command}\` to check (${outcome.detail}); this does not mean ${config.binaryName} is missing, so retry the command in a moment.`,
         };
       case 'launch-refused':
-        // The launch failed for a reason that will not change under a running daemon, so the configured
-        // "install it" message is the right one and is worth caching.
-        return { available: false, reason: 'not-found', error: config.notFoundMessage };
+        return cliInfoFromSpawnFailure(
+          processPort,
+          config,
+          command,
+          classifySpawnFailure(processPort.storage, processPort.cwd, outcome.code),
+        );
       case 'answered':
-        // A non-zero exit is the binary answering that it cannot report a version, which is as settled as an
-        // absent one and is cached the same way.
         return outcome.status === 0
           ? { available: true, version: result.stdout.trim(), authState: 'unknown' }
-          : { available: false, reason: 'not-found', error: config.notFoundMessage };
+          : {
+              available: false,
+              reason: 'cacheable-command-failure',
+              error: `\`${command}\` exited with status ${outcome.status} instead of reporting a version; ensure \`${config.binaryName}\` runs correctly for the user running the Coral daemon, then retry.`,
+            };
     }
   }
 

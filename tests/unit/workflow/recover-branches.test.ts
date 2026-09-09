@@ -289,7 +289,7 @@ function createHarness(options: {
 
   const waitRequests: WaitStreamRequest[] = [];
   const executionSvc: WorkflowExecutionPort & {
-    coralDispatch: ReturnType<typeof vi.fn>;
+    coralDispatch: ReturnType<typeof vi.fn<WorkflowExecutionPort['coralDispatch']>>;
     waitStream: ReturnType<typeof vi.fn>;
     awaitLaunch: ReturnType<typeof vi.fn>;
     abort: ReturnType<typeof vi.fn>;
@@ -654,6 +654,74 @@ describe('workflow recovery branch rules', () => {
     }
   });
 
+  it('quarantines a pending replacement launch check that established nothing', async () => {
+    const harness = createHarness({
+      atomPhase: 'running',
+      projectionPhase: 'error',
+      atomTerminals: {
+        0: {
+          content: '',
+          outcome: { kind: 'job_fault', fault: { kind: 'ghost_launch' } },
+          durationMs: 0,
+        },
+      },
+    });
+    setPendingReplacementLease(harness);
+    vi.mocked(harness.executionSvc.resume).mockResolvedValue({
+      status: 'undetermined',
+      code: 'provider_preflight_undetermined',
+      message: 'Provider preflight could not inspect credentials',
+    });
+    const finalizeWorkflow = vi.fn<(intent: WorkflowFinalizationIntent) => void>();
+
+    try {
+      await expect(
+        resumeAll({
+          db: harness.db,
+          progressStore: harness.progressStore,
+          loadJobDetails: loadJobProjectionDetails,
+          getExecutionService: () => harness.executionSvc,
+          createInvocationContext: harness.createInvocationContext,
+          finalizeWorkflow,
+          releaseFailedWorkflowDescendants: noFailedWorkflowDescendants,
+          time: fixedTime,
+        }),
+      ).resolves.toEqual([]);
+      expect(finalizeWorkflow).not.toHaveBeenCalled();
+      expect(harness.executionSvc.awaitLaunch).not.toHaveBeenCalled();
+      const continuation = harness.db
+        .prepare<[], { continuation_kind: string; continuation_key: string }>(
+          `SELECT continuation_kind, continuation_key
+             FROM recovery_quarantine
+            WHERE boundary_id = 'workflow-recovery'
+              AND subject_key = 'workflow-1'`,
+        )
+        .get();
+      expect(continuation?.continuation_kind).toBe('workflow-recovery.v1');
+      expect(JSON.parse(continuation?.continuation_key ?? '{}')).toMatchObject({
+        stage: 'external-outcome-unknown',
+        intendedFinalization: { kind: 'pending' },
+      });
+
+      await expect(
+        resumeAll({
+          db: harness.db,
+          progressStore: harness.progressStore,
+          loadJobDetails: loadJobProjectionDetails,
+          getExecutionService: () => harness.executionSvc,
+          createInvocationContext: harness.createInvocationContext,
+          finalizeWorkflow,
+          releaseFailedWorkflowDescendants: noFailedWorkflowDescendants,
+          time: fixedTime,
+        }),
+      ).resolves.toEqual([]);
+      expect(harness.executionSvc.resume).toHaveBeenCalledOnce();
+      expect(finalizeWorkflow).not.toHaveBeenCalled();
+    } finally {
+      harness.db.close();
+    }
+  });
+
   it('completes a pending replacement intent after a session-interrupted failure', async () => {
     const harness = createHarness({ atomPhase: 'running', projectionPhase: 'running' });
     const slot = harness.plan.slots[0];
@@ -930,7 +998,6 @@ describe('workflow recovery branch rules', () => {
     const missingJobId = randomUUID();
     const ids = { uuid: vi.fn(() => missingJobId) };
     const finalizeWorkflow = vi.fn<(intent: WorkflowFinalizationIntent) => void>();
-    // eslint-disable-next-line @typescript-eslint/no-misused-promises
     harness.executionSvc.coralDispatch.mockImplementation(async (_provider, _coralName, input) => {
       const jobId = String(input.jobId);
       if (jobId !== missingJobId) {
@@ -1034,7 +1101,8 @@ describe('workflow recovery branch rules', () => {
     const missingJobId = randomUUID();
     const finalizeWorkflow = vi.fn<(intent: WorkflowFinalizationIntent) => void>();
     harness.executionSvc.coralDispatch.mockResolvedValue({
-      status: 'rejected',
+      status: 'refused',
+      code: 'busy',
       message: 'launch capacity unavailable',
     });
     harness.executionSvc.abort.mockReturnValue({ aborted: [pendingJobId], notFound: [] });
@@ -1115,7 +1183,8 @@ describe('workflow recovery branch rules', () => {
     const completedJobId = harness.jobIdForSlot(completedSlot.slotId);
     const finalizeWorkflow = vi.fn<(intent: WorkflowFinalizationIntent) => void>();
     harness.executionSvc.coralDispatch.mockResolvedValue({
-      status: 'rejected',
+      status: 'refused',
+      code: 'busy',
       message: 'launch capacity unavailable',
     });
     harness.executionSvc.abort.mockReturnValue({ aborted: [completedJobId], notFound: [] });
@@ -2569,7 +2638,7 @@ describe('workflow recovery branch rules', () => {
             const decision = await (
               Reflect.get(target, property, target) as (...a: unknown[]) => Promise<ProviderSessionLaunchDecision>
             ).apply(target, args);
-            if (decision.status !== 'rejected') {
+            if (decision.status === 'running' || decision.status === 'queued') {
               replacementJobId = decision.jobId;
               releaseSessionJobClaim({
                 projectRoot: backend.projectRoot,

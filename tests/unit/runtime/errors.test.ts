@@ -406,7 +406,7 @@ describe('CoralSetupError', () => {
     expect(documentedCoralSetupErrorExitCode(contended.code)).toBe(75);
     expect(isRetryableCoralSetupError(contended)).toBe(true);
     expect(documentedCoralSetupErrorExitCode('store_open_unclassified')).toBe(70);
-    expect(documentedCoralSetupErrorExitCode('kb_unavailable')).toBe(1);
+    expect(documentedCoralSetupErrorExitCode('kb_unavailable')).toBe(75);
     expect(isRetryableCoralSetupError(documentedCoralSetupError('store_open_unclassified'))).toBe(false);
     expect(documentedCoralSetupErrorExitCode('not_a_documented_code')).toBeUndefined();
     expect(isRetryableCoralSetupError(new Error('database is locked'))).toBe(false);
@@ -874,6 +874,16 @@ describe('CoralSetupError', () => {
     expect(error.userMessage).not.toContain('/private/customer');
     expect(error.remediation).toContain('error.context.cause');
     expect(error.context?.cause).toBe("EACCES: permission denied, open '/private/customer/store.db'");
+  });
+
+  it('renders a provider preflight fault cause into operator-facing text', () => {
+    const cause = 'preflight implementation failed';
+    const error = documentedCoralSetupError('provider_preflight_faulted', { provider: 'codex', cause });
+
+    expect(error.userMessage).toBe(`Coral's codex provider preflight failed internally: ${cause}`);
+    expect(error.remediation).toContain('complete error message');
+    expect(error.remediation).not.toContain('error.context.cause');
+    expect(error.context).toEqual({ provider: 'codex', cause });
   });
 
   it('should construct with all fields', () => {

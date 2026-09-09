@@ -1,9 +1,14 @@
 import { resolve } from 'node:path';
 
-import type { EffortLevel, ProviderInstruction, ProviderPreflightInput } from '../../providers/contract.js';
-import type { BoundProvider } from '../../providers/bound-provider-contract.js';
 import { errorMessage } from '../../infra/error-format.js';
-import { type JobLaunchRequest, type RejectedLaunchDecision, rejectLaunch } from '../../jobs/launch.js';
+import type {
+  EffortLevel,
+  ProviderInstruction,
+  ProviderPreflightInput,
+  ProviderPreflightOutcome,
+} from '../../providers/contract.js';
+import type { BoundProvider } from '../../providers/bound-provider-contract.js';
+import { type JobLaunchRequest, type RefusedLaunchDecision, refuseLaunch } from '../../jobs/launch.js';
 import {
   AgentNotFoundError,
   AgentNamespaceNotFoundError,
@@ -16,6 +21,7 @@ import {
 } from '../../jobs/agent-resolution.js';
 import type { SessionAllocateOptions } from '../../sessions/contracts.js';
 import { describeSessionInterrupted, type SessionInterruptedFault } from '../../sessions/fault.js';
+import { documentedCoralSetupError } from '../../runtime/errors.js';
 import type { Runtime } from '../../runtime/ports.js';
 import type { StepDetail } from '../../workflow/execution-contract.js';
 import { SESSION_CONTROLLER_PROFILE_FIELDS, type RetentionPolicy } from '../../sessions/entry.js';
@@ -69,20 +75,20 @@ export function buildSessionControllerProfile(
   return profile;
 }
 
-export function mapResolverError(err: unknown): RejectedLaunchDecision | null {
-  if (err instanceof InvalidAgentRefError) return rejectLaunch('invalid_agent', err.message);
-  if (err instanceof AgentNotFoundError) return rejectLaunch('agent_not_found', err.message);
-  if (err instanceof AgentNamespaceNotFoundError) return rejectLaunch('agent_namespace_not_found', err.message);
+export function mapResolverError(err: unknown): RefusedLaunchDecision | null {
+  if (err instanceof InvalidAgentRefError) return refuseLaunch('invalid_agent', err.message);
+  if (err instanceof AgentNotFoundError) return refuseLaunch('agent_not_found', err.message);
+  if (err instanceof AgentNamespaceNotFoundError) return refuseLaunch('agent_namespace_not_found', err.message);
   return null;
 }
 
-export function normalizeCoralIntent(input: CoralIntent): CanonicalCoralIntent | RejectedLaunchDecision {
+export function normalizeCoralIntent(input: CoralIntent): CanonicalCoralIntent | RefusedLaunchDecision {
   const { sessionId, ...rest } = input;
   if (sessionId === undefined) {
     return rest;
   }
   if (sessionId.length === 0) {
-    return rejectLaunch('invalid_request', 'Session ID is required when provided.');
+    return refuseLaunch('invalid_request', 'Session ID is required when provided.');
   }
   return { ...rest, sessionId };
 }
@@ -201,41 +207,112 @@ export function toPreflightRuntime(
   };
 }
 
-export const PROVIDER_PREFLIGHT_TIMEOUT_MS = 30_000;
+export const PROVIDER_PREFLIGHT_ANSWER_BUDGET_MS = 27_000;
+export const PROVIDER_PREFLIGHT_RETRY_BACKOFF_MS = 1_000;
+
+export type PreflightDecision =
+  | { kind: 'satisfied' }
+  | { kind: 'refused'; message: string }
+  | { kind: 'undetermined'; cause: 'provider' | 'deadline'; message: string };
+
+function deadlinePreflightDecision(provider: BoundProvider): PreflightDecision {
+  return {
+    kind: 'undetermined',
+    cause: 'deadline',
+    message: `Coral could not complete the ${provider.name} availability check within ${PROVIDER_PREFLIGHT_ANSWER_BUDGET_MS}ms. Repeat the request; if it times out again, verify that the ${provider.name} CLI starts promptly for the user running the Coral daemon.`,
+  };
+}
+
+function isNonBlankString(value: unknown): value is string {
+  return typeof value === 'string' && value.trim().length > 0;
+}
+
+/**
+ * A provider that answers outside its own union has not answered, and recognising the discriminator is not
+ * enough to say it did: `refused` and `undetermined` are read for their message, and one that is absent or
+ * blank reaches the operator as a wire body promising a reason and carrying none. Anything this cannot
+ * classify throws, because a preflight that produced no answer is an internal fault and not a fourth answer.
+ */
+function classifyProviderPreflightOutcome(outcome: ProviderPreflightOutcome): PreflightDecision {
+  switch (outcome.kind) {
+    case 'satisfied':
+      return { kind: 'satisfied' };
+    case 'refused':
+      if (isNonBlankString(outcome.message)) {
+        return { kind: 'refused', message: outcome.message };
+      }
+      break;
+    case 'undetermined':
+      if (isNonBlankString(outcome.message)) {
+        return { kind: 'undetermined', cause: 'provider', message: outcome.message };
+      }
+      break;
+    default:
+      break;
+  }
+  throw new Error(`provider availability check returned an outcome outside its contract: ${JSON.stringify(outcome)}`);
+}
 
 function runPreflightWithTimeout(
   provider: BoundProvider,
   runtime: Omit<ProviderPreflightInput, 'access'>,
-): Promise<void> {
-  return new Promise<void>((resolve, reject) => {
+  deadline: bigint,
+): Promise<PreflightDecision> {
+  const remaining = deadline - runtime.time.monotonicNow();
+  if (remaining <= 0n) {
+    return Promise.resolve(deadlinePreflightDecision(provider));
+  }
+
+  return new Promise<PreflightDecision>((resolve, reject) => {
     let settled = false;
     const timeout = runtime.time.setTimeout(() => {
       if (settled) {
         return;
       }
       settled = true;
-      reject(new Error(`${provider.name} preflight timed out after ${PROVIDER_PREFLIGHT_TIMEOUT_MS}ms`));
-    }, PROVIDER_PREFLIGHT_TIMEOUT_MS);
+      resolve(deadlinePreflightDecision(provider));
+    }, Number(remaining));
     timeout.unref?.();
+
+    const rejectWith = (error: unknown): void => {
+      settled = true;
+      runtime.time.clearTimeout(timeout);
+      reject(
+        documentedCoralSetupError('provider_preflight_faulted', {
+          provider: provider.name,
+          cause: errorMessage(error),
+        }),
+      );
+    };
 
     Promise.resolve()
       .then(() => provider.preflight(runtime))
       .then(
-        () => {
+        (outcome) => {
           if (settled) {
+            return;
+          }
+          // No path may cancel the timer without settling this promise: once the timer is gone nothing else
+          // will, and a launch awaiting an unsettled preflight never returns.
+          let decision: PreflightDecision;
+          try {
+            decision =
+              runtime.time.monotonicNow() >= deadline
+                ? deadlinePreflightDecision(provider)
+                : classifyProviderPreflightOutcome(outcome);
+          } catch (error: unknown) {
+            rejectWith(error);
             return;
           }
           settled = true;
           runtime.time.clearTimeout(timeout);
-          resolve();
+          resolve(decision);
         },
         (error: unknown) => {
           if (settled) {
             return;
           }
-          settled = true;
-          runtime.time.clearTimeout(timeout);
-          reject(error instanceof Error ? error : new Error(String(error)));
+          rejectWith(error);
         },
       );
   });
@@ -244,11 +321,30 @@ function runPreflightWithTimeout(
 export async function runProviderPreflight(
   provider: BoundProvider,
   runtime: Omit<ProviderPreflightInput, 'access'>,
-): Promise<string | null> {
-  try {
-    await runPreflightWithTimeout(provider, runtime);
-    return null;
-  } catch (error: unknown) {
-    return errorMessage(error);
+): Promise<PreflightDecision> {
+  const deadline = runtime.time.monotonicNow() + BigInt(PROVIDER_PREFLIGHT_ANSWER_BUDGET_MS);
+  let isFinalProbe = false;
+  while (true) {
+    const decision = await runPreflightWithTimeout(provider, runtime, deadline);
+    // Only a returned provider non-answer may authorize another probe: a deadline may leave the
+    // prior probe in flight.
+    if (decision.kind !== 'undetermined' || decision.cause !== 'provider') {
+      return decision;
+    }
+
+    if (isFinalProbe) {
+      return decision;
+    }
+
+    const remaining = deadline - runtime.time.monotonicNow();
+    if (remaining <= 0n) {
+      return decision;
+    }
+    if (remaining <= BigInt(PROVIDER_PREFLIGHT_RETRY_BACKOFF_MS)) {
+      isFinalProbe = true;
+      continue;
+    }
+
+    await runtime.time.sleep(PROVIDER_PREFLIGHT_RETRY_BACKOFF_MS);
   }
 }

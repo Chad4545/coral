@@ -8,6 +8,7 @@ import { documentedCoralSetupError, serializeCoralSetupError } from '#src/runtim
 import { buildTransportErrorResponse } from '#src/transport/error-response.js';
 import { ChildPrincipalBindingError } from '#src/transport/ipc/child-principal-auth.js';
 import { IpcRpcError } from '#src/transport/ipc/client.js';
+import { domainResultToHttp, launchToHttp } from '#src/transport/response.js';
 
 describe('cli errors', () => {
   describe('buildErrorEnvelope', () => {
@@ -145,6 +146,27 @@ describe('cli errors', () => {
         message: 'Coral found an unrecognized entry in the interrupted backend store-reset staging area.',
         remediation:
           "Run 'coral-cli backend store-reset discard --target gen2 --flavor prod' to resume the interrupted reset under explicit operator control. Startup leaves the active store and staged incident unchanged.",
+      });
+    });
+
+    it('prints a provider preflight fault cause from a structured transport error before dropping its context', () => {
+      const cause = 'preflight implementation failed';
+      const error = documentedCoralSetupError('provider_preflight_faulted', { provider: 'codex', cause });
+      const response = buildTransportErrorResponse(error);
+
+      expect(response.statusCode).toBe(500);
+      expect(response.body).toMatchObject({ context: { provider: 'codex', cause } });
+      expect(
+        buildErrorEnvelope(new BackendToolHttpError(response.message, response.statusCode, response.body)),
+      ).toEqual({
+        envelope: {
+          error: true,
+          code: 'provider_preflight_faulted',
+          message: `Coral's codex provider preflight failed internally: ${cause}`,
+          remediation:
+            'Report provider_preflight_faulted with the complete error message. This internal fault does not establish whether the provider is installed, available, or authenticated; do not reinstall or re-authenticate based on this error.',
+        },
+        exitCode: 70,
       });
     });
 
@@ -331,16 +353,16 @@ describe('cli errors', () => {
     );
 
     it.each([
+      ['busy', 'All provider workers are busy'],
+      ['backend_recovering', 'Backend recovery is still in progress'],
       ['kb_disabled', 'KB daemon supervisor is disabled: disabled (CORAL_KB_ENABLE=0)'],
+      ['kb_unavailable', 'Knowledge base is unavailable'],
       ['kb_initializing', 'Knowledge base is starting up — retry in ~5 seconds'],
       ['kb_offline', 'Knowledge base is offline'],
       ['provider_host_inventory_unavailable', 'Provider-host inventory is temporarily unavailable.'],
     ] as const)('retries %s at exit 75 over IPC even though the wire carries no numeric status', (code, message) => {
-      // src/transport/ipc/server.ts's requestErrorResponse puts only the raw domain body
-      // (`{code, message, remediation?, detail?}`) on the JSON-RPC error `data` — no
-      // `statusCode`/`http` field ever crosses IPC. errorCodeToExit must recognize these
-      // three retry-later codes by name, the same way it already does for `transient` and
-      // `backend_shutting_down`, or this exact shape falls through to exit 1.
+      // No numeric HTTP status crosses IPC, so a code whose HTTP mapping is 503 must be recognised by name
+      // or it reaches the operator as a settled failure.
       const envelope = buildErrorEnvelope(
         new IpcRpcError({
           code: -32603,
@@ -351,17 +373,34 @@ describe('cli errors', () => {
 
       expect(envelope.exitCode).toBe(75);
     });
+
+    it.each([
+      ['provider_preflight_undetermined', 75],
+      ['provider_preflight_failed', 1],
+    ] as const)('maps IPC launch code %s to exit %i without an HTTP status', (code, exitCode) => {
+      const envelope = buildErrorEnvelope(
+        new IpcRpcError({
+          code: -32603,
+          message: 'Provider preflight result',
+          data: { code, message: 'Provider preflight result' },
+        }),
+      );
+
+      expect(envelope.exitCode).toBe(exitCode);
+    });
   });
 
   describe('errorCodeToExit', () => {
     it.each([
       ['invalid_usage', undefined, 2],
       ['transient', undefined, 75],
+      ['busy', undefined, 75],
       ['backend_shutting_down', undefined, 75],
+      ['backend_recovering', undefined, 75],
       ['kb_disabled', undefined, 75],
       ['kb_initializing', undefined, 75],
       ['kb_offline', undefined, 75],
-      ['kb_unavailable', undefined, 1],
+      ['kb_unavailable', undefined, 75],
       ['kb_unavailable', 503, 75],
       ['store_open_contended', undefined, 75],
       ['provider_host_inventory_unavailable', undefined, 75],
@@ -388,6 +427,30 @@ describe('cli errors', () => {
       expect(errorCodeToExit(code, httpStatus)).toBe(exitCode);
     });
 
+    it('keeps launch and domain retry-later codes aligned across HTTP and code-only exits', async () => {
+      const EXPECTED_LAUNCH_AND_DOMAIN_RETRY_LATER_CODES = [
+        'backend_recovering',
+        'busy',
+        'kb_disabled',
+        'provider_preflight_undetermined',
+      ];
+      const { DOCUMENTED_CORAL_SETUP_ERROR_CODES, LAUNCH_AND_DOMAIN_RETRY_LATER_ERROR_CODES } =
+        await import('#src/runtime/errors.js');
+
+      expect([...LAUNCH_AND_DOMAIN_RETRY_LATER_ERROR_CODES].sort()).toEqual(
+        EXPECTED_LAUNCH_AND_DOMAIN_RETRY_LATER_CODES.sort(),
+      );
+      const documentedCodes = new Set<string>(DOCUMENTED_CORAL_SETUP_ERROR_CODES);
+      expect([...LAUNCH_AND_DOMAIN_RETRY_LATER_ERROR_CODES].filter((code) => documentedCodes.has(code))).toEqual([]);
+
+      for (const code of LAUNCH_AND_DOMAIN_RETRY_LATER_ERROR_CODES) {
+        expect(launchToHttp({ status: 'refused', code, message: 'unused' }, 201).statusCode).toBe(503);
+        expect(launchToHttp({ status: 'undetermined', code, message: 'unused' }, 201).statusCode).toBe(503);
+        expect(domainResultToHttp({ ok: false, code, message: 'unused' }).statusCode).toBe(503);
+        expect(errorCodeToExit(code)).toBe(75);
+      }
+    });
+
     it('gives every NOT_OBSERVED_CORAL_SETUP_ERROR_CODES member exit 75 in both errorCodeToExit and expansionExitCode', async () => {
       const EXPECTED_NOT_OBSERVED_CODES = [
         'coordinator_unreachable',
@@ -410,6 +473,16 @@ describe('cli errors', () => {
         expect(errorCodeToExit(code)).toBe(75);
         expect(expansionExitCode({ status: 'error', code, userMessage: 'unused', remediation: 'unused' })).toBe(75);
       }
+    });
+
+    it('names provider_preflight_undetermined in the exit-75 catalog row', async () => {
+      const { readFileSync } = await import('node:fs');
+      const row = readFileSync('docs/cli-errors.md', 'utf-8')
+        .split('\n')
+        .find((line) => line.startsWith('| `75` |'));
+
+      expect(row).toBeDefined();
+      expect(row).toContain('`provider_preflight_undetermined`');
     });
 
     it('names every NOT_OBSERVED_CORAL_SETUP_ERROR_CODES member in the exit-75 catalog row', async () => {

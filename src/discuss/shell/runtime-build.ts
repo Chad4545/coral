@@ -9,13 +9,14 @@ import {
 } from '../events.js';
 import { nowIsoString } from '../../infra/time.js';
 import { isLivePhase } from '../../jobs/phase.js';
-import { errorMessage } from '../../infra/error-format.js';
+import { assertNever, errorMessage } from '../../infra/error-format.js';
+import { refuseLaunch, undeterminedLaunch } from '../../jobs/launch.js';
 import { backendLog } from '../../infra/backend-log.js';
 import type { InvocationContext } from '../../runtime/invocation-context.js';
 import type { CanonicalWorkDir } from '../../runtime/canonical-work-dir.js';
 import { appendRuntimeEvents, loadAttachedOrPersistedSnapshot } from './persistence.js';
 import type { ContinuitySnapshot } from '../../sessions/continuity.js';
-import type { AgentConfig, DiscussContext } from './types.js';
+import type { AgentConfig, DiscussContext, DiscussLaunchDecision } from './types.js';
 import { discussAgentExecution } from '../execution-policy.js';
 
 const RETRYABLE_ATTEMPT_OUTCOMES = new Set<DiscussAgentJobOutcome>([
@@ -34,7 +35,7 @@ export const PURPOSE_SPEECH: DiscussAgentJobPurpose = 'speech';
 export const PURPOSE_EPOCH_EVALUATION: DiscussAgentJobPurpose = 'epoch_evaluation';
 export const PURPOSE_FOLLOW_UP: DiscussAgentJobPurpose = 'follow_up';
 export const PURPOSE_SYNTHESIS: DiscussAgentJobPurpose = 'synthesis';
-const DISCUSS_LAUNCH_TIMEOUT_MS = 30_000;
+export const DISCUSS_LAUNCH_TIMEOUT_MS = 30_000;
 
 export type AttemptSuccess = {
   ok: true;
@@ -94,15 +95,24 @@ function isRetryableAttemptOutcome(outcome: DiscussAgentJobOutcome | undefined):
   return outcome !== undefined && RETRYABLE_ATTEMPT_OUTCOMES.has(outcome);
 }
 
-function withDiscussLaunchTimeout<T>(ctx: DiscussContext, launch: Promise<T>, label: string): Promise<T> {
-  return new Promise<T>((resolve, reject) => {
+function withDiscussLaunchTimeout(
+  ctx: DiscussContext,
+  launch: Promise<DiscussLaunchDecision>,
+  label: string,
+): Promise<DiscussLaunchDecision> {
+  return new Promise<DiscussLaunchDecision>((resolve, reject) => {
     let settled = false;
     const timeout = ctx.runtime.time.setTimeout(() => {
       if (settled) {
         return;
       }
       settled = true;
-      reject(new Error(`${label} timed out after ${DISCUSS_LAUNCH_TIMEOUT_MS}ms before returning a job id`));
+      resolve(
+        undeterminedLaunch(
+          'discuss_launch_undetermined',
+          `${label} timed out after ${DISCUSS_LAUNCH_TIMEOUT_MS}ms before returning a job id`,
+        ),
+      );
     }, DISCUSS_LAUNCH_TIMEOUT_MS);
     timeout.unref?.();
 
@@ -360,7 +370,7 @@ export async function executeAgentAttempt(
   }
 
   const executionSessionId = activeRun.executionSessionId;
-  const launch = await (async () => {
+  const launch = await (async (): Promise<DiscussLaunchDecision> => {
     try {
       const pendingLaunch =
         executionSessionId === undefined
@@ -397,21 +407,28 @@ export async function executeAgentAttempt(
             );
       return await withDiscussLaunchTimeout(ctx, pendingLaunch, `${provider} discuss launch`);
     } catch (error: unknown) {
-      return {
-        status: 'rejected' as const,
-        phase: 'preflight' as const,
-        code: 'launch_failed',
-        message: errorMessage(error),
-      };
+      return refuseLaunch('launch_failed', errorMessage(error));
     }
   })();
 
-  if (launch.status === 'rejected') {
-    return {
-      ok: false,
-      consumedAttempt: false,
-      message: launch.message,
-    };
+  switch (launch.status) {
+    case 'refused':
+      return {
+        ok: false,
+        consumedAttempt: false,
+        message: launch.message,
+      };
+    case 'undetermined':
+      return {
+        ok: false,
+        consumedAttempt: false,
+        message: `Discuss launch check established nothing: ${launch.message}`,
+      };
+    case 'running':
+    case 'queued':
+      break;
+    default:
+      return assertNever(launch);
   }
   const providerSessionId = launch.sessionId;
 
