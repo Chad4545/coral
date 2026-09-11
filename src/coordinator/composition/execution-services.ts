@@ -1,6 +1,7 @@
 import type { InvocationContext } from '../../runtime/invocation-context.js';
 import type { ProjectRequestPort, ExecutionServiceDeps } from '../contracts.js';
 import type { Runtime } from '../../runtime/ports.js';
+import type { SettlementRefusalRecorder } from '../../jobs/contracts/admission.js';
 import type { RecoveryCapableService } from '../../jobs/reconcile/contracts.js';
 import type { CoordinatorWorld } from './world.js';
 import { subscribeJobEvents } from '../../jobs/shell/event-subscription.js';
@@ -25,16 +26,17 @@ import { backendLog } from '../../infra/backend-log.js';
 import { createRecordedProcessObserver } from '../../infra/node-process.js';
 import { assertNever } from '../../infra/error-format.js';
 import type { ProviderOperationRecord } from '../../store/provider-operation-record.js';
+import type { ProviderOperationStartupOwnership } from '../../jobs/startup.js';
 import { ProviderOperationCleanupRouter } from '../../jobs/provider-operation-cleanup.js';
 import { readProviderOperationJobLaunch } from '../../jobs/provider-operation-state.js';
 import { readProjectionProviderSession } from '../../sessions/projections.js';
 import { materializeProviderOperationPrepare } from '../services/provider-operation-prepare.js';
 import { terminalizeProviderOperation } from '../../jobs/provider-operation-terminalization.js';
+import type { RecoveryCoordinator } from '../services/recovery/index.js';
 import {
   quarantineUnreadableProviderOperations,
   type RepairedProviderOperationAdoption,
-  type RecoveryCoordinator,
-} from '../services/recovery/index.js';
+} from '../services/recovery/retry-plans.js';
 import {
   attributeUnreadableProviderOperations,
   providerOperationMutationAdmission,
@@ -43,6 +45,10 @@ import {
   subscribeProviderOperationMutations,
 } from '../../store/provider-operation-journal.js';
 import { RecoveryQuarantineStore } from '../../recovery/quarantine.js';
+import type {
+  ProviderOperationAdoptionRefusal,
+  ProviderOperationStartupOwnershipReleaseDisposition,
+} from '../../recovery/unreadable-provider-operation.js';
 import {
   providerProxySetIdentitiesEqual,
   providerProxySetIdentityFromRecord,
@@ -74,6 +80,7 @@ type CreateExecutionServicesDeps = {
   runtime: Runtime;
   bundleHash: string;
   backendNamespace: string;
+  settlementRefusalRecorder: SettlementRefusalRecorder;
   createExecutionService: (ctx: InvocationContext, deps: ExecutionServiceDeps) => ProjectRequestPort;
   onProviderProxyLifecycleFatal(
     error: ProviderProxySetLifecycleFatalError | ProviderOperationReconcilerFatalError,
@@ -89,15 +96,25 @@ export function createExecutionServices({
   runtime,
   bundleHash,
   backendNamespace,
+  settlementRefusalRecorder,
   createExecutionService,
   onProviderProxyLifecycleFatal,
 }: CreateExecutionServicesDeps): {
   getExecutionService: (ctx: InvocationContext) => ProjectRequestPort;
   getRecoveryService: (ctx: InvocationContext) => RecoveryCapableService;
   listExecutionServices: () => ProjectRequestPort[];
-  adoptRepairedProviderOperation: (record: ProviderOperationRecord) => Promise<RepairedProviderOperationAdoption>;
+  adoptRepairedProviderOperation: (
+    record: ProviderOperationRecord,
+    recordKey?: string,
+  ) => Promise<RepairedProviderOperationAdoption>;
+  releaseUnreadableProviderOperationStartupOwnership: (
+    recordKey: string,
+  ) => Promise<ProviderOperationStartupOwnershipReleaseDisposition>;
   connectProviderOperationRecovery: (recoveryCoordinator: RecoveryCoordinator) => void;
-  reconcileProviderOperationsAtStartup: (signal: AbortSignal) => Promise<StartupReconciliationReport>;
+  reconcileProviderOperationsAtStartup: (
+    ownership: ProviderOperationStartupOwnership,
+    signal: AbortSignal,
+  ) => Promise<StartupReconciliationReport>;
   startProviderOperationReconciler: () => void;
   stopProviderOperationReconciler: () => ProviderOperationReconcilerStopDisposition;
 } {
@@ -106,6 +123,7 @@ export function createExecutionServices({
   const storeServicesRef = world.storeServicesRef;
   const providerOperationCleanup = new ProviderOperationCleanupRouter();
   world.operationRegistry.connectCleanup(providerOperationCleanup);
+  world.operationRegistry.connectBinding(world.launchCoordinator);
   const getProgressStore = () => {
     const storeServices = storeServicesRef.tryGet();
     if (storeServices === null) throw new Error('Coordinator store services are not connected.');
@@ -291,6 +309,9 @@ export function createExecutionServices({
     },
     startupSetRecovery,
     registry: world.operationRegistry,
+    binding: world.launchCoordinator,
+    releaseStartupOwnership: (operation) =>
+      providerOperationRecovery?.releaseProviderOperationStartupOwnership(operation) ?? { kind: 'not-owned' },
     materializePrepare: (record) =>
       materializeProviderOperationPrepare(
         {
@@ -369,16 +390,48 @@ export function createExecutionServices({
 
   const adoptRepairedProviderOperation = async (
     record: ProviderOperationRecord,
+    recordKey?: string,
   ): Promise<RepairedProviderOperationAdoption> => {
     if (!providerProxyClaimsInitialized || !providerProxyLifecycleInitialized) {
-      return { kind: 'refused', reason: 'the provider operation ownership path is not initialized' };
+      return {
+        kind: 'refused',
+        reason: 'the provider operation ownership path is not initialized',
+        remedy: { kind: 'restart-coordinator' },
+      };
+    }
+    if (providerOperationRecovery === null) {
+      return {
+        kind: 'refused',
+        reason: 'provider operation recovery ownership is not connected',
+        remedy: { kind: 'restart-coordinator' },
+      };
+    }
+
+    const ownership = providerOperationRecovery.adoptRepairedProviderOperationOwnership(record, recordKey);
+    if (ownership.bindingDisposition.kind === 'refused') {
+      return {
+        kind: 'refused',
+        reason: ownership.bindingDisposition.reason,
+        remedy: ownership.bindingDisposition.remedy,
+      };
+    }
+    if (ownership.bindingDisposition.kind === 'not-reconciled') {
+      return {
+        kind: 'refused',
+        reason: `the repaired provider operation is ${ownership.bindingDisposition.reason}`,
+        remedy: { kind: 'external-repair' },
+      };
     }
 
     world.providerProxyClaims.applyMutation({ kind: 'upserted', record });
     const setIdentity = providerProxySetIdentityFromRecord(record);
     const accepted = world.providerProxyClaims.claimFor(record.operation);
     if (accepted === null || !providerProxySetIdentitiesEqual(accepted.setIdentity, setIdentity)) {
-      return { kind: 'refused', reason: 'the provider operation claim mirror did not retain the decoded record' };
+      return {
+        kind: 'refused',
+        reason: 'the provider operation claim mirror did not retain the decoded record',
+        remedy: { kind: 'external-repair' },
+      };
     }
     providerProxyLifecycle.claimsChanged(setIdentity);
     await providerOperationReconciler.reconcile(record);
@@ -461,6 +514,7 @@ export function createExecutionServices({
       bundleHash,
       backendNamespace,
       launchCoordinator: world.launchCoordinator,
+      settlementRefusalRecorder,
       eventBus: world.eventBus,
       providerRegistry: world.providerRegistry,
       childPrincipalRegistry: world.childPrincipalRegistry,
@@ -516,13 +570,34 @@ export function createExecutionServices({
     getRecoveryService,
     listExecutionServices,
     adoptRepairedProviderOperation,
+    releaseUnreadableProviderOperationStartupOwnership: async (recordKey) => {
+      const resolution = providerOperationRecovery?.releaseUnreadableProviderOperationStartupOwnership(recordKey);
+      if (resolution === undefined) return { kind: 'completed', releasedLaunchPermits: 0 };
+      const refusals: ProviderOperationAdoptionRefusal[] = [];
+      for (const readable of resolution.readableRecords) {
+        const adoption = await adoptRepairedProviderOperation(readable.record, readable.recordKey);
+        if (adoption.kind === 'accepted') continue;
+        refusals.push({
+          recordKey: readable.recordKey,
+          jobId: readable.record.operation.jobId,
+          operationId: readable.record.operation.operationId,
+          proxyInstanceId: readable.record.operation.proxyInstanceId,
+          buildSetId: readable.record.operation.buildSetId,
+          reason: adoption.reason,
+          remedy: adoption.remedy,
+        });
+      }
+      return refusals.length === 0
+        ? { kind: 'completed', releasedLaunchPermits: resolution.released }
+        : { kind: 'adoption-refused', releasedLaunchPermits: resolution.released, refusals };
+    },
     connectProviderOperationRecovery: (recoveryCoordinator) => {
       providerOperationRecovery = recoveryCoordinator;
     },
-    reconcileProviderOperationsAtStartup: async (signal) => {
+    reconcileProviderOperationsAtStartup: async (ownership, signal) => {
       await initializeProviderProxyClaims();
       await initializeProviderProxyLifecycle();
-      return providerOperationReconciler.reconcileAtStartup(signal);
+      return providerOperationReconciler.reconcileAtStartup(ownership, signal);
     },
     startProviderOperationReconciler: () => providerOperationReconciler.start(),
     stopProviderOperationReconciler: () => {

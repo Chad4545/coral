@@ -1,3 +1,4 @@
+import { Command } from 'commander';
 import { describe, expect, it } from 'vitest';
 
 import { BackendToolHttpError } from '#src/transport/http/errors.js';
@@ -11,6 +12,7 @@ import type { JobDetailResponse } from '#src/jobs/records.js';
 import type { AbortResult } from '#src/jobs/contracts/abort-registry.js';
 import type { WaitStreamEvent } from '#src/jobs/wait.js';
 import { fixtureCanonicalWorkDir } from '#tests/helpers/canonical-work-dir.js';
+import { executeRenderedCommand, operatorArtifactLines } from '#tests/helpers/rendered-command.js';
 import { BackendUnreachableError, TransientHttpError } from '#src/infra/http-errors.js';
 import { buildErrorEnvelope, UsageError } from '#src/cli/errors.js';
 import {
@@ -18,7 +20,13 @@ import {
   type DocumentedCoralSetupErrorCode,
   type OperatorFacingCoralSetupError,
 } from '#src/runtime/errors.js';
-import { formatBackendStatus as formatComposedBackendStatus, formatShutdown } from '#src/cli/format/backend.js';
+import {
+  formatBackendStatus as formatComposedBackendStatus,
+  formatRecoveryQuarantineList,
+  formatShutdown,
+  formatUnreadableProviderOperationDiscard,
+} from '#src/cli/format/backend.js';
+import { encodeRecoveryQuarantineKey } from '#src/recovery/quarantine.js';
 import {
   formatDiscussAbort,
   formatDiscussParticipate,
@@ -284,7 +292,9 @@ describe('cli format', () => {
 
   describe('formatLaunchWaitHint', () => {
     it('formats the wait command for a detached launch', () => {
-      expect(formatLaunchWaitHint(runningDecision)).toBe('Run coral-cli wait jobs job-1 to wait for completion.');
+      expect(formatLaunchWaitHint(runningDecision)).toBe(
+        'Wait for completion with the command below.\ncommand=coral-cli wait jobs job-1',
+      );
     });
   });
 
@@ -485,7 +495,7 @@ describe('cli format', () => {
       expect(formatted).toContain('Result:\nWorkflow summary');
     });
 
-    it('renders a wait hint while the job is still running', () => {
+    it('renders and executes the wait command while the job is still running', async () => {
       const running = {
         ...jobDetailResponse,
         status: {
@@ -495,7 +505,8 @@ describe('cli format', () => {
         exit: null,
       } satisfies JobDetailResponse;
 
-      expect(formatJobDetail(running)).toMatchInlineSnapshot(`
+      const rendered = formatJobDetail(running);
+      expect(rendered).toMatchInlineSnapshot(`
         "Job job-1
         Phase: running
         Readiness: ready
@@ -507,8 +518,24 @@ describe('cli format', () => {
         Work dir: /work/coral
         Updated: 2026-07-03T08:01:00.000Z
         Last seq: 5
-        Run coral-cli wait jobs job-1 to follow it."
+        Follow it with the command below.
+        command=coral-cli wait jobs job-1"
       `);
+
+      let waitedJobId: string | undefined;
+      const program = new Command();
+      program.exitOverride();
+      program
+        .command('wait')
+        .command('jobs')
+        .argument('<job-id>')
+        .action((jobId: string) => {
+          waitedJobId = jobId;
+        });
+      const tokens = await executeRenderedCommand(program, rendered, { label: 'command' });
+
+      expect(waitedJobId).toBe('job-1');
+      expect(tokens).toEqual(['coral-cli', 'wait', 'jobs', 'job-1']);
     });
 
     it('renders aborted terminal details from the outcome when content is empty', () => {
@@ -918,6 +945,419 @@ describe('cli format', () => {
       );
     });
 
+    it('renders launch permit holder and execution owner as separate identities', () => {
+      const status = {
+        status: 'ok',
+        health: {
+          ...baseHealth,
+          components: [],
+          queueDepth: 0,
+          diagnostics: {
+            launchPermits: [
+              {
+                reservationId: 'reservation-1',
+                jobId: 'job-1',
+                pool: 'default' as const,
+                provider: 'codex',
+                holder: { kind: 'system-task' as const, id: 'permit-task' },
+                executionOwner: { kind: 'system-task' as const, id: 'execution-task' },
+                heldForMs: 900_001,
+              },
+            ],
+          },
+        },
+      } satisfies BackendStatusFull;
+
+      expect(formatBackendStatus(status)).toContain(
+        [
+          'Launch permits:',
+          '  reservation=reservation-1 job=job-1 pool=default provider=codex heldForMs=900001',
+          '    holder=system-task:permit-task',
+          '    executionOwner=system-task:execution-task',
+        ].join('\n'),
+      );
+    });
+
+    it('renders transferred launch ownership with both the attempted and current holders', () => {
+      const status = {
+        status: 'ok',
+        health: {
+          ...baseHealth,
+          components: [],
+          queueDepth: 0,
+          diagnostics: {
+            launchReleaseDispositions: [
+              {
+                reservationId: 'reservation-1',
+                jobId: 'job-1',
+                pool: 'default' as const,
+                provider: 'codex',
+                attemptedHolder: { kind: 'local-execution' as const },
+                disposition: {
+                  kind: 'transferred' as const,
+                  pool: 'default' as const,
+                  holder: { kind: 'proxy-operation' as const, operationId: 'operation-1' },
+                },
+                observedAtMs: 123_456,
+              },
+            ],
+          },
+        },
+      } satisfies BackendStatusFull;
+
+      expect(formatBackendStatus(status)).toContain(
+        [
+          'Launch release dispositions:',
+          '  reservation=reservation-1 job=job-1 pool=default provider=codex observedAtMs=123456',
+          '    attemptedHolder=local-execution',
+          '    disposition=transferred pool=default holder=proxy-operation:operation-1',
+        ].join('\n'),
+      );
+    });
+
+    it('renders provider-operation adoption refusals with the actionable record identity', () => {
+      const status = {
+        status: 'ok',
+        health: {
+          ...baseHealth,
+          components: [],
+          queueDepth: 0,
+          diagnostics: {
+            providerOperationAdoptionRefusals: [
+              {
+                triggerRecordKey: 'discarded-record-key',
+                rowDisposition: 'discarded' as const,
+                releasedLaunchPermits: 0,
+                recordKey: 'surviving-record-key',
+                jobId: 'job-1',
+                operationId: 'operation-1',
+                proxyInstanceId: 'proxy-1',
+                buildSetId: 'build-set-1',
+                reason: 'the provider operation ownership path is not initialized',
+                remedy: { kind: 'restart-coordinator' as const },
+                observedAtMs: 123_456,
+              },
+            ],
+          },
+        },
+      } satisfies BackendStatusFull;
+
+      const output = formatBackendStatus(status);
+      expect(output).toContain('Provider-operation adoption refusals:');
+      expect(output).toContain('record=surviving-record-key job=job-1 operation=operation-1');
+      expect(output).toContain('triggerRecord=discarded-record-key rowDisposition=discarded');
+      expect(output).toContain('restart or repair the canonical coordinator externally');
+      expect(operatorArtifactLines(output)).toEqual([
+        'command=coral-cli jobs detail job-1',
+        'command=coral-cli backend status',
+      ]);
+    });
+
+    it.each([
+      {
+        remedy: { kind: 'restart-coordinator' as const },
+        required: ['restart or repair the canonical coordinator externally', 'Coral retries adoption during startup'],
+        forbidden: 'recovery-quarantine list',
+      },
+      {
+        remedy: { kind: 'remote-settlement' as const },
+        required: ['remote settlement path', 'automatically'],
+        forbidden: 'external repair',
+      },
+      {
+        remedy: { kind: 'external-repair' as const },
+        required: ['external repair', 'no Coral command can repair it'],
+        forbidden: 'automatically',
+      },
+    ])('renders the $remedy.kind adoption remedy', ({ remedy, required, forbidden }) => {
+      const output = formatUnreadableProviderOperationDiscard({
+        key: 'discarded-record-key',
+        revision: 'a'.repeat(64),
+        kind: 'adoption-refused',
+        rowDisposition: 'discarded',
+        releasedLaunchPermits: 0,
+        refusals: [
+          {
+            recordKey: 'surviving-record-key',
+            jobId: 'job-1',
+            operationId: 'operation-1',
+            proxyInstanceId: 'proxy-1',
+            buildSetId: 'build-set-1',
+            reason: 'cause-specific diagnostic text',
+            remedy,
+          },
+        ],
+      });
+
+      expect(output).toContain('record=surviving-record-key');
+      expect(operatorArtifactLines(output)).toEqual([
+        'command=coral-cli jobs detail job-1',
+        'command=coral-cli backend status',
+      ]);
+      for (const action of required) expect(output).toContain(action);
+      if (forbidden !== undefined) expect(output).not.toContain(forbidden);
+    });
+
+    it.each(['recovery-quarantine-discard', 'recovery-quarantine-clear'] as const)(
+      'renders and executes the complete list artifact for the %s adoption remedy',
+      async (kind) => {
+        const output = formatUnreadableProviderOperationDiscard({
+          key: 'discarded-record-key',
+          revision: 'a'.repeat(64),
+          kind: 'adoption-refused',
+          rowDisposition: 'discarded',
+          releasedLaunchPermits: 0,
+          refusals: [
+            {
+              recordKey: 'surviving-record-key',
+              jobId: 'job-1',
+              operationId: 'operation-1',
+              proxyInstanceId: 'proxy-1',
+              buildSetId: 'build-set-1',
+              reason: 'cause-specific diagnostic text',
+              remedy: { kind, command: { kind: 'list' } },
+            },
+          ],
+        });
+        expect(operatorArtifactLines(output)).toEqual([
+          'command=coral-cli backend recovery-quarantine list',
+          'command=coral-cli jobs detail job-1',
+          'command=coral-cli backend status',
+        ]);
+
+        let listed = false;
+        const program = new Command();
+        program.exitOverride();
+        program
+          .command('backend')
+          .command('recovery-quarantine')
+          .command('list')
+          .action(() => {
+            listed = true;
+          });
+        const tokens = await executeRenderedCommand(program, output, {
+          label: 'command',
+          includes: 'recovery-quarantine list',
+        });
+
+        expect(listed).toBe(true);
+        expect(tokens).toEqual(['coral-cli', 'backend', 'recovery-quarantine', 'list']);
+      },
+    );
+
+    it('renders and executes the exact readable-discard artifact for an adoption refusal', async () => {
+      const revision = `fingerprint:sha256:${'b'.repeat(64)}`;
+      const output = formatUnreadableProviderOperationDiscard({
+        key: 'discarded-record-key',
+        revision: 'a'.repeat(64),
+        kind: 'adoption-refused',
+        rowDisposition: 'discarded',
+        releasedLaunchPermits: 0,
+        refusals: [
+          {
+            recordKey: 'surviving-record-key',
+            jobId: 'job-1',
+            operationId: 'operation-1',
+            proxyInstanceId: 'proxy-1',
+            buildSetId: 'build-set-1',
+            reason: 'cause-specific diagnostic text',
+            remedy: {
+              kind: 'recovery-quarantine-discard',
+              command: {
+                kind: 'discard-provider-operation',
+                key: 'surviving-record-key',
+                revision,
+                allowReadable: true,
+              },
+            },
+          },
+        ],
+      });
+      const encodedKey = encodeRecoveryQuarantineKey('surviving-record-key');
+      expect(operatorArtifactLines(output)).toEqual([
+        `discard=coral-cli backend recovery-quarantine discard-provider-operation --key ${encodedKey} --revision ${JSON.stringify(revision)} --allow-readable`,
+        'command=coral-cli jobs detail job-1',
+        'command=coral-cli backend status',
+      ]);
+
+      let received: Readonly<{ key: string; revision: string; allowReadable: boolean }> | undefined;
+      const program = new Command();
+      program.exitOverride();
+      program
+        .command('backend')
+        .command('recovery-quarantine')
+        .command('discard-provider-operation')
+        .requiredOption('--key <key>')
+        .requiredOption('--revision <revision>')
+        .option('--allow-readable')
+        .action((options: { key: string; revision: string; allowReadable?: boolean }) => {
+          received = { ...options, allowReadable: options.allowReadable === true };
+        });
+      const tokens = await executeRenderedCommand(program, output, { label: 'discard' });
+
+      expect(received).toEqual({ key: encodedKey, revision, allowReadable: true });
+      expect(tokens).toEqual([
+        'coral-cli',
+        'backend',
+        'recovery-quarantine',
+        'discard-provider-operation',
+        '--key',
+        encodedKey,
+        '--revision',
+        revision,
+        '--allow-readable',
+      ]);
+    });
+
+    it('renders the complete recovery-quarantine clear command for an eligible row', () => {
+      const key = 'surviving-record-key';
+      const revision = `sha256:${'a'.repeat(64)}`;
+      const output = formatRecoveryQuarantineList([
+        {
+          boundary: 'provider-operation-unreadable',
+          subject: { key, revision: { kind: 'fingerprint', value: revision } },
+          state: 'active',
+          stage: 'settle',
+          retry: null,
+          continuation: null,
+          errorMessage: 'adoption refused',
+          detail: 'operator retry required',
+          remedy: null,
+          detectedAt: '2026-09-11T00:00:00.000Z',
+          updatedAt: '2026-09-11T00:00:00.000Z',
+        },
+      ]);
+
+      expect(operatorArtifactLines(output)).toEqual([
+        `clear=coral-cli backend recovery-quarantine clear --boundary "provider-operation-unreadable" --key ${encodeRecoveryQuarantineKey(key)} --revision "fingerprint:${revision}"`,
+      ]);
+    });
+
+    it('renders automatic launch reclamation evidence', () => {
+      const status = {
+        status: 'ok',
+        health: {
+          ...baseHealth,
+          components: [],
+          queueDepth: 0,
+          diagnostics: {
+            launchReclamations: [
+              {
+                reservationId: 'reservation-reclaimed-1',
+                jobId: 'job-reclaimed-1',
+                pool: 'default' as const,
+                provider: 'codex',
+                holder: { kind: 'proxy-operation' as const, operationId: 'operation-reclaimed-1' },
+                heldForMs: 30_000,
+                evidence: {
+                  kind: 'provider-operation-absent' as const,
+                  operationId: 'operation-reclaimed-1',
+                  jobEvidence: { kind: 'job-terminal' as const, phase: 'aborted' as const },
+                },
+                reclaimedAtMs: 123_456,
+              },
+              {
+                reservationId: 'reservation-reclaimed-2',
+                jobId: 'job-reclaimed-2',
+                pool: 'default' as const,
+                provider: 'codex',
+                holder: {
+                  kind: 'undecided-provider-operation' as const,
+                  recordKeys: ['record-a', 'record-b'],
+                },
+                heldForMs: 40_000,
+                evidence: {
+                  kind: 'provider-operation-records-absent' as const,
+                  recordKeys: ['record-a', 'record-b'],
+                  jobEvidence: { kind: 'job-absent' as const },
+                },
+                reclaimedAtMs: 123_457,
+              },
+            ],
+          },
+        },
+      } satisfies BackendStatusFull;
+
+      expect(formatBackendStatus(status)).toContain(
+        [
+          'Automatic launch reclamations:',
+          '  reservation=reservation-reclaimed-1 job=job-reclaimed-1 pool=default provider=codex heldForMs=30000 reclaimedAtMs=123456',
+          '    holder=proxy-operation:operation-reclaimed-1',
+          '    evidence=provider-operation-absent:operation-reclaimed-1 jobEvidence=job-terminal:aborted',
+          '  reservation=reservation-reclaimed-2 job=job-reclaimed-2 pool=default provider=codex heldForMs=40000 reclaimedAtMs=123457',
+          '    holder=undecided-provider-operation:["record-a","record-b"]',
+          '    evidence=provider-operation-records-absent:["record-a","record-b"] jobEvidence=job-absent',
+        ].join('\n'),
+      );
+    });
+
+    it.each(['terminal-persist-failed', 'claim-release-failed', 'claim-already-reassigned'] as const)(
+      'renders the settlement refusal cause %s',
+      (cause) => {
+        const status = {
+          status: 'ok',
+          health: {
+            ...baseHealth,
+            components: [],
+            queueDepth: 0,
+            diagnostics: {
+              settlementRefusalRecordingFailures: [
+                {
+                  jobId: 'job-1',
+                  cause,
+                  error: 'quarantine recording failed',
+                  observedAtMs: 123_456,
+                },
+              ],
+            },
+          },
+        } satisfies BackendStatusFull;
+
+        const output = formatBackendStatus(status);
+        expect(output).toContain(`job=job-1 cause=${cause} observedAtMs=123456`);
+        const contract = {
+          'terminal-persist-failed': ['repair the job store externally', 'cannot retry'],
+          'claim-release-failed': ['repair session persistence externally', 'cannot retry'],
+          'claim-already-reassigned': ['no automatic retry applies', 'current session owner externally'],
+        }[cause];
+        for (const expected of contract) expect(output).toContain(expected);
+        expect(operatorArtifactLines(output)).toEqual([
+          'command=coral-cli jobs detail job-1',
+          'command=coral-cli backend status',
+        ]);
+      },
+    );
+
+    it('renders identity-keyed settled-unbound status persistence failures', () => {
+      const status = {
+        status: 'ok',
+        health: {
+          ...baseHealth,
+          components: [],
+          queueDepth: 0,
+          diagnostics: {
+            settlementRefusalRecordingFailures: [
+              {
+                jobId: 'job-unbound',
+                operationId: 'operation-unbound',
+                cause: 'settled-unbound-status-persist-failed' as const,
+                error: 'recovery quarantine unavailable',
+                observedAtMs: 123_456,
+              },
+            ],
+          },
+        },
+      } satisfies BackendStatusFull;
+
+      expect(formatBackendStatus(status)).toContain(
+        'job=job-unbound operation=operation-unbound cause=settled-unbound-status-persist-failed observedAtMs=123456',
+      );
+      const output = formatBackendStatus(status);
+      expect(output).toContain('retries this settlement-status write automatically');
+      expect(operatorArtifactLines(output)).toEqual(['command=coral-cli backend status']);
+      expect(output).toContain('job=job-unbound operation=operation-unbound');
+    });
+
     it('renders skipped provider-proxy-set candidate identities without offering an unauthorized command', () => {
       const invalidToken = 'pps1.future-row';
       const disagreementToken = 'pps2.other-identity';
@@ -1032,7 +1472,8 @@ describe('cli format', () => {
       expect(output).toContain('  kb: degraded');
       expect(output).toContain('    reason: curate-publish (3 consecutive failures)');
       expect(output).toContain('    last error: publish timed out');
-      expect(output).toContain('    hint: free disk space, then coral-cli backend shutdown to reset');
+      expect(output).toContain('    hint: free disk space, then run the shutdown command below to reset');
+      expect(operatorArtifactLines(output)).toEqual(['command=coral-cli backend shutdown']);
     });
 
     it('omits the last-error line for a degraded component when lastError is empty', () => {
@@ -1087,7 +1528,8 @@ describe('cli format', () => {
       expect(output).toContain('    attempts: 4');
       expect(output).toContain('    retry: daemon restart required');
       expect(output).not.toContain('lastErrorStack');
-      expect(output).toContain('    hint: restart the daemon: coral-cli backend shutdown');
+      expect(output).toContain('    hint: restart the daemon with the command below');
+      expect(operatorArtifactLines(output)).toEqual(['command=coral-cli backend shutdown']);
     });
 
     it('omits the last-log line for an offline component when lastLogLine is absent', () => {
@@ -1102,7 +1544,8 @@ describe('cli format', () => {
       const output = formatBackendStatus(status);
       expect(output).toContain('  kb: offline');
       expect(output).not.toContain('last log:');
-      expect(output).toContain('    hint: restart the daemon: coral-cli backend shutdown');
+      expect(output).toContain('    hint: restart the daemon with the command below');
+      expect(operatorArtifactLines(output)).toEqual(['command=coral-cli backend shutdown']);
     });
 
     it('points a non-retryable offline component at the failure details and reindex recovery', () => {
@@ -1124,8 +1567,9 @@ describe('cli format', () => {
       const output = formatBackendStatus(status);
       expect(output).toContain('    retry: not retryable');
       expect(output).toContain(
-        '    hint: review the failure details above; coral-cli kb reindex can rebuild a corrupt KB index',
+        '    hint: review the failure details above; the reindex command below can rebuild a corrupt KB index',
       );
+      expect(operatorArtifactLines(output)).toEqual(['command=coral-cli kb reindex']);
     });
 
     it('omits the queue-depth line when queueDepth is absent', () => {
@@ -1142,10 +1586,10 @@ describe('cli format', () => {
 
     it('formats each no-daemon observation without inventing a general absence', () => {
       expect(formatBackendStatus({ status: 'no_record_no_socket' })).toBe(
-        'No coordinator discovery record and no coordinator socket at the current expected address were found. Any coral-cli mutating command (or a Claude Code session start) attempts startup.',
+        'No coordinator discovery record and no coordinator socket at the current expected address were found. Any mutating Coral command (or a Claude Code session start) attempts startup.',
       );
       expect(formatBackendStatus({ status: 'recorded_process_absent', pid: 4242 })).toBe(
-        'A coordinator discovery record names pid=4242, and that process was observed absent. The record may be stale while another coordinator holds the socket without having published its own record. Any coral-cli mutating command (or a Claude Code session start) attempts startup or handoff.',
+        'A coordinator discovery record names pid=4242, and that process was observed absent. The record may be stale while another coordinator holds the socket without having published its own record. Any mutating Coral command (or a Claude Code session start) attempts startup or handoff.',
       );
     });
 
@@ -1167,8 +1611,8 @@ describe('cli format', () => {
       expect(text).toBe(
         [
           'Backend state is unknown: the recorded coordinator address is answered by a Coral coordinator for namespace=another-installation flavor=dev, which is not the identity the discovery record carries.',
-          'That says only who holds the recorded port, which the operating system reassigns freely: it is not a report that the backend stopped, and it is not a conflict over startup, because this installation is reached through its own socket rather than that port. A coral-cli mutating command (or a Claude Code session start) still attempts startup or handoff.',
-          "Next step: the record names a port that coordinator holds, so it is stale unless the recorded process still owns it: run 'ps -p 4242' (or check your process manager), and if that is not Coral, delete /run/coral/coordinator.json and run a coral-cli mutating command; it attempts startup or handoff. coral-cli backend shutdown cannot stop the coordinator that answered: it presents the boot token from a record that coordinator never wrote, and is rejected.",
+          'That says only who holds the recorded port, which the operating system reassigns freely: it is not a report that the backend stopped, and it is not a conflict over startup, because this installation is reached through its own socket rather than that port. A mutating Coral command (or a Claude Code session start) still attempts startup or handoff.',
+          "Next step: the record names a port that coordinator holds, so it is stale unless the recorded process still owns it: run 'ps -p 4242' (or check your process manager), and if that is not Coral, delete /run/coral/coordinator.json and run a mutating Coral command; it attempts startup or handoff. The ordinary shutdown command cannot stop the coordinator that answered: it presents the boot token from a record that coordinator never wrote, and is rejected.",
         ].join('\n'),
       );
       expect(text, 'nothing observed here says startup cannot proceed').not.toMatch(/stays held|remains held/u);
@@ -1244,7 +1688,7 @@ describe('cli format', () => {
 
       expect(text).toMatch(/ps -p 4242/u);
       expect(text).toContain('/run/coral/coordinator.json');
-      expect(text).toMatch(/coral-cli mutating command; it attempts startup or handoff/u);
+      expect(text).toMatch(/mutating Coral command; it attempts startup or handoff/u);
     });
 
     // Not "not running": the coordinator's own IPC socket exists with no record written yet, so a boot in
@@ -1272,7 +1716,7 @@ describe('cli format', () => {
           'Coral recorded a recent coordinator failure.',
           'Phase: startup_failed',
           'Retryable: no',
-          'Next step: inspect the coordinator log, fix the reported cause, then retry a coral-cli mutating command; it attempts startup or handoff.',
+          'Next step: inspect the coordinator log, fix the reported cause, then retry a mutating Coral command; it attempts startup or handoff.',
         ].join('\n'),
       );
     });
@@ -1327,7 +1771,7 @@ describe('cli format', () => {
           'Phase: startup_failed',
           'Retryable: no',
           'Cause: Coral recorded a setup refusal from another Coral build, whose codes this build cannot name. [code=future_setup_refusal]',
-          "Next step: inspect the coordinator log for that code, upgrade Coral, then retry a coral-cli mutating command; it attempts startup or handoff. Rerun coral-cli backend status to observe that attempt's result.",
+          "Next step: inspect the coordinator log for that code, upgrade Coral, then retry a mutating Coral command; it attempts startup or handoff. Inspect backend status again to observe that attempt's result.",
         ].join('\n'),
       );
     });
@@ -1408,7 +1852,7 @@ describe('cli format', () => {
           'Phase: startup_failed',
           'Retryable: no',
           'Cause: Coral documents this setup refusal, but the details recorded with it are not in the shape this build renders that code from, so its text could not be regenerated. [code=handoff_socket_holder_unverified]',
-          "Next step: inspect the coordinator log for that code, upgrade Coral, then retry a coral-cli mutating command; it attempts startup or handoff. Rerun coral-cli backend status to observe that attempt's result.",
+          "Next step: inspect the coordinator log for that code, upgrade Coral, then retry a mutating Coral command; it attempts startup or handoff. Inspect backend status again to observe that attempt's result.",
         ].join('\n'),
       );
     });
@@ -1435,7 +1879,10 @@ describe('cli format', () => {
 
     it('formats an unauthorized backend status with a recovery hint', () => {
       expect(formatBackendStatus({ status: 'unauthorized' })).toBe(
-        'Backend unauthorized. The discovery record and daemon token disagree — run coral-cli backend shutdown, then retry a coral-cli mutating command; it attempts startup or handoff with a fresh token.',
+        [
+          'Backend unauthorized. The discovery record and daemon token disagree. Run the shutdown command below, then retry a mutating Coral command; it attempts startup or handoff with a fresh token.',
+          'command=coral-cli backend shutdown',
+        ].join('\n'),
       );
     });
 
@@ -1515,8 +1962,6 @@ describe('cli format', () => {
       expect(formatShutdown(result)).not.toBe('Backend shutdown initiated');
     });
 
-    // Was `reason: 'unauthorized'` — a token no producer emits, pinning the raw-token render that the closed
-    // union and the exhaustive switch now make impossible to reach.
     it('formats a rejected shutdown capability as a refusal that names an exit', () => {
       const result = {
         ok: false,
@@ -1528,11 +1973,10 @@ describe('cli format', () => {
       expect(formatShutdown(result), 'the coordinator is up; this is not a report that it stopped').toMatch(
         /did not accept the request/u,
       );
-      // A refusal with nothing an operator can do is the shape §11 forbids, and this one said "needs manual
-      // intervention" while naming neither the process nor a command. The pid comes from our own record, and
-      // it is the only handle on a coordinator that will not accept our token.
       expect(formatShutdown(result), 'the live coordinator is identified').toMatch(/pid 4242/u);
-      expect(formatShutdown(result), 'and the next step is a command that exists').toMatch(/coral-cli backend status/u);
+      expect(operatorArtifactLines(formatShutdown(result)), 'and the next step is a command that exists').toEqual([
+        'command=coral-cli backend status',
+      ]);
       expect(formatShutdown(result), 'retrying is the one thing that cannot work here').toMatch(/no retry/u);
     });
 
@@ -1552,11 +1996,11 @@ describe('cli format', () => {
       expect(text, 'the pid is still named').toMatch(/4242/u);
       expect(text, 'but confirmed liveness is not claimed for it').not.toMatch(/^It is running \(pid/mu);
       expect(text, 'the hedge itself is present').toMatch(/not independently confirmed alive/u);
-      expect(text, 'and the next step is a command that exists').toMatch(/coral-cli backend status/u);
+      expect(operatorArtifactLines(text), 'and the next step is a command that exists').toEqual([
+        'command=coral-cli backend status',
+      ]);
     });
 
-    // Neither remedy is reachable through a coral-cli command: `shutdownBackend` refuses on an unreadable
-    // record before it ever dials, since host/port/bootToken all live in the record it could not read.
     it('does not tell the operator to run a coral-cli command that cannot reach an unreadable record', () => {
       const statusText = formatBackendStatus({
         status: 'undecodable_record',
@@ -1602,7 +2046,9 @@ describe('cli format', () => {
       expect(parsed.indicator).toBe('[hybrid]');
       expect(parsed.results[0].note).toBe('cli-kb-tooling');
       expect(parsed.results[0].kind).toBe('note');
-      expect(parsed.warning).toContain('node "/tmp/coral-cli.cjs" kb reindex');
+      expect(parsed.warning).toBe(
+        'Enhanced KB index is stale; run node "/tmp/coral-cli.cjs" kb reindex to refresh it.',
+      );
     });
 
     it('formats an empty kb search result set', () => {
@@ -1805,7 +2251,7 @@ describe('cli format', () => {
       expect(formatErrorEnvelope(envelope, error.statusCode)).toBe('Missing prompt [code=bad_request, http=400]');
     });
 
-    it('does not normalize multi-line envelope heads while omitting diagnostics', () => {
+    it('keeps envelope tags on the first line of a multi-line message', () => {
       const formatted = formatErrorEnvelope(
         {
           error: true,
@@ -1816,7 +2262,18 @@ describe('cli format', () => {
         400,
       );
 
-      expect(formatted.split('\n')).toEqual(['line one', 'line two [code=bad_request, http=400]']);
+      expect(formatted.split('\n')).toEqual(['line one [code=bad_request, http=400]', 'line two']);
+    });
+
+    it('preserves a rendered command line byte-for-byte in a multi-line error', () => {
+      const command = 'command=coral-cli backend recovery-quarantine list';
+      const formatted = formatErrorEnvelope({
+        error: true,
+        code: 'transient',
+        message: `Retry after recovery.\n${command}`,
+      });
+
+      expect(formatted.split('\n')).toEqual(['Retry after recovery. [code=transient]', command]);
     });
 
     it('formats BackendUnreachableError envelopes on a single line with recovery guidance', () => {

@@ -8,11 +8,13 @@ import { providerOperationRecord } from '#tests/unit/store/provider-operation-fi
 
 type ExecutingRecord = Extract<ProviderOperationRecord, { phase: 'executing' }>;
 
-function meta(overrides: Readonly<{ proxyInstanceId?: string }> = {}): ExecutingRecord {
+function meta(
+  overrides: Readonly<{ jobId?: string; operationId?: string; proxyInstanceId?: string }> = {},
+): ExecutingRecord {
   return providerOperationRecord('executing', {
     operation: {
-      jobId: randomUUID(),
-      operationId: randomUUID(),
+      jobId: overrides.jobId ?? randomUUID(),
+      operationId: overrides.operationId ?? randomUUID(),
       buildSetId: randomUUID(),
       proxyInstanceId: overrides.proxyInstanceId ?? randomUUID(),
     },
@@ -24,12 +26,22 @@ function identityFor(m: ExecutingRecord): ProviderOperationEventIdentity {
 }
 
 function cleanupFor(m: ExecutingRecord) {
-  return { jobId: m.operation.jobId, pool: 'default' as const };
+  return { kind: 'job-local' as const, jobId: m.operation.jobId, pool: 'default' as const };
+}
+
+function proxyCleanupFor(m: ExecutingRecord) {
+  return {
+    kind: 'proxy-binding' as const,
+    jobId: m.operation.jobId,
+    operationId: m.operation.operationId,
+    pool: 'default' as const,
+  };
 }
 
 function registryWithCleanup(release = vi.fn()) {
   const registry = new LocalOperationRegistry();
   registry.connectCleanup({ release });
+  registry.connectBinding({ settleProviderOperationBinding: () => ({ kind: 'settled-unbound' }) } as never);
   return { registry, release };
 }
 
@@ -80,7 +92,7 @@ describe('LocalOperationRegistry', () => {
     registry.settled(identityFor(m));
 
     expect(release).toHaveBeenCalledOnce();
-    expect(release).toHaveBeenCalledWith(cleanupFor(m));
+    expect(release).toHaveBeenCalledWith(proxyCleanupFor(m));
     expect(registry.stateForJob(m.operation.jobId)).toBeNull();
   });
 
@@ -113,10 +125,26 @@ describe('LocalOperationRegistry', () => {
     expect(release).toHaveBeenCalledTimes(1);
   });
 
+  it('retains identity-addressed local state when binding settlement is refused', () => {
+    const registry = new LocalOperationRegistry();
+    registry.connectCleanup({ release: vi.fn() });
+    registry.connectBinding({
+      settleProviderOperationBinding: () => ({ kind: 'refused', reason: 'mailbox full' }),
+    } as never);
+    const m = meta();
+    registry.activate(m, fakeControl().control, cleanupFor(m));
+
+    registry.settled(identityFor(m));
+
+    expect(registry.stateForJob(m.operation.jobId)).toBe('activated');
+    expect(registry.operationsFor(m.operation.proxyInstanceId)).toEqual([identityFor(m)]);
+  });
+
   it('publishes settlement only after registry and admission cleanup are complete', () => {
     const order: string[] = [];
     const registry = new LocalOperationRegistry();
     registry.connectCleanup({ release: () => order.push('cleanup') });
+    registry.connectBinding({ settleProviderOperationBinding: () => ({ kind: 'settled-unbound' }) } as never);
     registry.connectSettlementObserver((jobId) => {
       expect(registry.stateForJob(jobId)).toBeNull();
       order.push('settlement-observer');
@@ -136,6 +164,7 @@ describe('LocalOperationRegistry', () => {
     const activated = meta();
     const release = vi.fn();
     registry.connectCleanup({ release });
+    registry.connectBinding({ settleProviderOperationBinding: () => ({ kind: 'settled-unbound' }) } as never);
     registry.activate(activated, fakeControl().control, cleanupFor(activated));
 
     expect(() =>
@@ -145,6 +174,29 @@ describe('LocalOperationRegistry', () => {
     expect(release).not.toHaveBeenCalled();
     expect(registry.stateForJob(activated.operation.jobId)).toBe('activated');
     expect(registry.stateForJob('unknown')).toBeNull();
+  });
+
+  it('does not release a reused job id when an older operation settles late', () => {
+    const released: unknown[] = [];
+    const { registry } = registryWithCleanup(
+      vi.fn((identity: unknown) => {
+        released.push(identity);
+      }),
+    );
+    const jobId = randomUUID();
+    const older = meta({ jobId, operationId: randomUUID() });
+    const current = meta({ jobId, operationId: randomUUID() });
+    registry.activate(older, fakeControl().control, cleanupFor(older));
+    registry.activate(current, fakeControl().control, cleanupFor(current));
+
+    registry.settled(identityFor(older));
+
+    expect(released).toEqual([]);
+    expect(registry.stateForJob(jobId)).toBe('activated');
+
+    registry.settled(identityFor(current));
+    expect(released).toEqual([proxyCleanupFor(current)]);
+    expect(registry.stateForJob(jobId)).toBeNull();
   });
 
   it("stop() records the cause and sends it through the entry's control capability", async () => {
@@ -235,6 +287,7 @@ describe('LocalOperationRegistry', () => {
 
     it('drops a settled entry — a fixed snapshot never reports an operation this coordinator already let go', () => {
       const registry = new LocalOperationRegistry();
+      registry.connectBinding({ settleProviderOperationBinding: () => ({ kind: 'settled-unbound' }) } as never);
       const proxyInstanceId = randomUUID();
       const m = meta({ proxyInstanceId });
       registry.activate(m, fakeControl().control, cleanupFor(m));

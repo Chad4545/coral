@@ -189,6 +189,256 @@ describe('/health typed shape (AC10a)', () => {
     expect(isBackendHealth(stuck)).toBe(true);
   });
 
+  it('decodes launch permit diagnostics and rejects a malformed entry', () => {
+    const launchPermit = {
+      reservationId: 'reservation-1',
+      jobId: 'job-1',
+      pool: 'default',
+      provider: 'codex',
+      holder: { kind: 'proxy-operation', operationId: 'operation-1' },
+      executionOwner: { kind: 'provider-session', id: 'session-1' },
+      heldForMs: 900_001,
+    } as const;
+
+    expect(
+      parseBackendHealth({ ...HEALTHY_BASE, diagnostics: { launchPermits: [launchPermit] } })?.health.diagnostics
+        ?.launchPermits,
+    ).toEqual([launchPermit]);
+    expect(
+      parseBackendHealth({
+        ...HEALTHY_BASE,
+        diagnostics: { launchPermits: [{ ...launchPermit, holder: { kind: 'system-task' } }] },
+      }),
+    ).toBeNull();
+    expect(
+      parseBackendHealth({
+        ...HEALTHY_BASE,
+        diagnostics: {
+          launchPermits: [
+            {
+              ...launchPermit,
+              holder: { kind: 'local-execution', operationId: 'op-1' },
+            },
+          ],
+        },
+      }),
+    ).toBeNull();
+  });
+
+  it('decodes settlement recording failures and rejects malformed evidence', () => {
+    const report = {
+      ...HEALTHY_BASE,
+      diagnostics: {
+        settlementRefusalRecordingFailures: [
+          {
+            jobId: 'job-settlement-failure',
+            cause: 'claim-release-failed',
+            error: 'quarantine database unavailable',
+            observedAtMs: 123,
+          },
+          {
+            jobId: 'job-reassigned-claim',
+            cause: 'claim-already-reassigned',
+            error: 'claim belongs to a successor',
+            observedAtMs: 124,
+          },
+          {
+            jobId: 'job-settled-unbound',
+            operationId: 'operation-settled-unbound',
+            cause: 'settled-unbound-status-persist-failed',
+            error: 'durable status write failed',
+            observedAtMs: 125,
+          },
+        ],
+      },
+    };
+    expect(parseBackendHealth(report)?.health.diagnostics?.settlementRefusalRecordingFailures).toEqual(
+      report.diagnostics.settlementRefusalRecordingFailures,
+    );
+    expect(
+      parseBackendHealth({
+        ...report,
+        diagnostics: {
+          settlementRefusalRecordingFailures: [
+            { ...report.diagnostics.settlementRefusalRecordingFailures[0], observedAtMs: -1 },
+          ],
+        },
+      }),
+    ).toBeNull();
+    expect(
+      parseBackendHealth({
+        ...report,
+        diagnostics: {
+          settlementRefusalRecordingFailures: [
+            {
+              jobId: 'job-settled-unbound',
+              cause: 'settled-unbound-status-persist-failed',
+              error: 'durable status write failed',
+              observedAtMs: 125,
+            },
+          ],
+        },
+      }),
+    ).toBeNull();
+  });
+
+  it('decodes non-release launch dispositions and rejects conflicting disposition data', () => {
+    const launchReleaseDisposition = {
+      reservationId: 'reservation-release-1',
+      jobId: 'job-release-1',
+      pool: 'default',
+      provider: 'codex',
+      attemptedHolder: { kind: 'local-execution' },
+      disposition: {
+        kind: 'transferred',
+        pool: 'default',
+        holder: { kind: 'proxy-operation', operationId: 'operation-successor' },
+      },
+      observedAtMs: 456,
+    } as const;
+
+    expect(
+      parseBackendHealth({
+        ...HEALTHY_BASE,
+        diagnostics: { launchReleaseDispositions: [launchReleaseDisposition] },
+      })?.health.diagnostics?.launchReleaseDispositions,
+    ).toEqual([launchReleaseDisposition]);
+    expect(
+      parseBackendHealth({
+        ...HEALTHY_BASE,
+        diagnostics: {
+          launchReleaseDispositions: [
+            {
+              ...launchReleaseDisposition,
+              disposition: {
+                kind: 'already-released',
+                pool: 'default',
+                holder: { kind: 'proxy-operation', operationId: 'operation-successor' },
+              },
+            },
+          ],
+        },
+      }),
+    ).toBeNull();
+  });
+
+  const providerOperationAdoptionRemedies = [
+    { kind: 'restart-coordinator' },
+    { kind: 'remote-settlement' },
+    { kind: 'recovery-quarantine-discard', command: { kind: 'list' } },
+    { kind: 'recovery-quarantine-clear', command: { kind: 'list' } },
+    { kind: 'external-repair' },
+  ] as const;
+
+  it.each(providerOperationAdoptionRemedies)('decodes the $kind provider-operation adoption remedy', (remedy) => {
+    const refusal = {
+      triggerRecordKey: 'discarded-record-key',
+      rowDisposition: 'discarded',
+      releasedLaunchPermits: 0,
+      recordKey: 'surviving-record-key',
+      jobId: 'job-1',
+      operationId: 'operation-1',
+      proxyInstanceId: 'proxy-1',
+      buildSetId: 'build-set-1',
+      reason: 'the provider operation ownership path is not initialized',
+      remedy,
+      observedAtMs: 456,
+    } as const;
+
+    expect(
+      parseBackendHealth({
+        ...HEALTHY_BASE,
+        diagnostics: { providerOperationAdoptionRefusals: [refusal] },
+      })?.health.diagnostics?.providerOperationAdoptionRefusals,
+    ).toEqual([refusal]);
+  });
+
+  it('rejects a provider-operation adoption refusal with an incomplete identity', () => {
+    const refusal = {
+      triggerRecordKey: 'discarded-record-key',
+      rowDisposition: 'discarded',
+      releasedLaunchPermits: 0,
+      recordKey: 'surviving-record-key',
+      jobId: 'job-1',
+      operationId: 'operation-1',
+      proxyInstanceId: 'proxy-1',
+      buildSetId: 'build-set-1',
+      reason: 'the provider operation ownership path is not initialized',
+      remedy: { kind: 'remote-settlement' },
+      observedAtMs: 456,
+    } as const;
+
+    expect(
+      parseBackendHealth({
+        ...HEALTHY_BASE,
+        diagnostics: {
+          providerOperationAdoptionRefusals: [{ ...refusal, recordKey: '' }],
+        },
+      }),
+    ).toBeNull();
+  });
+
+  it('decodes holder-specific launch reclamation evidence and rejects mismatched authorization', () => {
+    const reclamation = {
+      reservationId: 'reservation-reclaimed-1',
+      jobId: 'job-reclaimed-1',
+      pool: 'default',
+      provider: 'codex',
+      holder: { kind: 'proxy-operation', operationId: 'operation-reclaimed-1' },
+      heldForMs: 30_000,
+      evidence: {
+        kind: 'provider-operation-absent',
+        operationId: 'operation-reclaimed-1',
+        jobEvidence: { kind: 'job-terminal', phase: 'aborted' },
+      },
+      reclaimedAtMs: 789,
+    } as const;
+
+    expect(
+      parseBackendHealth({
+        ...HEALTHY_BASE,
+        diagnostics: { launchReclamations: [reclamation] },
+      })?.health.diagnostics?.launchReclamations,
+    ).toEqual([reclamation]);
+    expect(
+      parseBackendHealth({
+        ...HEALTHY_BASE,
+        diagnostics: {
+          launchReclamations: [
+            {
+              ...reclamation,
+              evidence: {
+                ...reclamation.evidence,
+                jobEvidence: { kind: 'job-terminal', phase: 'running' },
+              },
+            },
+          ],
+        },
+      }),
+    ).toBeNull();
+    expect(
+      parseBackendHealth({
+        ...HEALTHY_BASE,
+        diagnostics: {
+          launchReclamations: [{ ...reclamation, evidence: { kind: 'job-terminal', phase: 'aborted' } }],
+        },
+      }),
+    ).toBeNull();
+    expect(
+      parseBackendHealth({
+        ...HEALTHY_BASE,
+        diagnostics: {
+          launchReclamations: [
+            {
+              ...reclamation,
+              evidence: { ...reclamation.evidence, operationId: 'different-operation' },
+            },
+          ],
+        },
+      }),
+    ).toBeNull();
+  });
+
   it.each([
     { coverage: 'complete', liveJobs: 2, unknownJobs: 1, recoveryDefectJobs: 1 },
     { coverage: 'unknown', liveJobs: 0, unknownJobs: 3, recoveryDefectJobs: 0 },

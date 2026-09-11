@@ -70,6 +70,12 @@ import {
   type RunStartupRecoveryOrchestratorFn,
 } from '../lifecycle.js';
 import { createUnreadableProviderOperationDiscardService } from '../services/recovery/unreadable-provider-operation-discard.js';
+import { createSettledUnboundStatusPort } from '../services/recovery/settled-unbound-status.js';
+import {
+  observeProviderOperationRecord,
+  providerOperationRecordKeyPrefix,
+  readProviderOperations,
+} from '../../store/provider-operation-journal.js';
 import { createRuntimeComponentRegistry } from '../runtime-components/registry.js';
 import type { CoordinatorCoreOptions, CoordinatorCoreResult } from './types.js';
 import { isWorkflowInputFailure, workflowCompiler } from '../../workflow/compile.js';
@@ -96,7 +102,6 @@ import type {
   UnequipExpansionResult,
 } from '../../expansion/rpc-contract.js';
 import { KbJobRecorder, normalizeHostedKbFailureDetail } from '../../jobs/kb/recorder.js';
-import { AbortRegistry } from '../../jobs/shell/abort-registry.js';
 import { type KbDaemonHealthSnapshot, type KbDaemonSupervisor } from '../live/kb-daemon-supervisor.js';
 import type { ProviderHostAdministrationAuthority, ProviderHostManager } from '../live/provider-hosts/index.js';
 import {
@@ -108,16 +113,26 @@ import { createKbDaemonHealthComponent } from '../runtime-components/kb-health-c
 import { readCorpusState } from '../../kb/state/corpus-state.js';
 import { markJobAsError } from '../../jobs/reconcile/recovery-effects.js';
 import type { JobProgressStore } from '../../jobs/contracts/job-store.js';
+import type {
+  LaunchPermitReclamationDiagnostic,
+  LaunchReclamationProbeResult,
+  LaunchReleaseDiagnostic,
+} from '../../jobs/contracts/admission.js';
+import { LAUNCH_RECLAMATION_SWEEP_INTERVAL_MS, MAX_LAUNCH_RELEASE_DIAGNOSTICS } from '../live/admission.js';
 import { RecoveryQuarantineStore } from '../../recovery/quarantine.js';
 import {
   assertRecoverySourceRegistryComplete,
+  COORDINATOR_JOB_RECOVERY_BOUNDARY,
   createRecoveryQuarantineRetryService,
   createRecoverySourceRegistry,
+  SETTLED_UNBOUND_STATUS_BOUNDARY,
   UNREADABLE_PROVIDER_OPERATION_BOUNDARY,
   type RecoveryRetryQuarantinePort,
 } from '../../recovery/source-registry.js';
 import {
+  createCoordinatorJobSettlementRefusalRecorder,
   createCoordinatorJobRecoveryRetryPlan,
+  createSettledUnboundStatusRetryPlan,
   createUnreadableProviderOperationRetryPlan,
 } from '../services/recovery/index.js';
 import { createDiscussionCandidateRetryPlan, createDiscussionSourceRetryPlan } from '../../discuss/shell/recovery.js';
@@ -133,6 +148,8 @@ import { jobInCallerScope } from '../../jobs/scope.js';
 import type { ProviderProxySetBooleanOperatorExitResult } from '../services/provider-proxy-set/index.js';
 
 export const MAX_EVENT_STREAM_CONNECTIONS = 100;
+export const LAUNCH_PERMIT_REPORT_AGE_MS = 15 * 60 * 1000;
+export const MAX_SETTLEMENT_REFUSAL_DIAGNOSTICS = 100;
 const KB_DAEMON_JOB_ABORT_PROXY_TTL_MS = 24 * 60 * 60 * 1000;
 
 type KbReadRpcPort = Pick<
@@ -500,6 +517,8 @@ export function createCoordinatorCore(
   const defaultsPlan = resolveCoordinatorDefaults(options, runtime);
   const startupRecoveryBarrier = createStartupRecoveryBarrier();
   const world = createCoordinatorWorld(options, runtime, defaultsPlan, startupRecoveryBarrier.read);
+  const components = createRuntimeComponentRegistry();
+  const runtimeState = createRuntimeState(world.now(), components);
   const kbDaemonSupervisor = options.kbDaemonSupervisor;
   const identity = world.identity;
   const strictHealthIdentity = resolveStrictBundleIdentity();
@@ -528,11 +547,141 @@ export function createCoordinatorCore(
   };
   const recoverySources = createRecoverySourceRegistry();
   const recoveryDb = () => getProgressStore().getDb();
+  const settlementRefusalRecordingFailures = new Map<
+    string,
+    NonNullable<NonNullable<HealthSnapshot['diagnostics']>['settlementRefusalRecordingFailures']>[number]
+  >();
+  const recordSettlementRefusalFailure = (
+    key: string,
+    failure: NonNullable<NonNullable<HealthSnapshot['diagnostics']>['settlementRefusalRecordingFailures']>[number],
+  ): void => {
+    settlementRefusalRecordingFailures.delete(key);
+    settlementRefusalRecordingFailures.set(key, failure);
+    if (settlementRefusalRecordingFailures.size <= MAX_SETTLEMENT_REFUSAL_DIAGNOSTICS) return;
+    const oldest = settlementRefusalRecordingFailures.keys().next().value;
+    if (oldest !== undefined) settlementRefusalRecordingFailures.delete(oldest);
+  };
+  const settledUnboundStatus = createSettledUnboundStatusPort(recoveryDb, runtime.time);
+  world.launchCoordinator.connectSettledUnboundStatus({
+    rebind: (subject) => settledUnboundStatus.rebind(subject),
+    record(identity) {
+      const result = settledUnboundStatus.record(identity);
+      const diagnosticKey = JSON.stringify(['settled-unbound', identity.jobId, identity.operationId]);
+      if (result.kind === 'refused') {
+        recordSettlementRefusalFailure(diagnosticKey, {
+          jobId: identity.jobId,
+          operationId: identity.operationId,
+          cause: 'settled-unbound-status-persist-failed',
+          error: result.reason,
+          observedAtMs: runtime.time.now(),
+        });
+      } else {
+        settlementRefusalRecordingFailures.delete(diagnosticKey);
+      }
+      return result;
+    },
+    clear(identity, ownership) {
+      const cleared = settledUnboundStatus.clear(identity, ownership);
+      if (cleared) {
+        settlementRefusalRecordingFailures.delete(
+          JSON.stringify(['settled-unbound', identity.jobId, identity.operationId]),
+        );
+      }
+      return cleared;
+    },
+    clearAbsent(identity) {
+      const cleared = settledUnboundStatus.clearAbsent(identity);
+      if (cleared) {
+        settlementRefusalRecordingFailures.delete(
+          JSON.stringify(['settled-unbound', identity.jobId, identity.operationId]),
+        );
+      }
+      return cleared;
+    },
+    clearRefusal(identity) {
+      settlementRefusalRecordingFailures.delete(
+        JSON.stringify(['settled-unbound', identity.jobId, identity.operationId]),
+      );
+    },
+  });
+  world.launchCoordinator.connectProviderOperationBindingJournal((identity) => {
+    try {
+      const scan = readProviderOperations(recoveryDb());
+      if (
+        scan.records.some(
+          (record) =>
+            record.operation.jobId === identity.jobId && record.operation.operationId === identity.operationId,
+        )
+      ) {
+        return { kind: 'present' };
+      }
+      const keyPrefix = `${providerOperationRecordKeyPrefix(identity.jobId)}${identity.operationId}:`;
+      return scan.unreadableKeys.some((key) => key.startsWith(keyPrefix)) ? { kind: 'present' } : { kind: 'absent' };
+    } catch (error: unknown) {
+      return { kind: 'unknown', reason: formatError(error) };
+    }
+  });
+  const readJobReclamation = (jobId: string): LaunchReclamationProbeResult<'local-execution'> => {
+    const status = getProgressStore().readStatus(jobId);
+    if (status === null) return { kind: 'job-absent' };
+    return isTerminalPhase(status.phase) ? { kind: 'job-terminal', phase: status.phase } : { kind: 'job-live' };
+  };
+  world.launchCoordinator.connectLaunchReclamationOracle('local-execution', (permit) =>
+    readJobReclamation(permit.jobId),
+  );
+  world.launchCoordinator.connectLaunchReclamationOracle('recovery', (permit) => readJobReclamation(permit.jobId));
+  world.launchCoordinator.connectLaunchReclamationOracle('proxy-operation', (permit) => {
+    const evidence = readJobReclamation(permit.jobId);
+    if (evidence.kind === 'job-live') return evidence;
+    const scan = readProviderOperations(recoveryDb());
+    if (
+      scan.records.some(
+        (record) =>
+          record.operation.jobId === permit.jobId && record.operation.operationId === permit.holder.operationId,
+      )
+    ) {
+      return { kind: 'job-live' };
+    }
+    const keyPrefix = `${providerOperationRecordKeyPrefix(permit.jobId)}${permit.holder.operationId}:`;
+    return scan.unreadableKeys.some((key) => key.startsWith(keyPrefix))
+      ? { kind: 'job-live' }
+      : {
+          kind: 'provider-operation-absent',
+          operationId: permit.holder.operationId,
+          jobEvidence: evidence,
+        };
+  });
+  world.launchCoordinator.connectLaunchReclamationOracle('undecided-provider-operation', (permit) => {
+    const evidence = readJobReclamation(permit.jobId);
+    if (evidence.kind === 'job-live') return evidence;
+    return permit.holder.recordKeys.some((key) => observeProviderOperationRecord(recoveryDb(), key).kind !== 'absent')
+      ? { kind: 'job-live' }
+      : {
+          kind: 'provider-operation-records-absent',
+          recordKeys: permit.holder.recordKeys,
+          jobEvidence: evidence,
+        };
+  });
+  const launchReclamationTimer = runtime.time.setInterval(() => {
+    try {
+      world.launchCoordinator.sweepStaleLaunchPermits();
+    } catch {
+      // A maintenance timer must not terminate a coordinator that booted successfully.
+    }
+  }, LAUNCH_RECLAMATION_SWEEP_INTERVAL_MS);
+  launchReclamationTimer.unref?.();
   let adoptRepairedProviderOperation: ReturnType<
     typeof createExecutionServices
   >['adoptRepairedProviderOperation'] = async () => ({
     kind: 'refused',
     reason: 'the coordinator execution services are not composed',
+    remedy: { kind: 'restart-coordinator' },
+  });
+  let releaseUnreadableProviderOperationStartupOwnership: ReturnType<
+    typeof createExecutionServices
+  >['releaseUnreadableProviderOperationStartupOwnership'] = async () => ({
+    kind: 'completed',
+    releasedLaunchPermits: 0,
   });
   const createSystemInvocationContext = (
     projectRoot: CanonicalWorkDir,
@@ -553,7 +702,7 @@ export function createCoordinatorCore(
     const projectRoot = canonicalizeWorkDir(rawProjectRoot, runtime.env.cwd());
     return createSystemInvocationContext(projectRoot, 'recovery-retry');
   };
-  recoverySources.register('coordinator-job-recovery', (subject, signal, quarantine) =>
+  recoverySources.register(COORDINATOR_JOB_RECOVERY_BOUNDARY, (subject, signal, quarantine) =>
     createCoordinatorJobRecoveryRetryPlan(recoveryDb(), subject, signal, quarantine),
   );
   recoverySources.register('discussion-source', (subject, signal) =>
@@ -597,10 +746,50 @@ export function createCoordinatorCore(
   recoverySources.register('crashed-job-terminalization', (subject) =>
     createCrashedJobTerminalizationRetryPlan(recoveryDb(), subject),
   );
+  recoverySources.register(SETTLED_UNBOUND_STATUS_BOUNDARY, (subject, _signal, quarantine) =>
+    createSettledUnboundStatusRetryPlan(recoveryDb(), subject, quarantine, (absence) =>
+      world.launchCoordinator.releaseSettledUnboundStatusAfterObservedAbsence(absence),
+    ),
+  );
   recoverySources.register(UNREADABLE_PROVIDER_OPERATION_BOUNDARY, (subject) =>
     createUnreadableProviderOperationRetryPlan(recoveryDb(), subject, adoptRepairedProviderOperation),
   );
   assertRecoverySourceRegistryComplete(recoverySources);
+  const providerOperationAdoptionRefusals = new Map<
+    string,
+    NonNullable<NonNullable<HealthSnapshot['diagnostics']>['providerOperationAdoptionRefusals']>[number]
+  >();
+  const durableSettlementRefusalRecorder = createCoordinatorJobSettlementRefusalRecorder({
+    getDb: recoveryDb,
+    isBoundaryRegistered: (boundary) => recoverySources.has(boundary),
+    upsert: (write) => getRecoveryQuarantineStore().upsert(write),
+  });
+  const settlementRefusalRecorder = {
+    async record(input: Parameters<typeof durableSettlementRefusalRecorder.record>[0]): Promise<boolean> {
+      try {
+        const recorded = await durableSettlementRefusalRecorder.record(input);
+        if (recorded) {
+          settlementRefusalRecordingFailures.delete(input.jobId);
+          return true;
+        }
+        recordSettlementRefusalFailure(input.jobId, {
+          jobId: input.jobId,
+          cause: input.cause,
+          error: 'The recovery quarantine write did not persist.',
+          observedAtMs: runtime.time.now(),
+        });
+        return false;
+      } catch (error: unknown) {
+        recordSettlementRefusalFailure(input.jobId, {
+          jobId: input.jobId,
+          cause: input.cause,
+          error: formatError(error),
+          observedAtMs: runtime.time.now(),
+        });
+        throw error;
+      }
+    },
+  };
   const recoveryQuarantineRetry = createRecoveryQuarantineRetryService({
     instanceId: world.identity.instanceId,
     ids: runtime.ids,
@@ -609,14 +798,59 @@ export function createCoordinatorCore(
   });
   const recoveryQuarantine: RpcPorts['recoveryQuarantine'] = {
     clear: (request, signal) => recoveryQuarantineRetry.clear(request, signal),
-    discardProviderOperation: (request) => {
+    discardProviderOperation: async (request) => {
+      if (runtimeState.getLaunchFenceActive()) {
+        return unreadableProviderOperationDiscardResultSchema.parse({
+          ...request,
+          kind: 'recovery-in-progress',
+          code: 'backend_recovering',
+          message: 'Provider-operation discard is unavailable while startup recovery owns the launch fence.',
+          remedy: {
+            kind: 'recovery-quarantine-discard',
+            command: {
+              kind: 'discard-provider-operation',
+              key: request.key,
+              revision: `fingerprint:${request.revision}`,
+              allowReadable: request.allowReadable === true,
+            },
+          },
+        });
+      }
       const discard = createUnreadableProviderOperationDiscardService({
         instanceId: world.identity.instanceId,
         ids: runtime.ids,
         db: recoveryDb(),
         time: runtime.time,
       });
-      return unreadableProviderOperationDiscardResultSchema.parse(discard.discard(request));
+      const result = unreadableProviderOperationDiscardResultSchema.parse(discard.discard(request));
+      if (result.kind === 'discarded' || result.kind === 'absent') {
+        const ownership = await releaseUnreadableProviderOperationStartupOwnership(result.key);
+        if (ownership.kind === 'adoption-refused') {
+          const observedAtMs = runtime.time.now();
+          for (const refusal of ownership.refusals) {
+            providerOperationAdoptionRefusals.delete(refusal.recordKey);
+            providerOperationAdoptionRefusals.set(refusal.recordKey, {
+              triggerRecordKey: result.key,
+              rowDisposition: result.kind,
+              releasedLaunchPermits: ownership.releasedLaunchPermits,
+              ...refusal,
+              observedAtMs,
+            });
+            if (providerOperationAdoptionRefusals.size > MAX_LAUNCH_RELEASE_DIAGNOSTICS) {
+              const oldestRecordKey = providerOperationAdoptionRefusals.keys().next().value;
+              if (oldestRecordKey !== undefined) providerOperationAdoptionRefusals.delete(oldestRecordKey);
+            }
+          }
+          return unreadableProviderOperationDiscardResultSchema.parse({
+            ...result,
+            kind: 'adoption-refused',
+            rowDisposition: result.kind,
+            releasedLaunchPermits: ownership.releasedLaunchPermits,
+            refusals: ownership.refusals,
+          });
+        }
+      }
+      return result;
     },
   };
 
@@ -633,8 +867,6 @@ export function createCoordinatorCore(
     (() => {
       throw storeServicesStartupNotReadyError();
     });
-  const components = createRuntimeComponentRegistry();
-  const runtimeState = createRuntimeState(world.now(), components);
   const streamResponses = new Set<ServerResponse>();
   const eventStreamSubscriptions = new WeakMap<EventStreamHandlers, () => void>();
   let readIpcOpenSockets = () => 0;
@@ -644,6 +876,7 @@ export function createCoordinatorCore(
     runtime,
     bundleHash: world.identity.bundleHash,
     backendNamespace: world.namespace,
+    settlementRefusalRecorder,
     createExecutionService: defaults.createExecutionService,
     onProviderProxyLifecycleFatal: (error) => {
       world.log(`Fatal provider proxy lifecycle error: ${formatError(error)}\n`);
@@ -651,6 +884,7 @@ export function createCoordinatorCore(
     },
   });
   adoptRepairedProviderOperation = services.adoptRepairedProviderOperation;
+  releaseUnreadableProviderOperationStartupOwnership = services.releaseUnreadableProviderOperationStartupOwnership;
 
   const discuss = createDiscussRuntime({
     world,
@@ -661,7 +895,7 @@ export function createCoordinatorCore(
       ? { discardSessionArtifacts: options.discardSessionArtifacts }
       : {}),
   });
-  const internalJobAbortRegistry = new AbortRegistry(runtime.ids);
+  const internalJobAbortRegistry = world.launchCoordinator.getInternalAbortRegistry();
 
   const control = createCoordinatorControl({
     world,
@@ -778,6 +1012,15 @@ export function createCoordinatorCore(
       world.childPrincipalRegistry.revokeParentJob(event.jobId);
     }
   };
+  const onLaunchReclamationJobPhaseChanged = (): void => {
+    try {
+      if (world.launchCoordinator.active > 0 && getProgressStore().liveJobCount() === 0) {
+        world.launchCoordinator.sweepStaleLaunchPermits();
+      }
+    } catch {
+      // An unreadable liveness view cannot authorize reclamation or escape an event callback.
+    }
+  };
   const onChildPrincipalJobCompleted = (event: { jobId: string }): void => {
     world.childPrincipalRegistry.revokeParentJob(event.jobId);
   };
@@ -787,10 +1030,12 @@ export function createCoordinatorCore(
     }
   };
   world.eventBus.on('job:phase_changed', onChildPrincipalJobPhaseChanged);
+  world.eventBus.on('job:phase_changed', onLaunchReclamationJobPhaseChanged);
   world.eventBus.on('job:completed', onChildPrincipalJobCompleted);
   world.eventBus.on('discuss:updated', onChildPrincipalDiscussUpdated);
   const disposeChildPrincipalTerminalListeners = (): void => {
     world.eventBus.off('job:phase_changed', onChildPrincipalJobPhaseChanged);
+    world.eventBus.off('job:phase_changed', onLaunchReclamationJobPhaseChanged);
     world.eventBus.off('job:completed', onChildPrincipalJobCompleted);
     world.eventBus.off('discuss:updated', onChildPrincipalDiscussUpdated);
   };
@@ -1226,6 +1471,7 @@ export function createCoordinatorCore(
         const systemProviderScope = world.systemProviderScope;
 
         let activeJobs = 0;
+        let carrierLivenessByJobId = new Map<string, 'live' | 'absent' | 'unknown'>();
         let carrierDiagnostics: NonNullable<NonNullable<HealthSnapshot['diagnostics']>['carriers']>;
         if (storeServices === null) {
           carrierDiagnostics = {
@@ -1266,6 +1512,9 @@ export function createCoordinatorCore(
             const recoveryDefectJobs = observations.filter(
               ({ observation }) => observation.defect === 'local-unknown-after-recovery-decision',
             ).length;
+            carrierLivenessByJobId = new Map(
+              observations.map(({ jobId, observation }) => [jobId, observation.liveness]),
+            );
             activeJobs = liveJobs + unknownJobs;
             carrierDiagnostics = { coverage: 'complete', liveJobs, unknownJobs, recoveryDefectJobs };
           } catch {
@@ -1294,6 +1543,15 @@ export function createCoordinatorCore(
           providerProxyDispositionSkips?: NonNullable<
             NonNullable<HealthSnapshot['diagnostics']>['providerProxyDispositionSkips']
           >;
+          settlementRefusalRecordingFailures?: NonNullable<
+            NonNullable<HealthSnapshot['diagnostics']>['settlementRefusalRecordingFailures']
+          >;
+          providerOperationAdoptionRefusals?: NonNullable<
+            NonNullable<HealthSnapshot['diagnostics']>['providerOperationAdoptionRefusals']
+          >;
+          launchPermits?: NonNullable<NonNullable<HealthSnapshot['diagnostics']>['launchPermits']>;
+          launchReleaseDispositions?: LaunchReleaseDiagnostic[];
+          launchReclamations?: LaunchPermitReclamationDiagnostic[];
         } = { carriers: carrierDiagnostics };
         if (mutationBlocked !== undefined) {
           diagnostics.mutationBlocked = mutationBlocked;
@@ -1312,12 +1570,40 @@ export function createCoordinatorCore(
         if (providerProxyDispositionSkips.length > 0) {
           diagnostics.providerProxyDispositionSkips = [...providerProxyDispositionSkips];
         }
+        if (settlementRefusalRecordingFailures.size > 0) {
+          diagnostics.settlementRefusalRecordingFailures = [...settlementRefusalRecordingFailures.values()];
+        }
+        if (providerOperationAdoptionRefusals.size > 0) {
+          diagnostics.providerOperationAdoptionRefusals = [...providerOperationAdoptionRefusals.values()];
+        }
+        const launchPermits = world.launchCoordinator
+          .activeLaunchPermits()
+          .filter(
+            ({ jobId, heldForMs }) =>
+              heldForMs > LAUNCH_PERMIT_REPORT_AGE_MS || carrierLivenessByJobId.get(jobId) !== 'live',
+          );
+        if (launchPermits.length > 0) {
+          diagnostics.launchPermits = launchPermits;
+        }
+        const launchReleaseDispositions = world.launchCoordinator.launchReleaseDiagnostics();
+        if (launchReleaseDispositions.length > 0) {
+          diagnostics.launchReleaseDispositions = launchReleaseDispositions;
+        }
+        const launchReclamations = world.launchCoordinator.launchReclamationDiagnostics();
+        if (launchReclamations.length > 0) {
+          diagnostics.launchReclamations = launchReclamations;
+        }
         const hasDiagnostics =
           diagnostics.carriers !== undefined ||
           diagnostics.mutationBlocked !== undefined ||
           diagnostics.consumerStuck !== undefined ||
           diagnostics.providerProxySets !== undefined ||
-          diagnostics.providerProxyDispositionSkips !== undefined;
+          diagnostics.providerProxyDispositionSkips !== undefined ||
+          diagnostics.settlementRefusalRecordingFailures !== undefined ||
+          diagnostics.providerOperationAdoptionRefusals !== undefined ||
+          diagnostics.launchPermits !== undefined ||
+          diagnostics.launchReleaseDispositions !== undefined ||
+          diagnostics.launchReclamations !== undefined;
 
         return {
           status: coarseStatus,
@@ -1458,6 +1744,7 @@ export function createCoordinatorCore(
     ...(world.providerProxyAuthority === undefined ? {} : { providerProxyAuthority: world.providerProxyAuthority }),
     kbDaemonSupervisor: kbDaemonSupervisorWithTrackedShutdown,
     disposeLifecycleReactor: async () => {
+      runtime.time.clearInterval(launchReclamationTimer);
       disposeChildPrincipalTerminalListeners();
       disposeKbDaemonExitListener();
       disposeDaemonJobTerminalListeners();

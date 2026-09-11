@@ -112,10 +112,6 @@ function _jobResultPath(jobId: string): string {
   return join(runtime.paths.coral.exports.jobsRoot, jobId, 'result.md');
 }
 
-function cancelQueued(jobId: string, pool?: 'default' | 'discuss' | 'curate'): boolean {
-  return launchCoordinator.cancelQueued(jobId, pool);
-}
-
 function _getActiveJobIds(pool?: 'default' | 'discuss' | 'curate'): string[] {
   return launchCoordinator.getActiveJobIds(pool);
 }
@@ -126,10 +122,6 @@ function terminateAll(): void {
 
 function _queueDepth(pool?: 'default' | 'discuss' | 'curate'): number {
   return launchCoordinator.queueDepth(pool);
-}
-
-function releaseLaunch(jobId: string, pool?: 'default' | 'discuss' | 'curate'): void {
-  launchCoordinator.releaseLaunch(jobId, pool);
 }
 
 function createService(
@@ -154,6 +146,7 @@ function createService(
     bundleHash: options.bundleHash,
     backendNamespace: options.backendNamespace ?? TEST_BACKEND_NAMESPACE,
     launchCoordinator,
+    settlementRefusalRecorder: { record: () => true },
     eventBus,
     providerRegistry,
     pluginRegistry: options.pluginRegistry ?? { discoverPluginRoot: () => null },
@@ -662,10 +655,6 @@ describe('ExecutionService abort', () => {
   afterEach(async () => {
     trackAllJobDirs();
     terminateAll();
-    for (const jobId of createdJobIds) {
-      cancelQueued(jobId);
-      releaseLaunch(jobId);
-    }
     await new Promise((resolve) => setTimeout(resolve, 0));
     for (const jobId of createdJobIds) {
       rmSync(join(JOBS_DIR, jobId), { recursive: true, force: true });
@@ -721,21 +710,25 @@ describe('ExecutionService abort', () => {
     if (decision.status !== 'queued') throw new Error('expected queued launch');
     trackJob(decision.jobId);
 
-    const abortResult = service.abort([decision.jobId]);
     const { progressStore } =
       /* @intentional-private-access — seed or inspect execution internals with no public test seam */
       getInternals(service);
+    expect(launchCoordinator.reservationFor(decision.jobId)).toMatchObject({ kind: 'queued' });
+    const abortResult = service.abort([decision.jobId]);
 
     expect(abortResult).toEqual({
       aborted: [decision.jobId],
       notFound: [],
     });
-    expect(progressStore.readStatus(decision.jobId)).toMatchObject({
-      phase: 'aborted',
-      result: {
-        outcome: { kind: 'aborted', reason: 'queue_shutdown' },
-      },
+    await vi.waitFor(() => {
+      expect(progressStore.readStatus(decision.jobId)).toMatchObject({
+        phase: 'aborted',
+        result: {
+          outcome: { kind: 'aborted', reason: 'queue_shutdown' },
+        },
+      });
     });
+    expect(launchCoordinator.reservationFor(decision.jobId)).toBeNull();
   });
 });
 import { initTestJob } from '#tests/helpers/session.js';

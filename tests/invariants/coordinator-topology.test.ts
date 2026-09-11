@@ -42,6 +42,8 @@ const DOMAIN_API_TARGETS = new Set<string>();
 // list just enumerates which domain files are public surface.
 const CONTRACT_TARGETS = new Set([
   'src/jobs/contracts/admission.ts',
+  // An entry below this line stays contract-only: no coordinator-owned runtime implementation may move into it.
+  'src/jobs/contracts/provider-operation-lifecycle.ts',
   'src/jobs/launch.ts',
   'src/jobs/outcome.ts',
   'src/jobs/wait.ts',
@@ -90,6 +92,7 @@ const COORDINATOR_GLUE_SOURCES = new Set([
   'src/coordinator/shutdown.ts',
   'src/coordinator/shutdown-recovery.ts',
   'src/coordinator/startup-recovery.ts',
+  'src/coordinator/live/admission.ts',
   'src/coordinator/live/durable-transport.ts',
   'src/coordinator/live/kb-daemon-supervisor.ts',
 ]);
@@ -223,6 +226,14 @@ describe('coordinator topology invariants', () => {
         !COORDINATOR_EDGES.some((edge) => edge.source.startsWith(prefix) && !isAlwaysPermittedTarget(edge.target)),
     );
     expect(unexercisedBroadPrefixes).toEqual([]);
+  });
+
+  it('keeps launch admission implementation reach-through limited to the abort registry it owns', () => {
+    const bypasses = COORDINATOR_EDGES.filter(
+      ({ source, target }) => source === 'src/coordinator/live/admission.ts' && !isAlwaysPermittedTarget(target),
+    ).map(({ source, target }) => `${source} -> ${target}`);
+
+    expect(bypasses).toEqual(['src/coordinator/live/admission.ts -> src/jobs/shell/abort-registry.ts']);
   });
 
   it('forbids retired execution imports and shell/reconcile reach-through outside exempt glue', () => {

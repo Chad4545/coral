@@ -1,7 +1,7 @@
 import { currentEventMetadata, withInvocationScope } from './invocation-scope.js';
 import type { InvocationContext } from '../runtime/invocation-context.js';
 import type { ExecutionServiceDeps, ListResult, ProjectRequestPort } from './contracts.js';
-import type { LaunchPool } from '../jobs/contracts/admission.js';
+import type { LaunchPermit } from '../jobs/contracts/admission.js';
 import type {
   ProviderRecoveryAuthority,
   RecoveredAppServerInterruptResult,
@@ -13,7 +13,6 @@ import type {
   ProviderSessionLaunchDecision,
   WorkflowLaunchDecision,
 } from '../jobs/launch.js';
-import type { AbortReason } from '../jobs/outcome.js';
 import type { JobPhase } from '../jobs/phase.js';
 import type { AppServerRuntime, JobLaunch, JobRuntime, JobTerminalInput, LaunchReadiness } from '../jobs/records.js';
 import type { TerminalWriteOptions } from '../jobs/contracts/job-store.js';
@@ -58,7 +57,6 @@ export class ExecutionService implements RecoveryCapableService, ProjectRequestP
   private readonly progressStore: ExecutionServiceDeps['progressStore'];
   private readonly projectRoot: string;
   private readonly eventBus: TypedEventBus;
-  private readonly jobPools = new Map<string, LaunchPool>();
   private readonly launchOrchestrator: LaunchOrchestrator;
   private readonly launchService: JobLaunchService;
   private readonly workflowService: WorkflowExecutionService;
@@ -91,13 +89,14 @@ export class ExecutionService implements RecoveryCapableService, ProjectRequestP
       abortRegistry: this.abortRegistry,
       progressStore: this.progressStore,
       launchAdmission: deps.launchCoordinator,
+      providerOperationBinding: deps.launchCoordinator,
       durableSpawner: deps.launchCoordinator,
       providerRegistry: deps.providerRegistry,
       runtime: this.runtime,
       coordinatorCommit,
       backendNamespace: this.backendNamespace,
       bundleHash: this.bundleHash,
-      jobPools: this.jobPools,
+      settlementRefusalRecorder: deps.settlementRefusalRecorder,
       getEventMetadata: () => {
         try {
           return currentEventMetadata();
@@ -106,6 +105,7 @@ export class ExecutionService implements RecoveryCapableService, ProjectRequestP
         }
       },
       terminalMaterializer: { recordProviderTerminal },
+      ...(deps.operations === undefined ? {} : { operations: deps.operations }),
       ...(deps.appServerProxyRoute === undefined ? {} : { appServerProxyRoute: deps.appServerProxyRoute }),
     });
     deps.providerOperationCleanup?.register(this.launchOrchestrator);
@@ -113,7 +113,6 @@ export class ExecutionService implements RecoveryCapableService, ProjectRequestP
       sessionManager: this.sessionManager,
       launchQueue: deps.launchCoordinator,
       eventBus: this.eventBus,
-      jobPools: this.jobPools,
       time: this.runtime.time,
       loadJobProjectionDetail: deps.loadJobProjectionDetail,
       readJobEvents: deps.readJobEvents,
@@ -135,7 +134,6 @@ export class ExecutionService implements RecoveryCapableService, ProjectRequestP
       launchAdmission: deps.launchCoordinator,
       launchRecovery: deps.launchCoordinator,
       providerRegistry: deps.providerRegistry,
-      jobPools: this.jobPools,
       launchOrchestrator: this.launchOrchestrator,
       childPrincipalRegistry: deps.childPrincipalRegistry,
       parentPrincipal: ctx.principal,
@@ -191,10 +189,6 @@ export class ExecutionService implements RecoveryCapableService, ProjectRequestP
     });
     this.abortService = new JobAbortService({
       abortRegistry: this.abortRegistry,
-      progressStore: this.progressStore,
-      launchAdmission: deps.launchCoordinator,
-      jobPools: this.jobPools,
-      launchOrchestrator: this.launchOrchestrator,
     });
   }
 
@@ -289,7 +283,7 @@ export class ExecutionService implements RecoveryCapableService, ProjectRequestP
     sessionId: string,
     result: JobTerminalInput,
     phase: JobPhase,
-    options: TerminalWriteOptions & { pool: LaunchPool },
+    options: TerminalWriteOptions & { permit: LaunchPermit },
   ): ReturnType<RecoveryService['completeRecoveredJob']> {
     return this.recoveryService.completeRecoveredJob(jobId, sessionId, result, phase, options);
   }
@@ -308,10 +302,6 @@ export class ExecutionService implements RecoveryCapableService, ProjectRequestP
     runtimeRecord: AppServerRuntime,
   ): Promise<RecoveredAppServerInterruptResult> {
     return this.recoveryService.interruptAppServerJob(authority, runtimeRecord);
-  }
-
-  private finishQueuedAbort(jobId: string, sessionId: string, reason: AbortReason): void {
-    this.abortService.finishQueuedAbort(jobId, sessionId, reason);
   }
 
   async finalizeInterruptedAppServerJob(

@@ -21,14 +21,23 @@ import {
 } from '#src/cli/format/backend.js';
 import { buildProgram } from '#src/cli/program.js';
 import { encodeRecoveryQuarantineKey, RecoveryQuarantineStore } from '#src/recovery/quarantine.js';
-import { UNREADABLE_PROVIDER_OPERATION_BOUNDARY } from '#src/recovery/source-registry.js';
+import {
+  UNREADABLE_PROVIDER_OPERATION_BOUNDARY,
+  type RecoveryQuarantineClearRequest,
+} from '#src/recovery/source-registry.js';
+import { createUnreadableProviderOperationDiscardService } from '#src/coordinator/services/recovery/unreadable-provider-operation-discard.js';
+import { sha256Hex } from '#src/infra/hash.js';
 import { createRealRuntime } from '#src/runtime/real.js';
 import { currentCoralStoreFormat } from '#src/store-format.js';
 import { applyBundledStoreSchema, classifyStoreFile, openStoreDatabase } from '#src/store/db.js';
 import { TOOL_TIMEOUT_MS } from '#src/transport/http/sse.js';
 import { PROVIDER_OPERATION_RECORD_VERSION } from '#src/store/provider-operation-record.js';
+import { encodeProviderOperationRecord } from '#src/store/provider-operation-record.js';
+import { insertProviderOperation, readProviderOperation } from '#src/store/provider-operation-journal.js';
 import * as ipcEnsure from '#src/transport/ipc/ensure.js';
 import { IpcRpcError } from '#src/transport/ipc/client.js';
+import { executeRenderedCommand, operatorArtifactLines } from '#tests/helpers/rendered-command.js';
+import { providerOperationRecord } from '#tests/unit/store/provider-operation-fixtures.js';
 
 const storeReset: StoreResetCommandOperations = {
   list: () => ({ incidents: [] }),
@@ -70,6 +79,24 @@ function programWith(recoveryQuarantine: RecoveryQuarantineCommandOperations): C
   program.exitOverride();
   registerBackendCommands(program, { storeReset, recoveryQuarantine });
   return program;
+}
+
+async function expectRenderedClearDispatch(rendered: string, expected: RecoveryQuarantineClearRequest): Promise<void> {
+  let dispatched: RecoveryQuarantineClearRequest | undefined;
+  const clear: RecoveryQuarantineCommandOperations['clear'] = async (request) => {
+    dispatched = request;
+    return { ...request, disposition: 'advanced' };
+  };
+  stdout = '';
+  stderr = '';
+  process.exitCode = undefined;
+
+  await executeRenderedCommand(programWith({ list: () => [], clear }), rendered, {
+    label: 'command',
+    includes: 'recovery-quarantine clear',
+  });
+
+  expect(dispatched).toEqual(expected);
 }
 
 describe('backend recovery-quarantine commands', () => {
@@ -131,6 +158,11 @@ describe('backend recovery-quarantine commands', () => {
         'workflow-1',
       )} revision="fingerprint:revision-1" state=active stage=hydrate`,
     );
+    expect(operatorArtifactLines(stdout)).toEqual([
+      `clear=coral-cli backend recovery-quarantine clear --boundary "workflow-recovery" --key ${encodeRecoveryQuarantineKey('workflow-1')} --revision "fingerprint:revision-1"`,
+      `clear=coral-cli backend recovery-quarantine clear --boundary "workflow-recovery" --key ${encodeRecoveryQuarantineKey('workflow-literal-sentinel')} --revision "fingerprint:until-cleared"`,
+      `clear=coral-cli backend recovery-quarantine clear --boundary "workflow-recovery" --key ${encodeRecoveryQuarantineKey('workflow-unversioned')} --revision "until-cleared"`,
+    ]);
     expect(stdout).toContain(
       `key=${encodeRecoveryQuarantineKey('workflow-literal-sentinel')} revision="fingerprint:until-cleared"`,
     );
@@ -176,7 +208,7 @@ describe('backend recovery-quarantine commands', () => {
     expect(rendered).toContain(`key=${encodeRecoveryQuarantineKey(key)}`);
     expect(rendered).toContain('detected_at=unavailable updated_at=unavailable');
     expect(rendered).toContain('derived from the durable unreadable provider operation row');
-    expect(rendered).not.toContain('discard=');
+    expect(operatorArtifactLines(rendered)).toEqual([]);
   });
 
   it.each([
@@ -187,7 +219,7 @@ describe('backend recovery-quarantine commands', () => {
       persisted: true,
       revision: { kind: 'fingerprint' as const, value: `sha256:${'a'.repeat(64)}` },
       key: 'provider_operation_saga.v1:record:00000000-0000-4000-8000-000000000001:00000000-0000-4000-8000-000000000002:00000000-0000-4000-8000-000000000003:00000000-0000-4000-8000-000000000004',
-      prints: true,
+      labels: ['clear', 'discard'],
     },
     {
       state: 'retrying' as const,
@@ -196,7 +228,7 @@ describe('backend recovery-quarantine commands', () => {
       persisted: true,
       revision: { kind: 'fingerprint' as const, value: `sha256:${'a'.repeat(64)}` },
       key: 'provider_operation_saga.v1:record:00000000-0000-4000-8000-000000000001:00000000-0000-4000-8000-000000000002:00000000-0000-4000-8000-000000000003:00000000-0000-4000-8000-000000000004',
-      prints: false,
+      labels: [],
     },
     {
       state: 'continuation' as const,
@@ -205,7 +237,7 @@ describe('backend recovery-quarantine commands', () => {
       persisted: true,
       revision: { kind: 'fingerprint' as const, value: `sha256:${'a'.repeat(64)}` },
       key: 'provider_operation_saga.v1:record:00000000-0000-4000-8000-000000000001:00000000-0000-4000-8000-000000000002:00000000-0000-4000-8000-000000000003:00000000-0000-4000-8000-000000000004',
-      prints: false,
+      labels: [],
     },
     {
       state: 'active' as const,
@@ -214,7 +246,7 @@ describe('backend recovery-quarantine commands', () => {
       persisted: false,
       revision: { kind: 'fingerprint' as const, value: `sha256:${'a'.repeat(64)}` },
       key: 'provider_operation_saga.v1:record:00000000-0000-4000-8000-000000000001:00000000-0000-4000-8000-000000000002:00000000-0000-4000-8000-000000000003:00000000-0000-4000-8000-000000000004',
-      prints: false,
+      labels: [],
     },
     {
       state: 'active' as const,
@@ -223,7 +255,7 @@ describe('backend recovery-quarantine commands', () => {
       persisted: true,
       revision: { kind: 'until-cleared' as const },
       key: 'provider_operation_saga.v1:record:00000000-0000-4000-8000-000000000001:00000000-0000-4000-8000-000000000002:00000000-0000-4000-8000-000000000003:00000000-0000-4000-8000-000000000004',
-      prints: false,
+      labels: ['clear'],
     },
     {
       state: 'active' as const,
@@ -232,11 +264,11 @@ describe('backend recovery-quarantine commands', () => {
       persisted: true,
       revision: { kind: 'fingerprint' as const, value: `sha256:${'a'.repeat(64)}` },
       key: 'not-a-provider-operation-key',
-      prints: false,
+      labels: ['clear'],
     },
   ])(
-    'prints discard=$prints for $state persisted=$persisted evidence',
-    ({ state, retry, continuation, persisted, revision, key, prints }) => {
+    'prints exactly $labels for $state persisted=$persisted evidence',
+    ({ state, retry, continuation, persisted, revision, key, labels }) => {
       const rendered = formatRecoveryQuarantineList([
         {
           boundary: UNREADABLE_PROVIDER_OPERATION_BOUNDARY,
@@ -247,11 +279,21 @@ describe('backend recovery-quarantine commands', () => {
           continuation,
           errorMessage: 'unreadable',
           detail: 'operator decision required',
+          remedy: {
+            kind: 'recovery-quarantine-discard',
+            command: {
+              kind: 'discard-provider-operation',
+              key,
+              revision: revision.kind === 'fingerprint' ? `fingerprint:${revision.value}` : 'until-cleared',
+              allowReadable: false,
+            },
+          },
           detectedAt: persisted ? '2026-08-28T00:00:00.000Z' : null,
           updatedAt: persisted ? '2026-08-28T00:00:00.000Z' : null,
         },
       ]);
-      expect(rendered.includes('discard=')).toBe(prints);
+      const renderedLabels = operatorArtifactLines(rendered).map((line) => line.slice(0, line.indexOf('=')));
+      expect(renderedLabels).toEqual(labels);
     },
   );
 
@@ -260,24 +302,122 @@ describe('backend recovery-quarantine commands', () => {
       `provider_operation_saga.v${PROVIDER_OPERATION_RECORD_VERSION}:record:` +
       '00000000-0000-4000-8000-000000000001:00000000-0000-4000-8000-000000000002:' +
       '00000000-0000-4000-8000-000000000003:00000000-0000-4000-8000-000000000004';
-    const revision = `sha256:${'a'.repeat(64)}`;
+    const rawValue = 'not-json';
+    const revision = `sha256:${sha256Hex(rawValue)}`;
+    const baseDir = mkdtempSync(join(tmpdir(), 'coral-recovery-quarantine-discard-cli-'));
+    tempDirectories.push(baseDir);
+    const runtime = createRealRuntime('prod', { baseDir });
+    mkdirSync(dirname(runtime.paths.coral.store.dbFile), { recursive: true });
+    const db = openStoreDatabase({
+      path: runtime.paths.coral.store.dbFile,
+      storage: runtime.storage,
+      storeFormat: currentCoralStoreFormat(),
+      flavor: runtime.flavor,
+    });
+    applyBundledStoreSchema(db, currentCoralStoreFormat());
+    db.prepare<[string, string]>('INSERT INTO meta (key, value) VALUES (?, ?)').run(key, rawValue);
+    const quarantine = new RecoveryQuarantineStore(db, runtime.time);
     const entry = {
       boundary: UNREADABLE_PROVIDER_OPERATION_BOUNDARY,
       subject: { key, revision: { kind: 'fingerprint' as const, value: revision } },
       state: 'active' as const,
       stage: 'hydrate' as const,
-      retry: null,
-      continuation: null,
       errorMessage: 'unreadable',
       detail: 'discardable exact row',
-      detectedAt: '2026-08-28T00:00:00.000Z',
-      updatedAt: '2026-08-28T00:00:00.000Z',
+      remedy: {
+        kind: 'recovery-quarantine-discard' as const,
+        command: {
+          kind: 'discard-provider-operation' as const,
+          key,
+          revision: `fingerprint:${revision}`,
+          allowReadable: false,
+        },
+      },
     };
-    const discardProviderOperation = vi.fn<
-      NonNullable<RecoveryQuarantineCommandOperations['discardProviderOperation']>
-    >(async (request) => ({ ...request, kind: 'discarded' as const }));
+    expect(quarantine.upsert(entry)).toBe(true);
+    const discard = createUnreadableProviderOperationDiscardService({
+      instanceId: 'listed-unreadable-discard',
+      ids: runtime.ids,
+      db,
+      time: runtime.time,
+    });
+    const listing = formatRecoveryQuarantineList(quarantine.list());
+    await executeRenderedCommand(
+      programWith({
+        list: () => quarantine.list(),
+        clear: vi.fn(),
+        discardProviderOperation: async (request) => discard.discard(request),
+      }),
+      listing,
+      { label: 'discard', includes: encodeRecoveryQuarantineKey(key) },
+    );
 
-    await programWith({ list: () => [entry], clear: vi.fn(), discardProviderOperation }).parseAsync([
+    expect(db.prepare<[string], { value: string }>('SELECT value FROM meta WHERE key = ?').get(key)).toBeUndefined();
+    expect(quarantine.read(UNREADABLE_PROVIDER_OPERATION_BOUNDARY, key)).toBeNull();
+    expect(stdout).toBe(`${formatUnreadableProviderOperationDiscard({ key, revision, kind: 'discarded' })}\n`);
+    expect(stdout).toContain('permanently removed');
+    expect(stderr).toBe('');
+    expect(process.exitCode).toBe(0);
+    db.close();
+  });
+
+  it('should require consent, then execute the complete readable-discard remedy from the listing', async () => {
+    const baseDir = mkdtempSync(join(tmpdir(), 'coral-recovery-quarantine-readable-cli-'));
+    tempDirectories.push(baseDir);
+    const runtime = createRealRuntime('prod', { baseDir });
+    mkdirSync(dirname(runtime.paths.coral.store.dbFile), { recursive: true });
+    const db = openStoreDatabase({
+      path: runtime.paths.coral.store.dbFile,
+      storage: runtime.storage,
+      storeFormat: currentCoralStoreFormat(),
+      flavor: runtime.flavor,
+    });
+    applyBundledStoreSchema(db, currentCoralStoreFormat());
+    const record = providerOperationRecord('executing');
+    insertProviderOperation(db, record);
+    const key =
+      `provider_operation_saga.v${PROVIDER_OPERATION_RECORD_VERSION}:record:` +
+      `${record.operation.jobId}:${record.operation.operationId}:` +
+      `${record.operation.proxyInstanceId}:${record.operation.buildSetId}`;
+    const revision = `sha256:${sha256Hex(encodeProviderOperationRecord(record))}`;
+    const quarantine = new RecoveryQuarantineStore(db, runtime.time);
+    const entry = {
+      boundary: UNREADABLE_PROVIDER_OPERATION_BOUNDARY,
+      subject: { key, revision: { kind: 'fingerprint' as const, value: revision } },
+      state: 'active' as const,
+      stage: 'hydrate' as const,
+      errorMessage: 'More than one readable provider operation row claims this job.',
+      detail: 'Explicit consent is required before discarding this readable row.',
+      remedy: {
+        kind: 'recovery-quarantine-discard' as const,
+        command: {
+          kind: 'discard-provider-operation' as const,
+          key,
+          revision: `fingerprint:${revision}`,
+          allowReadable: true,
+        },
+      },
+    };
+    expect(quarantine.upsert(entry)).toBe(true);
+    const quarantineBefore = quarantine.list();
+    const discard = createUnreadableProviderOperationDiscardService({
+      instanceId: 'readable-no-consent',
+      ids: runtime.ids,
+      db,
+      time: runtime.time,
+    });
+    type DiscardRequest = Parameters<NonNullable<RecoveryQuarantineCommandOperations['discardProviderOperation']>>[0];
+    const discardRequests: DiscardRequest[] = [];
+    const discardProviderOperation = async (request: DiscardRequest) => {
+      discardRequests.push(request);
+      return discard.discard(request);
+    };
+
+    await programWith({
+      list: () => quarantine.list(),
+      clear: vi.fn(),
+      discardProviderOperation,
+    }).parseAsync([
       'node',
       'coral-cli',
       'backend',
@@ -289,11 +429,76 @@ describe('backend recovery-quarantine commands', () => {
       `fingerprint:${revision}`,
     ]);
 
-    expect(discardProviderOperation).toHaveBeenCalledWith({ key, revision });
-    expect(stdout).toBe(`${formatUnreadableProviderOperationDiscard({ key, revision, kind: 'discarded' })}\n`);
-    expect(stdout).toContain('permanently removed');
+    expect(readProviderOperation(db, record.operation)).toEqual(record);
+    expect(quarantine.list()).toEqual(quarantineBefore);
+    expect(stderr).toContain('Readable provider-operation discard requires explicit consent');
+    expect(discardRequests).toEqual([]);
+    expect(stdout).toBe('');
+    expect(process.exitCode).toBe(2);
+
+    stderr = '';
+    process.exitCode = undefined;
+    const tokens = await executeRenderedCommand(
+      programWith({
+        list: () => quarantine.list(),
+        clear: vi.fn(),
+        discardProviderOperation,
+      }),
+      formatRecoveryQuarantineList(quarantine.list()),
+      { label: 'discard', includes: encodeRecoveryQuarantineKey(key) },
+    );
+
+    expect(tokens).toEqual([
+      'coral-cli',
+      'backend',
+      'recovery-quarantine',
+      'discard-provider-operation',
+      '--key',
+      encodeRecoveryQuarantineKey(key),
+      '--revision',
+      `fingerprint:${revision}`,
+      '--allow-readable',
+    ]);
+    expect(discardRequests).toEqual([{ key, revision, allowReadable: true }]);
+    expect(readProviderOperation(db, record.operation)).toBeNull();
+    expect(quarantine.read(UNREADABLE_PROVIDER_OPERATION_BOUNDARY, key)).toBeNull();
+    expect(stdout).toContain(`key=${encodeRecoveryQuarantineKey(key)}`);
+    expect(stdout).toContain(`revision=${JSON.stringify(`fingerprint:${revision}`)}`);
+    expect(operatorArtifactLines(stdout)).toEqual([
+      'command=coral-cli backend recovery-quarantine list',
+      'command=coral-cli backend status',
+    ]);
     expect(stderr).toBe('');
     expect(process.exitCode).toBe(0);
+    db.close();
+  });
+
+  it('should refuse a retired tagged key at CLI ingress without calling the destructive operation', async () => {
+    const key =
+      `provider_operation_saga.v${PROVIDER_OPERATION_RECORD_VERSION}:record:` +
+      '00000000-0000-4000-8000-000000000021:00000000-0000-4000-8000-000000000022:' +
+      '00000000-0000-4000-8000-000000000023:00000000-0000-4000-8000-000000000024';
+    const revision = `sha256:${'c'.repeat(64)}`;
+    const discardProviderOperation: NonNullable<
+      RecoveryQuarantineCommandOperations['discardProviderOperation']
+    > = async () => {
+      throw new Error('Malformed tagged key reached the destructive operation');
+    };
+
+    await programWith({ list: () => [], clear: vi.fn(), discardProviderOperation }).parseAsync([
+      'node',
+      'coral-cli',
+      'backend',
+      'recovery-quarantine',
+      'discard-provider-operation',
+      '--key',
+      encodeRecoveryQuarantineKey(`readable-provider-operation\u0000${key}`),
+      '--revision',
+      `fingerprint:${revision}`,
+    ]);
+
+    expect(stderr).toContain('Invalid provider-operation coordinate');
+    expect(process.exitCode).toBe(2);
   });
 
   it.each<
@@ -308,10 +513,52 @@ describe('backend recovery-quarantine commands', () => {
       exitCode: 0,
       stream: 'stdout',
     },
+    {
+      result: {
+        key: 'raw-key',
+        revision: `sha256:${'a'.repeat(64)}`,
+        kind: 'recovery-in-progress',
+        code: 'backend_recovering',
+        message: 'Provider-operation discard is unavailable while startup recovery owns the launch fence.',
+        remedy: {
+          kind: 'recovery-quarantine-discard',
+          command: {
+            kind: 'discard-provider-operation',
+            key: 'raw-key',
+            revision: `fingerprint:sha256:${'a'.repeat(64)}`,
+            allowReadable: false,
+          },
+        },
+      },
+      exitCode: 75,
+      stream: 'stderr',
+    },
     { result: { key: 'raw-key', revision: `sha256:${'a'.repeat(64)}`, kind: 'absent' }, exitCode: 1, stream: 'stderr' },
     {
       result: { key: 'raw-key', revision: `sha256:${'a'.repeat(64)}`, kind: 'readable' },
       exitCode: 1,
+      stream: 'stderr',
+    },
+    {
+      result: {
+        key: 'raw-key',
+        revision: `sha256:${'a'.repeat(64)}`,
+        kind: 'adoption-refused',
+        rowDisposition: 'discarded',
+        releasedLaunchPermits: 0,
+        refusals: [
+          {
+            recordKey: 'surviving-record-key',
+            jobId: 'job-1',
+            operationId: 'operation-1',
+            proxyInstanceId: 'proxy-1',
+            buildSetId: 'build-set-1',
+            reason: 'the provider operation ownership path is not initialized',
+            remedy: { kind: 'restart-coordinator' },
+          },
+        ],
+      },
+      exitCode: 75,
       stream: 'stderr',
     },
     {
@@ -360,7 +607,13 @@ describe('backend recovery-quarantine commands', () => {
       stream: 'stderr',
     },
   ])('maps discard result $result.kind to exit $exitCode on $stream', async ({ result, exitCode, stream }) => {
-    const discardProviderOperation = vi.fn(async () => result);
+    type DiscardRequest = Parameters<NonNullable<RecoveryQuarantineCommandOperations['discardProviderOperation']>>[0];
+    const discardRequests: DiscardRequest[] = [];
+    const discardProviderOperation = vi.fn(async (request: DiscardRequest) => {
+      discardRequests.push(request);
+      return result;
+    });
+    const expectedRequest = { key: result.key, revision: result.revision };
     await programWith({ list: () => [], clear: vi.fn(), discardProviderOperation }).parseAsync([
       'node',
       'coral-cli',
@@ -373,6 +626,7 @@ describe('backend recovery-quarantine commands', () => {
       `fingerprint:${result.revision}`,
     ]);
 
+    expect(discardRequests).toEqual([expectedRequest]);
     expect(process.exitCode).toBe(exitCode);
     const rendered = stream === 'stdout' ? stdout : stderr;
     expect(rendered).toContain(encodeRecoveryQuarantineKey(result.key));
@@ -384,6 +638,33 @@ describe('backend recovery-quarantine commands', () => {
     if (result.kind.includes('coordinator') || result.kind === 'timeout') {
       expect(stderr).toContain(`revision="fingerprint:${result.revision}"`);
       expect(stderr).toContain('No discard verdict');
+    }
+    if (result.kind === 'adoption-refused') {
+      expect(stderr).toContain('startup ownership remains unresolved');
+      expect(stderr).toContain(
+        `record=${encodeRecoveryQuarantineKey('surviving-record-key')} job=job-1 operation=operation-1`,
+      );
+      expect(stderr).toContain('capacity remains held');
+    }
+    if (result.kind === 'recovery-in-progress') {
+      expect(stderr).toContain('[backend_recovering]');
+      const refusal = stderr;
+      stderr = '';
+      process.exitCode = undefined;
+      await executeRenderedCommand(programWith({ list: () => [], clear: vi.fn(), discardProviderOperation }), refusal, {
+        label: 'command',
+      });
+      expect(discardRequests).toEqual([expectedRequest, expectedRequest]);
+      expect(stderr).toContain('[backend_recovering]');
+      expect(stderr).toContain(encodeRecoveryQuarantineKey(result.key));
+      expect(process.exitCode).toBe(75);
+    }
+    if (result.kind === 'readable') {
+      await expectRenderedClearDispatch(stderr, {
+        boundary: UNREADABLE_PROVIDER_OPERATION_BOUNDARY,
+        key: result.key,
+        revision: result.revision,
+      });
     }
   });
 
@@ -469,7 +750,7 @@ describe('backend recovery-quarantine commands', () => {
     ['advanced', 'resolved and removed', ''],
     ['quarantined', 'still quarantined', 'recovery-quarantine list'],
     ['continuation', 'partial progress', 'recovery-quarantine list'],
-  ] as const)('should render %s as an actionable operator outcome', (disposition, outcome, recovery) => {
+  ] as const)('should render %s as an actionable operator outcome', async (disposition, outcome, recovery) => {
     const formatted = formatRecoveryQuarantineClear({
       boundary: 'workflow-recovery',
       key: 'workflow-1',
@@ -478,7 +759,13 @@ describe('backend recovery-quarantine commands', () => {
     });
 
     expect(formatted).toContain(outcome);
-    if (recovery.length > 0) expect(formatted).toContain(recovery);
+    if (recovery.length > 0) {
+      expect(formatted).toContain(recovery);
+      await executeRenderedCommand(programWith({ list: () => [], clear: vi.fn() }), formatted, {
+        label: 'command',
+      });
+      expect(stdout).toBe('Recovery quarantine is empty.\n');
+    }
   });
 
   it('should report the exact retry disposition returned by the coordinator', async () => {
@@ -512,7 +799,7 @@ describe('backend recovery-quarantine commands', () => {
     });
     expect(stdout).toBe(`${formatRecoveryQuarantineClear(expected)}\n`);
     expect(stdout).toContain('partial progress');
-    expect(stdout).toContain('recovery-quarantine list');
+    expect(operatorArtifactLines(stdout)).toEqual(['command=coral-cli backend recovery-quarantine list']);
     expect(stderr).toBe('');
   });
 
@@ -557,6 +844,7 @@ describe('backend recovery-quarantine commands', () => {
       stage: 'hydrate' as const,
       errorMessage: 'failed to hydrate persisted workflow',
       detail: 'retained for operator retry',
+      remedy: null,
       retry: null,
       continuation: null,
       detectedAt: '2026-08-28T00:00:00.000Z',
@@ -589,7 +877,6 @@ describe('backend recovery-quarantine commands', () => {
   });
 
   it('should execute the continuation instruction and show the durable continuation', async () => {
-    const instruction = 'coral-cli backend recovery-quarantine list';
     const continuation = {
       boundary: 'workflow-recovery',
       subject: { key: 'workflow-1', revision: { kind: 'fingerprint' as const, value: 'revision-1' } },
@@ -597,6 +884,7 @@ describe('backend recovery-quarantine commands', () => {
       stage: 'settle' as const,
       errorMessage: 'workflow settlement remains partial',
       detail: 'durable continuation retained',
+      remedy: null,
       retry: null,
       continuation: { kind: 'workflow-recovery.v1', key: 'workflow-1' },
       detectedAt: '2026-08-03T00:00:00.000Z',
@@ -608,10 +896,11 @@ describe('backend recovery-quarantine commands', () => {
       revision: continuation.subject.revision.value,
       disposition: 'continuation',
     });
-    expect(formatted).toContain(`Run ${instruction}`);
 
     const clear = vi.fn();
-    await programWith({ list: () => [continuation], clear }).parseAsync(['node', ...instruction.split(' ')]);
+    await executeRenderedCommand(programWith({ list: () => [continuation], clear }), formatted, {
+      label: 'command',
+    });
 
     expect(clear).not.toHaveBeenCalled();
     expect(stdout).toContain('state=continuation');
@@ -628,6 +917,7 @@ describe('backend recovery-quarantine commands', () => {
       stage: 'settle' as const,
       errorMessage: 'Retention provider binding is unavailable',
       detail: 'P4 settle failed',
+      remedy: null,
       retry: null,
       continuation: null,
       detectedAt: '2026-08-15T09:03:29.786Z',
@@ -705,8 +995,16 @@ describe('backend recovery-quarantine commands', () => {
     expect(clear).toHaveBeenCalledOnce();
     expect(stdout).toBe('');
     expect(stderr).toContain('Recovery quarantine mutation requires the canonical coordinator');
-    expect(stderr).toContain('coral-cli backend status');
+    expect(operatorArtifactLines(stderr)).toEqual([
+      'command=coral-cli backend status',
+      `command=coral-cli backend recovery-quarantine clear --boundary "workflow-recovery" --key ${encodeRecoveryQuarantineKey('workflow-1')} --revision "revision-1"`,
+    ]);
     expect(process.exitCode).toBe(69);
+    await expectRenderedClearDispatch(stderr, {
+      boundary: 'workflow-recovery',
+      key: 'workflow-1',
+      revision: 'revision-1',
+    });
   });
 
   it('should use the ensured IPC catalog client for clear', async () => {
@@ -801,6 +1099,62 @@ describe('backend recovery-quarantine commands', () => {
     );
   });
 
+  it('preserves a coordinator adoption refusal as the discard command result', async () => {
+    const coordinate = { key: 'raw-key', revision: `sha256:${'a'.repeat(64)}` };
+    const refusal = {
+      recordKey: 'surviving-record-key',
+      jobId: '00000000-0000-4000-8000-000000000001',
+      operationId: '00000000-0000-4000-8000-000000000002',
+      proxyInstanceId: '00000000-0000-4000-8000-000000000003',
+      buildSetId: '00000000-0000-4000-8000-000000000004',
+      reason: 'the provider operation ownership path is not initialized',
+      remedy: { kind: 'restart-coordinator' },
+    };
+    vi.spyOn(ipcEnsure, 'ensure').mockResolvedValue({
+      request: vi.fn().mockResolvedValue({
+        ...coordinate,
+        kind: 'adoption-refused',
+        rowDisposition: 'discarded',
+        releasedLaunchPermits: 0,
+        refusals: [refusal],
+      }),
+    } as never);
+
+    await expect(createRecoveryQuarantineCommandOperations().discardProviderOperation?.(coordinate)).resolves.toEqual({
+      ...coordinate,
+      kind: 'adoption-refused',
+      rowDisposition: 'discarded',
+      releasedLaunchPermits: 0,
+      refusals: [refusal],
+    });
+  });
+
+  it('preserves a startup-recovery refusal as the discard command result', async () => {
+    const coordinate = { key: 'raw-key', revision: `sha256:${'a'.repeat(64)}` };
+    const refusal = {
+      ...coordinate,
+      kind: 'recovery-in-progress' as const,
+      code: 'backend_recovering' as const,
+      message: 'Provider-operation discard is unavailable while startup recovery owns the launch fence.',
+      remedy: {
+        kind: 'recovery-quarantine-discard',
+        command: {
+          kind: 'discard-provider-operation',
+          key: coordinate.key,
+          revision: `fingerprint:${coordinate.revision}`,
+          allowReadable: false,
+        },
+      },
+    };
+    vi.spyOn(ipcEnsure, 'ensure').mockResolvedValue({
+      request: vi.fn().mockResolvedValue(refusal),
+    } as never);
+
+    await expect(createRecoveryQuarantineCommandOperations().discardProviderOperation?.(coordinate)).resolves.toEqual(
+      refusal,
+    );
+  });
+
   it('should report coordinator contract drift without calling it unreachable', async () => {
     vi.spyOn(ipcEnsure, 'ensure').mockResolvedValue({
       request: vi.fn().mockResolvedValue({ disposition: 'advanced' }),
@@ -824,6 +1178,11 @@ describe('backend recovery-quarantine commands', () => {
 
     expect(stderr).toContain('invalid recovery quarantine retry result');
     expect(stderr).not.toContain('not reachable');
+    await expectRenderedClearDispatch(stderr, {
+      boundary: 'workflow-recovery',
+      key: 'workflow-1',
+      revision: 'revision-1',
+    });
   });
 
   it('should report an IPC timeout without calling it unreachable', async () => {
@@ -849,6 +1208,11 @@ describe('backend recovery-quarantine commands', () => {
 
     expect(stderr).toContain('timed out before the coordinator returned a result');
     expect(stderr).not.toContain('not reachable');
+    await expectRenderedClearDispatch(stderr, {
+      boundary: 'workflow-recovery',
+      key: 'workflow-1',
+      revision: 'revision-1',
+    });
   });
 
   it('should reject an invalid exact coordinate before invoking clear', async () => {
@@ -870,7 +1234,7 @@ describe('backend recovery-quarantine commands', () => {
 
     expect(clear).not.toHaveBeenCalled();
     expect(stderr).toContain('Recovery boundary is required');
-    expect(stderr).toContain('coral-cli backend recovery-quarantine list');
+    expect(operatorArtifactLines(stderr)).toEqual(['command=coral-cli backend recovery-quarantine list']);
     expect(process.exitCode).toBe(2);
   });
 

@@ -234,6 +234,9 @@ describe('provider host idle properties', () => {
     const storeServicesRef = createStoreServicesRef();
     const storeDb = newRawDatabase(':memory:');
     const operationRegistry = new LocalOperationRegistry();
+    operationRegistry.connectBinding({
+      settleProviderOperationBinding: () => ({ kind: 'settled-unbound' }),
+    } as never);
     const retirement = { reevaluateIdleRetirement: vi.fn() };
     const record = providerOperationRecord('executing');
     if (record.phase !== 'executing') throw new Error('expected executing operation fixture');
@@ -257,7 +260,7 @@ describe('provider host idle properties', () => {
       operationRegistry.activate(
         record,
         { stop: async () => undefined },
-        { jobId: record.operation.jobId, pool: 'default' },
+        { kind: 'job-local', jobId: record.operation.jobId, pool: 'default' },
       );
 
       operationRegistry.settled(record.operation);
@@ -274,6 +277,9 @@ describe('provider host idle properties', () => {
     const storeServicesRef = createStoreServicesRef();
     const storeDb = newRawDatabase(':memory:');
     const operationRegistry = new LocalOperationRegistry();
+    operationRegistry.connectBinding({
+      settleProviderOperationBinding: () => ({ kind: 'settled-unbound' }),
+    } as never);
     const record = providerOperationRecord('executing');
     if (record.phase !== 'executing') throw new Error('expected executing operation fixture');
     const exactRef = record.activationAck.hostRef;
@@ -299,7 +305,7 @@ describe('provider host idle properties', () => {
     operationRegistry.activate(
       record,
       { stop: async () => undefined },
-      { jobId: record.operation.jobId, pool: 'default' },
+      { kind: 'job-local', jobId: record.operation.jobId, pool: 'default' },
     );
 
     expect(() => operationRegistry.settled(record.operation)).not.toThrow();

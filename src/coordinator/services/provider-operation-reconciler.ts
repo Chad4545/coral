@@ -4,6 +4,8 @@ import { AsyncLocalStorage } from 'node:async_hooks';
 import type { TimePort, TimerHandle } from '../../infra/port-types.js';
 import { assertNever, errorMessage } from '../../infra/error-format.js';
 import type { AppServerProxyPlacementResult } from '../../jobs/contracts/app-server-proxy-route.js';
+import type { ProviderOperationBindingPort } from '../../jobs/contracts/provider-operation-lifecycle.js';
+import type { ProviderOperationStartupOwnership } from '../../jobs/startup.js';
 import type { JobProgressStore } from '../../jobs/contracts/job-store.js';
 import { buildJobEventRefs } from '../../jobs/refs.js';
 import {
@@ -69,7 +71,8 @@ import {
   type ProviderProxySetKey,
   type ProviderProxySetIdentity,
 } from './provider-proxy-set/identity.js';
-import type { ProviderOperationRecoveryAcceptance } from './recovery/index.js';
+import type { ProviderOperationRecoveryAcceptance } from './recovery/provider-operation-job-recovery.js';
+import type { ProviderOperationStartupRelease } from './recovery/provider-operation-startup-ownership.js';
 import {
   type ContainmentAbsenceAcceptance,
   type ContainmentAbsenceOperationalIncident,
@@ -167,6 +170,19 @@ export type ProviderOperationReconcilerStopDisposition =
 
 export interface StartupSetRecoveryPort {
   recoverSetAtStartup(work: StartupProviderSetWork, signal: AbortSignal): Promise<StartupSetRecoveryResult>;
+}
+
+function startupOperationCanReconcile(ownership: ProviderOperationStartupOwnership['records'][number]): boolean {
+  if (ownership.bindingDisposition.kind === 'not-reconciled') return false;
+  if (ownership.bindingDisposition.kind === 'refused') return false;
+  if (ownership.phase === 'settlement-pending') return true;
+  if (ownership.phase === 'local-recovery-pending') return false;
+  if (ownership.phase === 'prestart-cleanup-pending') return ownership.restoredPermit !== null;
+  return (
+    ownership.bindingDisposition.kind === 'prepared' ||
+    ownership.bindingDisposition.kind === 'bound' ||
+    ownership.bindingDisposition.kind === 'already-settled'
+  );
 }
 
 function groupStartupProviderSetWork(records: readonly ProviderOperationRecord[]): StartupProviderSetWork[] {
@@ -279,6 +295,8 @@ type ProviderOperationReconcilerDeps = Readonly<{
   ) => Promise<ProviderOperationAuthorityAcquisitionResult>;
   startupSetRecovery: StartupSetRecoveryPort;
   registry: Pick<LocalOperationRegistry, 'activate' | 'attach' | 'settled' | 'stop'>;
+  binding: ProviderOperationBindingPort;
+  releaseStartupOwnership(operation: ProviderOperationIdentity): ProviderOperationStartupRelease;
   materializePrepare: (
     record: Extract<ProviderOperationRecord, { phase: 'prepare-pending' }>,
   ) => Promise<ProviderOperationPrepareMaterializationResult> | ProviderOperationPrepareMaterializationResult;
@@ -422,6 +440,11 @@ type ExecutingAttachmentAttempt =
   | Readonly<{ kind: 'advanced'; current: ProviderOperationRecord | null }>
   | Readonly<{ kind: 'retry-recorded' }>;
 
+type ExecutingRegistration =
+  | Readonly<{ kind: 'registered' }>
+  | Readonly<{ kind: 'already-settled' }>
+  | Readonly<{ kind: 'rekey-refused'; current: ProviderOperationRecord | null }>;
+
 function operationKey(identity: ProviderOperationIdentity): string {
   return `${identity.jobId}:${identity.operationId}:${identity.proxyInstanceId}:${identity.buildSetId}`;
 }
@@ -448,6 +471,11 @@ function isProviderOperationRecoveryAcceptance(
 function boundedPrepareRefusalReason(error: unknown): string {
   const reason = providerOperationErrorReason(error).trim();
   return (reason.length === 0 ? 'Provider operation prepare was refused.' : reason).slice(0, 4096);
+}
+
+function boundedRekeyRefusalReason(reason: string): string {
+  const diagnostic = reason.trim();
+  return (diagnostic.length === 0 ? 'Coordinator ownership re-key was refused.' : diagnostic).slice(0, 4096);
 }
 
 export class ProviderOperationReconciler
@@ -519,13 +547,26 @@ export class ProviderOperationReconciler
     return disposition;
   }
 
-  reconcileAtStartup(signal: AbortSignal): Promise<StartupReconciliationReport> {
+  reconcileAtStartup(
+    ownership: ProviderOperationStartupOwnership,
+    signal: AbortSignal,
+  ): Promise<StartupReconciliationReport> {
     if (!this.#canMutate()) return Promise.reject(new Error('Provider operation mutation admission is closed.'));
-    return this.#admission().run('provider-operation-startup-reconciliation', () => this.#reconcileAtStartup(signal));
+    return this.#admission().run('provider-operation-startup-reconciliation', () =>
+      this.#reconcileAtStartup(ownership, signal),
+    );
   }
 
-  async #reconcileAtStartup(signal: AbortSignal): Promise<StartupReconciliationReport> {
-    const { records } = readProviderOperations(this.#deps.getProgressStore().getDb());
+  async #reconcileAtStartup(
+    ownership: ProviderOperationStartupOwnership,
+    signal: AbortSignal,
+  ): Promise<StartupReconciliationReport> {
+    const hydratedOperations = new Set(
+      ownership.records.filter(startupOperationCanReconcile).map(({ operation }) => operationKey(operation)),
+    );
+    const records = readProviderOperations(this.#deps.getProgressStore().getDb()).records.filter((record) =>
+      hydratedOperations.has(operationKey(record.operation)),
+    );
     const incidents: StartupReconciliationIncident[] = [];
     let setsVisited = 0;
     let operationsVisited = 0;
@@ -1656,9 +1697,11 @@ export class ProviderOperationReconciler
     directive: Extract<ProviderOperationAfterReleaseDirective, { kind: 'terminal-failed' | 'terminal-aborted' }>,
   ): ProviderOperationRecord | null {
     this.#assertActiveDrive();
+    this.#settleBindingOrThrow(record.operation);
+    this.#releaseStartupAndRetireBindingOrThrow(record);
     const result = this.#deps.terminalization.terminalize(record, directive);
     if (result.kind === 'conflict') return result.current;
-    this.#complete(record.operation, { kind: 'terminalized' });
+    this.#completeTerminalized(record);
     return null;
   }
 
@@ -1681,6 +1724,7 @@ export class ProviderOperationReconciler
       const deleted = this.#deleteSettledOperation(record);
       if (deleted.kind === 'conflict' && deleted.current !== null) return deleted.current;
       this.#settlements.delete(operationKey(record.operation));
+      this.#completeTerminalized(record);
       return null;
     } catch (error: unknown) {
       await this.#recordRetry(record, error);
@@ -1703,8 +1747,9 @@ export class ProviderOperationReconciler
       }
       if (record.phase === 'settlement-pending') {
         const deleted = this.#deleteSettledOperation(record);
-        if (deleted.kind === 'conflict') continue;
+        if (deleted.kind === 'conflict' && deleted.current !== null) continue;
         this.#settlements.delete(operationKey(record.operation));
+        this.#completeTerminalized(record);
         return { kind: 'accepted', operation: notice.operation, disposition: 'settlement-deleted' };
       }
       if (
@@ -1712,7 +1757,7 @@ export class ProviderOperationReconciler
         record.phase === 'activation-resolution-pending' ||
         record.phase === 'executing'
       ) {
-        const directive =
+        const fallback =
           record.phase === 'activation-resolution-pending'
             ? record.activationIndeterminate
             : record.phase === 'proxy-activation-pending'
@@ -1726,17 +1771,18 @@ export class ProviderOperationReconciler
                   code: 'provider_lost',
                   reason: 'The provider became unavailable, so this job stopped before completion. Retry the job.',
                 };
+        const directive = this.#rekeyRefusalDirective(record) ?? fallback;
         const terminalized = await this.#terminalizeDisappearance(record, directive);
         if (terminalized.kind === 'operational-failure') return terminalized;
         if (terminalized.kind === 'conflict') continue;
-        this.#complete(record.operation, { kind: 'terminalized' });
+        this.#completeTerminalized(record);
         return { kind: 'accepted', operation: notice.operation, disposition: 'terminalization-committed' };
       }
       if (record.phase === 'prestart-cleanup-pending' && record.afterRelease.kind !== 'local-authorized') {
         const terminalized = await this.#terminalizeDisappearance(record, record.afterRelease);
         if (terminalized.kind === 'operational-failure') return terminalized;
         if (terminalized.kind === 'conflict') continue;
-        this.#complete(record.operation, { kind: 'terminalized' });
+        this.#completeTerminalized(record);
         return { kind: 'accepted', operation: notice.operation, disposition: 'terminalization-committed' };
       }
       if (record.phase === 'local-recovery-pending') {
@@ -1777,17 +1823,18 @@ export class ProviderOperationReconciler
       }
       if (record.phase === 'settlement-pending') {
         const deleted = this.#deleteSettledOperation(record);
-        if (deleted.kind === 'conflict') continue;
+        if (deleted.kind === 'conflict' && deleted.current !== null) continue;
         this.#settlements.delete(operationKey(record.operation));
+        this.#completeTerminalized(record);
         return { kind: 'accepted', operation: notice.operation, disposition: 'settlement-deleted' };
       }
       if (record.phase === 'local-recovery-pending') {
         return { kind: 'accepted', operation: notice.operation, disposition: 'local-recovery-committed' };
       }
-      const terminalized = await this.#terminalizeAbandonment(record, directive);
+      const terminalized = await this.#terminalizeAbandonment(record, this.#rekeyRefusalDirective(record) ?? directive);
       if (terminalized.kind === 'operational-failure') return terminalized;
       if (terminalized.kind === 'conflict') continue;
-      this.#complete(record.operation, { kind: 'terminalized' });
+      this.#completeTerminalized(record);
       return { kind: 'accepted', operation: notice.operation, disposition: 'terminalization-committed' };
     }
   }
@@ -1799,6 +1846,8 @@ export class ProviderOperationReconciler
     | ProviderOperationTerminalizationResult
     | Extract<DisappearanceDeliveryAttemptOutcome, { kind: 'operational-failure' }>
   > {
+    this.#settleBindingOrThrow(record.operation);
+    this.#releaseStartupAndRetireBindingOrThrow(record);
     return new Promise((resolve, reject) => {
       const turn = this.#deps.recoveryDispatcher.begin(
         'disappearance-delivery',
@@ -1833,6 +1882,8 @@ export class ProviderOperationReconciler
     | ProviderOperationTerminalizationResult
     | Extract<RepresentationAbandonmentDeliveryAttemptOutcome, { kind: 'operational-failure' }>
   > {
+    this.#settleBindingOrThrow(record.operation);
+    this.#releaseStartupAndRetireBindingOrThrow(record);
     return new Promise((resolve, reject) => {
       const turn = this.#deps.recoveryDispatcher.begin(
         'representation-abandonment-delivery',
@@ -1968,19 +2019,47 @@ export class ProviderOperationReconciler
     if (attempt.kind === 'advanced') {
       this.#attachments.delete(key);
       this.#deps.registry.settled(record.operation);
+      if (attempt.current === null) {
+        const release = this.#deps.releaseStartupOwnership(record.operation);
+        if (release.kind !== 'transferred') {
+          this.#retireBindingOrThrow(record.operation);
+        }
+      }
       return attempt.current;
     }
     if (attempt.kind === 'operation-absent') {
       this.#attachments.delete(key);
-      return this.#terminalize(record, {
-        kind: 'terminal-failed',
-        code: 'provider_lost',
-        reason: 'The provider proxy proved that the committed operation is absent.',
-      });
+      return this.#terminalize(
+        record,
+        this.#rekeyRefusalDirective(record) ?? {
+          kind: 'terminal-failed',
+          code: 'provider_lost',
+          reason: 'The provider proxy proved that the committed operation is absent.',
+        },
+      );
     }
 
-    this.#registerExecuting(attempt.record, authority);
-    return this.#completeExecutingAttachment(record, retryOwnership);
+    if (attempt.record.controlIntent.kind === 'rekey-refusal-containment') {
+      return this.#completeExecutingAttachment(record, retryOwnership, false);
+    }
+
+    const registration = this.#registerExecuting(attempt.record, authority);
+    if (registration.kind === 'rekey-refused') return registration.current;
+    if (registration.kind === 'already-settled') {
+      const current = readProviderOperation(this.#deps.getProgressStore().getDb(), record.operation);
+      if (current?.phase === 'executing') {
+        await this.#recordRetry(current, new Error('Operation settlement preceded local ownership binding.'));
+        return null;
+      }
+      if (current === null) {
+        const release = this.#deps.releaseStartupOwnership(record.operation);
+        if (release.kind !== 'transferred') {
+          this.#retireBindingOrThrow(record.operation);
+        }
+      }
+      return current;
+    }
+    return this.#completeExecutingAttachment(record, retryOwnership, true);
   }
 
   async #attemptExecutingAttachment(
@@ -2004,7 +2083,7 @@ export class ProviderOperationReconciler
 
       const current = readProviderOperation(this.#deps.getProgressStore().getDb(), record.operation);
       const attachedRecord = current?.phase === 'executing' ? current : record;
-      if (attachedRecord.controlIntent.kind === 'stop') {
+      if (attachedRecord.controlIntent.kind !== 'run') {
         await this.#awaitAuthority(
           authority.buildOperationControl(attachedRecord.operation).stop(attachedRecord.controlIntent.cause),
         );
@@ -2025,6 +2104,7 @@ export class ProviderOperationReconciler
   #completeExecutingAttachment(
     record: Extract<ProviderOperationRecord, { phase: 'executing' }>,
     retryOwnership: ProviderOperationRetryOwnership,
+    completePublication: boolean,
   ): ProviderOperationRecord | null {
     const result = completeExecutingProviderOperationAttachment(
       this.#deps.getProgressStore().getDb(),
@@ -2036,11 +2116,17 @@ export class ProviderOperationReconciler
       case 'completed':
       case 'already-completed':
         this.#attachments.delete(operationKey(record.operation));
-        this.#complete(record.operation, { kind: 'remote-executing' });
+        if (completePublication) this.#complete(record.operation, { kind: 'remote-executing' });
         return null;
       case 'advanced':
         this.#attachments.delete(operationKey(record.operation));
         this.#deps.registry.settled(record.operation);
+        if (result.current === null) {
+          const release = this.#deps.releaseStartupOwnership(record.operation);
+          if (release.kind !== 'transferred') {
+            this.#retireBindingOrThrow(record.operation);
+          }
+        }
         return result.current;
       case 'retry-superseded':
         return null;
@@ -2050,16 +2136,25 @@ export class ProviderOperationReconciler
   #registerExecuting(
     record: Extract<ProviderOperationRecord, { phase: 'executing' }>,
     authority: DurableProviderProxyOperationAuthority,
-  ): void {
+  ): ExecutingRegistration {
     this.#assertActiveDrive();
     const launch = readProviderOperationJobLaunch(this.#deps.getProgressStore(), record.operation.jobId);
     const cleanup = providerOperationCleanupIdentity(launch);
     const control = authority.buildOperationControl(record.operation);
+    const binding = this.#deps.binding.commitProviderOperationBinding(record.operation);
+    if (binding.kind === 'already-settled') return { kind: 'already-settled' };
+    if (binding.kind === 'refused') {
+      return {
+        kind: 'rekey-refused',
+        current: this.#recordRekeyRefusalContainment(record, binding.reason),
+      };
+    }
     if (this.#publications.has(operationKey(record.operation))) {
       this.#deps.registry.activate(record, control, cleanup);
     } else {
       this.#deps.registry.attach(record, control, cleanup);
     }
+    return { kind: 'registered' };
   }
 
   #prestartCleanupRecord(
@@ -2138,6 +2233,30 @@ export class ProviderOperationReconciler
     return next;
   }
 
+  #recordRekeyRefusalContainment(
+    record: Extract<ProviderOperationRecord, { phase: 'executing' }>,
+    reason: string,
+  ): ProviderOperationRecord | null {
+    const current = readProviderOperation(this.#deps.getProgressStore().getDb(), record.operation);
+    if (current?.phase !== 'executing') return current;
+    if (current.controlIntent.kind === 'rekey-refusal-containment') return current;
+    const now = this.#deps.time.now();
+    const next = providerOperationRecordSchema.parse({
+      ...current,
+      controlIntent: {
+        kind: 'rekey-refusal-containment',
+        cause: 'coordinator_rekey_refused',
+        reason: boundedRekeyRefusalReason(reason),
+        requestedAt: new Date(now).toISOString(),
+      },
+      revision: current.revision + 1,
+      retryNotBeforeMs: now,
+      retryCount: 0,
+      lastError: null,
+    });
+    return this.#transition(current, next);
+  }
+
   #requestControlIntent(
     identity: ProviderOperationIdentity,
     cause: ProviderStopCause,
@@ -2175,6 +2294,10 @@ export class ProviderOperationReconciler
           lastError: current.lastError,
         });
       } else if (current.phase === 'executing') {
+        if (current.controlIntent.kind === 'rekey-refusal-containment') {
+          void this.reconcile(current, preferredAuthority);
+          return;
+        }
         if (current.controlIntent.kind === 'stop') {
           this.#deps.registry.stop(current.operation.jobId, current.controlIntent.cause);
           void this.reconcile(current, preferredAuthority);
@@ -2216,7 +2339,66 @@ export class ProviderOperationReconciler
     record: Extract<ProviderOperationRecord, { phase: 'settlement-pending' }>,
   ): ReturnType<typeof deleteProviderOperation> {
     this.#assertActiveDrive();
+    this.#settleBindingOrThrow(record.operation);
+    this.#releaseStartupAndRetireBindingOrThrow(record);
     return deleteProviderOperation(this.#deps.getProgressStore().getDb(), record);
+  }
+
+  #releaseStartupAndRetireBindingOrThrow(record: ProviderOperationRecord): void {
+    const release = this.#deps.releaseStartupOwnership(record.operation);
+    if (release.kind === 'transferred') return;
+    if (
+      record.phase !== 'executing' &&
+      this.#publications.has(operationKey(record.operation)) &&
+      release.kind === 'not-owned'
+    ) {
+      return;
+    }
+    this.#retireBindingOrThrow(record.operation);
+  }
+
+  #settleBindingOrThrow(operation: ProviderOperationIdentity): void {
+    const settlement = this.#deps.binding.settleProviderOperationBinding(operation);
+    if (settlement.kind === 'refused') {
+      throw new Error(`Provider operation binding settlement was refused: ${settlement.reason}`);
+    }
+  }
+
+  #retireBindingOrThrow(operation: ProviderOperationIdentity): void {
+    const retirement = this.#deps.binding.retireProviderOperationBinding(operation);
+    if (retirement.kind === 'refused') {
+      throw new Error(`Provider operation binding retirement was refused: ${retirement.reason}`);
+    }
+  }
+
+  #rekeyRefusalDirective(
+    record: ProviderOperationRecord,
+  ): Extract<ProviderOperationTerminalDirective, { kind: 'terminal-failed' }> | null {
+    if (
+      (record.phase !== 'executing' && record.phase !== 'settlement-pending') ||
+      record.controlIntent.kind !== 'rekey-refusal-containment'
+    ) {
+      return null;
+    }
+    return {
+      kind: 'terminal-failed',
+      code: 'coordinator_rekey_refused',
+      reason: record.controlIntent.reason,
+    };
+  }
+
+  #completeTerminalized(record: ProviderOperationRecord): void {
+    const directive = this.#rekeyRefusalDirective(record);
+    this.#complete(
+      record.operation,
+      directive === null
+        ? { kind: 'terminalized' }
+        : {
+            kind: 'rekey-refused-contained',
+            operationId: record.operation.operationId,
+            reason: directive.reason,
+          },
+    );
   }
 
   async #recordRetry(record: ProviderOperationRecord, error: unknown, operationControlHeld = false): Promise<void> {
@@ -2358,7 +2540,7 @@ export class ProviderOperationReconciler
     }
 
     try {
-      finishProviderOperationDueSelection(
+      void finishProviderOperationDueSelection(
         this.#deps.getProgressStore().getDb(),
         selection,
         scanCutoffMs,

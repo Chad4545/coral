@@ -863,7 +863,6 @@ function createLifecycleHarness(
         providerRegistry,
         getRecoveryService,
         createInvocationContext,
-        providerOperationStartupOwnership,
         signal,
         recoverPersistedDiscussFn,
         knownDiscussSources,
@@ -881,7 +880,6 @@ function createLifecycleHarness(
         signal,
         log: identity.log,
         coordinatorCommit: createTestJobJournalDeps(options.progressStore, runtime).coordinatorCommit,
-        providerOperationStartupOwnership,
         interruptedAppServerReason: options.interruptedAppServerReason,
       });
       return recoverPersistedDiscussFn({
@@ -926,6 +924,7 @@ function createActualRecoveryService(
       bundleHash: '1111111111111111',
       backendNamespace: modules.pathsModule.pluginRootNamespace(options.pluginRoot),
       launchCoordinator: options.launchCoordinator,
+      settlementRefusalRecorder: { record: () => true },
       eventBus: options.eventBus,
       providerRegistry: options.providerRegistry,
       pluginRegistry: {
@@ -1037,13 +1036,18 @@ describe('lifecycle recovery', () => {
     progressStore
       .getDb()
       .prepare<[string, string]>('INSERT INTO meta (key, value) VALUES (?, ?)')
-      .run('provider_operation_saga.v2:record:unattributable', JSON.stringify({ version: 'unknown', locator: null }));
+      .run('provider_operation_saga.v3:record:unattributable', JSON.stringify({ version: 'unknown', locator: null }));
 
-    const runStartupRecoveryFn = vi.fn(async (inputs: StartupRecoveryInputs) => {
-      expect(inputs.providerOperationStartupOwnership).toEqual({ jobIds: [] });
-      return [];
+    const runStartupRecoveryFn = vi.fn(async (_inputs: StartupRecoveryInputs) => []);
+    const reconcileProviderOperationsAtStartup = vi.fn(async (ownership) => {
+      expect(ownership).toEqual({
+        completion: { kind: 'complete' },
+        jobIds: [],
+        records: [],
+        unreadable: [],
+      });
+      return { examined: 0 };
     });
-    const reconcileProviderOperationsAtStartup = vi.fn(async () => ({ examined: 0 }));
     const startProviderOperationReconciler = vi.fn();
     const publish = vi.fn();
     const cleanupStaleJobsFn = vi.fn();
@@ -2264,8 +2268,8 @@ describe('lifecycle recovery', () => {
         'queued-low',
         'queued-high',
       ]);
-      expect(recoveredCoordinator.queuePosition('queued-low')).toBe(1);
-      expect(recoveredCoordinator.queuePosition('queued-high')).toBe(2);
+      expect(recoveredCoordinator.queuePosition('queued-low', 'default')).toBe(1);
+      expect(recoveredCoordinator.queuePosition('queued-high', 'default')).toBe(2);
     } finally {
       await stopLifecycleController(controller);
     }
@@ -2352,7 +2356,6 @@ describe('lifecycle recovery', () => {
           getRecoveryService,
           createInvocationContext,
           recoveryCoordinator,
-          providerOperationStartupOwnership,
           signal,
         },
         runJobsStartup,
@@ -2377,7 +2380,6 @@ describe('lifecycle recovery', () => {
           signal,
           log: identity.log,
           coordinatorCommit: createTestJobJournalDeps(progressStore, runtime).coordinatorCommit,
-          providerOperationStartupOwnership,
         });
         return [];
       },
@@ -2568,9 +2570,10 @@ describe('lifecycle recovery', () => {
           {
             jobId,
             reason: 'recovery ownership was released without proof of recorded containment absence',
-            nextStep:
-              `Run coral-cli jobs detail ${jobId}; the recorded containment may still be live and is no longer ` +
-              'owned by recovery.',
+            nextStep: {
+              detail: 'The recorded containment may still be live and is no longer owned by recovery.',
+              remedy: { kind: 'jobs-detail', jobId },
+            },
           },
         ],
       });
@@ -3516,6 +3519,7 @@ describe('lifecycle recovery', () => {
     const coordinatorCommit = createTestJobJournalDeps(progressStore, runtime).coordinatorCommit;
     const signal = new AbortController().signal;
     const providerRegistry = createRecoveryProviderRegistry(modules);
+    const startupOwnership = new modules.engineModule.LaunchCoordinator({ runtime });
     const identity = {
       pluginRoot,
       namespace,
@@ -3563,6 +3567,7 @@ describe('lifecycle recovery', () => {
           principal: testProjectPrincipal(root),
         }),
         log,
+        startupOwnership,
       },
       boundRecovery.bound,
     );
@@ -3963,7 +3968,7 @@ describe('lifecycle recovery', () => {
         expectRecordedRecoveryFault(progressStore, jobId, adoptionError);
         expect(runtimeState.getLaunchFenceActive()).toBe(false);
         expect(controller.getRecoveryRegistry()?.has(jobId) ?? false).toBe(false);
-        expect(launchCoordinator.queuePosition(jobId)).toBeNull();
+        expect(launchCoordinator.queuePosition(jobId, 'default')).toBeNull();
         expect(launchCoordinator.getActiveJobIds()).not.toContain(jobId);
 
         const reader = new modules.sessionManagerModule.SessionManager(

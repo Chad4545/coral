@@ -6,6 +6,7 @@ import { join } from 'node:path';
 import { describe, expect, it, vi } from 'vitest';
 
 import { createExecutionServices } from '#src/coordinator/composition/execution-services.js';
+import { LaunchCoordinator } from '#src/coordinator/live/admission.js';
 import {
   createProviderProxyOperationAuthority,
   type DurableProviderProxyOperationAuthority,
@@ -26,10 +27,8 @@ import {
   type ProviderProxySetIdentity,
 } from '#src/coordinator/services/provider-proxy-set/identity.js';
 import { ProviderProxySetLifecycleRef } from '#src/coordinator/services/provider-proxy-set/lifecycle-ref.js';
-import {
-  createUnreadableProviderOperationRetryPlan,
-  quarantineUnreadableProviderOperations,
-} from '#src/coordinator/services/recovery/index.js';
+import { createUnreadableProviderOperationRetryPlan } from '#src/coordinator/services/recovery/index.js';
+import { quarantineUnreadableProviderOperations } from '#src/coordinator/services/recovery/retry-plans.js';
 import {
   createRecoveryQuarantineRetryService,
   createRecoverySourceRegistry,
@@ -71,6 +70,7 @@ import { newRawDatabase } from '#tests/helpers/test-db.js';
 import { seedTestSessionProjection } from '#tests/helpers/session.js';
 import { providerOperationRecord } from '#tests/unit/store/provider-operation-fixtures.js';
 import { testIncarnation } from '#tests/helpers/process-incarnation.js';
+import { createProviderOperationStartupOwnership } from '#src/coordinator/services/recovery/provider-operation-startup-ownership.js';
 
 /** The build these fixture worlds belong to; capsules built from the same fixtures are inheritable, not foreign. */
 const FIXTURE_BUILD_SET_ID = '00000000-0000-4000-8000-000000000004';
@@ -128,6 +128,29 @@ function providerOperationRecordKey(record: ProviderOperationRecord): string {
   ].join(':')}`;
 }
 
+const startupOwnershipHarnesses = new WeakMap<
+  LaunchCoordinator,
+  ReturnType<typeof createProviderOperationStartupOwnership>
+>();
+
+function startupOwnership(
+  runtime: ReturnType<typeof isolatedExecutionRuntime>,
+  progressStore: JobStore,
+  launchCoordinator: LaunchCoordinator,
+) {
+  let service = startupOwnershipHarnesses.get(launchCoordinator);
+  if (service === undefined) {
+    service = createProviderOperationStartupOwnership({
+      runtime,
+      progressStore,
+      binding: launchCoordinator,
+      log: () => undefined,
+    });
+    startupOwnershipHarnesses.set(launchCoordinator, service);
+  }
+  return service.hydrate(service.snapshot());
+}
+
 function createUnreadableStartupHarness() {
   const runtime = isolatedExecutionRuntime();
   const db = newRawDatabase(':memory:');
@@ -143,6 +166,7 @@ function createUnreadableStartupHarness() {
   const unreadableKey = providerOperationRecordKey(unreadable);
   insertProviderOperation(db, readable);
   db.prepare<[string, string]>('INSERT INTO meta (key, value) VALUES (?, ?)').run(unreadableKey, 'not-json');
+  const launchCoordinator = new LaunchCoordinator({ runtime });
   const world = {
     identity: { buildSetId: FIXTURE_BUILD_SET_ID, instanceId: FIXTURE_COORDINATOR_INSTANCE_ID },
     storeServicesRef: { tryGet: () => ({ progressStore }) },
@@ -152,12 +176,14 @@ function createUnreadableStartupHarness() {
     providerProxySetContainmentProver: noContainmentProver,
     reapRecordedContainment: unexpectedRecordedContainmentReap,
     providerHostManager: {},
+    launchCoordinator,
   } as never;
   const services = createExecutionServices({
     world,
     runtime,
     bundleHash: namespace,
     backendNamespace: namespace,
+    settlementRefusalRecorder: { record: () => true },
     onProviderProxyLifecycleFatal: (error) => {
       throw error;
     },
@@ -171,6 +197,9 @@ function createUnreadableStartupHarness() {
     db,
     quarantine: new RecoveryQuarantineStore(db, runtime.time),
     readable,
+    launchCoordinator,
+    progressStore,
+    runtime,
     services,
     unreadableKey,
   };
@@ -225,6 +254,7 @@ async function createSharedSetHarness(control: SharedSetControl) {
   const claims = new ProviderProxySetClaimMirror();
   const lifecycleRef = new ProviderProxySetLifecycleRef();
   const operationRegistry = new LocalOperationRegistry();
+  const launchCoordinator = new LaunchCoordinator({ runtime });
   const world = {
     identity: { buildSetId: FIXTURE_BUILD_SET_ID, instanceId: FIXTURE_COORDINATOR_INSTANCE_ID },
     storeServicesRef: { tryGet: () => ({ progressStore }) },
@@ -234,12 +264,14 @@ async function createSharedSetHarness(control: SharedSetControl) {
     providerProxySetContainmentProver: noContainmentProver,
     reapRecordedContainment: unexpectedRecordedContainmentReap,
     providerHostManager: {},
+    launchCoordinator,
   } as never;
   const services = createExecutionServices({
     world,
     runtime,
     bundleHash: namespace,
     backendNamespace: namespace,
+    settlementRefusalRecorder: { record: () => true },
     onProviderProxyLifecycleFatal: (error) => {
       throw error;
     },
@@ -247,7 +279,10 @@ async function createSharedSetHarness(control: SharedSetControl) {
       throw new Error('execution service creation was not expected');
     }) as never,
   });
-  await services.reconcileProviderOperationsAtStartup(new AbortController().signal);
+  await services.reconcileProviderOperationsAtStartup(
+    startupOwnership(runtime, progressStore, launchCoordinator),
+    new AbortController().signal,
+  );
 
   const settlement = providerOperationRecord('settlement-pending');
   const siblings = [
@@ -369,6 +404,9 @@ async function createSharedSetHarness(control: SharedSetControl) {
     formattedTimeout,
     lifecycle,
     records,
+    launchCoordinator,
+    progressStore,
+    runtime,
     services,
     settlement,
     setIdentity,
@@ -404,6 +442,7 @@ describe('execution services provider-proxy proof composition', () => {
       `${stranded.operation.proxyInstanceId}:${stranded.operation.buildSetId}`;
     db.prepare<[string, string]>('INSERT INTO meta (key, value) VALUES (?, ?)').run(supersededKey, 'unparsed');
 
+    const launchCoordinator = new LaunchCoordinator({ runtime });
     const world = {
       identity: { buildSetId: FIXTURE_BUILD_SET_ID, instanceId: FIXTURE_COORDINATOR_INSTANCE_ID },
       storeServicesRef: { tryGet: () => ({ progressStore }) },
@@ -413,6 +452,7 @@ describe('execution services provider-proxy proof composition', () => {
       providerProxySetContainmentProver: noContainmentProver,
       reapRecordedContainment: unexpectedRecordedContainmentReap,
       providerHostManager: {},
+      launchCoordinator,
     } as never;
 
     const services = createExecutionServices({
@@ -420,6 +460,7 @@ describe('execution services provider-proxy proof composition', () => {
       runtime,
       bundleHash: namespace,
       backendNamespace: namespace,
+      settlementRefusalRecorder: { record: () => true },
       onProviderProxyLifecycleFatal: (error) => {
         throw error;
       },
@@ -436,7 +477,10 @@ describe('execution services provider-proxy proof composition', () => {
       reported.push(String(message));
     });
     try {
-      await services.reconcileProviderOperationsAtStartup(new AbortController().signal);
+      await services.reconcileProviderOperationsAtStartup(
+        startupOwnership(runtime, progressStore, launchCoordinator),
+        new AbortController().signal,
+      );
       quarantined = new RecoveryQuarantineStore(db, runtime.time).list();
     } finally {
       warning.mockRestore();
@@ -468,6 +512,7 @@ describe('execution services provider-proxy proof composition', () => {
     });
     const claims = new ProviderProxySetClaimMirror();
     const lifecycleRef = new ProviderProxySetLifecycleRef();
+    const launchCoordinator = new LaunchCoordinator({ runtime });
     const world = {
       identity: { buildSetId: FIXTURE_BUILD_SET_ID, instanceId: FIXTURE_COORDINATOR_INSTANCE_ID },
       storeServicesRef: { tryGet: () => ({ progressStore }) },
@@ -477,12 +522,14 @@ describe('execution services provider-proxy proof composition', () => {
       providerProxySetContainmentProver: noContainmentProver,
       reapRecordedContainment: unexpectedRecordedContainmentReap,
       providerHostManager: {},
+      launchCoordinator,
     } as never;
     const services = createExecutionServices({
       world,
       runtime,
       bundleHash: namespace,
       backendNamespace: namespace,
+      settlementRefusalRecorder: { record: () => true },
       onProviderProxyLifecycleFatal: (error) => {
         throw error;
       },
@@ -490,10 +537,46 @@ describe('execution services provider-proxy proof composition', () => {
         throw new Error('execution service creation was not expected');
       }) as never,
     });
-    await services.reconcileProviderOperationsAtStartup(new AbortController().signal);
+    const repairedOwnership = createProviderOperationStartupOwnership({
+      runtime,
+      progressStore,
+      binding: launchCoordinator,
+      log: () => undefined,
+    });
+    services.connectProviderOperationRecovery({
+      adoptRepairedProviderOperationOwnership: (record: ProviderOperationRecord) => {
+        return repairedOwnership.adoptRepaired(record);
+      },
+      releaseProviderOperationStartupOwnership: repairedOwnership.release,
+    } as never);
+    await services.reconcileProviderOperationsAtStartup(
+      startupOwnership(runtime, progressStore, launchCoordinator),
+      new AbortController().signal,
+    );
 
     const repaired = providerOperationRecord('executing');
     const key = providerOperationRecordKey(repaired);
+    seedTestSessionProjection(db, {
+      sessionId: repaired.operation.jobId,
+      provider: 'codex',
+      projectRoot: process.cwd(),
+      backendNamespace: namespace,
+      activeJobId: repaired.operation.jobId,
+    });
+    progressStore.appendLaunchRequested(repaired.operation.jobId, {
+      jobId: repaired.operation.jobId,
+      owner: { kind: 'provider-session', id: repaired.operation.jobId },
+      sessionId: repaired.operation.jobId,
+      provider: 'codex',
+      projectRoot: process.cwd(),
+      backendNamespace: namespace,
+      jobKind: 'provider',
+      pool: 'default',
+      enqueueSequence: 1,
+      providerAction: 'exec',
+      request: { prompt: 'test', cwd: process.cwd(), bypassPermissions: false, coralEnv: {} },
+      createdAt: '2026-08-09T12:34:55.000Z',
+    });
     db.prepare<[string, string]>('INSERT INTO meta (key, value) VALUES (?, ?)').run(key, 'not-json');
     const quarantine = new RecoveryQuarantineStore(db, runtime.time);
     await quarantineUnreadableProviderOperations(
@@ -551,6 +634,80 @@ describe('execution services provider-proxy proof composition', () => {
     }
   });
 
+  it('returns the surviving record identity when startup ownership cannot adopt it', async () => {
+    const harness = createUnreadableStartupHarness();
+    const recordKey = providerOperationRecordKey(harness.readable);
+    harness.services.connectProviderOperationRecovery({
+      releaseUnreadableProviderOperationStartupOwnership: () => ({
+        released: 0,
+        readableRecords: [{ recordKey, record: harness.readable }],
+      }),
+    } as never);
+
+    try {
+      await expect(
+        harness.services.releaseUnreadableProviderOperationStartupOwnership(harness.unreadableKey),
+      ).resolves.toEqual({
+        kind: 'adoption-refused',
+        releasedLaunchPermits: 0,
+        refusals: [
+          {
+            recordKey,
+            ...harness.readable.operation,
+            reason: 'the provider operation ownership path is not initialized',
+            remedy: { kind: 'restart-coordinator' },
+          },
+        ],
+      });
+    } finally {
+      harness.services.stopProviderOperationReconciler();
+      harness.db.close();
+    }
+  });
+
+  it('preserves the remote-settlement remedy when repaired ownership is refused', async () => {
+    const harness = createUnreadableStartupHarness();
+    const recordKey = providerOperationRecordKey(harness.readable);
+
+    try {
+      await harness.services.reconcileProviderOperationsAtStartup(
+        startupOwnership(harness.runtime, harness.progressStore, harness.launchCoordinator),
+        new AbortController().signal,
+      );
+      harness.services.connectProviderOperationRecovery({
+        adoptRepairedProviderOperationOwnership: (record: ProviderOperationRecord) => ({
+          phase: 'settlement-pending',
+          operation: record.operation,
+          restoredPermit: null,
+          bindingDisposition: {
+            kind: 'refused',
+            reason: 'the remote provider still owns settlement',
+            remedy: { kind: 'remote-settlement' },
+          },
+        }),
+        releaseUnreadableProviderOperationStartupOwnership: () => ({
+          released: 0,
+          readableRecords: [{ recordKey, record: harness.readable }],
+        }),
+      } as never);
+
+      await expect(
+        harness.services.releaseUnreadableProviderOperationStartupOwnership(harness.unreadableKey),
+      ).resolves.toMatchObject({
+        kind: 'adoption-refused',
+        refusals: [
+          {
+            recordKey,
+            remedy: { kind: 'remote-settlement' },
+          },
+        ],
+      });
+    } finally {
+      harness.services.stopProviderOperationReconciler();
+      harness.db.close();
+    }
+  });
+
   it('initializes readable claims when quarantine materialization throws and writes durable status', async () => {
     const harness = createUnreadableStartupHarness();
     const write = vi.spyOn(RecoveryQuarantineStore.prototype, 'upsert').mockImplementationOnce(() => {
@@ -559,7 +716,10 @@ describe('execution services provider-proxy proof composition', () => {
 
     try {
       await expect(
-        harness.services.reconcileProviderOperationsAtStartup(new AbortController().signal),
+        harness.services.reconcileProviderOperationsAtStartup(
+          startupOwnership(harness.runtime, harness.progressStore, harness.launchCoordinator),
+          new AbortController().signal,
+        ),
       ).resolves.toBeDefined();
       expect(harness.claims.claimFor(harness.readable.operation)).not.toBeNull();
       expect(harness.quarantine.list()).toEqual([
@@ -614,7 +774,10 @@ describe('execution services provider-proxy proof composition', () => {
 
     try {
       await expect(
-        harness.services.reconcileProviderOperationsAtStartup(new AbortController().signal),
+        harness.services.reconcileProviderOperationsAtStartup(
+          startupOwnership(harness.runtime, harness.progressStore, harness.launchCoordinator),
+          new AbortController().signal,
+        ),
       ).resolves.toBeDefined();
       expect(harness.claims.claimFor(harness.readable.operation)).not.toBeNull();
       expect(harness.quarantine.read(UNREADABLE_PROVIDER_OPERATION_BOUNDARY, harness.unreadableKey)).toEqual({
@@ -634,6 +797,7 @@ describe('execution services provider-proxy proof composition', () => {
     const claims = new ProviderProxySetClaimMirror();
     const lifecycleRef = new ProviderProxySetLifecycleRef();
     const operationRegistry = new LocalOperationRegistry();
+    const launchCoordinator = new LaunchCoordinator({ runtime });
     const inheritProviderProxySet = vi.fn(async () => ({ kind: 'not-bequeathed' as const, reason: 'unused' }));
     const redeemDiscoveredCapsule = vi.fn(async () => {
       throw new Error('capsule redemption was not expected');
@@ -649,6 +813,7 @@ describe('execution services provider-proxy proof composition', () => {
       providerProxySetContainmentProver: { collectContainmentProof: proveContainmentAbsent },
       reapRecordedContainment: unexpectedRecordedContainmentReap,
       providerHostManager: {},
+      launchCoordinator,
     } as never;
 
     const services = createExecutionServices({
@@ -656,6 +821,7 @@ describe('execution services provider-proxy proof composition', () => {
       runtime,
       bundleHash: 'execution-services-assembly-test',
       backendNamespace: 'execution-services-assembly-test',
+      settlementRefusalRecorder: { record: () => true },
       onProviderProxyLifecycleFatal: (error) => {
         throw error;
       },
@@ -699,6 +865,7 @@ describe('execution services provider-proxy proof composition', () => {
       runtime,
       bundleHash: 'execution-services-stored-fault-test',
       backendNamespace: 'execution-services-stored-fault-test',
+      settlementRefusalRecorder: { record: () => true },
       onProviderProxyLifecycleFatal: (error) => {
         throw error;
       },
@@ -763,6 +930,14 @@ describe('execution services provider-proxy proof composition', () => {
     const claims = new ProviderProxySetClaimMirror();
     const lifecycleRef = new ProviderProxySetLifecycleRef();
     const operationRegistry = new LocalOperationRegistry();
+    const launchCoordinator = new LaunchCoordinator({ runtime });
+    const recoveryPermit = launchCoordinator.restoreActiveLaunch(
+      record.operation.jobId,
+      'codex',
+      { kind: 'provider-session', id: record.operation.jobId },
+      'default',
+    );
+    launchCoordinator.prepareProviderOperationBinding(recoveryPermit, record.operation);
     const readLaunchProjection = vi.fn(() => ({
       jobId: record.operation.jobId,
       owner: { kind: 'provider-session' as const, id: record.operation.jobId },
@@ -786,6 +961,7 @@ describe('execution services provider-proxy proof composition', () => {
       providerProxySetContainmentProver: noContainmentProver,
       reapRecordedContainment: unexpectedRecordedContainmentReap,
       providerHostManager: {},
+      launchCoordinator,
     } as never;
     const warning = vi.spyOn(backendLog, 'warn').mockImplementation(() => undefined);
     const services = createExecutionServices({
@@ -793,6 +969,7 @@ describe('execution services provider-proxy proof composition', () => {
       runtime,
       bundleHash: 'execution-services-fresh-publication-test',
       backendNamespace: 'execution-services-fresh-publication-test',
+      settlementRefusalRecorder: { record: () => true },
       onProviderProxyLifecycleFatal: (error) => {
         throw error;
       },
@@ -848,12 +1025,28 @@ describe('execution services provider-proxy proof composition', () => {
 
   it('preserves sibling operations when settlement times out on their shared proxy set', async () => {
     const harness = await createSharedSetHarness('settlement-timeout');
-    const { claims, db, formattedTimeout, records, services, settlement, setIdentity, siblings, stopAndReap, timeout } =
-      harness;
+    const {
+      claims,
+      db,
+      formattedTimeout,
+      launchCoordinator,
+      progressStore,
+      records,
+      runtime,
+      services,
+      settlement,
+      setIdentity,
+      siblings,
+      stopAndReap,
+      timeout,
+    } = harness;
     const info = vi.spyOn(backendLog, 'info').mockImplementation(() => undefined);
 
     try {
-      const report = await services.reconcileProviderOperationsAtStartup(new AbortController().signal);
+      const report = await services.reconcileProviderOperationsAtStartup(
+        startupOwnership(runtime, progressStore, launchCoordinator),
+        new AbortController().signal,
+      );
       const storedSettlement = readProviderOperation(db, settlement.operation);
       const storedSiblings = siblings.map((record) => readProviderOperation(db, record.operation));
 
@@ -998,6 +1191,7 @@ describe('execution services provider-proxy proof composition', () => {
       runtime,
       bundleHash: 'execution-services-test',
       backendNamespace: 'execution-services-test',
+      settlementRefusalRecorder: { record: () => true },
       onProviderProxyLifecycleFatal: (error) => {
         throw error;
       },
@@ -1084,6 +1278,10 @@ describe('execution services provider-proxy proof composition', () => {
     } as never;
     const db = newRawDatabase(':memory:');
     applyBundledStoreSchema(db, currentCoralStoreFormat());
+    const progressStore = new JobStore('execution-services-inheritance-test', runtime, createEventBodyCodec(), {
+      db,
+      providers: permissiveProviderLookupPort,
+    });
     const record = providerOperationRecord('settlement-pending');
     insertProviderOperation(db, record);
     const claims = new ProviderProxySetClaimMirror();
@@ -1093,10 +1291,11 @@ describe('execution services provider-proxy proof composition', () => {
       kind: 'containment-disappeared' as const,
       disappearanceReceipt: 'inheritance-process-proof',
     }));
+    const launchCoordinator = new LaunchCoordinator({ runtime });
     const world = {
       identity: { buildSetId: FIXTURE_BUILD_SET_ID, instanceId: FIXTURE_COORDINATOR_INSTANCE_ID },
       storeServicesRef: {
-        tryGet: () => ({ progressStore: { getDb: () => db } }),
+        tryGet: () => ({ progressStore }),
       },
       operationRegistry,
       providerProxyClaims: claims,
@@ -1110,12 +1309,14 @@ describe('execution services provider-proxy proof composition', () => {
       providerProxySetContainmentProver: noContainmentProver,
       reapRecordedContainment: unexpectedRecordedContainmentReap,
       providerHostManager: {},
+      launchCoordinator,
     } as never;
     const services = createExecutionServices({
       world,
       runtime,
       bundleHash: 'execution-services-inheritance-test',
       backendNamespace: 'execution-services-inheritance-test',
+      settlementRefusalRecorder: { record: () => true },
       onProviderProxyLifecycleFatal: (error) => {
         throw error;
       },
@@ -1124,7 +1325,10 @@ describe('execution services provider-proxy proof composition', () => {
       }) as never,
     });
 
-    await services.reconcileProviderOperationsAtStartup(new AbortController().signal);
+    await services.reconcileProviderOperationsAtStartup(
+      startupOwnership(runtime, progressStore, launchCoordinator),
+      new AbortController().signal,
+    );
     const lifecycle = lifecycleRef.get();
     if (lifecycle === null) throw new Error('provider proxy lifecycle was not composed');
     await flushMicrotasks();
@@ -1175,6 +1379,7 @@ describe('execution services provider-proxy heartbeat-hold composition', () => {
       providers: permissiveProviderLookupPort,
     });
     const lifecycleRef = new ProviderProxySetLifecycleRef();
+    const launchCoordinator = new LaunchCoordinator({ runtime });
     const world = {
       identity: { buildSetId: FIXTURE_BUILD_SET_ID, instanceId: FIXTURE_COORDINATOR_INSTANCE_ID },
       storeServicesRef: { tryGet: () => ({ progressStore }) },
@@ -1184,12 +1389,14 @@ describe('execution services provider-proxy heartbeat-hold composition', () => {
       providerProxySetContainmentProver: noContainmentProver,
       reapRecordedContainment: unexpectedRecordedContainmentReap,
       providerHostManager: {},
+      launchCoordinator,
     } as never;
     const services = createExecutionServices({
       world,
       runtime,
       bundleHash: namespace,
       backendNamespace: namespace,
+      settlementRefusalRecorder: { record: () => true },
       onProviderProxyLifecycleFatal: (error) => {
         throw error;
       },
@@ -1197,7 +1404,10 @@ describe('execution services provider-proxy heartbeat-hold composition', () => {
         throw new Error('execution service creation was not expected');
       }) as never,
     });
-    await services.reconcileProviderOperationsAtStartup(new AbortController().signal);
+    await services.reconcileProviderOperationsAtStartup(
+      startupOwnership(runtime, progressStore, launchCoordinator),
+      new AbortController().signal,
+    );
     const lifecycle = lifecycleRef.get();
     if (lifecycle === null) throw new Error('provider proxy lifecycle was not composed');
 

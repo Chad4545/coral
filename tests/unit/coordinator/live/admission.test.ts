@@ -1,16 +1,28 @@
 import { testIncarnation } from '#tests/helpers/process-incarnation.js';
 import { EventEmitter } from 'node:events';
 import { PassThrough } from 'node:stream';
-import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import { afterEach, beforeEach, describe, expect, expectTypeOf, it, vi } from 'vitest';
 import { createRealRuntime } from '#src/runtime/real.js';
-import { LaunchCoordinator } from '#src/coordinator/live/admission.js';
+import {
+  LaunchCoordinator,
+  LAUNCH_RECLAMATION_AGE_FLOOR_MS,
+  MAX_LAUNCH_RELEASE_DIAGNOSTICS,
+  MAX_SETTLED_UNBOUND_BINDINGS,
+  SETTLED_UNBOUND_ABSENCE_CHECK_MS,
+  SETTLED_UNBOUND_UNKNOWN_OBSERVATION_LIMIT,
+} from '#src/coordinator/live/admission.js';
 import type { DurableProcessCleanup } from '#src/coordinator/live/durable-transport.js';
 import type { DurableContainmentOperatorControl } from '#src/providers/cli-runner.js';
 import { DefaultProviderHostManager } from '#src/coordinator/live/provider-hosts/index.js';
-import type { LaunchPool } from '#src/jobs/contracts/admission.js';
+import type { LaunchPermit, LaunchPool, LaunchReclamationProbeResult } from '#src/jobs/contracts/admission.js';
+import type {
+  ProviderOperationBindingIdentity,
+  SettledUnboundStatusOwnership,
+} from '#src/jobs/contracts/provider-operation-lifecycle.js';
 import { canProbeProcessIncarnation, type ProcessIncarnation } from '#src/infra/node-process.js';
 import type { ChildProcessLike } from '#src/infra/port-types.js';
 import { liveChildAuthority } from '#src/infra/process-supervision.js';
+import { AbortRegistry } from '#src/jobs/shell/abort-registry.js';
 import type {
   DurableCliProcessSubject,
   DurableContainmentStatus,
@@ -174,6 +186,10 @@ function createProviderProcessRuntime(
 
 function providerOwner(id: string) {
   return { kind: 'provider-session' as const, id };
+}
+
+function testSettledUnboundOwnership(identity: ProviderOperationBindingIdentity): SettledUnboundStatusOwnership {
+  return { identity, subjects: [] } as unknown as SettledUnboundStatusOwnership;
 }
 
 describe('launch admission', () => {
@@ -350,22 +366,31 @@ describe('launch admission', () => {
   });
 
   it('returns an admitted outcome when capacity is available', () => {
-    expect(coordinator.requestLaunch('job-1', 'codex', providerOwner('session-1'))).toEqual({
-      type: 'immediate',
+    const admission = coordinator.requestLaunch('job-1', 'codex', providerOwner('session-1'), 'default');
+    expect(admission).toMatchObject({ type: 'immediate' });
+    if (admission === 'queue_full' || admission.type !== 'immediate') throw new Error('expected immediate permit');
+    expect(admission.permit).toMatchObject({
+      jobId: 'job-1',
+      pool: 'default',
+      provider: 'codex',
+      holder: { kind: 'local-execution' },
     });
+    expect(admission.permit.reservationId).not.toBe('');
     expect(coordinator.queueDepth()).toBe(0);
-    expect(coordinator.queuePosition('job-1')).toBeNull();
+    expect(coordinator.queuePosition('job-1', 'default')).toBeNull();
   });
 
   it('fails closed for a runtime pool value outside the exhaustive LaunchPool set', async () => {
     const invalidPool = 'unknown-pool' as LaunchPool;
     const invariantMessage = 'Launch admission invariant violated: unknown pool "unknown-pool".';
+    const valid = coordinator.requestLaunch('valid', 'codex', providerOwner('valid-session'), 'default');
+    if (valid === 'queue_full' || valid.type !== 'immediate') throw new Error('expected immediate permit');
+    const invalidPermit = { ...valid.permit, pool: invalidPool } satisfies LaunchPermit;
 
     expect(() => coordinator.requestLaunch('intruder', 'codex', providerOwner('session'), invalidPool)).toThrow(
       invariantMessage,
     );
-    expect(() => coordinator.releaseLaunch('intruder', invalidPool)).toThrow(invariantMessage);
-    expect(() => coordinator.cancelQueued('intruder', invalidPool)).toThrow(invariantMessage);
+    expect(() => coordinator.releaseLaunch(invalidPermit)).toThrow(invariantMessage);
     expect(() => coordinator.queueDepth(invalidPool)).toThrow(invariantMessage);
     expect(() => coordinator.queuePosition('intruder', invalidPool)).toThrow(invariantMessage);
     expect(() => coordinator.getActiveJobIds(invalidPool)).toThrow(invariantMessage);
@@ -375,20 +400,19 @@ describe('launch admission', () => {
         command: 'never-spawned',
         args: [],
         jobDir: '/never-created',
-        permitGranted: true,
         pool: invalidPool,
       }),
     ).rejects.toThrow(invariantMessage);
-    expect(coordinator.active).toBe(0);
+    expect(coordinator.active).toBe(1);
     expect(coordinator.queueDepth()).toBe(0);
   });
 
   it('returns a queued outcome with the current position when capacity is full', () => {
-    expect(coordinator.requestLaunch('job-1', 'codex', providerOwner('session-1'))).toMatchObject({
+    expect(coordinator.requestLaunch('job-1', 'codex', providerOwner('session-1'), 'default')).toMatchObject({
       type: 'immediate',
     });
 
-    const queued = coordinator.requestLaunch('job-2', 'codex', providerOwner('session-2'));
+    const queued = coordinator.requestLaunch('job-2', 'codex', providerOwner('session-2'), 'default');
 
     expect(queued).not.toBe('queue_full');
     expect(queued).toMatchObject({
@@ -396,14 +420,46 @@ describe('launch admission', () => {
       queuePosition: 1,
     });
     expect(coordinator.queueDepth()).toBe(1);
-    expect(coordinator.queuePosition('job-2')).toBe(1);
+    expect(coordinator.queuePosition('job-2', 'default')).toBe(1);
+  });
+
+  it('describes active and queued reservations without exposing release authority', () => {
+    const active = coordinator.requestLaunch('active-view', 'codex', providerOwner('active-session'), 'default');
+    if (active === 'queue_full' || active.type !== 'immediate') throw new Error('expected active reservation');
+    const queued = coordinator.requestLaunch('queued-view', 'claude', providerOwner('queued-session'), 'default');
+    if (queued === 'queue_full' || queued.type !== 'queued') throw new Error('expected queued reservation');
+
+    const activeView = coordinator.reservationFor('active-view');
+    expect(activeView).toMatchObject({
+      kind: 'active',
+      pool: 'default',
+      provider: 'codex',
+      executionOwner: providerOwner('active-session'),
+      holder: { kind: 'local-execution' },
+      heldForMs: expect.any(Number),
+    });
+    expect(activeView).not.toHaveProperty('permit');
+    expect(activeView).not.toHaveProperty('reservationId');
+
+    const queuedView = coordinator.reservationFor('queued-view');
+    expect(queuedView).toEqual({
+      kind: 'queued',
+      reservationId: expect.any(String),
+      pool: 'default',
+      provider: 'claude',
+      executionOwner: providerOwner('queued-session'),
+      position: 1,
+    });
+    expect(queuedView).not.toHaveProperty('permit');
   });
 
   it('rejects duplicate job ids without exposing or mutating the incumbent reservation', async () => {
-    expect(coordinator.requestLaunch('active', 'codex', providerOwner('session-active'))).toMatchObject({
+    const active = coordinator.requestLaunch('active', 'codex', providerOwner('session-active'), 'default');
+    expect(active).toMatchObject({
       type: 'immediate',
     });
-    const queued = coordinator.requestLaunch('queued', 'codex', providerOwner('session-queued'));
+    if (active === 'queue_full' || active.type !== 'immediate') throw new Error('expected active reservation');
+    const queued = coordinator.requestLaunch('queued', 'codex', providerOwner('session-queued'), 'default');
     if (queued === 'queue_full' || queued.type !== 'queued') throw new Error('expected queued reservation');
 
     expect(() => coordinator.requestLaunch('active', 'claude', providerOwner('intruder-active'), 'discuss')).toThrow(
@@ -414,25 +470,46 @@ describe('launch admission', () => {
     );
 
     expect(coordinator.getActiveJobIds()).toEqual(['active']);
-    expect(coordinator.queuePosition('queued')).toBe(1);
+    expect(coordinator.queuePosition('queued', 'default')).toBe(1);
     expect(coordinator.getActiveJobIds('discuss')).toEqual([]);
     expect(coordinator.queueDepth('discuss')).toBe(0);
 
     const permit = queued.waitForPermit();
-    coordinator.releaseLaunch('active');
+    coordinator.releaseLaunch(active.permit);
     await permit;
     expect(coordinator.getActiveJobIds()).toEqual(['queued']);
   });
 
   it('tracks default and discuss pools independently', async () => {
-    expect(coordinator.requestLaunch('default-1', 'codex', providerOwner('default-session-1'))).toMatchObject({
+    const defaultAdmission = coordinator.requestLaunch(
+      'default-1',
+      'codex',
+      providerOwner('default-session-1'),
+      'default',
+    );
+    expect(defaultAdmission).toMatchObject({
       type: 'immediate',
     });
-    expect(
-      coordinator.requestLaunch('discuss-1', 'codex', { kind: 'discussion', id: 'discussion-1' }, 'discuss'),
-    ).toMatchObject({ type: 'immediate' });
+    const discussAdmission = coordinator.requestLaunch(
+      'discuss-1',
+      'codex',
+      { kind: 'discussion', id: 'discussion-1' },
+      'discuss',
+    );
+    expect(discussAdmission).toMatchObject({ type: 'immediate' });
+    if (defaultAdmission === 'queue_full' || defaultAdmission.type !== 'immediate') {
+      throw new Error('expected immediate default permit');
+    }
+    if (discussAdmission === 'queue_full' || discussAdmission.type !== 'immediate') {
+      throw new Error('expected immediate discuss permit');
+    }
 
-    const queuedDefault = coordinator.requestLaunch('default-2', 'codex', providerOwner('default-session-2'));
+    const queuedDefault = coordinator.requestLaunch(
+      'default-2',
+      'codex',
+      providerOwner('default-session-2'),
+      'default',
+    );
     const queuedDiscuss = coordinator.requestLaunch(
       'discuss-2',
       'codex',
@@ -449,12 +526,12 @@ describe('launch admission', () => {
     const defaultPermit = queuedDefault.waitForPermit();
     const discussPermit = queuedDiscuss.waitForPermit();
 
-    coordinator.releaseLaunch('default-1');
+    coordinator.releaseLaunch(defaultAdmission.permit);
     await defaultPermit;
     expect(coordinator.queueDepth()).toBe(0);
     expect(coordinator.queueDepth('discuss')).toBe(1);
 
-    coordinator.releaseLaunch('discuss-1', 'discuss');
+    coordinator.releaseLaunch(discussAdmission.permit);
     await discussPermit;
     expect(coordinator.queueDepth('discuss')).toBe(0);
     expect(coordinator.getActiveJobIds()).toEqual(['default-2']);
@@ -462,12 +539,12 @@ describe('launch admission', () => {
   });
 
   it('returns queue_full when the internal queue limit is reached', async () => {
-    expect(coordinator.requestLaunch('job-1', 'codex', providerOwner('session-1'))).toMatchObject({
+    expect(coordinator.requestLaunch('job-1', 'codex', providerOwner('session-1'), 'default')).toMatchObject({
       type: 'immediate',
     });
 
     for (let i = 2; i <= 21; i += 1) {
-      const result = coordinator.requestLaunch(`job-${i}`, 'codex', providerOwner(`session-${i}`));
+      const result = coordinator.requestLaunch(`job-${i}`, 'codex', providerOwner(`session-${i}`), 'default');
       expect(result).not.toBe('queue_full');
       if (result !== 'queue_full' && result.type === 'queued') {
         void result.waitForPermit().catch(() => null);
@@ -475,16 +552,18 @@ describe('launch admission', () => {
     }
 
     expect(coordinator.queueDepth()).toBe(20);
-    expect(coordinator.requestLaunch('job-22', 'codex', providerOwner('session-22'))).toBe('queue_full');
+    expect(coordinator.requestLaunch('job-22', 'codex', providerOwner('session-22'), 'default')).toBe('queue_full');
     await coordinator.terminateAll();
   });
 
   it('admits queued jobs in strict FIFO order when a launch is released', async () => {
-    expect(coordinator.requestLaunch('job-1', 'codex', providerOwner('session-1'))).toMatchObject({
+    const first = coordinator.requestLaunch('job-1', 'codex', providerOwner('session-1'), 'default');
+    expect(first).toMatchObject({
       type: 'immediate',
     });
-    const queuedSecond = coordinator.requestLaunch('job-2', 'codex', providerOwner('session-2'));
-    const queuedThird = coordinator.requestLaunch('job-3', 'codex', providerOwner('session-3'));
+    if (first === 'queue_full' || first.type !== 'immediate') throw new Error('expected immediate permit');
+    const queuedSecond = coordinator.requestLaunch('job-2', 'codex', providerOwner('session-2'), 'default');
+    const queuedThird = coordinator.requestLaunch('job-3', 'codex', providerOwner('session-3'), 'default');
 
     if (queuedSecond === 'queue_full' || queuedSecond.type !== 'queued') throw new Error('expected queued job-2');
     if (queuedThird === 'queue_full' || queuedThird.type !== 'queued') throw new Error('expected queued job-3');
@@ -495,25 +574,27 @@ describe('launch admission', () => {
       thirdGranted = true;
     });
 
-    coordinator.releaseLaunch('job-1');
-    await secondPermit;
+    coordinator.releaseLaunch(first.permit);
+    const admittedSecond = await secondPermit;
     await Promise.resolve();
 
     expect(thirdGranted).toBe(false);
-    expect(coordinator.queuePosition('job-3')).toBe(1);
+    expect(coordinator.queuePosition('job-3', 'default')).toBe(1);
 
-    coordinator.releaseLaunch('job-2');
+    coordinator.releaseLaunch(admittedSecond);
     await thirdPermit;
     expect(thirdGranted).toBe(true);
     expect(coordinator.queueDepth()).toBe(0);
   });
 
-  it('cancelQueued rejects the queued permit and advances the queue head', async () => {
-    expect(coordinator.requestLaunch('job-1', 'codex', providerOwner('session-1'))).toMatchObject({
+  it('queued-handle cancellation rejects the queued permit and advances the queue head', async () => {
+    const first = coordinator.requestLaunch('job-1', 'codex', providerOwner('session-1'), 'default');
+    expect(first).toMatchObject({
       type: 'immediate',
     });
-    const queuedSecond = coordinator.requestLaunch('job-2', 'codex', providerOwner('session-2'));
-    const queuedThird = coordinator.requestLaunch('job-3', 'codex', providerOwner('session-3'));
+    if (first === 'queue_full' || first.type !== 'immediate') throw new Error('expected immediate permit');
+    const queuedSecond = coordinator.requestLaunch('job-2', 'codex', providerOwner('session-2'), 'default');
+    const queuedThird = coordinator.requestLaunch('job-3', 'codex', providerOwner('session-3'), 'default');
 
     if (queuedSecond === 'queue_full' || queuedSecond.type !== 'queued') throw new Error('expected queued job-2');
     if (queuedThird === 'queue_full' || queuedThird.type !== 'queued') throw new Error('expected queued job-3');
@@ -523,41 +604,76 @@ describe('launch admission', () => {
       (error: unknown) => error as Error,
     );
 
-    expect(coordinator.cancelQueued('job-2')).toBe(true);
+    expect(queuedSecond.cancel()).toEqual({ kind: 'cancelled' });
     expect((await rejected)?.message).toBe('Launch canceled while queued');
 
     const thirdPermit = queuedThird.waitForPermit();
-    coordinator.releaseLaunch('job-1');
+    coordinator.releaseLaunch(first.permit);
     await thirdPermit;
-    expect(coordinator.queuePosition('job-3')).toBeNull();
+    expect(coordinator.queuePosition('job-3', 'default')).toBeNull();
+  });
+
+  it('observes a recovered queue cancellation before a waiter attaches', async () => {
+    coordinator.restoreActiveLaunch('blocker', 'codex', providerOwner('blocker-session'), 'default');
+    const restored = coordinator.restoreQueuedLaunch(
+      'recovered',
+      'codex',
+      providerOwner('recovered-session'),
+      'default',
+    );
+    const unhandled: unknown[] = [];
+    const observeUnhandled = (error: unknown): void => {
+      unhandled.push(error);
+    };
+    process.on('unhandledRejection', observeUnhandled);
+
+    try {
+      expect(restored.cancel()).toEqual({ kind: 'cancelled' });
+      await new Promise<void>((resolve) => setImmediate(resolve));
+      expect(unhandled).toEqual([]);
+      await expect(restored.waitForPermit()).rejects.toThrow('Launch canceled while queued');
+    } finally {
+      process.off('unhandledRejection', observeUnhandled);
+    }
   });
 
   it('binds queued-handle cancellation to its exact reservation generation', async () => {
-    coordinator.requestLaunch('blocker-1', 'codex', providerOwner('blocker-session-1'));
-    const staleHandle = coordinator.requestLaunch('reused-job', 'codex', providerOwner('old-session'));
+    const firstBlocker = coordinator.requestLaunch('blocker-1', 'codex', providerOwner('blocker-session-1'), 'default');
+    if (firstBlocker === 'queue_full' || firstBlocker.type !== 'immediate') throw new Error('expected blocker');
+    const staleHandle = coordinator.requestLaunch('reused-job', 'codex', providerOwner('old-session'), 'default');
     if (staleHandle === 'queue_full' || staleHandle.type !== 'queued') throw new Error('expected old queued handle');
+    coordinator.releaseLaunch(firstBlocker.permit);
+    const stalePermit = await staleHandle.waitForPermit();
+    coordinator.releaseLaunch(stalePermit);
 
-    coordinator.releaseLaunch('blocker-1');
-    await staleHandle.waitForPermit();
-    coordinator.releaseLaunch('reused-job');
-
-    coordinator.requestLaunch('blocker-2', 'codex', providerOwner('blocker-session-2'));
-    const currentHandle = coordinator.requestLaunch('reused-job', 'codex', providerOwner('new-session'));
+    const secondBlocker = coordinator.requestLaunch(
+      'blocker-2',
+      'codex',
+      providerOwner('blocker-session-2'),
+      'default',
+    );
+    if (secondBlocker === 'queue_full' || secondBlocker.type !== 'immediate') throw new Error('expected blocker');
+    const currentHandle = coordinator.requestLaunch('reused-job', 'codex', providerOwner('new-session'), 'default');
     if (currentHandle === 'queue_full' || currentHandle.type !== 'queued') {
       throw new Error('expected current queued handle');
     }
 
-    expect(staleHandle.cancel()).toBe(false);
-    expect(coordinator.queuePosition('reused-job')).toBe(1);
+    expect(staleHandle.cancel()).toEqual({ kind: 'admitted', permit: stalePermit });
+    expect(coordinator.queuePosition('reused-job', 'default')).toBe(1);
 
     const permit = currentHandle.waitForPermit();
-    coordinator.releaseLaunch('blocker-2');
+    coordinator.releaseLaunch(secondBlocker.permit);
     await permit;
     expect(coordinator.getActiveJobIds()).toEqual(['reused-job']);
   });
 
   it('restores active and queued launches for recovery bookkeeping', async () => {
-    coordinator.restoreActiveLaunch('default-1', 'codex', providerOwner('default-session-1'), 'default');
+    const restoredDefault = coordinator.restoreActiveLaunch(
+      'default-1',
+      'codex',
+      providerOwner('default-session-1'),
+      'default',
+    );
     coordinator.restoreActiveLaunch('discuss-1', 'codex', { kind: 'discussion', id: 'discussion-1' }, 'discuss');
     expect(coordinator.active).toBe(2);
 
@@ -566,9 +682,743 @@ describe('launch admission', () => {
     expect(coordinator.queueDepth()).toBe(1);
 
     const permit = restored.waitForPermit();
-    coordinator.releaseLaunch('default-1');
+    coordinator.releaseLaunch(restoredDefault);
     await permit;
     expect(coordinator.getActiveJobIds('default')).toContain('queued-1');
+  });
+
+  it('does not type job evidence as proxy-shaped reclamation authorization', () => {
+    const jobEvidence = { kind: 'job-terminal', phase: 'completed' } as const;
+
+    expectTypeOf(jobEvidence).not.toMatchTypeOf<LaunchReclamationProbeResult<'proxy-operation'>>();
+    expectTypeOf(jobEvidence).not.toMatchTypeOf<LaunchReclamationProbeResult<'undecided-provider-operation'>>();
+  });
+
+  it('reclaims a terminal proxy permit only with exact operation absence evidence', async () => {
+    let now = 10_000;
+    const base = createRealRuntime('prod');
+    const localCoordinator = new LaunchCoordinator({
+      runtime: { ...base, time: { ...base.time, now: () => now } },
+    });
+    localCoordinator.connectLaunchReclamationOracle('proxy-operation', () => ({
+      kind: 'provider-operation-absent',
+      operationId: 'different-operation',
+      jobEvidence: { kind: 'job-terminal', phase: 'completed' },
+    }));
+    const ended = localCoordinator.requestLaunch('ended-job', 'codex', providerOwner('ended-session'), 'default');
+    if (ended === 'queue_full' || ended.type !== 'immediate') throw new Error('expected ended permit');
+    const identity = { jobId: ended.permit.jobId, operationId: 'ended-operation' };
+    expect(localCoordinator.prepareProviderOperationBinding(ended.permit, identity)).toEqual({ kind: 'prepared' });
+    const binding = localCoordinator.commitProviderOperationBinding(identity);
+    if (binding.kind !== 'bound') throw new Error('expected proxy permit');
+    const waiting = localCoordinator.requestLaunch('waiting-job', 'codex', providerOwner('waiting-session'), 'default');
+    if (waiting === 'queue_full' || waiting.type !== 'queued') throw new Error('expected queued permit');
+
+    now += LAUNCH_RECLAMATION_AGE_FLOOR_MS;
+    localCoordinator.sweepStaleLaunchPermits();
+    expect(localCoordinator.reservationFor(ended.permit.jobId)).toMatchObject({
+      kind: 'active',
+      holder: { kind: 'proxy-operation', operationId: identity.operationId },
+    });
+    expect(localCoordinator.queuePosition('waiting-job', 'default')).toBe(1);
+    expect(localCoordinator.launchReclamationDiagnostics()).toEqual([]);
+
+    localCoordinator.connectLaunchReclamationOracle('proxy-operation', (permit) => ({
+      kind: 'provider-operation-absent',
+      operationId: permit.holder.operationId,
+      jobEvidence: { kind: 'job-terminal', phase: 'completed' },
+    }));
+    localCoordinator.sweepStaleLaunchPermits();
+    const admitted = await waiting.waitForPermit();
+
+    expect(localCoordinator.active).toBe(1);
+    expect(localCoordinator.reservationFor(ended.permit.jobId)).toBeNull();
+    expect(localCoordinator.reservationFor(admitted.jobId)).toMatchObject({
+      kind: 'active',
+      holder: { kind: 'local-execution' },
+    });
+    expect(localCoordinator.launchReclamationDiagnostics()).toEqual([
+      expect.objectContaining({
+        reservationId: ended.permit.reservationId,
+        jobId: ended.permit.jobId,
+        holder: { kind: 'proxy-operation', operationId: identity.operationId },
+        heldForMs: LAUNCH_RECLAMATION_AGE_FLOOR_MS,
+        evidence: {
+          kind: 'provider-operation-absent',
+          operationId: identity.operationId,
+          jobEvidence: { kind: 'job-terminal', phase: 'completed' },
+        },
+      }),
+    ]);
+  });
+
+  it('does not reclaim a young permit during the reserve-before-journal window', () => {
+    let now = 20_000;
+    const base = createRealRuntime('prod');
+    const localCoordinator = new LaunchCoordinator({
+      runtime: { ...base, time: { ...base.time, now: () => now } },
+    });
+    localCoordinator.connectLaunchReclamationOracle('local-execution', () => ({ kind: 'job-absent' }));
+    const starting = localCoordinator.requestLaunch(
+      'starting-job',
+      'codex',
+      providerOwner('starting-session'),
+      'default',
+    );
+    if (starting === 'queue_full' || starting.type !== 'immediate') throw new Error('expected starting permit');
+
+    now += LAUNCH_RECLAMATION_AGE_FLOOR_MS - 1;
+    localCoordinator.sweepStaleLaunchPermits();
+
+    expect(localCoordinator.active).toBe(1);
+    expect(localCoordinator.reservationFor(starting.permit.jobId)).toMatchObject({
+      kind: 'active',
+      holder: { kind: 'local-execution' },
+    });
+    expect(localCoordinator.launchReclamationDiagnostics()).toEqual([]);
+
+    now += 1;
+    localCoordinator.sweepStaleLaunchPermits();
+
+    expect(localCoordinator.active).toBe(0);
+    expect(localCoordinator.reservationFor(starting.permit.jobId)).toBeNull();
+    expect(localCoordinator.launchReclamationDiagnostics()).toEqual([
+      expect.objectContaining({
+        reservationId: starting.permit.reservationId,
+        holder: { kind: 'local-execution' },
+        evidence: { kind: 'job-absent' },
+      }),
+    ]);
+  });
+
+  it('retains queue-handoff permits after the reclamation age floor', () => {
+    let now = 22_000;
+    const base = createRealRuntime('prod');
+    const localCoordinator = new LaunchCoordinator({
+      runtime: { ...base, time: { ...base.time, now: () => now } },
+    });
+    const blocker = localCoordinator.requestLaunch(
+      'queue-handoff-blocker',
+      'codex',
+      providerOwner('queue-handoff-blocker-session'),
+      'default',
+    );
+    const queued = localCoordinator.requestLaunch(
+      'unregistered-holder',
+      'codex',
+      providerOwner('unregistered-holder-session'),
+      'default',
+    );
+    if (blocker === 'queue_full' || blocker.type !== 'immediate') throw new Error('expected blocker permit');
+    if (queued === 'queue_full' || queued.type !== 'queued') throw new Error('expected queued reservation');
+
+    expect(localCoordinator.releaseLaunch(blocker.permit)).toMatchObject({ kind: 'released' });
+    now += LAUNCH_RECLAMATION_AGE_FLOOR_MS;
+    localCoordinator.sweepStaleLaunchPermits();
+
+    expect(localCoordinator.reservationFor('unregistered-holder')).toMatchObject({
+      kind: 'active',
+      holder: { kind: 'queue-handoff' },
+    });
+    expect(localCoordinator.launchReclamationDiagnostics()).toEqual([]);
+    const cancellation = queued.cancel();
+    if (cancellation.kind !== 'admitted') throw new Error('expected queue handoff permit');
+    expect(localCoordinator.releaseLaunch(cancellation.permit)).toMatchObject({ kind: 'released' });
+  });
+
+  it('retains undecided provider-operation ownership until every named record is absent', async () => {
+    let now = 25_000;
+    const base = createRealRuntime('prod');
+    const localCoordinator = new LaunchCoordinator({
+      runtime: { ...base, time: { ...base.time, now: () => now } },
+    });
+    const recordKeys = ['provider-operation-record-1', 'provider-operation-record-2'];
+    const presentRecords = new Set(recordKeys);
+    const held = localCoordinator.restoreActiveLaunch(
+      'ambiguous-job',
+      'codex',
+      providerOwner('ambiguous-session'),
+      'default',
+      { kind: 'undecided-provider-operation', recordKeys },
+    );
+    expect(localCoordinator.reclaimLaunchPermit(held)).toBe(false);
+    localCoordinator.connectLaunchReclamationOracle('undecided-provider-operation', () => {
+      throw new Error('record journal unavailable');
+    });
+    expect(localCoordinator.reclaimLaunchPermit(held)).toBe(false);
+    localCoordinator.connectLaunchReclamationOracle('undecided-provider-operation', (permit) =>
+      permit.holder.recordKeys.some((key) => presentRecords.has(key))
+        ? { kind: 'job-live' }
+        : {
+            kind: 'provider-operation-records-absent',
+            recordKeys: permit.holder.recordKeys,
+            jobEvidence: { kind: 'job-terminal', phase: 'completed' },
+          },
+    );
+    const waiting = localCoordinator.requestLaunch(
+      'post-ambiguity',
+      'codex',
+      providerOwner('post-ambiguity-session'),
+      'default',
+    );
+    if (waiting === 'queue_full' || waiting.type !== 'queued') throw new Error('expected queued permit');
+
+    now += LAUNCH_RECLAMATION_AGE_FLOOR_MS;
+    localCoordinator.sweepStaleLaunchPermits();
+    presentRecords.delete(recordKeys[0] ?? '');
+    localCoordinator.sweepStaleLaunchPermits();
+
+    expect(localCoordinator.reservationFor(held.jobId)).toMatchObject({
+      kind: 'active',
+      holder: { kind: 'undecided-provider-operation', recordKeys },
+    });
+    expect(localCoordinator.queuePosition('post-ambiguity', 'default')).toBe(1);
+
+    presentRecords.clear();
+    localCoordinator.sweepStaleLaunchPermits();
+    const admitted = await waiting.waitForPermit();
+
+    expect(localCoordinator.reservationFor(held.jobId)).toBeNull();
+    expect(admitted.jobId).toBe('post-ambiguity');
+    expect(localCoordinator.launchReclamationDiagnostics()).toEqual([
+      expect.objectContaining({
+        reservationId: held.reservationId,
+        holder: { kind: 'undecided-provider-operation', recordKeys },
+        evidence: {
+          kind: 'provider-operation-records-absent',
+          recordKeys,
+          jobEvidence: { kind: 'job-terminal', phase: 'completed' },
+        },
+      }),
+    ]);
+  });
+
+  it('retains permits when an oracle throws or a holder kind has no registered oracle', () => {
+    let now = 30_000;
+    const base = createRealRuntime('prod');
+    const localCoordinator = new LaunchCoordinator({
+      runtime: { ...base, time: { ...base.time, now: () => now } },
+    });
+    localCoordinator.connectLaunchReclamationOracle('local-execution', (permit) => {
+      const jobId = permit.jobId;
+      if (jobId === 'unreadable-job') throw new Error('journal unavailable');
+      return { kind: 'job-terminal', phase: 'aborted' };
+    });
+    const unreadable = localCoordinator.requestLaunch(
+      'unreadable-job',
+      'codex',
+      providerOwner('unreadable-session'),
+      'default',
+    );
+    const proxySource = localCoordinator.requestLaunch('proxy-job', 'codex', providerOwner('proxy-session'), 'discuss');
+    if (unreadable === 'queue_full' || unreadable.type !== 'immediate') throw new Error('expected unreadable permit');
+    if (proxySource === 'queue_full' || proxySource.type !== 'immediate') throw new Error('expected proxy source');
+    const identity = { jobId: proxySource.permit.jobId, operationId: 'unconnected-operation' };
+    expect(localCoordinator.prepareProviderOperationBinding(proxySource.permit, identity)).toEqual({
+      kind: 'prepared',
+    });
+    const binding = localCoordinator.commitProviderOperationBinding(identity);
+    if (binding.kind !== 'bound') throw new Error('expected proxy permit');
+
+    now += LAUNCH_RECLAMATION_AGE_FLOOR_MS;
+    localCoordinator.sweepStaleLaunchPermits();
+
+    expect(localCoordinator.active).toBe(2);
+    expect(localCoordinator.reservationFor(unreadable.permit.jobId)).toMatchObject({ kind: 'active' });
+    expect(localCoordinator.reservationFor(binding.successorPermit.jobId)).toMatchObject({
+      kind: 'active',
+      holder: { kind: 'proxy-operation', operationId: identity.operationId },
+    });
+    expect(localCoordinator.launchReclamationDiagnostics()).toEqual([]);
+  });
+
+  it('never reclaims a permit for a live job', () => {
+    let now = 40_000;
+    const base = createRealRuntime('prod');
+    const localCoordinator = new LaunchCoordinator({
+      runtime: { ...base, time: { ...base.time, now: () => now } },
+    });
+    localCoordinator.connectLaunchReclamationOracle('local-execution', () => ({ kind: 'job-live' }));
+    const live = localCoordinator.requestLaunch('live-job', 'codex', providerOwner('live-session'), 'default');
+    if (live === 'queue_full' || live.type !== 'immediate') throw new Error('expected live permit');
+
+    now += LAUNCH_RECLAMATION_AGE_FLOOR_MS * 2;
+    localCoordinator.sweepStaleLaunchPermits();
+
+    expect(localCoordinator.active).toBe(1);
+    expect(localCoordinator.reservationFor(live.permit.jobId)).toMatchObject({
+      kind: 'active',
+      holder: { kind: 'local-execution' },
+    });
+    expect(localCoordinator.launchReclamationDiagnostics()).toEqual([]);
+  });
+
+  it('fences a reused job id from a stale permit', () => {
+    const first = coordinator.requestLaunch('reused', 'codex', providerOwner('first'), 'default');
+    if (first === 'queue_full' || first.type !== 'immediate') throw new Error('expected first permit');
+    expect(coordinator.releaseLaunch(first.permit)).toEqual({
+      kind: 'released',
+      pool: 'default',
+      admittedNext: false,
+    });
+
+    const second = coordinator.requestLaunch('reused', 'codex', providerOwner('second'), 'default');
+    if (second === 'queue_full' || second.type !== 'immediate') throw new Error('expected second permit');
+    expect(second.permit.reservationId).not.toBe(first.permit.reservationId);
+    expect(coordinator.releaseLaunch(first.permit)).toEqual({ kind: 'already-released', pool: 'default' });
+    expect(coordinator.reservationFor('reused')).toMatchObject({
+      kind: 'active',
+      executionOwner: providerOwner('second'),
+    });
+  });
+
+  it('rejects a synthetic durable reservation that collides across pools', async () => {
+    const base = createRealRuntime('prod');
+    const uuid = vi.fn().mockReturnValueOnce('existing-reservation').mockReturnValueOnce('collision');
+    const localCoordinator = new LaunchCoordinator({ runtime: { ...base, ids: { ...base.ids, uuid } } });
+    const existing = localCoordinator.requestLaunch(
+      'spawndurable-collision',
+      'codex',
+      { kind: 'discussion', id: 'collision-discussion' },
+      'discuss',
+    );
+    if (existing === 'queue_full' || existing.type !== 'immediate') throw new Error('expected existing reservation');
+
+    await expect(
+      localCoordinator.spawnDurableJob({
+        provider: 'codex',
+        command: 'never-spawned',
+        args: [],
+        jobDir: '/never-created',
+        pool: 'default',
+      }),
+    ).rejects.toThrow(/reservation already exists for job spawndurable-collision in pool discuss/u);
+    expect(localCoordinator.reservationFor('spawndurable-collision')).toMatchObject({
+      kind: 'active',
+      pool: 'discuss',
+    });
+  });
+
+  it('binds and settles a proxy operation with a successor permit', () => {
+    const admission = coordinator.requestLaunch('job-proxy', 'codex', providerOwner('session-proxy'), 'default');
+    if (admission === 'queue_full' || admission.type !== 'immediate') throw new Error('expected source permit');
+    const identity = { jobId: 'job-proxy', operationId: 'operation-proxy' };
+
+    expect(coordinator.prepareProviderOperationBinding(admission.permit, identity)).toEqual({ kind: 'prepared' });
+    const binding = coordinator.commitProviderOperationBinding(identity);
+    expect(binding).toMatchObject({
+      kind: 'bound',
+      successorPermit: {
+        reservationId: admission.permit.reservationId,
+        holder: { kind: 'proxy-operation', operationId: 'operation-proxy' },
+      },
+    });
+    if (binding.kind !== 'bound') throw new Error('expected bound operation');
+    expect(coordinator.releaseLaunch(admission.permit)).toEqual({
+      kind: 'transferred',
+      pool: 'default',
+      holder: { kind: 'proxy-operation', operationId: 'operation-proxy' },
+    });
+    expect(coordinator.launchReleaseDiagnostics()).toEqual([
+      {
+        reservationId: admission.permit.reservationId,
+        jobId: admission.permit.jobId,
+        pool: 'default',
+        provider: 'codex',
+        attemptedHolder: { kind: 'local-execution' },
+        disposition: {
+          kind: 'transferred',
+          pool: 'default',
+          holder: { kind: 'proxy-operation', operationId: 'operation-proxy' },
+        },
+        observedAtMs: expect.any(Number),
+      },
+    ]);
+    expect(coordinator.settleProviderOperationBinding(identity)).toMatchObject({
+      kind: 'settled',
+      reservationId: admission.permit.reservationId,
+    });
+    expect(coordinator.releaseLaunch(binding.successorPermit)).toEqual({
+      kind: 'already-released',
+      pool: 'default',
+    });
+  });
+
+  it('distinguishes source transfer from releasing the successor permit', () => {
+    const admission = coordinator.requestLaunch(
+      'job-successor',
+      'codex',
+      providerOwner('session-successor'),
+      'default',
+    );
+    if (admission === 'queue_full' || admission.type !== 'immediate') throw new Error('expected source permit');
+    const identity = { jobId: 'job-successor', operationId: 'operation-successor' };
+
+    expect(coordinator.prepareProviderOperationBinding(admission.permit, identity)).toEqual({ kind: 'prepared' });
+    const binding = coordinator.commitProviderOperationBinding(identity);
+    if (binding.kind !== 'bound') throw new Error('expected successor permit');
+
+    expect(coordinator.releaseLaunch(admission.permit)).toEqual({
+      kind: 'transferred',
+      pool: 'default',
+      holder: { kind: 'proxy-operation', operationId: identity.operationId },
+    });
+    expect(coordinator.releaseLaunch(binding.successorPermit)).toEqual({
+      kind: 'released',
+      pool: 'default',
+      admittedNext: false,
+    });
+    expect(coordinator.releaseLaunch(binding.successorPermit)).toEqual({ kind: 'already-released', pool: 'default' });
+    expect(coordinator.releaseLaunch(admission.permit)).toEqual({ kind: 'already-released', pool: 'default' });
+  });
+
+  it('bounds non-release diagnostics by reservation identity', () => {
+    let evictedReservationId = '';
+    for (let index = 0; index <= MAX_LAUNCH_RELEASE_DIAGNOSTICS; index += 1) {
+      const admission = coordinator.requestLaunch(
+        `diagnostic-${index}`,
+        'codex',
+        providerOwner(`diagnostic-session-${index}`),
+        'default',
+      );
+      if (admission === 'queue_full' || admission.type !== 'immediate') {
+        throw new Error('expected diagnostic source permit');
+      }
+      coordinator.releaseLaunch(admission.permit);
+      coordinator.releaseLaunch(admission.permit);
+      if (index === 0) evictedReservationId = admission.permit.reservationId;
+    }
+
+    const diagnostics = coordinator.launchReleaseDiagnostics();
+    expect(diagnostics).toHaveLength(MAX_LAUNCH_RELEASE_DIAGNOSTICS);
+    expect(diagnostics.some(({ reservationId }) => reservationId === evictedReservationId)).toBe(false);
+    expect(diagnostics.at(-1)).toMatchObject({
+      jobId: `diagnostic-${MAX_LAUNCH_RELEASE_DIAGNOSTICS}`,
+      disposition: { kind: 'already-released' },
+    });
+  });
+
+  it('commutes settlement before preparation without inventing a reservation id', () => {
+    const identity = { jobId: 'job-early-settlement', operationId: 'operation-early-settlement' };
+    expect(coordinator.settleProviderOperationBinding(identity)).toEqual({ kind: 'settled-unbound' });
+
+    const admission = coordinator.requestLaunch(
+      identity.jobId,
+      'codex',
+      providerOwner('session-early-settlement'),
+      'default',
+    );
+    if (admission === 'queue_full' || admission.type !== 'immediate') throw new Error('expected source permit');
+    expect(coordinator.prepareProviderOperationBinding(admission.permit, identity)).toEqual({
+      kind: 'already-settled',
+    });
+    expect(coordinator.reservationFor(identity.jobId)).toBeNull();
+    expect(coordinator.commitProviderOperationBinding(identity)).toEqual({ kind: 'already-settled' });
+  });
+
+  it('retires an unknown settlement after journal absence is established', async () => {
+    vi.useFakeTimers();
+    try {
+      coordinator.connectProviderOperationBindingJournal(() => ({ kind: 'absent' }));
+      const identity = { jobId: 'job-absent-settlement', operationId: 'operation-absent-settlement' };
+      const statuses = new Set([`${identity.jobId}:${identity.operationId}`]);
+      coordinator.connectSettledUnboundStatus({
+        rebind: () => null,
+        record: (settled) => ({ kind: 'recorded', ownership: testSettledUnboundOwnership(settled) }),
+        clear: (settled) => statuses.delete(`${settled.jobId}:${settled.operationId}`),
+        clearAbsent: (settled) => statuses.delete(`${settled.jobId}:${settled.operationId}`),
+        clearRefusal: () => {},
+      });
+      expect(coordinator.settleProviderOperationBinding(identity)).toEqual({ kind: 'settled-unbound' });
+
+      await vi.advanceTimersByTimeAsync(SETTLED_UNBOUND_ABSENCE_CHECK_MS);
+      expect(statuses).toEqual(new Set());
+      const admission = coordinator.requestLaunch(
+        identity.jobId,
+        'codex',
+        providerOwner('session-after-absence'),
+        'default',
+      );
+      if (admission === 'queue_full' || admission.type !== 'immediate') throw new Error('expected source permit');
+      expect(coordinator.prepareProviderOperationBinding(admission.permit, identity)).toEqual({ kind: 'prepared' });
+      expect(coordinator.releaseLaunch(admission.permit)).toMatchObject({ kind: 'released' });
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('moves persistently unknown settlement evidence to a durable successor until preparation consumes it', async () => {
+    vi.useFakeTimers();
+    try {
+      const statuses = new Set<string>();
+      coordinator.connectProviderOperationBindingJournal(() => ({
+        kind: 'unknown',
+        reason: 'journal unavailable',
+      }));
+      coordinator.connectSettledUnboundStatus({
+        rebind: () => null,
+        record: (identity) => {
+          statuses.add(`${identity.jobId}:${identity.operationId}`);
+          return { kind: 'recorded', ownership: testSettledUnboundOwnership(identity) };
+        },
+        clear: (identity) => statuses.delete(`${identity.jobId}:${identity.operationId}`),
+        clearAbsent: (identity) => statuses.delete(`${identity.jobId}:${identity.operationId}`),
+        clearRefusal: () => {},
+      });
+      const identity = { jobId: 'job-unknown-settlement', operationId: 'operation-unknown-settlement' };
+
+      expect(coordinator.settleProviderOperationBinding(identity)).toEqual({ kind: 'settled-unbound' });
+      await vi.advanceTimersByTimeAsync(SETTLED_UNBOUND_ABSENCE_CHECK_MS * SETTLED_UNBOUND_UNKNOWN_OBSERVATION_LIMIT);
+      expect(statuses).toEqual(new Set([`${identity.jobId}:${identity.operationId}`]));
+
+      const admission = coordinator.requestLaunch(
+        identity.jobId,
+        'codex',
+        providerOwner('session-after-unknown'),
+        'default',
+      );
+      if (admission === 'queue_full' || admission.type !== 'immediate') throw new Error('expected source permit');
+      expect(coordinator.prepareProviderOperationBinding(admission.permit, identity)).toEqual({
+        kind: 'already-settled',
+      });
+      expect(statuses).toEqual(new Set());
+      expect(coordinator.reservationFor(identity.jobId)).toBeNull();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('reports every binding retirement disposition and retains a refused successor', async () => {
+    vi.useFakeTimers();
+    try {
+      let clearAllowed = false;
+      const identity = { jobId: 'retirement-disposition-job', operationId: 'retirement-disposition-operation' };
+      coordinator.connectProviderOperationBindingJournal(() => ({
+        kind: 'unknown',
+        reason: 'journal unavailable',
+      }));
+      coordinator.connectSettledUnboundStatus({
+        rebind: () => null,
+        record: (settled) => ({ kind: 'recorded', ownership: testSettledUnboundOwnership(settled) }),
+        clear: () => clearAllowed,
+        clearAbsent: () => clearAllowed,
+        clearRefusal: () => {},
+      });
+      expect(coordinator.settleProviderOperationBinding(identity)).toEqual({ kind: 'settled-unbound' });
+      await vi.advanceTimersByTimeAsync(SETTLED_UNBOUND_ABSENCE_CHECK_MS * SETTLED_UNBOUND_UNKNOWN_OBSERVATION_LIMIT);
+
+      expect(coordinator.retireProviderOperationBinding(identity)).toEqual({
+        kind: 'refused',
+        reason: 'The durable unsettled settlement status could not be cleared.',
+      });
+      clearAllowed = true;
+      expect(coordinator.retireProviderOperationBinding(identity)).toEqual({ kind: 'retired' });
+      expect(coordinator.retireProviderOperationBinding(identity)).toEqual({ kind: 'nothing-to-retire' });
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('counts a recorded durable successor against the unresolved settlement budget', async () => {
+    vi.useFakeTimers();
+    try {
+      coordinator.connectProviderOperationBindingJournal(() => ({
+        kind: 'unknown',
+        reason: 'journal unavailable',
+      }));
+      coordinator.connectSettledUnboundStatus({
+        rebind: () => null,
+        record: (identity) => ({ kind: 'recorded', ownership: testSettledUnboundOwnership(identity) }),
+        clear: () => true,
+        clearAbsent: () => true,
+        clearRefusal: () => {},
+      });
+      expect(
+        coordinator.settleProviderOperationBinding({
+          jobId: 'durable-successor-job',
+          operationId: 'durable-successor-operation',
+        }),
+      ).toEqual({ kind: 'settled-unbound' });
+      await vi.advanceTimersByTimeAsync(SETTLED_UNBOUND_ABSENCE_CHECK_MS * SETTLED_UNBOUND_UNKNOWN_OBSERVATION_LIMIT);
+
+      for (let index = 0; index < MAX_SETTLED_UNBOUND_BINDINGS - 1; index += 1) {
+        expect(
+          coordinator.settleProviderOperationBinding({
+            jobId: `successor-mailbox-job-${index}`,
+            operationId: `successor-mailbox-operation-${index}`,
+          }),
+        ).toEqual({ kind: 'settled-unbound' });
+      }
+      expect(
+        coordinator.settleProviderOperationBinding({
+          jobId: 'successor-mailbox-overflow',
+          operationId: 'successor-mailbox-overflow',
+        }),
+      ).toMatchObject({ kind: 'refused' });
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('counts a status-recording refusal against the unresolved settlement budget', async () => {
+    vi.useFakeTimers();
+    try {
+      coordinator.connectProviderOperationBindingJournal(() => ({
+        kind: 'unknown',
+        reason: 'journal unavailable',
+      }));
+      coordinator.connectSettledUnboundStatus({
+        rebind: () => null,
+        record: () => ({ kind: 'refused', reason: 'status store unavailable' }),
+        clear: () => false,
+        clearAbsent: () => false,
+        clearRefusal: () => {},
+      });
+      expect(
+        coordinator.settleProviderOperationBinding({
+          jobId: 'refused-successor-job',
+          operationId: 'refused-successor-operation',
+        }),
+      ).toEqual({ kind: 'settled-unbound' });
+      await vi.advanceTimersByTimeAsync(SETTLED_UNBOUND_ABSENCE_CHECK_MS * SETTLED_UNBOUND_UNKNOWN_OBSERVATION_LIMIT);
+
+      for (let index = 0; index < MAX_SETTLED_UNBOUND_BINDINGS - 1; index += 1) {
+        expect(
+          coordinator.settleProviderOperationBinding({
+            jobId: `refused-successor-mailbox-job-${index}`,
+            operationId: `refused-successor-mailbox-operation-${index}`,
+          }),
+        ).toEqual({ kind: 'settled-unbound' });
+      }
+      expect(
+        coordinator.settleProviderOperationBinding({
+          jobId: 'refused-successor-mailbox-overflow',
+          operationId: 'refused-successor-mailbox-overflow',
+        }),
+      ).toMatchObject({ kind: 'refused' });
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('bounds unsettled mailbox entries', () => {
+    vi.useFakeTimers();
+    try {
+      for (let index = 0; index < MAX_SETTLED_UNBOUND_BINDINGS; index += 1) {
+        expect(
+          coordinator.settleProviderOperationBinding({
+            jobId: `mailbox-job-${index}`,
+            operationId: `operation-${index}`,
+          }),
+        ).toEqual({ kind: 'settled-unbound' });
+      }
+      expect(
+        coordinator.settleProviderOperationBinding({ jobId: 'mailbox-overflow', operationId: 'operation-overflow' }),
+      ).toMatchObject({ kind: 'refused' });
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('settles a prepared source permit and makes repeated settlement idempotent', () => {
+    const admission = coordinator.requestLaunch('job-prepared', 'codex', providerOwner('session-prepared'), 'default');
+    if (admission === 'queue_full' || admission.type !== 'immediate') throw new Error('expected source permit');
+    const identity = { jobId: 'job-prepared', operationId: 'operation-prepared' };
+
+    expect(coordinator.prepareProviderOperationBinding(admission.permit, identity)).toEqual({ kind: 'prepared' });
+    expect(coordinator.settleProviderOperationBinding(identity)).toEqual({
+      kind: 'settled',
+      reservationId: admission.permit.reservationId,
+    });
+    expect(coordinator.settleProviderOperationBinding(identity)).toEqual({ kind: 'already-settled' });
+    expect(coordinator.commitProviderOperationBinding(identity)).toEqual({ kind: 'already-settled' });
+    expect(coordinator.releaseLaunch(admission.permit)).toEqual({ kind: 'already-released', pool: 'default' });
+  });
+
+  it('does not let delayed settlement for an old operation release a newer job generation', () => {
+    const first = coordinator.requestLaunch('job-reused-operation', 'codex', providerOwner('first'), 'default');
+    if (first === 'queue_full' || first.type !== 'immediate') throw new Error('expected first permit');
+    const oldOperation = { jobId: first.permit.jobId, operationId: 'old-operation' };
+    expect(coordinator.prepareProviderOperationBinding(first.permit, oldOperation)).toEqual({ kind: 'prepared' });
+    expect(coordinator.releaseLaunch(first.permit)).toMatchObject({ kind: 'released' });
+
+    const second = coordinator.requestLaunch('job-reused-operation', 'codex', providerOwner('second'), 'default');
+    if (second === 'queue_full' || second.type !== 'immediate') throw new Error('expected second permit');
+
+    expect(coordinator.settleProviderOperationBinding(oldOperation)).toEqual({ kind: 'settled-unbound' });
+    expect(coordinator.reservationFor(second.permit.jobId)).toMatchObject({
+      kind: 'active',
+      executionOwner: providerOwner('second'),
+    });
+    expect(coordinator.releaseLaunch(second.permit)).toMatchObject({ kind: 'released' });
+  });
+
+  it('retires the exact prepared binding when its source permit completes', () => {
+    const old = coordinator.requestLaunch('job-refused-bind', 'codex', providerOwner('old'), 'default');
+    if (old === 'queue_full' || old.type !== 'immediate') throw new Error('expected old permit');
+    const identity = { jobId: old.permit.jobId, operationId: 'operation-refused-bind' };
+    expect(coordinator.prepareProviderOperationBinding(old.permit, identity)).toEqual({ kind: 'prepared' });
+    expect(coordinator.releaseLaunch(old.permit)).toMatchObject({ kind: 'released' });
+
+    const current = coordinator.requestLaunch('job-refused-bind', 'codex', providerOwner('current'), 'default');
+    if (current === 'queue_full' || current.type !== 'immediate') throw new Error('expected current permit');
+    expect(coordinator.prepareProviderOperationBinding(current.permit, identity)).toEqual({ kind: 'prepared' });
+    expect(coordinator.reservationFor(current.permit.jobId)).toMatchObject({ kind: 'active' });
+
+    expect(coordinator.releaseLaunch(current.permit)).toMatchObject({ kind: 'released' });
+    expect(coordinator.reservationFor(current.permit.jobId)).toBeNull();
+  });
+
+  it('keys operation bindings by both job and operation id', () => {
+    const first = coordinator.requestLaunch('job-one', 'codex', providerOwner('session-one'), 'default');
+    const second = coordinator.requestLaunch('job-two', 'codex', providerOwner('session-two'), 'discuss');
+    if (first === 'queue_full' || first.type !== 'immediate') throw new Error('expected first source permit');
+    if (second === 'queue_full' || second.type !== 'immediate') throw new Error('expected second source permit');
+
+    const operationId = 'shared-operation-id';
+    expect(coordinator.prepareProviderOperationBinding(first.permit, { jobId: 'job-one', operationId })).toEqual({
+      kind: 'prepared',
+    });
+    expect(coordinator.prepareProviderOperationBinding(second.permit, { jobId: 'job-two', operationId })).toEqual({
+      kind: 'prepared',
+    });
+    expect(coordinator.settleProviderOperationBinding({ jobId: 'job-one', operationId })).toMatchObject({
+      kind: 'settled',
+      reservationId: first.permit.reservationId,
+    });
+    expect(coordinator.reservationFor('job-two')).toMatchObject({ kind: 'active' });
+  });
+
+  it('cancels only the matching prepared operation binding', () => {
+    const admission = coordinator.requestLaunch('job-cancel', 'codex', providerOwner('session-cancel'), 'default');
+    if (admission === 'queue_full' || admission.type !== 'immediate') throw new Error('expected source permit');
+    const identity = { jobId: 'job-cancel', operationId: 'operation-cancel' };
+    expect(coordinator.prepareProviderOperationBinding(admission.permit, identity)).toEqual({ kind: 'prepared' });
+
+    const wrongPermit = { ...admission.permit, reservationId: 'stale-reservation' };
+    expect(coordinator.cancelProviderOperationBinding(wrongPermit, identity)).toMatchObject({ kind: 'refused' });
+    expect(coordinator.cancelProviderOperationBinding(admission.permit, identity)).toEqual({ kind: 'cancelled' });
+    expect(coordinator.reservationFor(identity.jobId)).toMatchObject({
+      kind: 'active',
+      holder: { kind: 'local-execution' },
+    });
+  });
+
+  it('returns the exact admitted permit when cancellation loses the queue race', async () => {
+    const blocker = coordinator.requestLaunch('blocker', 'codex', providerOwner('blocker-session'), 'default');
+    if (blocker === 'queue_full' || blocker.type !== 'immediate') throw new Error('expected blocker permit');
+    const queued = coordinator.requestLaunch('racing', 'codex', providerOwner('racing-session'), 'default');
+    if (queued === 'queue_full' || queued.type !== 'queued') throw new Error('expected queued reservation');
+    const waiting = queued.waitForPermit();
+
+    coordinator.releaseLaunch(blocker.permit);
+    const cancellation = queued.cancel();
+    if (cancellation.kind !== 'admitted') throw new Error('expected admission to win');
+    expect(cancellation.permit.holder).toEqual({ kind: 'queue-handoff' });
+    expect(coordinator.releaseLaunch(cancellation.permit)).toMatchObject({ kind: 'released' });
+    const waiterPermit = await waiting;
+    expect(waiterPermit.reservationId).toBe(cancellation.permit.reservationId);
+    expect(coordinator.releaseLaunch(waiterPermit)).toEqual({ kind: 'already-released', pool: 'default' });
   });
 
   it('confirms termination when a refused attempt is followed by observed absence', async () => {
@@ -725,7 +1575,6 @@ describe('launch admission', () => {
       command: 'codex',
       args: ['exec'],
       jobDir: '/tmp/pending-wrapper',
-      permitGranted: true,
     });
     const controller = new AbortController();
     const termination = localCoordinator.terminateAll(controller.signal);
@@ -779,7 +1628,6 @@ describe('launch admission', () => {
       command: 'codex',
       args: ['exec'],
       jobDir: '/tmp/held-durable-launch',
-      permitGranted: true,
     });
     await launchObserved;
 
@@ -799,10 +1647,15 @@ describe('launch admission', () => {
     await expect(termination).resolves.toEqual({ kind: 'all-observed-absent' });
   });
 
-  it('terminates an accepted wrapper aborted before identification and retains it until settlement', async () => {
+  it('keeps a caller-owned launch slot while an aborted wrapper remains unsettled', async () => {
+    process.env.CORAL_MAX_WORKERS = '1';
     const base = createRealRuntime('prod');
-    const controller = new AbortController();
-    const requestTermination = vi.fn();
+    const requestTermination = vi.fn(() => ({
+      kind: 'signal-failed' as const,
+      pid: TEST_PROVIDER_PID,
+      signal: 'SIGTERM' as const,
+      reason: 'kill-port-returned-false' as const,
+    }));
     let acceptWrapper!: () => void;
     const wrapperAccepted = new Promise<void>((resolve) => {
       acceptWrapper = resolve;
@@ -811,6 +1664,131 @@ describe('launch admission', () => {
     const wrapperSettlement = new Promise<void>((resolve) => {
       settleWrapper = resolve;
     });
+    let identifyWrapper!: () => void;
+    let observeContainmentHold!: () => void;
+    const containmentHeld = new Promise<void>((resolve) => {
+      observeContainmentHold = resolve;
+    });
+    const launch = vi.fn((options: Parameters<Runtime['process']['durable']['launch']>[0]) => {
+      options.onWrapperSpawned?.({
+        pid: TEST_PROVIDER_PID,
+        settled: wrapperSettlement,
+        requestTermination,
+      });
+      identifyWrapper = () =>
+        options.onWrapperIdentified?.({
+          runtimeRecord: {
+            transport: 'durable-cli',
+            pid: TEST_PROVIDER_PID,
+            stdoutPath: '/tmp/accepted-pending-wrapper/stdout',
+            stderrPath: '/tmp/accepted-pending-wrapper/stderr',
+            startTime: new Date(0).toISOString(),
+          },
+          pid: TEST_PROVIDER_PID,
+          leaderIncarnation: TEST_PROVIDER_INCARNATION,
+          signalAuthority: testSignalAuthority(TEST_PROVIDER_PID, () => false),
+        });
+      acceptWrapper();
+      return new Promise<never>(() => undefined);
+    });
+    let elapsedMs = 0n;
+    const runtime: Runtime = {
+      ...base,
+      time: {
+        ...base.time,
+        monotonicNow: () => elapsedMs,
+        sleep: async (milliseconds) => {
+          elapsedMs += BigInt(milliseconds);
+        },
+      },
+      process: {
+        ...base.process,
+        kill: (_pid, signal) => signal === 0,
+        observeLiveness: () => 'alive',
+        readProcessIncarnation: () => TEST_PROVIDER_INCARNATION,
+        observeRecordedProcessAsync: async () => 'alive',
+        durable: { ...base.process.durable, launch },
+      },
+    };
+    const localCoordinator = new LaunchCoordinator({ runtime });
+    const abortRegistry = new AbortRegistry(runtime.ids);
+    const admission = localCoordinator.requestLaunch(
+      'caller-owned-pending-wrapper',
+      'codex',
+      providerOwner('caller-owned-pending-wrapper'),
+      'default',
+    );
+    if (admission === 'queue_full' || admission.type !== 'immediate') throw new Error('expected caller permit');
+    const callerPermit = admission.permit;
+    abortRegistry.register(callerPermit.jobId, undefined, () => localCoordinator.releaseLaunch(callerPermit));
+    void localCoordinator.spawnDurableJob({
+      provider: 'codex',
+      command: 'codex',
+      args: ['exec'],
+      jobDir: '/tmp/accepted-pending-wrapper',
+      jobId: callerPermit.jobId,
+      callerOwnership: { permit: callerPermit, abortHoldOwner: abortRegistry },
+      signal: abortRegistry.getSignal(callerPermit.jobId) ?? undefined,
+      onDurableProcessIdentity: (_identity, status) => {
+        if (status?.kind === 'held') observeContainmentHold();
+        return { kind: 'published' };
+      },
+    });
+    await wrapperAccepted;
+    const queued = localCoordinator.requestLaunch(
+      'queued-after-caller-wrapper',
+      'codex',
+      providerOwner('queued-after-caller-wrapper'),
+      'default',
+    );
+    if (queued === 'queue_full' || queued.type !== 'queued') throw new Error('expected queued launch');
+
+    const abort = abortRegistry.abort([callerPermit.jobId]);
+
+    expect(requestTermination).toHaveBeenCalledOnce();
+    expect(abort.refused).toEqual([
+      expect.objectContaining({
+        jobId: callerPermit.jobId,
+        reason: 'pending wrapper termination failed: SIGTERM:kill-port-returned-false',
+      }),
+    ]);
+    expect(localCoordinator.reservationFor(callerPermit.jobId)).toMatchObject({ kind: 'active' });
+    expect(localCoordinator.queuePosition('queued-after-caller-wrapper', 'default')).toBe(1);
+
+    identifyWrapper();
+    await containmentHeld;
+    settleWrapper();
+    await Promise.resolve();
+    expect(localCoordinator.reservationFor(callerPermit.jobId)).toMatchObject({ kind: 'active' });
+    expect(localCoordinator.queuePosition('queued-after-caller-wrapper', 'default')).toBe(1);
+
+    await vi.waitFor(() => {
+      expect(abortRegistry.abort([callerPermit.jobId]).abandoned).toEqual([
+        expect.objectContaining({ jobId: callerPermit.jobId }),
+      ]);
+    });
+    const admitted = await queued.waitForPermit();
+    expect(localCoordinator.reservationFor(callerPermit.jobId)).toBeNull();
+    expect(localCoordinator.reservationFor(admitted.jobId)).toMatchObject({ kind: 'active' });
+    expect(localCoordinator.releaseLaunch(admitted)).toMatchObject({ kind: 'released' });
+  });
+
+  it('keeps the launch slot while an aborted pending wrapper termination has not settled', async () => {
+    const base = createRealRuntime('prod');
+    let acceptWrapper!: () => void;
+    const wrapperAccepted = new Promise<void>((resolve) => {
+      acceptWrapper = resolve;
+    });
+    let settleWrapper!: () => void;
+    const wrapperSettlement = new Promise<void>((resolve) => {
+      settleWrapper = resolve;
+    });
+    const requestTermination = vi.fn(() => ({
+      kind: 'signal-failed' as const,
+      pid: TEST_PROVIDER_PID,
+      signal: 'SIGTERM' as const,
+      reason: 'kill-port-returned-false' as const,
+    }));
     const launch = vi.fn((options: Parameters<Runtime['process']['durable']['launch']>[0]) => {
       options.onWrapperSpawned?.({
         pid: TEST_PROVIDER_PID,
@@ -832,26 +1810,36 @@ describe('launch admission', () => {
       provider: 'codex',
       command: 'codex',
       args: ['exec'],
-      jobDir: '/tmp/accepted-pending-wrapper',
-      permitGranted: true,
-      signal: controller.signal,
+      jobDir: '/tmp/pending-wrapper-slot',
     });
     await wrapperAccepted;
+    const [pendingPermit] = localCoordinator.activeLaunchPermits();
+    if (pendingPermit === undefined || pendingPermit.holder.kind !== 'system-task') {
+      throw new Error('expected pending durable launch permit');
+    }
+    const queued = localCoordinator.requestLaunch(
+      'queued-after-pending-wrapper',
+      'codex',
+      providerOwner('queued-after-pending-wrapper'),
+      'default',
+    );
+    if (queued === 'queue_full' || queued.type !== 'queued') throw new Error('expected queued launch');
 
-    controller.abort();
-
-    expect(requestTermination).toHaveBeenCalledOnce();
-    let terminationSettled = false;
-    const termination = localCoordinator.terminateAll().then((result) => {
-      terminationSettled = true;
-      return result;
-    });
-    await Promise.resolve();
-    expect(terminationSettled).toBe(false);
+    const abort = localCoordinator.getInternalAbortRegistry().abort([pendingPermit.jobId]);
+    expect(abort.refused).toEqual([
+      expect.objectContaining({
+        jobId: pendingPermit.jobId,
+        reason: 'pending wrapper termination failed: SIGTERM:kill-port-returned-false',
+      }),
+    ]);
+    expect(localCoordinator.reservationFor(pendingPermit.jobId)).toMatchObject({ kind: 'active' });
+    expect(localCoordinator.queuePosition('queued-after-pending-wrapper', 'default')).toBe(1);
 
     settleWrapper();
-
-    await expect(termination).resolves.toEqual({ kind: 'all-observed-absent' });
+    const admitted = await queued.waitForPermit();
+    expect(localCoordinator.reservationFor(pendingPermit.jobId)).toBeNull();
+    expect(localCoordinator.reservationFor(admitted.jobId)).toMatchObject({ kind: 'active' });
+    expect(localCoordinator.releaseLaunch(admitted)).toMatchObject({ kind: 'released' });
   });
 
   it('reaps a live Darwin wrapper before propagating a readiness rejection', async () => {
@@ -922,7 +1910,6 @@ describe('launch admission', () => {
         command: 'codex',
         args: ['exec'],
         jobDir: '/tmp/readiness-rejection',
-        permitGranted: true,
       }),
     ).rejects.toThrow('synthetic readiness rejection');
 
@@ -1010,7 +1997,6 @@ describe('launch admission', () => {
         command: 'codex',
         args: ['exec'],
         jobDir: '/tmp/provisional-readiness-rejection',
-        permitGranted: true,
         onDurableProcessIdentity: observations,
       }),
     ).rejects.toThrow('synthetic provisional readiness rejection');
@@ -1065,7 +2051,6 @@ describe('launch admission', () => {
       command: 'codex',
       args: ['exec'],
       jobDir: '/tmp/unpublished-launch',
-      permitGranted: true,
       onRuntimeRecord,
       onDurableProcessIdentity,
     });
@@ -1173,7 +2158,6 @@ describe('launch admission', () => {
         command: 'codex',
         args: ['exec'],
         jobDir: '/tmp/wrapper-crash',
-        permitGranted: true,
       }),
     ).rejects.toBe(wrapperError);
 
@@ -1181,7 +2165,7 @@ describe('launch admission', () => {
     expect(cleanupOwnership.cleanupRetentions.size).toBe(0);
   });
 
-  it('publishes a durable hold and makes abort an explicit abandonment without absence proof', async () => {
+  it('lets the reported synthetic holder abort a stuck containment and release its exact permit', async () => {
     const base = createRealRuntime('prod');
     const incarnation = testIncarnation(7_002);
     const childRoot = { pid: TEST_PROVIDER_PID + 1, incarnation };
@@ -1225,7 +2209,6 @@ describe('launch admission', () => {
       },
     };
     const localCoordinator = new LaunchCoordinator({ runtime });
-    const abort = new AbortController();
     const holdControls: DurableContainmentOperatorControl[] = [];
     const observations = vi.fn(
       (
@@ -1242,8 +2225,6 @@ describe('launch admission', () => {
       command: 'codex',
       args: ['exec'],
       jobDir: '/tmp/held-result',
-      permitGranted: true,
-      signal: abort.signal,
       onDurableProcessIdentity: observations,
     });
 
@@ -1255,11 +2236,23 @@ describe('launch admission', () => {
         ),
       ).toBe(true);
     });
-    abort.abort();
+    const [holder] = localCoordinator.activeLaunchPermits();
+    if (holder === undefined || holder.holder.kind !== 'system-task') {
+      throw new Error('Expected the durable transport to report its synthetic holder.');
+    }
+    expect(localCoordinator.reservationFor(holder.jobId)).toMatchObject({ kind: 'active' });
+
+    const firstAbort = localCoordinator.getInternalAbortRegistry().abort([holder.jobId]);
+    expect(firstAbort.refused).toEqual([expect.objectContaining({ jobId: holder.jobId })]);
     const holdControl = holdControls.at(-1);
     if (holdControl === undefined) throw new Error('Expected durable containment abandonment control');
-    // Abandonment refuses while a cleanup attempt is settling; its named exit is repeating the abort.
-    await vi.waitFor(() => expect(holdControl.abandon()).toMatchObject({ kind: 'abandoned' }));
+    let secondAbort: ReturnType<ReturnType<LaunchCoordinator['getInternalAbortRegistry']>['abort']> | undefined;
+    await vi.waitFor(() => {
+      secondAbort = localCoordinator.getInternalAbortRegistry().abort([holder.jobId]);
+      expect(secondAbort.abandoned).toEqual([expect.objectContaining({ jobId: holder.jobId })]);
+    });
+    expect(localCoordinator.reservationFor(holder.jobId)).toBeNull();
+    expect(localCoordinator.active).toBe(0);
 
     await expect(spawn).resolves.toMatchObject({ code: 0, aborted: true });
     expect(
@@ -1359,7 +2352,6 @@ describe('launch admission', () => {
         command: 'codex',
         args: ['exec'],
         jobDir: '/tmp/failed-absence-publication',
-        permitGranted: true,
         signal: abort.signal,
         onDurableProcessIdentity: observations,
       })
@@ -1406,7 +2398,7 @@ describe('launch admission', () => {
   it('refuses new admission after shutdown begins', async () => {
     await expect(coordinator.terminateAll()).resolves.toEqual({ kind: 'all-observed-absent' });
 
-    expect(() => coordinator.requestLaunch('late-job', 'codex', providerOwner('late-session'))).toThrow(
+    expect(() => coordinator.requestLaunch('late-job', 'codex', providerOwner('late-session'), 'default')).toThrow(
       'Launch rejected because shutdown has begun',
     );
     await expect(
@@ -1415,7 +2407,6 @@ describe('launch admission', () => {
         command: 'codex',
         args: ['exec'],
         jobDir: '/tmp/sim/jobs/late-job',
-        permitGranted: true,
       }),
     ).rejects.toThrow('Launch rejected because shutdown has begun');
   });

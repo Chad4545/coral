@@ -24,10 +24,17 @@ function runCli(
   stderr: string;
   status: number;
 } {
+  const {
+    CORAL_CHILD: _coralChild,
+    CORAL_CHILD_PRINCIPAL_HANDLE: _childPrincipal,
+    CORAL_JOB_ID: _coralJobId,
+    CORAL_SESSION_ID: _coralSessionId,
+    ...topLevelEnv
+  } = process.env;
   const result = spawnSync('node', [CLI_BUNDLE, ...args], {
     encoding: 'utf8',
     timeout: 5000,
-    env: { ...process.env, ...options.env },
+    env: { ...topLevelEnv, ...options.env },
     input: options.input,
   });
   return {
@@ -258,7 +265,7 @@ describe('cli main — backend status without daemon', () => {
 
     expect(status).toBe(0);
     expect(stdout.trim().split('\n')).toEqual([
-      'No coordinator discovery record and no coordinator socket at the current expected address were found. Any coral-cli mutating command (or a Claude Code session start) attempts startup.',
+      'No coordinator discovery record and no coordinator socket at the current expected address were found. Any mutating Coral command (or a Claude Code session start) attempts startup.',
       expect.stringMatching(
         /^Routing invocation [0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}: terminal; continued current \(incumbent-absent\)\.$/,
       ),

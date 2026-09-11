@@ -1,5 +1,6 @@
 import type { ProcessLiveness } from '#src/infra/node-process.js';
 import { randomUUID } from 'node:crypto';
+import { Command } from 'commander';
 import { describe, expect, it, vi } from 'vitest';
 
 import { currentCoralStoreFormat } from '#src/store-format.js';
@@ -15,6 +16,9 @@ import { createRealRuntime } from '#src/runtime/real.js';
 import { fixtureCanonicalWorkDir } from '#tests/helpers/canonical-work-dir.js';
 import { JobStore } from '#src/jobs/store.js';
 import { createRecoveryCoordinator } from '#src/coordinator/services/recovery/index.js';
+import { quarantineUnreadableProviderOperations } from '#src/coordinator/services/recovery/retry-plans.js';
+import { LaunchCoordinator } from '#src/coordinator/live/admission.js';
+import { createUnreadableProviderOperationDiscardService } from '#src/coordinator/services/recovery/unreadable-provider-operation-discard.js';
 import type {
   ProviderRecoveryAuthority,
   ProviderRecoveryAuthorityCapture,
@@ -22,7 +26,13 @@ import type {
 } from '#src/jobs/reconcile/contracts.js';
 import type { JobLaunch } from '#src/jobs/records.js';
 import type { InvocationContext } from '#src/runtime/invocation-context.js';
-import { insertProviderOperation, readProviderOperation } from '#src/store/provider-operation-journal.js';
+import {
+  compareAndSwapProviderOperation,
+  deleteProviderOperation,
+  insertProviderOperation,
+  observeProviderOperationRecord,
+  readProviderOperation,
+} from '#src/store/provider-operation-journal.js';
 import { encodeProviderOperationRecord } from '#src/store/provider-operation-record.js';
 import { providerOperationRecordSchema, type ProviderOperationRecord } from '#src/store/provider-operation-record.js';
 import { ProviderOperationReconciler } from '#src/coordinator/services/provider-operation-reconciler.js';
@@ -34,6 +44,14 @@ import {
   writeDurableCliProcessRuntimeMeta,
 } from '#src/jobs/runtime-meta-store.js';
 import { testIncarnation } from '#tests/helpers/process-incarnation.js';
+import { encodeRecoveryQuarantineKey, RecoveryQuarantineStore } from '#src/recovery/quarantine.js';
+import {
+  COORDINATOR_JOB_RECOVERY_BOUNDARY,
+  UNREADABLE_PROVIDER_OPERATION_BOUNDARY,
+} from '#src/recovery/source-registry.js';
+import { formatRecoveryQuarantineList } from '#src/cli/format/backend.js';
+import { registerBackendCommands } from '#src/cli/commands/backend.js';
+import { executeRenderedCommand } from '#tests/helpers/rendered-command.js';
 
 import { providerOperationRecord } from '../../../store/provider-operation-fixtures.js';
 
@@ -150,13 +168,16 @@ function seedRunningDurableJob(
   });
 }
 
-function committedOperation(overrides: {
-  jobId: string;
-  operationId: string;
-  proxyInstanceId: string;
-}): ProviderOperationRecord {
-  const fixture = providerOperationRecord('executing');
-  if (fixture.phase !== 'executing') throw new Error('executing fixture failed validation');
+function committedOperation(
+  overrides: {
+    jobId: string;
+    operationId: string;
+    proxyInstanceId: string;
+  },
+  phase: 'executing' | 'settlement-pending' = 'executing',
+): ProviderOperationRecord {
+  const fixture = providerOperationRecord(phase);
+  if (!('activationAck' in fixture)) throw new Error(`Fixture phase '${phase}' carries no activation ack.`);
   return providerOperationRecordSchema.parse({
     ...fixture,
     operation: {
@@ -238,25 +259,808 @@ async function createHeldRecoveryCoordinator(
     signal,
     coordinatorCommit,
   });
+  const launchCoordinator = new LaunchCoordinator({ runtime });
+  launchCoordinator.connectLaunchReclamationOracle('undecided-provider-operation', (permit) =>
+    permit.holder.recordKeys.some((key) => observeProviderOperationRecord(progressStore.getDb(), key).kind !== 'absent')
+      ? { kind: 'job-live' }
+      : {
+          kind: 'provider-operation-records-absent',
+          recordKeys: permit.holder.recordKeys,
+          jobEvidence: { kind: 'job-terminal', phase: 'completed' },
+        },
+  );
+  let phaseChanged: ((event: unknown) => void) | null = null;
   const recoveryCoordinator = createRecoveryCoordinator(
     {
       progressStore,
       runtime,
       runtimeState: { setLaunchFenceActive: vi.fn() },
-      eventBus: { emit: vi.fn() } as never,
+      eventBus: {
+        on: vi.fn((event: string, listener: (input: unknown) => void) => {
+          if (event === 'job:phase_changed') phaseChanged = listener;
+        }),
+        off: vi.fn(),
+        emit: vi.fn(),
+      } as never,
       getRecoveryService,
       createInvocationContext,
       log,
+      startupOwnership: launchCoordinator,
     },
     boundRecovery.bound,
   );
   return {
+    launchCoordinator,
     recoveryCoordinator,
+    log,
     runStartupRecovery: () => boundRecovery.run(recoveryCoordinator),
+    emitTerminalPhase: (jobId: string) => {
+      phaseChanged?.({ jobId, previousPhase: 'running', phase: 'completed' });
+    },
   };
 }
 
 describe('runStartupRecovery provider-operation ownership', () => {
+  it('hydrates the complete readable phase matrix with only the phases that need a startup permit', async () => {
+    const runtime = createRealRuntime('prod');
+    const progressStore = createProgressStore(runtime);
+    const phases = [
+      'prepare-pending',
+      'guardian-activation-pending',
+      'proxy-activation-pending',
+      'activation-resolution-pending',
+      'executing',
+      'prestart-cleanup-pending',
+      'local-recovery-pending',
+      'settlement-pending',
+    ] as const;
+
+    const records = phases.map((phase, index) => {
+      const jobId = randomUUID();
+      const sessionId = randomUUID();
+      const fixture = providerOperationRecord(phase, { job: index + 100 });
+      const record = providerOperationRecord(phase, {
+        operation: { ...fixture.operation, jobId, operationId: randomUUID() },
+      });
+      seedRunningAppServerJob(progressStore, {
+        jobId,
+        sessionId,
+        provider: 'codex',
+        proxyInstanceId: record.operation.proxyInstanceId,
+      });
+      insertProviderOperation(progressStore.getDb(), record);
+      return record;
+    });
+    const { recoveryCoordinator } = await createHeldRecoveryCoordinator(
+      runtime,
+      progressStore,
+      createFakeService(),
+      'readable-phase-matrix',
+    );
+
+    const ownership = recoveryCoordinator.hydrateProviderOperationStartupOwnership(
+      recoveryCoordinator.snapshotProviderOperationStartupOwnership(),
+    );
+    expect(ownership.completion).toEqual({ kind: 'complete' });
+    const byPhase = new Map(ownership.records.map((record) => [record.phase, record]));
+    const liveCapable = phases.slice(0, 5);
+
+    for (const phase of liveCapable) {
+      expect(byPhase.get(phase)).toMatchObject({
+        restoredPermit: expect.objectContaining({ holder: { kind: 'recovery' } }),
+        bindingDisposition: { kind: 'prepared' },
+      });
+    }
+    expect(byPhase.get('prestart-cleanup-pending')).toMatchObject({
+      restoredPermit: expect.objectContaining({ holder: { kind: 'recovery' } }),
+      bindingDisposition: { kind: 'not-required', owner: 'prestart-cleanup' },
+    });
+    expect(byPhase.get('local-recovery-pending')).toMatchObject({
+      restoredPermit: null,
+      bindingDisposition: { kind: 'not-required', owner: 'generic-job-recovery' },
+    });
+    expect(byPhase.get('settlement-pending')).toMatchObject({
+      restoredPermit: null,
+      bindingDisposition: { kind: 'settled-unbound' },
+    });
+    expect(ownership.jobIds).toEqual(expect.arrayContaining(records.map((record) => record.operation.jobId)));
+    await recoveryCoordinator.teardown();
+  });
+
+  it('reports an operator hold only after the startup ownership fence is durable', async () => {
+    const runtime = createRealRuntime('prod');
+    const progressStore = createProgressStore(runtime);
+    const jobId = randomUUID();
+    const record = committedOperation({ jobId, operationId: randomUUID(), proxyInstanceId: randomUUID() });
+    seedRunningAppServerJob(progressStore, {
+      jobId,
+      sessionId: randomUUID(),
+      provider: 'codex',
+      proxyInstanceId: record.operation.proxyInstanceId,
+    });
+    insertProviderOperation(progressStore.getDb(), record);
+    const { launchCoordinator, recoveryCoordinator } = await createHeldRecoveryCoordinator(
+      runtime,
+      progressStore,
+      createFakeService(),
+      'durable-startup-ownership-fence',
+    );
+    vi.spyOn(launchCoordinator, 'prepareProviderOperationBinding').mockReturnValue({
+      kind: 'refused',
+      reason: 'startup binding refused',
+    });
+
+    const ownership = recoveryCoordinator.hydrateProviderOperationStartupOwnership(
+      recoveryCoordinator.snapshotProviderOperationStartupOwnership(),
+    );
+
+    expect(ownership.records).toEqual([
+      expect.objectContaining({
+        operation: record.operation,
+        restoredPermit: expect.objectContaining({ holder: { kind: 'recovery' } }),
+        bindingDisposition: {
+          kind: 'refused',
+          reason: 'startup binding refused',
+          remedy: { kind: 'restart-coordinator' },
+        },
+      }),
+    ]);
+    expect(ownership.completion).toMatchObject({
+      kind: 'held',
+      holds: [expect.objectContaining({ jobId, remedy: { kind: 'restart-coordinator' } })],
+    });
+    expect(readProviderOperation(progressStore.getDb(), record.operation)).toMatchObject({
+      retryNotBeforeMs: Number.MAX_SAFE_INTEGER,
+      lastError: { code: 'provider_operation_startup_ownership_refused' },
+    });
+    expect(launchCoordinator.reservationFor(jobId)).toMatchObject({
+      kind: 'active',
+      holder: { kind: 'recovery' },
+    });
+    await recoveryCoordinator.teardown();
+  });
+
+  it('retains restored startup ownership when binding settlement is refused', async () => {
+    const runtime = createRealRuntime('prod');
+    const progressStore = createProgressStore(runtime);
+    const jobId = randomUUID();
+    const record = committedOperation({ jobId, operationId: randomUUID(), proxyInstanceId: randomUUID() });
+    if (record.phase !== 'executing') throw new Error('expected executing provider operation');
+    const settlement = providerOperationRecordSchema.parse({
+      ...record,
+      phase: 'settlement-pending',
+      terminalProviderSeq: record.committedThroughProviderSeq,
+      settlementIntent: 'release-after-terminal',
+      revision: record.revision + 1,
+      retryNotBeforeMs: runtime.time.now(),
+      retryCount: 0,
+      lastError: null,
+    });
+    if (settlement.phase !== 'settlement-pending') throw new Error('expected settlement provider operation');
+    seedRunningAppServerJob(progressStore, {
+      jobId,
+      sessionId: randomUUID(),
+      provider: 'codex',
+      proxyInstanceId: record.operation.proxyInstanceId,
+    });
+    insertProviderOperation(progressStore.getDb(), record);
+    const { launchCoordinator, recoveryCoordinator } = await createHeldRecoveryCoordinator(
+      runtime,
+      progressStore,
+      createFakeService(),
+      'durable-startup-settlement-refusal',
+    );
+    const prepareProviderOperationBinding = launchCoordinator.prepareProviderOperationBinding.bind(launchCoordinator);
+    vi.spyOn(launchCoordinator, 'prepareProviderOperationBinding')
+      .mockImplementationOnce(() => {
+        const advance = compareAndSwapProviderOperation(progressStore.getDb(), record, settlement);
+        if (advance.kind !== 'updated') throw new Error('provider operation did not reach settlement during the race');
+        return { kind: 'refused', reason: 'startup binding raced with settlement' };
+      })
+      .mockImplementation(prepareProviderOperationBinding);
+    vi.spyOn(launchCoordinator, 'settleProviderOperationBinding').mockReturnValue({
+      kind: 'refused',
+      reason: 'settlement mailbox full',
+    });
+
+    const ownership = recoveryCoordinator.hydrateProviderOperationStartupOwnership(
+      recoveryCoordinator.snapshotProviderOperationStartupOwnership(),
+    );
+
+    expect(ownership.records).toEqual([
+      expect.objectContaining({
+        operation: record.operation,
+        restoredPermit: expect.objectContaining({ holder: { kind: 'recovery' } }),
+        bindingDisposition: {
+          kind: 'refused',
+          reason: 'settlement mailbox full',
+          remedy: { kind: 'remote-settlement' },
+        },
+      }),
+    ]);
+    expect(ownership.completion).toMatchObject({
+      kind: 'held',
+      holds: [expect.objectContaining({ jobId, remedy: { kind: 'remote-settlement' } })],
+    });
+    expect(readProviderOperation(progressStore.getDb(), record.operation)).toEqual(settlement);
+    expect(launchCoordinator.reservationFor(jobId)).toMatchObject({
+      kind: 'active',
+      holder: { kind: 'recovery' },
+    });
+    await recoveryCoordinator.teardown();
+  });
+
+  it('hands a vanished provider operation to generic recovery without retaining its startup permit', async () => {
+    const runtime = createRealRuntime('prod');
+    const progressStore = createProgressStore(runtime);
+    const jobId = randomUUID();
+    const record = committedOperation({ jobId, operationId: randomUUID(), proxyInstanceId: randomUUID() });
+    seedRunningAppServerJob(progressStore, {
+      jobId,
+      sessionId: randomUUID(),
+      provider: 'codex',
+      proxyInstanceId: record.operation.proxyInstanceId,
+    });
+    insertProviderOperation(progressStore.getDb(), record);
+    const { launchCoordinator, recoveryCoordinator } = await createHeldRecoveryCoordinator(
+      runtime,
+      progressStore,
+      createFakeService(),
+      'vanished-startup-ownership-row',
+    );
+    const prepareProviderOperationBinding = launchCoordinator.prepareProviderOperationBinding.bind(launchCoordinator);
+    vi.spyOn(launchCoordinator, 'prepareProviderOperationBinding')
+      .mockImplementationOnce((_permit, _operation) => {
+        const current = readProviderOperation(progressStore.getDb(), record.operation);
+        if (current === null) throw new Error('expected provider operation before the binding race');
+        const deletion = deleteProviderOperation(progressStore.getDb(), current);
+        if (deletion.kind !== 'deleted') throw new Error('provider operation did not vanish during the binding race');
+        return { kind: 'refused', reason: 'startup binding raced with deletion' };
+      })
+      .mockImplementation(prepareProviderOperationBinding);
+
+    const ownership = recoveryCoordinator.hydrateProviderOperationStartupOwnership(
+      recoveryCoordinator.snapshotProviderOperationStartupOwnership(),
+    );
+
+    expect(ownership.records).toEqual([
+      expect.objectContaining({
+        operation: record.operation,
+        restoredPermit: null,
+        bindingDisposition: {
+          kind: 'not-reconciled',
+          reason: 'record-absent',
+          owner: { kind: 'generic-job-recovery' },
+        },
+      }),
+    ]);
+    expect(ownership.completion).toEqual({ kind: 'complete' });
+    expect(ownership.jobIds).toEqual([]);
+    expect(readProviderOperation(progressStore.getDb(), record.operation)).toBeNull();
+    expect(launchCoordinator.reservationFor(jobId)).toBeNull();
+    expect(launchCoordinator.active).toBe(0);
+    const successor = launchCoordinator.requestLaunch(
+      randomUUID(),
+      'codex',
+      { kind: 'system-task', id: 'post-vanished-row-capacity' },
+      'default',
+    );
+    expect(successor).toMatchObject({ type: 'immediate' });
+    if (successor !== 'queue_full' && successor.type === 'immediate') {
+      expect(launchCoordinator.releaseLaunch(successor.permit)).toMatchObject({ kind: 'released' });
+    }
+    await recoveryCoordinator.teardown();
+  });
+
+  it('hands a provider operation that reaches settlement to the settlement path without an operator hold', async () => {
+    const runtime = createRealRuntime('prod');
+    const progressStore = createProgressStore(runtime);
+    const jobId = randomUUID();
+    const record = committedOperation({ jobId, operationId: randomUUID(), proxyInstanceId: randomUUID() });
+    if (record.phase !== 'executing') throw new Error('expected executing provider operation');
+    const settlement = providerOperationRecordSchema.parse({
+      ...record,
+      phase: 'settlement-pending',
+      terminalProviderSeq: record.committedThroughProviderSeq,
+      settlementIntent: 'release-after-terminal',
+      revision: record.revision + 1,
+      retryNotBeforeMs: runtime.time.now(),
+      retryCount: 0,
+      lastError: null,
+    });
+    if (settlement.phase !== 'settlement-pending') throw new Error('expected settlement provider operation');
+    seedRunningAppServerJob(progressStore, {
+      jobId,
+      sessionId: randomUUID(),
+      provider: 'codex',
+      proxyInstanceId: record.operation.proxyInstanceId,
+    });
+    insertProviderOperation(progressStore.getDb(), record);
+    const { launchCoordinator, recoveryCoordinator } = await createHeldRecoveryCoordinator(
+      runtime,
+      progressStore,
+      createFakeService(),
+      'settlement-startup-ownership-race',
+    );
+    const prepareProviderOperationBinding = launchCoordinator.prepareProviderOperationBinding.bind(launchCoordinator);
+    vi.spyOn(launchCoordinator, 'prepareProviderOperationBinding')
+      .mockImplementationOnce(() => {
+        const advance = compareAndSwapProviderOperation(progressStore.getDb(), record, settlement);
+        if (advance.kind !== 'updated') throw new Error('provider operation did not reach settlement during the race');
+        return { kind: 'refused', reason: 'startup binding raced with settlement' };
+      })
+      .mockImplementation(prepareProviderOperationBinding);
+
+    const ownership = recoveryCoordinator.hydrateProviderOperationStartupOwnership(
+      recoveryCoordinator.snapshotProviderOperationStartupOwnership(),
+    );
+
+    expect(ownership.records).toEqual([
+      expect.objectContaining({
+        phase: 'settlement-pending',
+        operation: record.operation,
+        bindingDisposition: { kind: 'already-settled' },
+      }),
+    ]);
+    expect(ownership.completion).toEqual({ kind: 'complete' });
+    expect(readProviderOperation(progressStore.getDb(), record.operation)).toEqual(settlement);
+    expect(launchCoordinator.reservationFor(jobId)).toBeNull();
+    expect(launchCoordinator.active).toBe(0);
+    await recoveryCoordinator.teardown();
+  });
+
+  it('returns and reports a held startup disposition while provider-operation ownership is unresolved', async () => {
+    const runtime = createRealRuntime('prod');
+    const progressStore = createProgressStore(runtime);
+    const jobId = randomUUID();
+    const sessionId = randomUUID();
+    const first = committedOperation({ jobId, operationId: randomUUID(), proxyInstanceId: randomUUID() });
+    const second = committedOperation(
+      { jobId, operationId: randomUUID(), proxyInstanceId: randomUUID() },
+      'settlement-pending',
+    );
+    seedRunningAppServerJob(progressStore, {
+      jobId,
+      sessionId,
+      provider: 'codex',
+      proxyInstanceId: first.operation.proxyInstanceId,
+    });
+    insertProviderOperation(progressStore.getDb(), first);
+    insertProviderOperation(progressStore.getDb(), second);
+    const { recoveryCoordinator, log, runStartupRecovery } = await createHeldRecoveryCoordinator(
+      runtime,
+      progressStore,
+      createFakeService(),
+      'ambiguous-startup-disposition',
+    );
+
+    const disposition = await runStartupRecovery();
+
+    expect(disposition).toMatchObject({
+      kind: 'held',
+      durableContainmentHeld: false,
+      providerOperationHolds: expect.arrayContaining([
+        expect.objectContaining({
+          jobId,
+          remedy: expect.objectContaining({ kind: 'recovery-quarantine-discard' }),
+        }),
+      ]),
+    });
+    const messages = log.mock.calls.flatMap((call) => call).join('\n');
+    expect(messages).toContain('Recovery reconciliation remains held');
+    expect(messages).not.toContain('Recovery adoption complete');
+    expect(messages).not.toContain('coral-cli');
+    const quarantine = new RecoveryQuarantineStore(progressStore.getDb(), runtime.time);
+    const discarded = quarantine.list().find((entry) => entry.subject.key.includes(first.operation.operationId));
+    if (discarded === undefined) throw new Error('expected first readable quarantine row');
+    const discard = createUnreadableProviderOperationDiscardService({
+      instanceId: 'ambiguous-startup-disposition',
+      ids: runtime.ids,
+      db: progressStore.getDb(),
+      time: runtime.time,
+    });
+    const output = vi.spyOn(process.stdout, 'write').mockImplementation(() => true);
+    try {
+      const program = new Command();
+      program.exitOverride();
+      registerBackendCommands(program, {
+        recoveryQuarantine: {
+          list: () => quarantine.list(),
+          clear: async () => {
+            throw new Error('clear was not requested');
+          },
+          discardProviderOperation: async (request) => discard.discard(request),
+        },
+      });
+      await executeRenderedCommand(program, formatRecoveryQuarantineList(quarantine.list()), {
+        label: 'discard',
+        includes: encodeRecoveryQuarantineKey(discarded.subject.key),
+      });
+    } finally {
+      output.mockRestore();
+      process.exitCode = undefined;
+    }
+    expect(readProviderOperation(progressStore.getDb(), first.operation)).toBeNull();
+    expect(quarantine.read(UNREADABLE_PROVIDER_OPERATION_BOUNDARY, discarded.subject.key)).toBeNull();
+    await recoveryCoordinator.teardown();
+  });
+
+  it('prints and executes the exact discard command for an unreadable startup hold', async () => {
+    const runtime = createRealRuntime('prod');
+    const progressStore = createProgressStore(runtime);
+    const jobId = randomUUID();
+    seedQueuedProviderJob(progressStore, { jobId, sessionId: randomUUID(), enqueueSequence: 1 });
+    const unreadableKey =
+      `provider_operation_saga.v1:record:${jobId}:${randomUUID()}:` + `${randomUUID()}:${randomUUID()}`;
+    progressStore
+      .getDb()
+      .prepare<[string, string]>('INSERT INTO meta (key, value) VALUES (?, ?)')
+      .run(unreadableKey, 'not json at all');
+    const observation = observeProviderOperationRecord(progressStore.getDb(), unreadableKey);
+    if (observation.kind !== 'unreadable') throw new Error('expected unreadable provider-operation row');
+    const quarantine = new RecoveryQuarantineStore(progressStore.getDb(), runtime.time);
+    await expect(quarantineUnreadableProviderOperations(quarantine, [observation.attribution])).resolves.toMatchObject({
+      materialized: 1,
+      retained: 0,
+      failed: [],
+    });
+    const { recoveryCoordinator, log, runStartupRecovery } = await createHeldRecoveryCoordinator(
+      runtime,
+      progressStore,
+      createFakeService(),
+      'unreadable-startup-hold-command',
+    );
+
+    const disposition = await runStartupRecovery();
+
+    expect(disposition).toMatchObject({
+      kind: 'held',
+      providerOperationHolds: expect.arrayContaining([
+        expect.objectContaining({
+          remedy: {
+            kind: 'recovery-quarantine-discard',
+            command: expect.objectContaining({
+              kind: 'discard-provider-operation',
+              key: unreadableKey,
+              allowReadable: false,
+            }),
+          },
+        }),
+      ]),
+    });
+    const messages = log.mock.calls.flatMap((call) => call).join('\n');
+    expect(messages).not.toContain('coral-cli');
+    const entry = quarantine.read(UNREADABLE_PROVIDER_OPERATION_BOUNDARY, unreadableKey);
+    if (entry === null) throw new Error('expected unreadable provider-operation quarantine entry');
+    const discard = createUnreadableProviderOperationDiscardService({
+      instanceId: 'unreadable-startup-hold-command',
+      ids: runtime.ids,
+      db: progressStore.getDb(),
+      time: runtime.time,
+    });
+    const output = vi.spyOn(process.stdout, 'write').mockImplementation(() => true);
+    try {
+      const program = new Command();
+      program.exitOverride();
+      registerBackendCommands(program, {
+        recoveryQuarantine: {
+          list: () => quarantine.list(),
+          clear: async () => {
+            throw new Error('clear was not requested');
+          },
+          discardProviderOperation: async (request) => discard.discard(request),
+        },
+      });
+      await executeRenderedCommand(program, formatRecoveryQuarantineList(quarantine.list()), {
+        label: 'discard',
+        includes: encodeRecoveryQuarantineKey(unreadableKey),
+      });
+    } finally {
+      output.mockRestore();
+      process.exitCode = undefined;
+    }
+    expect(observeProviderOperationRecord(progressStore.getDb(), unreadableKey)).toEqual({ kind: 'absent' });
+    expect(quarantine.read(UNREADABLE_PROVIDER_OPERATION_BOUNDARY, unreadableKey)).toBeNull();
+    await recoveryCoordinator.teardown();
+  });
+
+  it('returns a hold when exact local recovery is not accepted', async () => {
+    const runtime = createRealRuntime('prod');
+    const progressStore = createProgressStore(runtime);
+    const jobId = randomUUID();
+    const sessionId = randomUUID();
+    seedQueuedProviderJob(progressStore, { jobId, sessionId, enqueueSequence: 1 });
+    const fixture = providerOperationRecord('local-recovery-pending');
+    const record = providerOperationRecordSchema.parse({
+      ...fixture,
+      operation: { ...fixture.operation, jobId },
+    });
+    if (record.phase !== 'local-recovery-pending') throw new Error('expected local recovery saga');
+    insertProviderOperation(progressStore.getDb(), record);
+    const { recoveryCoordinator, runStartupRecovery } = await createHeldRecoveryCoordinator(
+      runtime,
+      progressStore,
+      createFakeService({
+        recoverQueuedJob: async () => {
+          throw new Error('recovery acceptance unavailable');
+        },
+      }),
+      'local-recovery-refusal',
+    );
+
+    await expect(runStartupRecovery()).resolves.toMatchObject({
+      kind: 'held',
+      providerOperationHolds: [
+        expect.objectContaining({
+          kind: 'operation',
+          jobId,
+          operationId: record.operation.operationId,
+          reason: expect.stringContaining('recovery acceptance unavailable'),
+          remedy: { kind: 'restart-coordinator' },
+        }),
+      ],
+    });
+    expect(readProviderOperation(progressStore.getDb(), record.operation)).toMatchObject({
+      retryNotBeforeMs: Number.MAX_SAFE_INTEGER,
+      lastError: {
+        code: 'provider_operation_startup_ownership_refused',
+        message: expect.stringContaining('recovery acceptance unavailable'),
+      },
+    });
+    await recoveryCoordinator.teardown();
+  });
+
+  it('allows one readable discard to unblock the exact settlement that returns capacity', async () => {
+    const runtime = createRealRuntime('prod');
+    const progressStore = createProgressStore(runtime);
+    const jobId = randomUUID();
+    const sessionId = randomUUID();
+    const first = committedOperation({ jobId, operationId: randomUUID(), proxyInstanceId: randomUUID() });
+    const second = committedOperation({ jobId, operationId: randomUUID(), proxyInstanceId: randomUUID() });
+    seedRunningAppServerJob(progressStore, {
+      jobId,
+      sessionId,
+      provider: 'codex',
+      proxyInstanceId: first.operation.proxyInstanceId,
+    });
+    insertProviderOperation(progressStore.getDb(), first);
+    insertProviderOperation(progressStore.getDb(), second);
+    const { launchCoordinator, recoveryCoordinator } = await createHeldRecoveryCoordinator(
+      runtime,
+      progressStore,
+      createFakeService(),
+      'ambiguous-readable-discard',
+    );
+
+    const ownership = recoveryCoordinator.hydrateProviderOperationStartupOwnership(
+      recoveryCoordinator.snapshotProviderOperationStartupOwnership(),
+    );
+    expect(ownership.completion).toMatchObject({
+      kind: 'held',
+      holds: expect.arrayContaining([
+        expect.objectContaining({
+          jobId,
+          remedy: expect.objectContaining({ kind: 'recovery-quarantine-discard' }),
+        }),
+      ]),
+    });
+    expect(launchCoordinator.reservationFor(jobId)).toMatchObject({ kind: 'active' });
+    expect(readProviderOperation(progressStore.getDb(), first.operation)).toMatchObject({
+      retryNotBeforeMs: Number.MAX_SAFE_INTEGER,
+    });
+    expect(readProviderOperation(progressStore.getDb(), second.operation)).toMatchObject({
+      retryNotBeforeMs: Number.MAX_SAFE_INTEGER,
+    });
+
+    const quarantine = new RecoveryQuarantineStore(progressStore.getDb(), runtime.time);
+    const coordinates = quarantine
+      .list()
+      .filter(
+        (entry) => entry.boundary === UNREADABLE_PROVIDER_OPERATION_BOUNDARY && entry.errorMessage.includes('readable'),
+      );
+    expect(coordinates).toHaveLength(2);
+    const listing = formatRecoveryQuarantineList(coordinates);
+    for (const entry of coordinates) {
+      expect(listing).toContain(encodeRecoveryQuarantineKey(entry.subject.key));
+      if (entry.subject.revision.kind !== 'fingerprint') throw new Error('expected fingerprint coordinate');
+      expect(listing).toContain(entry.subject.revision.value);
+    }
+    const discarded = coordinates.find((entry) => entry.subject.key.includes(first.operation.operationId));
+    const survivingCoordinate = coordinates.find((entry) => entry.subject.key.includes(second.operation.operationId));
+    if (discarded?.subject.revision.kind !== 'fingerprint') throw new Error('expected first record coordinate');
+    if (survivingCoordinate === undefined) throw new Error('expected second record coordinate');
+    const discard = createUnreadableProviderOperationDiscardService({
+      instanceId: 'ambiguous-readable-discard',
+      ids: runtime.ids,
+      db: progressStore.getDb(),
+      time: runtime.time,
+    });
+    const output = vi.spyOn(process.stdout, 'write').mockImplementation(() => true);
+    try {
+      const program = new Command();
+      program.exitOverride();
+      registerBackendCommands(program, {
+        recoveryQuarantine: {
+          list: () => quarantine.list(),
+          clear: async () => {
+            throw new Error('clear was not requested');
+          },
+          discardProviderOperation: async (request) => discard.discard(request),
+        },
+      });
+      await executeRenderedCommand(program, listing, {
+        label: 'discard',
+        includes: encodeRecoveryQuarantineKey(discarded.subject.key),
+      });
+    } finally {
+      output.mockRestore();
+      process.exitCode = undefined;
+    }
+    const resolution = recoveryCoordinator.releaseUnreadableProviderOperationStartupOwnership(discarded.subject.key);
+    expect(resolution.released).toBe(0);
+    expect(resolution.readableRecords).toHaveLength(1);
+    const surviving = resolution.readableRecords[0];
+    if (surviving === undefined) throw new Error('expected surviving provider operation');
+    expect(surviving.recordKey).toBe(survivingCoordinate.subject.key);
+    expect(surviving.record.operation.operationId).toBe(second.operation.operationId);
+    expect(recoveryCoordinator.adoptRepairedProviderOperationOwnership(surviving.record).bindingDisposition).toEqual({
+      kind: 'prepared',
+    });
+
+    expect(readProviderOperation(progressStore.getDb(), first.operation)).toBeNull();
+    expect(readProviderOperation(progressStore.getDb(), second.operation)).not.toBeNull();
+    expect(quarantine.list()).toEqual([]);
+    expect(launchCoordinator.settleProviderOperationBinding(second.operation)).toMatchObject({ kind: 'settled' });
+    expect(launchCoordinator.retireProviderOperationBinding(second.operation)).toEqual({ kind: 'retired' });
+    expect(launchCoordinator.reservationFor(jobId)).toBeNull();
+    expect(launchCoordinator.active).toBe(0);
+    const successor = launchCoordinator.requestLaunch(
+      randomUUID(),
+      'codex',
+      { kind: 'system-task', id: 'post-discard-capacity' },
+      'default',
+    );
+    expect(successor).toMatchObject({ type: 'immediate' });
+    if (successor !== 'queue_full' && successor.type === 'immediate') {
+      launchCoordinator.releaseLaunch(successor.permit);
+    }
+    await recoveryCoordinator.teardown();
+  });
+
+  it('does not report capacity for an unreadable ownership release that was already reclaimed', async () => {
+    const runtime = createRealRuntime('prod');
+    const progressStore = createProgressStore(runtime);
+    const jobId = randomUUID();
+    seedQueuedProviderJob(progressStore, { jobId, sessionId: randomUUID(), enqueueSequence: 1 });
+    const unreadableKey =
+      `provider_operation_saga.v1:record:${jobId}:${randomUUID()}:` + `${randomUUID()}:${randomUUID()}`;
+    progressStore
+      .getDb()
+      .prepare<[string, string]>('INSERT INTO meta (key, value) VALUES (?, ?)')
+      .run(unreadableKey, 'not json at all');
+    const { launchCoordinator, recoveryCoordinator } = await createHeldRecoveryCoordinator(
+      runtime,
+      progressStore,
+      createFakeService(),
+      'already-reclaimed-unreadable-ownership',
+    );
+    const ownership = recoveryCoordinator.hydrateProviderOperationStartupOwnership(
+      recoveryCoordinator.snapshotProviderOperationStartupOwnership(),
+    );
+    const unreadable = ownership.unreadable.find((candidate) => candidate.recordKey === unreadableKey);
+    if (unreadable === undefined || unreadable.restoredPermit === null) {
+      throw new Error('expected unreadable ownership permit');
+    }
+
+    progressStore.getDb().prepare<[string]>('DELETE FROM meta WHERE key = ?').run(unreadableKey);
+    expect(launchCoordinator.reclaimLaunchPermit(unreadable.restoredPermit)).toBe(true);
+    const resolution = recoveryCoordinator.releaseUnreadableProviderOperationStartupOwnership(unreadableKey);
+
+    expect(resolution).toEqual({ released: 0, readableRecords: [] });
+    expect(launchCoordinator.active).toBe(0);
+    expect(launchCoordinator.reservationFor(jobId)).toBeNull();
+    expect(launchCoordinator.launchReclamationDiagnostics()).toEqual([
+      expect.objectContaining({
+        reservationId: unreadable.restoredPermit.reservationId,
+        evidence: {
+          kind: 'provider-operation-records-absent',
+          recordKeys: [unreadableKey],
+          jobEvidence: { kind: 'job-terminal', phase: 'completed' },
+        },
+      }),
+    ]);
+    await recoveryCoordinator.teardown();
+  });
+
+  it('retains ambiguous readable ownership on terminal events until every recorded row is absent', async () => {
+    const runtime = createRealRuntime('prod');
+    const progressStore = createProgressStore(runtime);
+    const jobId = randomUUID();
+    const sessionId = randomUUID();
+    const first = committedOperation({ jobId, operationId: randomUUID(), proxyInstanceId: randomUUID() });
+    const second = committedOperation(
+      { jobId, operationId: randomUUID(), proxyInstanceId: randomUUID() },
+      'settlement-pending',
+    );
+    seedRunningAppServerJob(progressStore, {
+      jobId,
+      sessionId,
+      provider: 'codex',
+      proxyInstanceId: first.operation.proxyInstanceId,
+    });
+    insertProviderOperation(progressStore.getDb(), first);
+    insertProviderOperation(progressStore.getDb(), second);
+    const { launchCoordinator, recoveryCoordinator, emitTerminalPhase } = await createHeldRecoveryCoordinator(
+      runtime,
+      progressStore,
+      createFakeService(),
+      'ambiguous-terminal-release',
+    );
+
+    const ownership = recoveryCoordinator.hydrateProviderOperationStartupOwnership(
+      recoveryCoordinator.snapshotProviderOperationStartupOwnership(),
+    );
+    const heldPermit = ownership.records[0]?.restoredPermit;
+    if (heldPermit?.holder.kind !== 'undecided-provider-operation') {
+      throw new Error('expected undecided provider-operation permit');
+    }
+    expect(heldPermit.holder.recordKeys).toHaveLength(2);
+    for (const record of ownership.records) {
+      expect(heldPermit.holder.recordKeys.some((key) => key.includes(record.operation.operationId))).toBe(true);
+    }
+
+    emitTerminalPhase(jobId);
+    expect(launchCoordinator.reservationFor(jobId)).toMatchObject({
+      kind: 'active',
+      holder: { kind: 'undecided-provider-operation' },
+    });
+
+    const quarantine = new RecoveryQuarantineStore(progressStore.getDb(), runtime.time);
+    const discard = createUnreadableProviderOperationDiscardService({
+      instanceId: 'ambiguous-terminal-release',
+      ids: runtime.ids,
+      db: progressStore.getDb(),
+      time: runtime.time,
+    });
+    const coordinates = quarantine.list().filter((entry) => entry.boundary === UNREADABLE_PROVIDER_OPERATION_BOUNDARY);
+    expect(coordinates).toHaveLength(1);
+    const fenced = coordinates[0];
+    if (fenced?.subject.revision.kind !== 'fingerprint') throw new Error('expected fingerprint coordinate');
+    expect(fenced.subject.key).toContain(first.operation.operationId);
+    expect(
+      discard.discard({
+        key: fenced.subject.key,
+        revision: fenced.subject.revision.value,
+        allowReadable: true,
+      }),
+    ).toMatchObject({ kind: 'discarded' });
+    emitTerminalPhase(jobId);
+    expect(launchCoordinator.reservationFor(jobId)).toMatchObject({
+      kind: 'active',
+      holder: { kind: 'undecided-provider-operation' },
+    });
+
+    const settling = readProviderOperation(progressStore.getDb(), second.operation);
+    if (settling === null) throw new Error('expected the settlement-pending row to survive the operator discard');
+    expect(deleteProviderOperation(progressStore.getDb(), settling)).toMatchObject({ kind: 'deleted' });
+    emitTerminalPhase(jobId);
+    expect(launchCoordinator.reservationFor(jobId)).toBeNull();
+
+    expect(launchCoordinator.active).toBe(0);
+    expect(launchCoordinator.launchReclamationDiagnostics()).toEqual([
+      expect.objectContaining({
+        reservationId: heldPermit.reservationId,
+        holder: heldPermit.holder,
+        evidence: {
+          kind: 'provider-operation-records-absent',
+          recordKeys: heldPermit.holder.recordKeys,
+          jobEvidence: { kind: 'job-terminal', phase: 'completed' },
+        },
+      }),
+    ]);
+    await recoveryCoordinator.teardown();
+  });
+
   it('hands a post-snapshot local fallback to exact generic recovery before deleting the saga', async () => {
     const runtime = createRealRuntime('prod');
     const progressStore = createProgressStore(runtime);
@@ -286,22 +1090,22 @@ describe('runStartupRecovery provider-operation ownership', () => {
     const targetAcceptance = deferred();
     const sentinelAcceptance = deferred();
     const sentinelStarted = deferred();
-    let recoveredLaunchCount = 0;
-    const recoverTargetQueuedJob = vi.fn(async () => {
+    const sentinelRecovered = deferred();
+    const recoverTargetQueuedJob = async () => {
       await targetAcceptance.promise;
-      recoveredLaunchCount += 1;
       return targetJobId;
-    });
-    const recoverQueuedJob = vi.fn(async (authority: ProviderRecoveryAuthority) => {
+    };
+    const recoverQueuedJob = async (authority: ProviderRecoveryAuthority) => {
       const jobId = authority.launchRecord.jobId;
       if (jobId === sentinelJobId) {
         sentinelStarted.resolve();
         await sentinelAcceptance.promise;
+        sentinelRecovered.resolve();
         return sentinelJobId;
       }
       if (jobId !== targetJobId) throw new Error(`unexpected recovery job ${jobId}`);
       return recoverTargetQueuedJob();
-    });
+    };
     const fakeService = createFakeService({ recoverQueuedJob });
     const createInvocationContext = (projectRoot: string): InvocationContext => ({
       projectRoot: fixtureCanonicalWorkDir(projectRoot),
@@ -339,15 +1143,17 @@ describe('runStartupRecovery provider-operation ownership', () => {
       signal,
       coordinatorCommit,
     });
+    const startupOwnership = new LaunchCoordinator({ runtime });
     const recoveryCoordinator = createRecoveryCoordinator(
       {
         progressStore,
         runtime,
         runtimeState: { setLaunchFenceActive: vi.fn() },
-        eventBus: { emit: vi.fn() } as never,
+        eventBus: { on: vi.fn(), off: vi.fn(), emit: vi.fn() } as never,
         getRecoveryService,
         createInvocationContext,
         log,
+        startupOwnership,
       },
       boundRecovery.bound,
     );
@@ -379,6 +1185,8 @@ describe('runStartupRecovery provider-operation ownership', () => {
         },
       },
       registry: { activate: vi.fn(), attach: vi.fn(), settled: vi.fn(), stop: vi.fn() },
+      binding: startupOwnership,
+      releaseStartupOwnership: (operation) => recoveryCoordinator.releaseProviderOperationStartupOwnership(operation),
       materializePrepare: () => {
         throw new Error('race test unexpectedly materialized a prepare');
       },
@@ -402,32 +1210,96 @@ describe('runStartupRecovery provider-operation ownership', () => {
       },
     });
 
-    await reconciler.reconcileAtStartup(signal);
+    const startupSnapshot = recoveryCoordinator.snapshotProviderOperationStartupOwnership();
+    await reconciler.reconcileAtStartup(
+      recoveryCoordinator.hydrateProviderOperationStartupOwnership(startupSnapshot),
+      signal,
+    );
     expect(readProviderOperation(progressStore.getDb(), saga.operation)?.phase).toBe('prestart-cleanup-pending');
 
-    const startupRecovery = boundRecovery.run(recoveryCoordinator);
+    let startupSettled = false;
+    const startupRecovery = boundRecovery.run(recoveryCoordinator).finally(() => {
+      startupSettled = true;
+    });
     await sentinelStarted.promise;
 
     const staleSaga = readProviderOperation(progressStore.getDb(), saga.operation);
     if (staleSaga?.phase !== 'prestart-cleanup-pending') throw new Error('expected stale prestart cleanup saga');
     const postSnapshotReconciliation = reconciler.reconcile(staleSaga, undefined, signal);
-    await vi.waitFor(() => expect(cancelOperation).toHaveBeenCalledTimes(2));
+    await vi.waitFor(() =>
+      expect(readProviderOperation(progressStore.getDb(), saga.operation)?.phase ?? null).toBe(
+        'local-recovery-pending',
+      ),
+    );
+
+    sentinelAcceptance.resolve();
+    await sentinelRecovered.promise;
     await new Promise<void>((resolve) => setImmediate(resolve));
-    expect
-      .soft(readProviderOperation(progressStore.getDb(), saga.operation)?.phase ?? null)
-      .toBe('local-recovery-pending');
-    expect.soft(recoverTargetQueuedJob, 'recoverQueuedJob').toHaveBeenCalledTimes(1);
-    expect.soft(recoveredLaunchCount).toBe(0);
+    expect(startupSettled).toBe(false);
+    expect(readProviderOperation(progressStore.getDb(), saga.operation)?.phase).toBe('local-recovery-pending');
 
     targetAcceptance.resolve();
     await postSnapshotReconciliation;
-    expect.soft(readProviderOperation(progressStore.getDb(), saga.operation)).toBeNull();
-    expect.soft(recoveredLaunchCount).toBe(1);
+    await expect(startupRecovery).resolves.toMatchObject({ kind: 'complete' });
+    expect(readProviderOperation(progressStore.getDb(), saga.operation)).toBeNull();
+    await recoveryCoordinator.teardown();
+  });
 
-    sentinelAcceptance.resolve();
-    await startupRecovery;
-    expect.soft(recoverTargetQueuedJob, 'recoverQueuedJob').toHaveBeenCalledTimes(1);
-    expect.soft(recoveredLaunchCount).toBe(1);
+  it('hands a job to generic recovery when its provider-operation row vanishes during the recovery walk', async () => {
+    const runtime = createRealRuntime('prod');
+    const progressStore = createProgressStore(runtime);
+    const jobId = randomUUID();
+    const sessionId = randomUUID();
+    const proxyInstanceId = randomUUID();
+    seedRunningAppServerJob(progressStore, { jobId, sessionId, provider: 'codex', proxyInstanceId });
+    const record = committedOperation({ jobId, operationId: randomUUID(), proxyInstanceId });
+    insertProviderOperation(progressStore.getDb(), record);
+    const recoveryEvidence = 'Generic recovery finalized the app-server job after its provider-operation row vanished.';
+    const fakeService = createFakeService({
+      finalizeInterruptedAppServerJob: async () => {
+        progressStore.appendProgress(jobId, sessionId, recoveryEvidence);
+      },
+    });
+    const { recoveryCoordinator, runStartupRecovery } = await createHeldRecoveryCoordinator(
+      runtime,
+      progressStore,
+      fakeService,
+      'provider-operation-walk-race-test',
+    );
+    const originalQuarantineRead = RecoveryQuarantineStore.prototype.read;
+    const hydrationWalkReached = deferred();
+    let hydrationWalkObserved = false;
+    const quarantineRead = vi.spyOn(RecoveryQuarantineStore.prototype, 'read').mockImplementation(function (
+      this: RecoveryQuarantineStore,
+      boundary,
+      subjectKey,
+    ) {
+      const record = originalQuarantineRead.call(this, boundary, subjectKey);
+      if (!hydrationWalkObserved && boundary === COORDINATOR_JOB_RECOVERY_BOUNDARY && subjectKey === jobId) {
+        hydrationWalkObserved = true;
+        hydrationWalkReached.resolve();
+      }
+      return record;
+    });
+    let startupSettled = false;
+    const startupRecovery = runStartupRecovery().finally(() => {
+      startupSettled = true;
+    });
+    await hydrationWalkReached.promise;
+    quarantineRead.mockRestore();
+    expect(startupSettled).toBe(false);
+    const current = readProviderOperation(progressStore.getDb(), record.operation);
+    if (current === null) throw new Error('expected provider operation during the recovery walk');
+    expect(deleteProviderOperation(progressStore.getDb(), current)).toMatchObject({ kind: 'deleted' });
+
+    await expect(startupRecovery).resolves.toMatchObject({ kind: 'complete' });
+
+    expect(readProviderOperation(progressStore.getDb(), record.operation)).toBeNull();
+    expect(
+      progressStore
+        .readJobEvents(jobId)
+        .some((event) => event.type === 'progress' && event.message === recoveryEvidence),
+    ).toBe(true);
     await recoveryCoordinator.teardown();
   });
 
@@ -547,10 +1419,11 @@ describe('runStartupRecovery provider-operation ownership', () => {
         progressStore,
         runtime,
         runtimeState: { setLaunchFenceActive: vi.fn() },
-        eventBus: { emit: vi.fn() } as never,
+        eventBus: { on: vi.fn(), off: vi.fn(), emit: vi.fn() } as never,
         getRecoveryService,
         createInvocationContext,
         log,
+        startupOwnership: new LaunchCoordinator({ runtime }),
       },
       boundRecovery.bound,
     );
@@ -561,13 +1434,15 @@ describe('runStartupRecovery provider-operation ownership', () => {
 
     // An indeterminate current-generation row contributes no fenced job id, preserving the permissive
     // behavior that predates startup admission holds.
-    const unattributableKey = 'provider_operation_saga.v2:record:not-canonical';
+    const unattributableKey = 'provider_operation_saga.v3:record:not-canonical';
     progressStore
       .getDb()
       .prepare<[string, string]>('INSERT INTO meta (key, value) VALUES (?, ?)')
       .run(unattributableKey, JSON.stringify({ version: 1, locator: {} }));
 
-    const beforeRetirement = recoveryCoordinator.snapshotProviderOperationStartupOwnership();
+    const beforeRetirement = recoveryCoordinator.hydrateProviderOperationStartupOwnership(
+      recoveryCoordinator.snapshotProviderOperationStartupOwnership(),
+    );
     const payloadJobId = providerOperationRecord('prepare-pending').operation.jobId;
     expect([...beforeRetirement.jobIds].sort()).toEqual(
       [goneJobId, liveJobId, groupJobId, zeroTargetJobId, failedProbeJobId, unwalkableJobId, payloadJobId].sort(),
@@ -575,7 +1450,9 @@ describe('runStartupRecovery provider-operation ownership', () => {
     expect([goneKey, liveKey, groupKey, zeroTargetKey, failedProbeKey, unwalkableKey].every(rowExists)).toBe(true);
 
     recoveryCoordinator.retireAbsentSupersededProviderOperations();
-    const ownership = recoveryCoordinator.snapshotProviderOperationStartupOwnership();
+    const ownership = recoveryCoordinator.hydrateProviderOperationStartupOwnership(
+      recoveryCoordinator.snapshotProviderOperationStartupOwnership(),
+    );
 
     expect({
       fenced: [...ownership.jobIds].sort(),
@@ -660,18 +1537,22 @@ describe('runStartupRecovery provider-operation ownership', () => {
         progressStore,
         runtime,
         runtimeState: { setLaunchFenceActive: vi.fn() },
-        eventBus: { emit: vi.fn() } as never,
+        eventBus: { on: vi.fn(), off: vi.fn(), emit: vi.fn() } as never,
         getRecoveryService,
         createInvocationContext,
         log,
+        startupOwnership: new LaunchCoordinator({ runtime }),
       },
       boundRecovery.bound,
     );
 
-    const startupOwnership = recoveryCoordinator.snapshotProviderOperationStartupOwnership();
-    expect(startupOwnership).toEqual({ jobIds: [jobId] });
+    const startupOwnership = recoveryCoordinator.hydrateProviderOperationStartupOwnership(
+      recoveryCoordinator.snapshotProviderOperationStartupOwnership(),
+    );
+    expect(startupOwnership.jobIds).toEqual([jobId]);
     expect(Object.isFrozen(startupOwnership)).toBe(true);
     expect(Object.isFrozen(startupOwnership.jobIds)).toBe(true);
+    expect(Object.isFrozen(startupOwnership.records)).toBe(true);
 
     await boundRecovery.run(recoveryCoordinator);
     expect(recoverQueuedJob).toHaveBeenCalledTimes(1);
@@ -754,10 +1635,11 @@ describe('runStartupRecovery provider-operation ownership', () => {
           progressStore,
           runtime,
           runtimeState: { setLaunchFenceActive: vi.fn() },
-          eventBus: { emit: vi.fn() } as never,
+          eventBus: { on: vi.fn(), off: vi.fn(), emit: vi.fn() } as never,
           getRecoveryService,
           createInvocationContext,
           log,
+          startupOwnership: new LaunchCoordinator({ runtime }),
         },
         boundRecovery.bound,
       );
@@ -1210,7 +2092,7 @@ describe('recovery coordinator teardown', () => {
         progressStore,
         runtime,
         runtimeState,
-        eventBus: { emit: vi.fn() } as never,
+        eventBus: { on: vi.fn(), off: vi.fn(), emit: vi.fn() } as never,
         getRecoveryService: () => createFakeService(),
         createInvocationContext: (projectRoot: string): InvocationContext => ({
           projectRoot: fixtureCanonicalWorkDir(projectRoot),
@@ -1218,6 +2100,7 @@ describe('recovery coordinator teardown', () => {
           coralEnv: {},
           principal: testProjectPrincipal(projectRoot),
         }),
+        startupOwnership: new LaunchCoordinator({ runtime }),
         log: vi.fn(),
       },
       null,

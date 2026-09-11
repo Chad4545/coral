@@ -184,10 +184,6 @@ function _jobResultPath(jobId: string): string {
   return join(runtime.paths.coral.exports.jobsRoot, jobId, 'result.md');
 }
 
-function cancelQueued(jobId: string, pool?: 'default' | 'discuss' | 'curate'): boolean {
-  return launchCoordinator.cancelQueued(jobId, pool);
-}
-
 function _getActiveJobIds(pool?: 'default' | 'discuss' | 'curate'): string[] {
   return launchCoordinator.getActiveJobIds(pool);
 }
@@ -198,10 +194,6 @@ function terminateAll(): void {
 
 function _queueDepth(pool?: 'default' | 'discuss' | 'curate'): number {
   return launchCoordinator.queueDepth(pool);
-}
-
-function releaseLaunch(jobId: string, pool?: 'default' | 'discuss' | 'curate'): void {
-  launchCoordinator.releaseLaunch(jobId, pool);
 }
 
 function createService(
@@ -280,6 +272,7 @@ function createService(
     bundleHash: options.bundleHash,
     backendNamespace: options.backendNamespace ?? TEST_BACKEND_NAMESPACE,
     launchCoordinator,
+    settlementRefusalRecorder: { record: () => true },
     eventBus,
     providerRegistry,
     pluginRegistry: options.pluginRegistry ?? { discoverPluginRoot: () => null },
@@ -684,10 +677,6 @@ describe('ExecutionService launch', () => {
   afterEach(async () => {
     trackAllJobDirs();
     terminateAll();
-    for (const jobId of createdJobIds) {
-      cancelQueued(jobId);
-      releaseLaunch(jobId);
-    }
     await new Promise((resolve) => setTimeout(resolve, 0));
     for (const jobId of createdJobIds) {
       rmSync(join(JOBS_DIR, jobId), { recursive: true, force: true });
@@ -791,6 +780,32 @@ describe('ExecutionService launch', () => {
     expect(abortRegistry.has(jobId)).toBe(false);
     expect(launchCoordinator.getActiveJobIds()).not.toContain(jobId);
     expect(execute).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    {
+      label: 'enqueue sequence construction',
+      inject: (progressStore: JobStore) =>
+        vi.spyOn(progressStore, 'nextEnqueueSequence').mockImplementation(() => {
+          throw new Error('enqueue sequence unavailable');
+        }),
+      message: 'enqueue sequence unavailable',
+    },
+  ])('returns initial-launch capacity after post-acquisition $label fails', async ({ inject, message }) => {
+    const never = new Promise<ProviderTurnResult>(() => {});
+    const { provider } = makeProvider({ execute: () => never });
+    mockState.getNewProvider.mockReturnValue(provider);
+    const progressStore = createProgressStore();
+    const service = createService(ctx, { progressStore });
+    const jobId = `construction-failure-${randomUUID()}`;
+    inject(progressStore);
+
+    await expect(service.start('codex', { prompt: 'fail after admission', jobId }, ctx)).rejects.toThrow(message);
+
+    expect(launchCoordinator.reservationFor(jobId)).toBeNull();
+    expect(launchCoordinator.active).toBe(0);
+    expect(launchCoordinator.queueDepth()).toBe(0);
+    expect(progressStore.readJobEvents(jobId)).toEqual([]);
   });
 
   it('removes the workflow abort registration when its atomic launch commit fails', async () => {
@@ -2094,7 +2109,7 @@ describe('ExecutionService launch', () => {
       const captured = await service.captureProviderRecoveryAuthority(recoveredLaunch);
       if (!captured.ok) throw new Error(`Expected recovery authority: ${captured.failure.reason}`);
       const blockerJobId = randomUUID();
-      launchCoordinator.restoreActiveLaunch(
+      const blockerPermit = launchCoordinator.restoreActiveLaunch(
         blockerJobId,
         'codex',
         { kind: 'provider-session', id: `session-${blockerJobId}` },
@@ -2102,7 +2117,7 @@ describe('ExecutionService launch', () => {
       );
 
       await expect(service.recoverQueuedJob(captured.authority)).resolves.toBe(legacySlotJobId);
-      launchCoordinator.releaseLaunch(blockerJobId, 'default');
+      launchCoordinator.releaseLaunch(blockerPermit);
       await waitForTerminalEvent(service, legacySlotJobId);
 
       expect(legacySlotJobId).toHaveLength(40);
@@ -2158,7 +2173,7 @@ describe('ExecutionService launch', () => {
       const captured = await service.captureProviderRecoveryAuthority(recoveredLaunch);
       if (!captured.ok) throw new Error(`Expected recovery authority: ${captured.failure.reason}`);
       const blockerJobId = randomUUID();
-      launchCoordinator.restoreActiveLaunch(
+      const blockerPermit = launchCoordinator.restoreActiveLaunch(
         blockerJobId,
         'codex',
         { kind: 'provider-session', id: `session-${blockerJobId}` },
@@ -2166,7 +2181,7 @@ describe('ExecutionService launch', () => {
       );
 
       await expect(service.recoverQueuedJob(captured.authority)).resolves.toBe(slotShapedJobId);
-      launchCoordinator.releaseLaunch(blockerJobId, 'default');
+      launchCoordinator.releaseLaunch(blockerPermit);
       await vi.waitFor(() => expect(activate).toHaveBeenCalled());
 
       expect(activate).toHaveBeenCalledWith(expect.objectContaining({ jobId: slotShapedJobId }), expect.anything());

@@ -1,4 +1,5 @@
 import type { RecoverySubject } from './containment.js';
+import type { ProviderOperationRemedy } from './provider-operation-remedy.js';
 
 const unreadableProviderOperationSubjectBrand: unique symbol = Symbol('unreadable-provider-operation-subject');
 const PROVIDER_OPERATION_FINGERPRINT = /^sha256:[0-9a-f]{64}$/u;
@@ -13,17 +14,48 @@ export type UnreadableProviderOperationSubject = Readonly<{
   [unreadableProviderOperationSubjectBrand]: true;
 }>;
 
-/** The raw row key and exact SHA-256 revision requested for operator discard. */
 export type UnreadableProviderOperationDiscardRequest = Readonly<{
   key: string;
   revision: string;
+  allowReadable?: boolean;
 }>;
 
-/** A destructive discard verdict or an exact recovery-ownership refusal. */
+export type ProviderOperationAdoptionRemedy = ProviderOperationRemedy;
+
+export type ProviderOperationAdoptionRefusal = Readonly<{
+  recordKey: string;
+  jobId: string;
+  operationId: string;
+  proxyInstanceId: string;
+  buildSetId: string;
+  reason: string;
+  remedy: ProviderOperationAdoptionRemedy;
+}>;
+
+export type ProviderOperationStartupOwnershipReleaseDisposition =
+  | Readonly<{ kind: 'completed'; releasedLaunchPermits: number }>
+  | Readonly<{
+      kind: 'adoption-refused';
+      releasedLaunchPermits: number;
+      refusals: readonly ProviderOperationAdoptionRefusal[];
+    }>;
+
 export type UnreadableProviderOperationDiscardResult = UnreadableProviderOperationDiscardRequest &
   (
+    | Readonly<{
+        kind: 'recovery-in-progress';
+        code: 'backend_recovering';
+        message: string;
+        remedy: ProviderOperationRemedy;
+      }>
     | Readonly<{ kind: 'discarded' }>
     | Readonly<{ kind: 'absent' }>
+    | Readonly<{
+        kind: 'adoption-refused';
+        rowDisposition: 'discarded' | 'absent';
+        releasedLaunchPermits: number;
+        refusals: readonly ProviderOperationAdoptionRefusal[];
+      }>
     | Readonly<{ kind: 'revision-mismatch'; currentRevision: string }>
     | Readonly<{ kind: 'readable' }>
     | Readonly<{ kind: 'quarantine-not-found' }>

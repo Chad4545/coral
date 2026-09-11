@@ -14,11 +14,11 @@ import type { ProviderBindingFailure } from '../../../providers/contracts/bindin
 import type {
   JobAdmissionPort,
   JobLaunchRecoveryPort,
-  LaunchPool,
+  LaunchPermit,
   QueuedHandle,
 } from '../../../jobs/contracts/admission.js';
 import type { JobProgressStore, TerminalWriteOptions } from '../../../jobs/contracts/job-store.js';
-import type { SessionJobClaimReleaseResult, SessionRecoveryPort } from '../../../sessions/contracts.js';
+import type { SessionRecoveryPort } from '../../../sessions/contracts.js';
 import type { Runtime } from '../../../runtime/ports.js';
 import type { BoundProvider, BoundProviderHostPreparationInput } from '../../../providers/bound-provider-contract.js';
 import type { JobAbortRegistryPort } from '../../../jobs/contracts/abort-registry.js';
@@ -29,6 +29,7 @@ import type {
   ProviderRecoveryLaunch,
   ProviderRecoverySession,
   RecoveredAppServerInterruptResult,
+  RecoveredJobCompletionDisposition,
 } from '../../../jobs/reconcile/contracts.js';
 import { toProviderRequest } from '../../../jobs/provider-request.js';
 import type { RecoveredAppServerFinalizationReason } from '../../../jobs/reconcile/interrupted-reason.js';
@@ -70,7 +71,6 @@ export interface RecoveryServiceDeps {
   launchAdmission: Pick<JobAdmissionPort, 'releaseLaunch'>;
   launchRecovery: JobLaunchRecoveryPort;
   providerRegistry: ProviderBindingCatalog;
-  jobPools: Map<string, LaunchPool>;
   launchOrchestrator: RecoveredJobLifecyclePort;
   childPrincipalRegistry: ChildPrincipalRegistry;
   parentPrincipal: Principal;
@@ -288,7 +288,7 @@ export class RecoveryService {
       sessionManager: this.deps.sessionManager,
       abortRegistry: this.deps.abortRegistry,
       launchAdmission: this.deps.launchAdmission,
-      jobPools: this.deps.jobPools,
+      launchPermit: null,
     });
   }
 
@@ -299,17 +299,12 @@ export class RecoveryService {
 
     let queuedHandle: QueuedHandle | null = null;
     try {
-      this.deps.jobPools.set(jobId, pool);
       queuedHandle = this.deps.launchRecovery.restoreQueuedLaunch(
         jobId,
         launchRecord.provider,
         launchRecord.owner,
         pool,
       );
-      this.deps.abortRegistry.register(jobId, () => {
-        queuedHandle?.cancel();
-      });
-
       this.deps.progressStore.rebindNamespace(jobId, this.deps.backendNamespace, this.deps.bundleHash);
 
       this.deps.launchOrchestrator.runRecoveredQueuedJob(
@@ -322,7 +317,7 @@ export class RecoveryService {
 
       return jobId;
     } catch (error: unknown) {
-      this.cleanupRecoveryRegistration(jobId, pool, queuedHandle);
+      this.cleanupRecoveryRegistration(jobId, queuedHandle);
       throw error;
     }
   }
@@ -357,7 +352,7 @@ export class RecoveryService {
       sessionManager: this.deps.sessionManager,
       abortRegistry: this.deps.abortRegistry,
       launchAdmission: this.deps.launchAdmission,
-      jobPools: this.deps.jobPools,
+      launchPermit: null,
     });
   }
 
@@ -372,12 +367,12 @@ export class RecoveryService {
     if (!isDurableCliRuntime(runtimeRecord)) {
       throw new Error(`Unsupported runtime transport for adoptRunningJob(${jobId}): ${runtimeRecord.transport}`);
     }
+    let permit: LaunchPermit | null = null;
     try {
-      this.deps.jobPools.set(jobId, pool);
-      this.deps.launchRecovery.restoreActiveLaunch(jobId, launchRecord.provider, launchRecord.owner, pool);
+      permit = this.deps.launchRecovery.restoreActiveLaunch(jobId, launchRecord.provider, launchRecord.owner, pool);
       this.deps.progressStore.rebindNamespace(jobId, this.deps.backendNamespace, this.deps.bundleHash);
     } catch (error: unknown) {
-      this.cleanupRecoveryRegistration(jobId, pool);
+      this.cleanupRecoveryRegistration(jobId, null, permit);
       throw error;
     }
 
@@ -387,22 +382,37 @@ export class RecoveryService {
       cleanup: () => {
         if (cleaned) return;
         cleaned = true;
-        this.cleanupRecoveryRegistration(jobId, pool);
+        this.cleanupRecoveryRegistration(jobId, null, permit);
       },
     };
   }
 
-  private cleanupRecoveryRegistration(jobId: string, pool: LaunchPool, queuedHandle: QueuedHandle | null = null): void {
+  private cleanupRecoveryRegistration(
+    jobId: string,
+    queuedHandle: QueuedHandle | null = null,
+    permit: LaunchPermit | null = null,
+  ): void {
     try {
       if (queuedHandle !== null) {
         void queuedHandle.waitForPermit().catch(() => undefined);
-        queuedHandle.cancel();
+        const cancellation = queuedHandle.cancel();
+        if (cancellation.kind === 'admitted') this.releaseRecoveryOwnership(cancellation.permit);
       }
       this.deps.abortRegistry.remove(jobId);
-      this.deps.jobPools.delete(jobId);
-      this.deps.launchAdmission.releaseLaunch(jobId, pool);
+      if (permit !== null) this.releaseRecoveryOwnership(permit);
     } catch (error: unknown) {
+      if (error instanceof RecoveryOwnershipReleaseError) throw error;
       throw new RecoveryOwnershipReleaseError(jobId, error);
+    }
+  }
+
+  private releaseRecoveryOwnership(permit: LaunchPermit): void {
+    const release = this.deps.launchAdmission.releaseLaunch(permit);
+    if (release.kind === 'transferred') {
+      throw new RecoveryOwnershipReleaseError(
+        permit.jobId,
+        new Error(`Launch ownership transferred to ${JSON.stringify(release.holder)}.`),
+      );
     }
   }
 
@@ -411,8 +421,8 @@ export class RecoveryService {
     sessionId: string,
     result: JobTerminalInput,
     phase: JobPhase,
-    options: TerminalWriteOptions & { pool: LaunchPool },
-  ): SessionJobClaimReleaseResult {
+    options: TerminalWriteOptions & { permit: LaunchPermit },
+  ): RecoveredJobCompletionDisposition {
     const currentStatus = this.deps.progressStore.readStatus(jobId);
     if (!currentStatus || !isTerminalPhase(currentStatus.phase)) {
       this.deps.launchOrchestrator.writeJobTerminal(jobId, sessionId, result, phase, {
@@ -431,15 +441,24 @@ export class RecoveryService {
     }
     const releaseResult = this.deps.sessionManager.releaseJob(sessionId, jobId);
 
-    const pool = this.deps.jobPools.get(jobId) ?? options.pool;
     try {
       this.deps.abortRegistry.remove(jobId);
-      this.deps.jobPools.delete(jobId);
-      this.deps.launchAdmission.releaseLaunch(jobId, pool);
+      const launchRelease = this.deps.launchAdmission.releaseLaunch(options.permit);
+      switch (launchRelease.kind) {
+        case 'released':
+        case 'already-released':
+          return { kind: 'completed', sessionClaimRelease: releaseResult, launchRelease };
+        case 'transferred':
+          return {
+            kind: 'transferred',
+            sessionClaimRelease: releaseResult,
+            pool: launchRelease.pool,
+            holder: launchRelease.holder,
+          };
+      }
     } catch (error: unknown) {
       throw new RecoveryOwnershipReleaseError(jobId, error);
     }
-    return releaseResult;
   }
 
   private sessionProviderContinuity(

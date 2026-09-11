@@ -4,6 +4,7 @@ import { isRecord } from '../../../infra/json.js';
 import { isSerializedCoralSetupError, type SerializedCoralSetupError } from '../../../runtime/errors.js';
 import { providerProxySetEnforcerObservationsSchema } from '../../../provider-proxy/containment-proof-contract.js';
 import { decodeProviderProxySetAddress } from '../../../provider-proxy/set-address.js';
+import { launchPermitDiagnosticsSchema, type LaunchPermitDiagnostics } from '../../server-ports.js';
 import {
   PROVIDER_PROXY_SET_OPERATOR_DISPOSITIONS,
   PROVIDER_PROXY_SET_OPERATOR_DISPOSITION_CAUSES,
@@ -123,7 +124,7 @@ export interface BackendHealth {
   /** Redacted daemon-owned provider routing: scope name and provider names only. */
   systemProviderScope?: { name: string; providers: string[] };
   kbDaemon?: TransportKbDaemonHealthSnapshot;
-  diagnostics?: {
+  diagnostics?: LaunchPermitDiagnostics & {
     carriers?: {
       coverage: 'complete' | 'unknown';
       liveJobs: number;
@@ -209,6 +210,34 @@ function isConsumerStuck(value: unknown): value is NonNullable<BackendHealth['di
     }
     return entry.metadataSeq === undefined || Number.isFinite(entry.metadataSeq);
   });
+}
+
+function isLaunchPermits(value: unknown): value is NonNullable<BackendHealth['diagnostics']>['launchPermits'] {
+  return launchPermitDiagnosticsSchema.safeParse({ launchPermits: value }).success;
+}
+
+function isSettlementRefusalRecordingFailures(
+  value: unknown,
+): value is NonNullable<BackendHealth['diagnostics']>['settlementRefusalRecordingFailures'] {
+  return launchPermitDiagnosticsSchema.safeParse({ settlementRefusalRecordingFailures: value }).success;
+}
+
+function isLaunchReleaseDispositions(
+  value: unknown,
+): value is NonNullable<BackendHealth['diagnostics']>['launchReleaseDispositions'] {
+  return launchPermitDiagnosticsSchema.safeParse({ launchReleaseDispositions: value }).success;
+}
+
+function isProviderOperationAdoptionRefusals(
+  value: unknown,
+): value is NonNullable<BackendHealth['diagnostics']>['providerOperationAdoptionRefusals'] {
+  return launchPermitDiagnosticsSchema.safeParse({ providerOperationAdoptionRefusals: value }).success;
+}
+
+function isLaunchReclamations(
+  value: unknown,
+): value is NonNullable<BackendHealth['diagnostics']>['launchReclamations'] {
+  return launchPermitDiagnosticsSchema.safeParse({ launchReclamations: value }).success;
 }
 
 type ProviderProxySet = NonNullable<NonNullable<BackendHealth['diagnostics']>['providerProxySets']>[number];
@@ -588,6 +617,27 @@ function parseDiagnostics(value: unknown): DiagnosticsParseResult | null {
   if (value.consumerStuck !== undefined && !isConsumerStuck(value.consumerStuck)) {
     return null;
   }
+  if (value.launchPermits !== undefined && !isLaunchPermits(value.launchPermits)) {
+    return null;
+  }
+  if (
+    value.settlementRefusalRecordingFailures !== undefined &&
+    !isSettlementRefusalRecordingFailures(value.settlementRefusalRecordingFailures)
+  ) {
+    return null;
+  }
+  if (value.launchReleaseDispositions !== undefined && !isLaunchReleaseDispositions(value.launchReleaseDispositions)) {
+    return null;
+  }
+  if (
+    value.providerOperationAdoptionRefusals !== undefined &&
+    !isProviderOperationAdoptionRefusals(value.providerOperationAdoptionRefusals)
+  ) {
+    return null;
+  }
+  if (value.launchReclamations !== undefined && !isLaunchReclamations(value.launchReclamations)) {
+    return null;
+  }
   const providerProxySets =
     value.providerProxySets === undefined ? null : parseProviderProxySets(value.providerProxySets);
   if (value.providerProxySets !== undefined && providerProxySets === null) {
@@ -608,11 +658,30 @@ function parseDiagnostics(value: unknown): DiagnosticsParseResult | null {
   ) {
     return null;
   }
+  const launchPermitDiagnostics: LaunchPermitDiagnostics = {
+    ...(value.launchPermits === undefined ? {} : { launchPermits: value.launchPermits }),
+    ...(value.settlementRefusalRecordingFailures === undefined
+      ? {}
+      : { settlementRefusalRecordingFailures: value.settlementRefusalRecordingFailures }),
+    ...(value.launchReleaseDispositions === undefined
+      ? {}
+      : { launchReleaseDispositions: value.launchReleaseDispositions }),
+    ...(value.providerOperationAdoptionRefusals === undefined
+      ? {}
+      : { providerOperationAdoptionRefusals: value.providerOperationAdoptionRefusals }),
+    ...(value.launchReclamations === undefined ? {} : { launchReclamations: value.launchReclamations }),
+  };
   const diagnostics = { ...value };
   delete diagnostics.providerProxySetRowSkips;
+  delete diagnostics.launchPermits;
+  delete diagnostics.settlementRefusalRecordingFailures;
+  delete diagnostics.launchReleaseDispositions;
+  delete diagnostics.providerOperationAdoptionRefusals;
+  delete diagnostics.launchReclamations;
   return {
     diagnostics: {
       ...diagnostics,
+      ...launchPermitDiagnostics,
       ...(providerProxySets === null
         ? {}
         : {

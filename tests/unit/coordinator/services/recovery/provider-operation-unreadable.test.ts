@@ -3,12 +3,13 @@ import { randomUUID } from 'node:crypto';
 
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
-import {
-  createUnreadableProviderOperationRetryPlan,
-  quarantineUnreadableProviderOperations,
-} from '#src/coordinator/services/recovery/index.js';
+import { createUnreadableProviderOperationRetryPlan } from '#src/coordinator/services/recovery/index.js';
+import { quarantineUnreadableProviderOperations } from '#src/coordinator/services/recovery/retry-plans.js';
 import { RecoveryQuarantineStore } from '#src/recovery/quarantine.js';
-import { unreadableProviderOperationSubject } from '#src/recovery/unreadable-provider-operation.js';
+import {
+  unreadableProviderOperationSubject,
+  type ProviderOperationAdoptionRemedy,
+} from '#src/recovery/unreadable-provider-operation.js';
 import type { RecoveryQuarantinePort } from '#src/recovery/containment.js';
 import { createRecoveryQuarantineRetryService, createRecoverySourceRegistry } from '#src/recovery/source-registry.js';
 import { currentCoralStoreFormat } from '#src/store-format.js';
@@ -139,12 +140,10 @@ describe('unreadable provider operation recovery quarantine', () => {
       throw new Error('expected unreadable provider operation quarantine entry');
     }
 
-    let adoptionCalls = 0;
     const sources = createRecoverySourceRegistry();
     sources.register(UNREADABLE_PROVIDER_OPERATION_BOUNDARY, (subject) =>
       createUnreadableProviderOperationRetryPlan(db, subject, () => {
-        adoptionCalls += 1;
-        return { kind: 'refused', reason: 'an absent row cannot be adopted' };
+        throw new Error('an absent row cannot be adopted');
       }),
     );
     const retry = createRecoveryQuarantineRetryService({
@@ -161,9 +160,75 @@ describe('unreadable provider operation recovery quarantine', () => {
 
     db.prepare<[string]>('DELETE FROM meta WHERE key = ?').run(key);
     await expect(retry.clear(request)).resolves.toEqual({ ...request, disposition: 'advanced' });
-    expect(adoptionCalls).toBe(0);
     expect(quarantine.list()).toEqual([]);
   });
+
+  it.each([
+    { remedy: { kind: 'restart-coordinator' } as const },
+    { remedy: { kind: 'remote-settlement' } as const },
+    { remedy: { kind: 'recovery-quarantine-discard', command: { kind: 'list' } } as const },
+    {
+      remedy: {
+        kind: 'recovery-quarantine-discard',
+        command: {
+          kind: 'discard-provider-operation',
+          key: 'provider-operation-row',
+          revision: `fingerprint:sha256:${'a'.repeat(64)}`,
+          allowReadable: true,
+        },
+      } as const,
+    },
+    { remedy: { kind: 'recovery-quarantine-clear', command: { kind: 'list' } } as const },
+    { remedy: { kind: 'external-repair' } as const },
+  ] satisfies readonly Readonly<{ remedy: ProviderOperationAdoptionRemedy }>[])(
+    'retains $remedy.kind advice when adoption of a readable row is refused',
+    async ({ remedy }) => {
+      const repaired = providerOperationRecord('executing');
+      const key = recordKey(repaired);
+      db.prepare<[string, string]>('INSERT INTO meta (key, value) VALUES (?, ?)').run(key, 'not-json');
+      await quarantineUnreadableProviderOperations(
+        quarantine,
+        attributeUnreadableProviderOperations(db, readProviderOperations(db).unreadableKeys),
+      );
+      const entry = quarantine.list()[0];
+      if (entry === undefined || entry.subject.revision.kind !== 'fingerprint') {
+        throw new Error('expected unreadable provider operation quarantine entry');
+      }
+      db.prepare<[string, string]>('UPDATE meta SET value = ? WHERE key = ?').run(
+        encodeProviderOperationRecord(repaired),
+        key,
+      );
+
+      const sources = createRecoverySourceRegistry();
+      sources.register(UNREADABLE_PROVIDER_OPERATION_BOUNDARY, (subject) =>
+        createUnreadableProviderOperationRetryPlan(db, subject, () => ({
+          kind: 'refused',
+          reason: 'cause-specific diagnostic text',
+          remedy,
+        })),
+      );
+      const retry = createRecoveryQuarantineRetryService({
+        instanceId: 'coordinator-1',
+        ids: { uuid: () => randomUUID() },
+        quarantine,
+        sources,
+      });
+      const request = {
+        boundary: UNREADABLE_PROVIDER_OPERATION_BOUNDARY,
+        key,
+        revision: entry.subject.revision.value,
+      };
+
+      await expect(retry.clear(request)).resolves.toEqual({ ...request, disposition: 'quarantined' });
+      expect(quarantine.list()).toEqual([
+        expect.objectContaining({
+          state: 'active',
+          detail: expect.stringContaining('did not accept ownership'),
+          remedy,
+        }),
+      ]);
+    },
+  );
 
   it('reports only the unreadable keys whose quarantine status could not be materialized', async () => {
     const firstKey = recordKey(providerOperationRecord('executing'));

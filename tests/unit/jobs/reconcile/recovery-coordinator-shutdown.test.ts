@@ -535,16 +535,7 @@ function createCoordinatorShutdownHarness(options: HarnessOptions) {
       listenFn: async () => ({ port: 4105, host: '127.0.0.1' }),
     },
     async (
-      {
-        identity,
-        runtime,
-        progressStore,
-        providerRegistry,
-        getRecoveryService,
-        createInvocationContext,
-        providerOperationStartupOwnership,
-        signal,
-      },
+      { identity, runtime, progressStore, providerRegistry, getRecoveryService, createInvocationContext, signal },
       runJobsStartup,
     ) => {
       await runJobsStartup({
@@ -558,7 +549,6 @@ function createCoordinatorShutdownHarness(options: HarnessOptions) {
         signal,
         log: identity.log,
         coordinatorCommit: createTestJobJournalDeps(progressStore, runtime).coordinatorCommit,
-        providerOperationStartupOwnership,
       });
       signal.throwIfAborted();
       const recoveredDiscussResumes = await recoverPersistedDiscussFn();
@@ -849,9 +839,10 @@ describe('recovery coordinator shutdown', () => {
           {
             jobId: RUNNING_ADOPTION_JOB_ID,
             reason: 'recovery ownership was released without proof of recorded containment absence',
-            nextStep:
-              `Run coral-cli jobs detail ${RUNNING_ADOPTION_JOB_ID}; the recorded containment may still be live ` +
-              'and is no longer owned by recovery.',
+            nextStep: {
+              detail: 'The recorded containment may still be live and is no longer owned by recovery.',
+              remedy: { kind: 'jobs-detail', jobId: RUNNING_ADOPTION_JOB_ID },
+            },
           },
         ],
       });
@@ -917,7 +908,7 @@ describe('recovery coordinator shutdown', () => {
       const recoveryRegistry = harness.controller.getRecoveryRegistry();
       expect(recoveryRegistry?.has(RUNNING_ADOPTION_JOB_ID)).toBe(true);
       expect(recoveryLog).toHaveBeenCalledWith(
-        'Recovery reconciliation completed with durable containment held for repair or operator abandonment. Launch fence lifted.\n',
+        'Recovery reconciliation remains held:\ndurable containment awaiting repair or operator abandonment\nLaunch fence lifted.\n',
       );
       expect(recoveryRegistry?.abort([RUNNING_ADOPTION_JOB_ID])).toEqual({
         aborted: [],
@@ -926,9 +917,10 @@ describe('recovery coordinator shutdown', () => {
           {
             jobId: RUNNING_ADOPTION_JOB_ID,
             reason: 'recovery ownership was released without proof of recorded containment absence',
-            nextStep:
-              `Run coral-cli jobs detail ${RUNNING_ADOPTION_JOB_ID}; the recorded containment may still be live ` +
-              'and is no longer owned by recovery.',
+            nextStep: {
+              detail: 'The recorded containment may still be live and is no longer owned by recovery.',
+              remedy: { kind: 'jobs-detail', jobId: RUNNING_ADOPTION_JOB_ID },
+            },
           },
         ],
       });

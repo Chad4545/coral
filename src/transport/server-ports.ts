@@ -1,11 +1,13 @@
 import type { ProcessIncarnation } from '../infra/node-process.js';
 import type { ServerResponse } from 'node:http';
+import { z } from 'zod';
 
 import type { StrictBundleManifest } from '../infra/bundle-manifest.js';
 import type { TimePort } from '../infra/port-types.js';
 import type { JobPhase } from '../jobs/phase.js';
 import type { JobTerminal } from '../jobs/records.js';
 import type { JobCreatedEvent } from '../jobs/contracts/event-stream.js';
+import { executionOwnerSchema } from '../runtime/execution-owner.js';
 import type { RpcPorts } from './rpc/ports.js';
 import type { Principal } from '../security/principal.js';
 import type { IpcAuthMetadata } from './ipc/json-rpc.js';
@@ -96,6 +98,208 @@ type TransportKbDaemonHealthSnapshot = {
   lastError?: string;
 };
 
+const launchPermitHolderSchema = z.discriminatedUnion('kind', [
+  z.object({ kind: z.literal('local-execution') }).strict(),
+  z.object({ kind: z.literal('system-task'), id: z.string().min(1) }).strict(),
+  z.object({ kind: z.literal('proxy-operation'), operationId: z.string().min(1) }).strict(),
+  z.object({ kind: z.literal('recovery') }).strict(),
+  z
+    .object({
+      kind: z.literal('undecided-provider-operation'),
+      recordKeys: z.array(z.string().min(1)).min(1).readonly(),
+    })
+    .strict(),
+  z.object({ kind: z.literal('queue-handoff') }).strict(),
+]);
+
+const launchPoolSchema = z.enum(['default', 'discuss', 'curate']);
+const launchJobReclamationEvidenceSchema = z.discriminatedUnion('kind', [
+  z.object({ kind: z.literal('job-absent') }).strict(),
+  z.object({ kind: z.literal('job-terminal'), phase: z.enum(['completed', 'error', 'aborted']) }).strict(),
+]);
+const launchReclamationBaseShape = {
+  reservationId: z.string().min(1),
+  jobId: z.string().min(1),
+  pool: launchPoolSchema,
+  provider: z.string().min(1),
+  heldForMs: z.number().finite().nonnegative(),
+  reclaimedAtMs: z.number().finite().nonnegative(),
+};
+const launchReclamationDiagnosticSchema = z.union([
+  z
+    .object({
+      ...launchReclamationBaseShape,
+      holder: z.object({ kind: z.literal('local-execution') }).strict(),
+      evidence: launchJobReclamationEvidenceSchema,
+    })
+    .strict(),
+  z
+    .object({
+      ...launchReclamationBaseShape,
+      holder: z.object({ kind: z.literal('recovery') }).strict(),
+      evidence: launchJobReclamationEvidenceSchema,
+    })
+    .strict(),
+  z
+    .object({
+      ...launchReclamationBaseShape,
+      holder: z.object({ kind: z.literal('proxy-operation'), operationId: z.string().min(1) }).strict(),
+      evidence: z
+        .object({
+          kind: z.literal('provider-operation-absent'),
+          operationId: z.string().min(1),
+          jobEvidence: launchJobReclamationEvidenceSchema,
+        })
+        .strict(),
+    })
+    .strict()
+    .refine((diagnostic) => diagnostic.holder.operationId === diagnostic.evidence.operationId),
+  z
+    .object({
+      ...launchReclamationBaseShape,
+      holder: z
+        .object({
+          kind: z.literal('undecided-provider-operation'),
+          recordKeys: z.array(z.string().min(1)).min(1).readonly(),
+        })
+        .strict(),
+      evidence: z
+        .object({
+          kind: z.literal('provider-operation-records-absent'),
+          recordKeys: z.array(z.string().min(1)).min(1).readonly(),
+          jobEvidence: launchJobReclamationEvidenceSchema,
+        })
+        .strict(),
+    })
+    .strict()
+    .refine(
+      (diagnostic) =>
+        new Set(diagnostic.holder.recordKeys).size === new Set(diagnostic.evidence.recordKeys).size &&
+        diagnostic.holder.recordKeys.every((key) => diagnostic.evidence.recordKeys.includes(key)),
+    ),
+]);
+
+export const launchPermitDiagnosticsSchema = z
+  .object({
+    launchPermits: z
+      .array(
+        z
+          .object({
+            reservationId: z.string().min(1),
+            jobId: z.string().min(1),
+            pool: launchPoolSchema,
+            provider: z.string().min(1),
+            holder: launchPermitHolderSchema,
+            executionOwner: executionOwnerSchema,
+            heldForMs: z.number().finite().nonnegative(),
+          })
+          .strict(),
+      )
+      .optional(),
+    settlementRefusalRecordingFailures: z
+      .array(
+        z.union([
+          z
+            .object({
+              jobId: z.string().min(1),
+              cause: z.enum(['terminal-persist-failed', 'claim-release-failed', 'claim-already-reassigned']),
+              error: z.string().min(1),
+              observedAtMs: z.number().finite().nonnegative(),
+            })
+            .strict(),
+          z
+            .object({
+              jobId: z.string().min(1),
+              operationId: z.string().min(1),
+              cause: z.literal('settled-unbound-status-persist-failed'),
+              error: z.string().min(1),
+              observedAtMs: z.number().finite().nonnegative(),
+            })
+            .strict(),
+        ]),
+      )
+      .optional(),
+    launchReleaseDispositions: z
+      .array(
+        z
+          .object({
+            reservationId: z.string().min(1),
+            jobId: z.string().min(1),
+            pool: launchPoolSchema,
+            provider: z.string().min(1),
+            attemptedHolder: launchPermitHolderSchema,
+            disposition: z.discriminatedUnion('kind', [
+              z.object({ kind: z.literal('already-released'), pool: launchPoolSchema }).strict(),
+              z
+                .object({ kind: z.literal('transferred'), pool: launchPoolSchema, holder: launchPermitHolderSchema })
+                .strict(),
+            ]),
+            observedAtMs: z.number().finite().nonnegative(),
+          })
+          .strict(),
+      )
+      .optional(),
+    providerOperationAdoptionRefusals: z
+      .array(
+        z
+          .object({
+            triggerRecordKey: z.string().min(1),
+            rowDisposition: z.enum(['discarded', 'absent']),
+            releasedLaunchPermits: z.number().int().nonnegative(),
+            recordKey: z.string().min(1),
+            jobId: z.string().min(1),
+            operationId: z.string().min(1),
+            proxyInstanceId: z.string().min(1),
+            buildSetId: z.string().min(1),
+            reason: z.string().min(1),
+            remedy: z.discriminatedUnion('kind', [
+              z.object({ kind: z.literal('restart-coordinator') }).strict(),
+              z.object({ kind: z.literal('remote-settlement') }).strict(),
+              z
+                .object({
+                  kind: z.literal('recovery-quarantine-discard'),
+                  command: z.union([
+                    z.object({ kind: z.literal('list') }).strict(),
+                    z
+                      .object({
+                        kind: z.literal('discard-provider-operation'),
+                        key: z.string().min(1),
+                        revision: z.string().min(1),
+                        allowReadable: z.boolean(),
+                      })
+                      .strict(),
+                  ]),
+                })
+                .strict(),
+              z
+                .object({
+                  kind: z.literal('recovery-quarantine-clear'),
+                  command: z.union([
+                    z.object({ kind: z.literal('list') }).strict(),
+                    z
+                      .object({
+                        kind: z.literal('clear'),
+                        boundary: z.string().min(1),
+                        key: z.string().min(1),
+                        revision: z.string().min(1),
+                      })
+                      .strict(),
+                  ]),
+                })
+                .strict(),
+              z.object({ kind: z.literal('external-repair') }).strict(),
+            ]),
+            observedAtMs: z.number().finite().nonnegative(),
+          })
+          .strict(),
+      )
+      .optional(),
+    launchReclamations: z.array(launchReclamationDiagnosticSchema).optional(),
+  })
+  .strict();
+
+export type LaunchPermitDiagnostics = z.infer<typeof launchPermitDiagnosticsSchema>;
+
 export type HealthSnapshot = {
   /**
    * Coarse lifecycle visibility surface for clients that validate the strict
@@ -160,7 +364,7 @@ export type HealthSnapshot = {
    * Carrier coverage is observational even when complete. Incident-only fields remain omitted when healthy
    * so operators can still grep for blocked writers and stuck consumers.
    */
-  diagnostics?: {
+  diagnostics?: LaunchPermitDiagnostics & {
     carriers?: {
       coverage: 'complete' | 'unknown';
       liveJobs: number;

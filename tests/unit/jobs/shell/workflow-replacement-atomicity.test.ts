@@ -113,7 +113,6 @@ describe('workflow replacement launch atomicity', () => {
       getSignal: vi.fn(() => undefined),
       remove: vi.fn((jobId: string) => registeredJobs.delete(jobId)),
     };
-    const jobPools = new Map();
     const providerRegistry = new ProviderRegistry();
     const provider = defineProvider({
       name: 'codex',
@@ -133,13 +132,14 @@ describe('workflow replacement launch atomicity', () => {
       progressStore,
       sessionManager,
       launchAdmission,
+      providerOperationBinding: launchAdmission,
       durableSpawner: {} as never,
       providerRegistry,
       runtime,
       coordinatorCommit,
       backendNamespace: 'test-ns',
       bundleHash: 'test-bundle',
-      jobPools,
+      settlementRefusalRecorder: { record: () => true },
       terminalMaterializer: { recordProviderTerminal: vi.fn() },
     });
     const request: ProviderRequest = {
@@ -160,6 +160,16 @@ describe('workflow replacement launch atomicity', () => {
       mintProtectedEnv: () => ({}),
     };
 
+    const metadataFailure = vi.spyOn(progressStore, 'readLaunchProjection').mockImplementationOnce(() => {
+      throw new Error('metadata projection unavailable');
+    });
+    expect(() => orchestrator.launchWorkflowReplacement(boundProvider, pending, request, replacementOptions)).toThrow(
+      'metadata projection unavailable',
+    );
+    expect(launchAdmission.active).toBe(0);
+    expect(db.prepare('SELECT COUNT(*) AS count FROM events').get()).toEqual({ count: eventCountBefore });
+    metadataFailure.mockRestore();
+
     db.exec(`CREATE TRIGGER fail_replacement_admission
       BEFORE INSERT ON events
       WHEN NEW.type = 'job.queue.admitted'
@@ -176,7 +186,6 @@ describe('workflow replacement launch atomicity', () => {
         count: 0,
       });
       expect(launchAdmission.getActiveJobIds()).toEqual([]);
-      expect(jobPools.size).toBe(0);
       expect(registeredJobs.size).toBe(0);
       const rolledBack = sessionManager.get('codex', session.sessionId);
       expect(rolledBack).toMatchObject({

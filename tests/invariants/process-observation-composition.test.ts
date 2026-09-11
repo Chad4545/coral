@@ -249,13 +249,6 @@ const COMPOSITION_DEBTS = new Map<string, CompositionDebt>([
     ),
   ],
   [
-    'src/coordinator/services/recovery/index.ts#createRecoveryCoordinator.retireAbsentSupersededProviderOperations.every',
-    debt(
-      'the superseded-row predicate maps alive and unknown to false while requiring proven absence for retirement',
-      'retireAbsentSupersededProviderOperations classifies the aggregate observation before retirement',
-    ),
-  ],
-  [
     'src/coordinator/services/recovery/interrupted-performer.ts#reapProviderOperationCarrier',
     debt(
       'carrier recovery reports every non-absence reap disposition by throwing from Promise<void>',
@@ -456,13 +449,6 @@ const COMPOSITION_DEBTS = new Map<string, CompositionDebt>([
     debt(
       'probe cleanup retains settlement in the process-incarnation probe registry while its terminator port returns void',
       'ProcessIncarnationProbeTerminator returns the graceful-kill disposition',
-    ),
-  ],
-  [
-    'src/coordinator/live/durable-transport.ts#spawnDurableJobTransport.schedulePendingWrapperTermination',
-    debt(
-      'pending wrapper settlement retains termination ownership while the AbortSignal callback returns void',
-      'schedulePendingWrapperTermination returns the disposition beside DurablePendingLaunchObligation.settled',
     ),
   ],
   [

@@ -4,7 +4,7 @@ import type {
   ProviderSessionLaunchDecision,
   WorkflowLaunchDecision,
 } from '../jobs/launch.js';
-import type { LaunchCoordinatorPort } from '../jobs/contracts/admission.js';
+import type { LaunchCoordinatorPort, SettlementRefusalRecorder } from '../jobs/contracts/admission.js';
 import type { ProviderDurableSpawner } from '../providers/cli-runner.js';
 import type { JobProgressStore } from '../jobs/contracts/job-store.js';
 import type { JobProjectionDetail } from '../jobs/read-queries.js';
@@ -24,7 +24,11 @@ import type { CanonicalWorkDir } from '../runtime/canonical-work-dir.js';
 import type { TypedEventBus } from './event-bus.js';
 import type { ChildPrincipalRegistry } from './child-principal-registry.js';
 import type { AppServerProxyRoute } from '../jobs/contracts/app-server-proxy-route.js';
-import type { ProviderOperationCleanupRegistrar } from '../jobs/contracts/provider-operation-lifecycle.js';
+import type {
+  ProviderOperationBindingPort,
+  ProviderOperationCleanupRegistrar,
+  SettledUnboundStatusHydrationPort,
+} from '../jobs/contracts/provider-operation-lifecycle.js';
 
 interface CoordinatorSessionOps {
   start(providerName: string, input: JobLaunchRequest, ctx: InvocationContext): Promise<ProviderSessionLaunchDecision>;
@@ -55,7 +59,10 @@ export interface ListResult {
   sessions: ProviderSession[];
 }
 
-type CoordinatorLaunchCoordinator = LaunchCoordinatorPort & ProviderDurableSpawner;
+type CoordinatorLaunchCoordinator = LaunchCoordinatorPort &
+  ProviderOperationBindingPort &
+  SettledUnboundStatusHydrationPort &
+  ProviderDurableSpawner;
 
 export type ExecutionServiceDeps = {
   runtime: Runtime;
@@ -63,6 +70,7 @@ export type ExecutionServiceDeps = {
   bundleHash?: string;
   backendNamespace: string;
   launchCoordinator: CoordinatorLaunchCoordinator;
+  settlementRefusalRecorder: SettlementRefusalRecorder;
   eventBus: TypedEventBus;
   providerRegistry: ProviderBindingCatalog;
   childPrincipalRegistry: ChildPrincipalRegistry;

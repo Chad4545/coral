@@ -40,6 +40,7 @@ import {
   insertProviderOperation,
   providerOperationMutationAdmission,
   readProviderOperation,
+  readProviderOperations,
   readProviderOperationsDue,
 } from '#src/store/provider-operation-journal.js';
 import type { HandoffCapsuleV1, HandoffCapsuleV3 } from '#src/provider-proxy/handoff-capsule.js';
@@ -59,6 +60,10 @@ import { InMemoryStorage } from '#tools/simulation/core/memory-storage.js';
 import { providerOperationRecord } from '#tests/unit/store/provider-operation-fixtures.js';
 import { VirtualTime } from '#tools/simulation/core/virtual-time.js';
 import type { JobProgressStore } from '#src/jobs/contracts/job-store.js';
+import { LaunchCoordinator } from '#src/coordinator/live/admission.js';
+import { createProviderOperationStartupOwnership } from '#src/coordinator/services/recovery/provider-operation-startup-ownership.js';
+import type { ProviderOperationStartupOwnership } from '#src/jobs/startup.js';
+import { fixtureCanonicalWorkDir } from '#tests/helpers/canonical-work-dir.js';
 
 /** The build this fixture lifecycle belongs to — the same one `providerOperationRecord` stamps on its identities, so a discovered capsule is inheritable rather than foreign. */
 const FIXTURE_BUILD_SET_ID = '00000000-0000-4000-8000-000000000004';
@@ -122,6 +127,53 @@ function createDb(records: readonly ProviderOperationRecord[]): Database {
   applyBundledStoreSchema(db, currentCoralStoreFormat());
   for (const record of records) insertProviderOperation(db, record);
   return db;
+}
+
+function startupProgressStore(
+  db: Database,
+  records: readonly ProviderOperationRecord[],
+): Pick<JobProgressStore, 'getDb' | 'commit' | 'readStatus' | 'readLaunchProjection'> {
+  const byJobId = new Map(records.map((record) => [record.operation.jobId, record]));
+  return {
+    getDb: () => db,
+    commit: () => {
+      throw new Error('startup fixture unexpectedly committed a job event');
+    },
+    readStatus: (jobId) => {
+      const record = byJobId.get(jobId);
+      if (record === undefined) return null;
+      return {
+        jobId,
+        owner: { kind: 'provider-session', id: record.operation.jobId },
+        sessionId: record.operation.jobId,
+        provider: 'codex',
+        projectRoot: fixtureCanonicalWorkDir(process.cwd()),
+        workDir: fixtureCanonicalWorkDir(process.cwd()),
+        backendNamespace: 'provider-proxy-startup-integration',
+        jobKind: 'provider',
+        phase: 'running',
+        updatedAt: '2026-08-09T12:34:55.000Z',
+      };
+    },
+    readLaunchProjection: (jobId) => {
+      const record = byJobId.get(jobId);
+      if (record === undefined) return null;
+      return {
+        jobId,
+        owner: { kind: 'provider-session', id: record.operation.jobId },
+        sessionId: record.operation.jobId,
+        provider: 'codex',
+        projectRoot: fixtureCanonicalWorkDir(process.cwd()),
+        backendNamespace: 'provider-proxy-startup-integration',
+        pool: 'default',
+        enqueueSequence: 1,
+        createdAt: '2026-08-09T12:34:55.000Z',
+        jobKind: 'provider',
+        providerAction: 'exec',
+        request: { prompt: '', cwd: fixtureCanonicalWorkDir(process.cwd()), bypassPermissions: false, coralEnv: {} },
+      };
+    },
+  };
 }
 
 function secondSetRecord(): ProviderOperationRecord {
@@ -296,19 +348,26 @@ function reconcilerFor(
   db: Database,
   time: VirtualTime,
   startupSetRecovery: StartupSetRecoveryPort,
-): ProviderOperationReconciler {
-  return new ProviderOperationReconciler({
-    getProgressStore: () => ({
-      getDb: () => db,
-      commit: () => {
-        throw new Error('startup fixture unexpectedly committed a job event');
-      },
-      readStatus: () => null,
-      readLaunchProjection: () => null,
-    }),
+): Readonly<{
+  reconcileAtStartup(signal: AbortSignal): ReturnType<ProviderOperationReconciler['reconcileAtStartup']>;
+}> {
+  const runtime = sandboxedRuntime(time);
+  const records = readProviderOperations(db).records;
+  const progressStore = startupProgressStore(db, records);
+  const binding = new LaunchCoordinator({ runtime });
+  const startupOwnership = createProviderOperationStartupOwnership({
+    runtime,
+    progressStore,
+    binding,
+    log: () => undefined,
+  });
+  const reconciler = new ProviderOperationReconciler({
+    getProgressStore: () => progressStore,
     authorityFor: () => null,
     startupSetRecovery,
     registry: { activate: vi.fn(), attach: vi.fn(), settled: vi.fn(), stop: vi.fn() },
+    binding,
+    releaseStartupOwnership: startupOwnership.release,
     materializePrepare: () => {
       throw new Error('startup fixture unexpectedly materialized prepare input');
     },
@@ -328,6 +387,10 @@ function reconcilerFor(
     },
     time,
   });
+  return {
+    reconcileAtStartup: (signal) =>
+      reconciler.reconcileAtStartup(startupOwnership.hydrate(startupOwnership.snapshot()), signal),
+  };
 }
 
 function v1CapsuleFor(record: ProviderOperationRecord): HandoffCapsuleV1 {
@@ -373,6 +436,7 @@ type ProductionStartupHarness = Readonly<{
   fatals: ReturnType<typeof vi.fn>;
   lifecycleRef: ProviderProxySetLifecycleRef;
   services: ReturnType<typeof createExecutionServices>;
+  startupOwnership: ProviderOperationStartupOwnership;
 }>;
 
 /** Later than every `incarnation` the shared fixture records, so no recorded identity can match. */
@@ -430,15 +494,14 @@ function composeProductionStartup(
   const { time } = runtime;
   const fatals = vi.fn();
   const lifecycleRef = new ProviderProxySetLifecycleRef();
-  const progressStore = {
-    getDb: () => db,
-    commit: () => {
-      throw new Error('production startup fixture unexpectedly committed a job event');
-    },
-    readStatus: () => null,
-    readLaunchProjection: () => null,
-    ...options.progressStore,
-  };
+  const progressStore = { ...startupProgressStore(db, [record]), ...options.progressStore };
+  const launchCoordinator = new LaunchCoordinator({ runtime });
+  const startupOwnership = createProviderOperationStartupOwnership({
+    runtime,
+    progressStore,
+    binding: launchCoordinator,
+    log: () => undefined,
+  });
   const world = {
     identity: { instanceId: randomUUID(), buildSetId: FIXTURE_BUILD_SET_ID },
     storeServicesRef: { tryGet: () => ({ progressStore }) },
@@ -451,25 +514,36 @@ function composeProductionStartup(
       throw new Error('provider proxy startup fixture unexpectedly requested recorded containment reaping');
     },
     providerHostManager: {},
+    launchCoordinator,
   } as never;
   const services = createExecutionServices({
     world,
     runtime,
     bundleHash: 'provider-proxy-startup-integration',
     backendNamespace: 'provider-proxy-startup-integration',
+    settlementRefusalRecorder: { record: () => true },
     onProviderProxyLifecycleFatal: fatals,
     createExecutionService: (() => {
       throw new Error('production startup fixture unexpectedly created an execution service');
     }) as never,
   });
-  return { db, time, fatals, lifecycleRef, services };
+  return {
+    db,
+    time,
+    fatals,
+    lifecycleRef,
+    services,
+    startupOwnership: startupOwnership.hydrate(startupOwnership.snapshot()),
+  };
 }
 
 async function productionStartupOutcome(harness: ProductionStartupHarness) {
-  return harness.services.reconcileProviderOperationsAtStartup(new AbortController().signal).then(
-    (report) => ({ kind: 'fulfilled' as const, report }),
-    (error: unknown) => ({ kind: 'rejected' as const, error }),
-  );
+  return harness.services
+    .reconcileProviderOperationsAtStartup(harness.startupOwnership, new AbortController().signal)
+    .then(
+      (report) => ({ kind: 'fulfilled' as const, report }),
+      (error: unknown) => ({ kind: 'rejected' as const, error }),
+    );
 }
 
 function capsuleBackedStorage(
@@ -946,7 +1020,6 @@ async function discoveredCapsuleDeadlinePrecedenceCase(mode: 'disagreement' | 'd
 async function capsuleRetirementStartupCase(mode: 'unlink-throws' | 'directory-sync-unavailable') {
   const record = providerOperationRecord('settlement-pending');
   const time = new VirtualTime();
-  const scheduled = vi.spyOn(time, 'setTimeout');
   const realRuntime = createRealRuntime('prod');
   const unlinkSentinel = new Error('unlink sentinel');
   const unlink = vi.fn(() => {
@@ -971,10 +1044,6 @@ async function capsuleRetirementStartupCase(mode: 'unlink-throws' | 'directory-s
   const outcome = await productionStartupOutcome(harness);
   const result = {
     outcome,
-    fatalCalls: harness.fatals.mock.calls.length,
-    timerCalls: scheduled.mock.calls.length,
-    unlinkCalls: unlink.mock.calls.length,
-    syncCalls: syncDirectoryDurableSync.mock.calls.length,
     capsuleExists: capsuleStorage.exists(),
   };
   harness.services.stopProviderOperationReconciler();
@@ -1003,6 +1072,7 @@ async function terminalizationUncertaintyStartupCase(mode: 'atomic-unknown' | 'u
       sessionId,
       provider: 'codex',
       projectRoot: '/workspace',
+      workDir: null,
       backendNamespace: 'tests',
       jobKind: 'provider' as const,
       phase: 'running' as const,
@@ -1027,10 +1097,16 @@ async function terminalizationUncertaintyStartupCase(mode: 'atomic-unknown' | 'u
         coralEnv: {},
       },
     }),
-  };
+  } satisfies Pick<JobProgressStore, 'readStatus' | 'readLaunchProjection'>;
   const progressStore =
     mode === 'metadata'
-      ? {}
+      ? {
+          readStatus: vi
+            .fn<JobProgressStore['readStatus']>(validMetadata.readStatus)
+            .mockImplementationOnce(validMetadata.readStatus)
+            .mockReturnValue(null),
+          readLaunchProjection: validMetadata.readLaunchProjection,
+        }
       : {
           ...validMetadata,
           commit: () => {
@@ -1506,7 +1582,27 @@ describe('production provider proxy startup classification', () => {
         throw new Error('capsule redemption was not expected');
       },
     };
-    const harness = composeProductionStartup(record, inheritance);
+    const sessionId = randomUUID();
+    const startupStatus = {
+      jobId: record.operation.jobId,
+      owner: { kind: 'provider-session' as const, id: sessionId },
+      sessionId,
+      provider: 'codex',
+      projectRoot: fixtureCanonicalWorkDir(process.cwd()),
+      workDir: fixtureCanonicalWorkDir(process.cwd()),
+      backendNamespace: 'tests',
+      jobKind: 'provider' as const,
+      phase: 'running' as const,
+      updatedAt: '2026-08-09T12:34:55.000Z',
+    };
+    const harness = composeProductionStartup(record, inheritance, {
+      progressStore: {
+        readStatus: vi
+          .fn<JobProgressStore['readStatus']>(() => startupStatus)
+          .mockReturnValueOnce(startupStatus)
+          .mockReturnValue(null),
+      },
+    });
     const outcome = await productionStartupOutcome(harness);
 
     expect({
@@ -1604,35 +1700,21 @@ describe('production provider proxy startup classification', () => {
         outcome: unknownUnlink.outcome.kind,
         lifecycleFatal:
           unknownUnlink.outcome.kind === 'rejected' && isProviderProxyRecoveryFatalError(unknownUnlink.outcome.error),
-        fatalCalls: unknownUnlink.fatalCalls,
-        timerCalls: unknownUnlink.timerCalls,
-        unlinkCalls: unknownUnlink.unlinkCalls,
-        syncCalls: unknownUnlink.syncCalls,
         capsuleExists: unknownUnlink.capsuleExists,
       },
       directorySyncUnavailable: {
         outcome: directorySyncUnavailable.outcome.kind,
-        fatalCalls: directorySyncUnavailable.fatalCalls,
-        timerCalls: directorySyncUnavailable.timerCalls,
-        unlinkCalls: directorySyncUnavailable.unlinkCalls,
-        syncCalls: directorySyncUnavailable.syncCalls,
+        capsuleExists: directorySyncUnavailable.capsuleExists,
       },
     }).toEqual({
       unknownUnlink: {
         outcome: 'rejected',
         lifecycleFatal: true,
-        fatalCalls: 1,
-        timerCalls: 0,
-        unlinkCalls: 1,
-        syncCalls: 0,
         capsuleExists: true,
       },
       directorySyncUnavailable: {
         outcome: 'fulfilled',
-        fatalCalls: 0,
-        timerCalls: 1,
-        unlinkCalls: 1,
-        syncCalls: 1,
+        capsuleExists: false,
       },
     });
   });

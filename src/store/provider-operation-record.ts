@@ -24,7 +24,17 @@ const receiptSchema = z.string().min(1).max(4096);
 const directiveReasonSchema = z.string().min(1).max(4096);
 const directiveCodeSchema = z.string().min(1).max(128);
 const providerAbortCauseSchema = z.enum(['signal_abort', 'user_abort', 'queue_shutdown']);
-const providerStopCauseSchema = z.enum(['restart', 'handoff', 'signal_abort', 'user_abort', 'queue_shutdown']);
+// A durable enum is pinned, never derived from the wire vocabulary it mirrors: `operation.stop.v1` may
+// gain a cause at any time, and a record written under an earlier generation must keep validating
+// against the exact set its generation shipped with.
+const providerStopCauseSchema = z.enum([
+  'restart',
+  'handoff',
+  'signal_abort',
+  'user_abort',
+  'queue_shutdown',
+  'coordinator_rekey_refused',
+]);
 const MAX_PROVIDER_OPERATION_RECORD_BYTES = 64 * 1024;
 const MAX_PRINCIPAL_WIRE_BYTES = 64 * 1024;
 
@@ -196,6 +206,14 @@ export const providerOperationNeverStartedDirectiveSchema = z.discriminatedUnion
 export const providerOperationControlIntentSchema = z.discriminatedUnion('kind', [
   z.object({ kind: z.literal('run') }).strict(),
   z.object({ kind: z.literal('stop'), cause: providerStopCauseSchema, requestedAt: z.string().datetime() }).strict(),
+  z
+    .object({
+      kind: z.literal('rekey-refusal-containment'),
+      cause: z.literal('coordinator_rekey_refused'),
+      reason: directiveReasonSchema,
+      requestedAt: z.string().datetime(),
+    })
+    .strict(),
 ]);
 
 const lastErrorSchema = z
@@ -227,8 +245,8 @@ const lastErrorSchema = z
  * generation neither decoded nor fenced.
  */
 export const PROVIDER_OPERATION_RECORD_GENERATIONS = {
-  retainedSuperseded: [1],
-  current: 2,
+  retainedSuperseded: [1, 2],
+  current: 3,
 } as const;
 
 export const PROVIDER_OPERATION_RECORD_VERSION = PROVIDER_OPERATION_RECORD_GENERATIONS.current;
@@ -329,6 +347,7 @@ const settlementPendingSchema = z
     ...commonFields,
     ...executingFields,
     phase: z.literal('settlement-pending'),
+    controlIntent: providerOperationControlIntentSchema,
     terminalProviderSeq: nonNegativeSafeIntegerSchema,
     settlementIntent: z.literal('release-after-terminal'),
   })

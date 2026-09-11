@@ -50,6 +50,7 @@ import { providerOperationRecordSchema } from '#src/store/provider-operation-rec
 import { newRawDatabase } from '#tests/helpers/test-db.js';
 import { createTestProviderProxyRecoveryDispatcher } from '#tests/helpers/provider-proxy-recovery-dispatcher.js';
 import { ProviderOperationReconciler } from '#src/coordinator/services/provider-operation-reconciler.js';
+import { LaunchCoordinator } from '#src/coordinator/live/admission.js';
 import { createAppServerProxyRoute } from '#src/coordinator/services/provider-proxy-launch-route.js';
 import { LocalOperationRegistry } from '#src/coordinator/services/operation-registry.js';
 import { createProviderProxyAuthorityFaultLatch } from '#src/coordinator/services/provider-proxy-authority-fault.js';
@@ -640,6 +641,16 @@ async function launchThroughRoute(
     }
   };
   const time = createRealTimePort();
+  const binding = new LaunchCoordinator({ runtime: createRealRuntime('prod') });
+  const admission = binding.requestLaunch(
+    jobId,
+    PREPARED.provider,
+    { kind: 'provider-session', id: sessionId },
+    'default',
+  );
+  if (admission === 'queue_full' || admission.type !== 'immediate') throw new Error('expected immediate permit');
+  const preparedBinding = binding.prepareProviderOperationBinding(admission.permit, { jobId, operationId });
+  if (preparedBinding.kind !== 'prepared') throw new Error('expected prepared operation binding');
   const reconciler = new ProviderOperationReconciler({
     getProgressStore: () => ({
       getDb: () => db,
@@ -674,6 +685,8 @@ async function launchThroughRoute(
     authorityFor: () => activeAuthority,
     startupSetRecovery: { recoverSetAtStartup: async () => ({ kind: 'authority', authority: activeAuthority }) },
     registry,
+    binding,
+    releaseStartupOwnership: () => ({ kind: 'not-owned' }),
     materializePrepare: () => ({ state: 'prepared', prepared: PREPARED }),
     recoverLocalJob: async () => undefined,
     completeLocalRecovery: () => undefined,
@@ -965,9 +978,8 @@ describe('provider-proxy operation lifecycle', () => {
     set.advanceSilently(5_001);
     const executing = readProviderOperation(launched.db, operation);
     if (executing?.phase !== 'executing') throw new Error('expected executing journal row');
-    const { controlIntent: _controlIntent, ...settlementRecord } = executing;
     const settlement = providerOperationRecordSchema.parse({
-      ...settlementRecord,
+      ...executing,
       phase: 'settlement-pending',
       committedThroughProviderSeq: 0,
       terminalProviderSeq: 0,
@@ -1272,6 +1284,7 @@ describe('provider-proxy operation lifecycle', () => {
     ['user_abort', 'terminal-awaiting-journal-ack'],
     ['signal_abort', 'terminal-awaiting-journal-ack'],
     ['queue_shutdown', 'terminal-awaiting-journal-ack'],
+    ['coordinator_rekey_refused', 'terminal-awaiting-journal-ack'],
   ])('stops on %s into %s, awaiting the coordinator’s durable decision', async (cause, expected) => {
     const set = await startProxy();
     const { operation, reserved } = await prepare(set);

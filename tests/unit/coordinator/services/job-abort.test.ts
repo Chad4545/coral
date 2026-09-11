@@ -15,12 +15,6 @@ describe('JobAbortService', () => {
         has: () => true,
         abort,
       } as never,
-      progressStore: {
-        readStatus: () => ({ phase: 'running' }),
-      } as never,
-      launchAdmission: { cancelQueued: () => false } as never,
-      jobPools: new Map(),
-      launchOrchestrator: {} as never,
     });
 
     expect(service.abort([refusal.jobId])).toEqual({

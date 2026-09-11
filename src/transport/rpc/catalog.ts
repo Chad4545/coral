@@ -110,17 +110,87 @@ export const recoveryQuarantineClearResultSchema = recoveryQuarantineClearReques
   })
   .strict();
 
+const providerOperationDiscardKeySchema = z
+  .string()
+  .min(1, 'Provider operation key is required')
+  .refine((key) => !key.includes('\u0000'), 'Provider operation key must not carry a subject tag');
+
 export const unreadableProviderOperationDiscardRequestSchema = z
   .object({
-    key: z.string().min(1, 'Provider operation key is required'),
+    key: providerOperationDiscardKeySchema,
     revision: z.string().regex(/^sha256:[0-9a-f]{64}$/u, 'Provider operation revision must be a SHA-256 fingerprint'),
+    allowReadable: z.boolean().optional(),
   })
   .strict() satisfies ZodType<UnreadableProviderOperationDiscardRequest>;
 
+const providerOperationAdoptionRefusalSchema = z
+  .object({
+    recordKey: providerOperationDiscardKeySchema,
+    jobId: z.string().min(1),
+    operationId: z.string().min(1),
+    proxyInstanceId: z.string().min(1),
+    buildSetId: z.string().min(1),
+    reason: z.string().min(1),
+    remedy: z.discriminatedUnion('kind', [
+      z.object({ kind: z.literal('restart-coordinator') }).strict(),
+      z.object({ kind: z.literal('remote-settlement') }).strict(),
+      z
+        .object({
+          kind: z.literal('recovery-quarantine-discard'),
+          command: z.union([
+            z.object({ kind: z.literal('list') }).strict(),
+            z
+              .object({
+                kind: z.literal('discard-provider-operation'),
+                key: providerOperationDiscardKeySchema,
+                revision: z.string().min(1),
+                allowReadable: z.boolean(),
+              })
+              .strict(),
+          ]),
+        })
+        .strict(),
+      z
+        .object({
+          kind: z.literal('recovery-quarantine-clear'),
+          command: z.union([
+            z.object({ kind: z.literal('list') }).strict(),
+            z
+              .object({
+                kind: z.literal('clear'),
+                boundary: z.string().min(1),
+                key: z.string().min(1),
+                revision: z.string().min(1),
+              })
+              .strict(),
+          ]),
+        })
+        .strict(),
+      z.object({ kind: z.literal('external-repair') }).strict(),
+    ]),
+  })
+  .strict();
+
 export const unreadableProviderOperationDiscardResultSchema: ZodType<UnreadableProviderOperationDiscardResult> =
   z.discriminatedUnion('kind', [
+    unreadableProviderOperationDiscardRequestSchema
+      .extend({
+        kind: z.literal('recovery-in-progress'),
+        code: z.literal('backend_recovering'),
+        message: z.string().min(1),
+        remedy: providerOperationAdoptionRefusalSchema.shape.remedy,
+      })
+      .strict(),
     unreadableProviderOperationDiscardRequestSchema.extend({ kind: z.literal('discarded') }).strict(),
     unreadableProviderOperationDiscardRequestSchema.extend({ kind: z.literal('absent') }).strict(),
+    unreadableProviderOperationDiscardRequestSchema
+      .extend({
+        kind: z.literal('adoption-refused'),
+        rowDisposition: z.enum(['discarded', 'absent']),
+        releasedLaunchPermits: z.number().int().nonnegative(),
+        refusals: z.array(providerOperationAdoptionRefusalSchema).min(1).readonly(),
+      })
+      .strict(),
     unreadableProviderOperationDiscardRequestSchema
       .extend({ kind: z.literal('revision-mismatch'), currentRevision: z.string().regex(/^sha256:[0-9a-f]{64}$/u) })
       .strict(),

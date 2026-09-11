@@ -23,7 +23,11 @@ const RULES: FaultAuthorityRule[] = [
   },
   {
     builder: 'providerRequestFailed',
-    allowed: new Set(['src/providers/claude/provider.ts', 'src/providers/claude/session-kernel.ts']),
+    allowed: new Set([
+      'src/providers/claude/provider.ts',
+      'src/providers/claude/session-kernel.ts',
+      'src/providers/proxy-failure.ts',
+    ]),
   },
 ];
 

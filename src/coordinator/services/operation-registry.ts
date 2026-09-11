@@ -6,6 +6,7 @@ import type { ProviderOperationEventIdentity } from '../../jobs/provider-event.j
 import type { ProviderStopCause } from '../../providers/contract.js';
 import type { ProviderOperationRecord } from '../../store/provider-operation-record.js';
 import type {
+  ProviderOperationBindingPort,
   ProviderOperationCleanupIdentity,
   ProviderOperationCleanupPort,
 } from '../../jobs/contracts/provider-operation-lifecycle.js';
@@ -47,15 +48,16 @@ function registryKey(jobId: string, operationId: string): string {
 export class LocalOperationRegistry {
   private readonly entries = new Map<string, RegistryEntry>();
   private cleanupPort: ProviderOperationCleanupPort = { release: () => undefined };
+  private bindingPort: ProviderOperationBindingPort | null = null;
   private settlementObserver: (jobId: string) => void = () => undefined;
-  // A job carries at most one live operation at a time, so a job id alone finds "whichever operation is
-  // currently live for it" — the shape `stop()` needs, since the abort registry only ever knows a job id
-  // (registration happens in `activateCommittedProviderLaunch`, before an operation id even exists — see
-  // `jobs/shell/launch.ts`).
   private readonly liveJobIndex = new Map<string, string>();
 
   connectCleanup(port: ProviderOperationCleanupPort): void {
     this.cleanupPort = port;
+  }
+
+  connectBinding(port: ProviderOperationBindingPort): void {
+    this.bindingPort = port;
   }
 
   connectSettlementObserver(observer: (jobId: string) => void): void {
@@ -71,16 +73,17 @@ export class LocalOperationRegistry {
     const identity: ProviderOperationEventIdentity = record.operation;
     const key = registryKey(identity.jobId, identity.operationId);
     const providerRoot = record.providerRoot;
-    const stopCause = record.controlIntent.kind === 'stop' ? record.controlIntent.cause : null;
-    this.entries.set(key, { identity, providerRoot, control, cleanup, state, stopCause });
+    const stopCause = record.controlIntent.kind === 'run' ? null : record.controlIntent.cause;
+    const proxyCleanup: ProviderOperationCleanupIdentity = {
+      kind: 'proxy-binding',
+      jobId: identity.jobId,
+      operationId: identity.operationId,
+      pool: cleanup.pool,
+    };
+    this.entries.set(key, { identity, providerRoot, control, cleanup: proxyCleanup, state, stopCause });
     this.liveJobIndex.set(identity.jobId, key);
   }
 
-  /**
-   * Registers a live operation only after the activation ACK and runtime-started event commit together — see
-   * `ProviderOperationReconciler`, the only production caller. The cleanup identity comes from the immutable
-   * job launch, so the same registration path remains available after coordinator restart.
-   */
   activate(
     record: Extract<ProviderOperationRecord, { phase: 'executing' }>,
     control: OperationStopControl,
@@ -100,21 +103,29 @@ export class LocalOperationRegistry {
   }
 
   /**
-   * Ends this coordinator's live tracking of one operation and addresses local cleanup once. Remote and
-   * guardian release stay with the durable settlement reconciler, so this method retains no dead control
-   * client after the terminal commit.
-   *
-   * Idempotent: an identity this registry never activated, or already settled, is a silent no-op rather than
-   * a fault, matching a replayed `provider.event.v1` terminal delivering the same settlement twice.
+   * Every settlement delivery must reach the generation-fenced binding mailbox, including an identity this
+   * registry never activated or has already removed; a delivery that stops short leaves its binding
+   * unretired. No control client may outlive the terminal commit.
    */
   settled(identity: ProviderOperationEventIdentity): void {
+    const bindingPort = this.bindingPort;
+    if (bindingPort === null) {
+      throw new Error('Provider operation binding authority is not connected.');
+    }
+    const binding = bindingPort.settleProviderOperationBinding(identity);
+    if (binding.kind === 'refused') return;
+
     const key = registryKey(identity.jobId, identity.operationId);
     const entry = this.entries.get(key);
-    if (entry === undefined) return;
+    if (entry === undefined) {
+      this.settlementObserver(identity.jobId);
+      return;
+    }
     this.entries.delete(key);
-    if (this.liveJobIndex.get(identity.jobId) === key) this.liveJobIndex.delete(identity.jobId);
+    const isCurrentOperation = this.liveJobIndex.get(identity.jobId) === key;
+    if (isCurrentOperation) this.liveJobIndex.delete(identity.jobId);
     try {
-      this.cleanupPort.release(entry.cleanup);
+      if (isCurrentOperation) this.cleanupPort.release(entry.cleanup);
     } finally {
       this.settlementObserver(identity.jobId);
     }

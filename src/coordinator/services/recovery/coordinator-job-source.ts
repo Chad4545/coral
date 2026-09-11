@@ -18,6 +18,7 @@ import {
   projectionSessionRevisionFields,
   withConsistentRead,
 } from '../../../recovery/row-revision-fields.js';
+import { COORDINATOR_JOB_RECOVERY_BOUNDARY } from '../../../recovery/source-registry.js';
 
 export type RawCoordinatorSessionRow = {
   readonly session_id: string;
@@ -35,12 +36,16 @@ type RawProviderOperationSagaRow = {
   readonly value: string;
 };
 
-export type RawCoordinatorJobRecoveryEnvelope = {
+type CoordinatorJobRecoveryFacts = {
   readonly jobId: string;
   readonly projection: ProjectionJobStoredRow | null;
   readonly statusEvents: readonly EventsRow[];
   readonly claimedSession: RawCoordinatorSessionRow | null;
   readonly providerOperations: readonly RawProviderOperationSagaRow[];
+};
+
+export type RawCoordinatorJobRecoveryEnvelope = CoordinatorJobRecoveryFacts & {
+  readonly subject: RecoverySubject;
 };
 
 function scanCoordinatorJobRecoveryEnvelopes(
@@ -124,7 +129,10 @@ function scanCoordinatorJobRecoveryEnvelopes(
         claimedSession,
         providerOperations: readProviderOperations.all(`${providerOperationRecordKeyPrefix(jobId)}%`),
       }));
-    return [...jobEnvelopes, ...orphanedClaims];
+    return [...jobEnvelopes, ...orphanedClaims].map((facts) => ({
+      ...facts,
+      subject: coordinatorJobRecoverySubject(facts),
+    }));
   });
 }
 
@@ -142,7 +150,7 @@ function providerOperationRevisionFields(rows: readonly RawProviderOperationSaga
   return rows.map((row) => ({ table: 'meta', key: row.key, field: 'value', value: sha256Hex(row.value) }));
 }
 
-function coordinatorJobRecoverySubject(raw: RawCoordinatorJobRecoveryEnvelope) {
+function coordinatorJobRecoverySubject(raw: CoordinatorJobRecoveryFacts): RecoverySubject {
   const fields =
     raw.projection === null
       ? [{ table: 'projection_jobs', key: raw.jobId, field: 'projection', value: null }]
@@ -161,12 +169,12 @@ export function coordinatorJobRecoverySource(
   options: Readonly<{ subjectKey?: string; subject?: RecoverySubject }> = {},
 ): RecoverySource<RawCoordinatorJobRecoveryEnvelope> {
   return defineRecoverySource({
-    boundary: 'coordinator-job-recovery',
+    boundary: COORDINATOR_JOB_RECOVERY_BOUNDARY,
     scanSubject: options.subject ?? {
-      key: options.subjectKey ?? 'coordinator-job-recovery-discovery',
+      key: options.subjectKey ?? `${COORDINATOR_JOB_RECOVERY_BOUNDARY}-discovery`,
       revision: { kind: 'until-cleared' },
     },
     scan: () => scanCoordinatorJobRecoveryEnvelopes(db, options.subject?.key ?? options.subjectKey),
-    subject: coordinatorJobRecoverySubject,
+    subject: (raw) => raw.subject,
   });
 }

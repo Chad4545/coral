@@ -147,10 +147,6 @@ function jobResultPath(jobId: string): string {
   return join(runtime.paths.coral.exports.jobsRoot, jobId, 'result.md');
 }
 
-function cancelQueued(jobId: string, pool?: 'default' | 'discuss' | 'curate'): boolean {
-  return launchCoordinator.cancelQueued(jobId, pool);
-}
-
 function _getActiveJobIds(pool?: 'default' | 'discuss' | 'curate'): string[] {
   return launchCoordinator.getActiveJobIds(pool);
 }
@@ -161,10 +157,6 @@ function terminateAll(): void {
 
 function _queueDepth(pool?: 'default' | 'discuss' | 'curate'): number {
   return launchCoordinator.queueDepth(pool);
-}
-
-function releaseLaunch(jobId: string, pool?: 'default' | 'discuss' | 'curate'): void {
-  launchCoordinator.releaseLaunch(jobId, pool);
 }
 
 function createService(
@@ -236,6 +228,7 @@ function createService(
     bundleHash: options.bundleHash,
     backendNamespace: options.backendNamespace ?? TEST_BACKEND_NAMESPACE,
     launchCoordinator,
+    settlementRefusalRecorder: { record: () => true },
     eventBus,
     providerRegistry,
     pluginRegistry: options.pluginRegistry ?? { discoverPluginRoot: () => null },
@@ -752,10 +745,6 @@ describe('ExecutionService wait', () => {
   afterEach(async () => {
     trackAllJobDirs();
     terminateAll();
-    for (const jobId of createdJobIds) {
-      cancelQueued(jobId);
-      releaseLaunch(jobId);
-    }
     await new Promise((resolve) => setTimeout(resolve, 0));
     for (const jobId of createdJobIds) {
       rmSync(join(JOBS_DIR, jobId), { recursive: true, force: true });

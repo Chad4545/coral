@@ -28,6 +28,7 @@ import { prepareTestCodexAppServer } from '#tests/helpers/provider-credentials.j
 import { parseExpression } from '#src/workflow/parser.js';
 import { type AgentRef } from '#src/jobs/agent-resolution.js';
 import { LaunchCoordinator } from '#src/coordinator/live/admission.js';
+import type { LaunchPermit, LaunchPool } from '#src/jobs/contracts/admission.js';
 import { getMaxWorkers } from '#src/coordinator/live/worker-limits.js';
 import type { ProviderServerHandle, SpawnProviderServerFn } from '#src/providers/app-server-transport.js';
 import type { ChildProcessLike } from '#src/infra/port-types.js';
@@ -208,8 +209,8 @@ function jobResultPath(jobId: string): string {
   return join(runtime.paths.coral.exports.jobsRoot, jobId, 'result.md');
 }
 
-function cancelQueued(jobId: string, pool?: 'default' | 'discuss' | 'curate'): boolean {
-  return launchCoordinator.cancelQueued(jobId, pool);
+function releaseLaunch(permit: LaunchPermit): void {
+  launchCoordinator.releaseLaunch(permit);
 }
 
 function getActiveJobIds(pool?: 'default' | 'discuss' | 'curate'): string[] {
@@ -224,12 +225,13 @@ function queueDepth(pool?: 'default' | 'discuss' | 'curate'): number {
   return launchCoordinator.queueDepth(pool);
 }
 
-function releaseLaunch(jobId: string, pool?: 'default' | 'discuss' | 'curate'): void {
-  launchCoordinator.releaseLaunch(jobId, pool);
-}
-
-function restoreActiveLaunch(jobId: string, provider: string, pool?: 'default' | 'discuss' | 'curate'): void {
-  launchCoordinator.restoreActiveLaunch(jobId, provider, { kind: 'provider-session', id: `session-${jobId}` }, pool);
+function restoreActiveLaunch(jobId: string, provider: string, pool: LaunchPool): LaunchPermit {
+  return launchCoordinator.restoreActiveLaunch(
+    jobId,
+    provider,
+    { kind: 'provider-session', id: `session-${jobId}` },
+    pool,
+  );
 }
 
 function createService(
@@ -328,6 +330,7 @@ function createService(
     bundleHash: options.bundleHash,
     backendNamespace: options.backendNamespace ?? TEST_BACKEND_NAMESPACE,
     launchCoordinator,
+    settlementRefusalRecorder: { record: () => true },
     eventBus,
     providerRegistry,
     pluginRegistry: options.pluginRegistry ?? { discoverPluginRoot: () => null },
@@ -706,12 +709,24 @@ async function occupyProviderSlots(
   service: ExecutionService,
   ctx: InvocationContext,
   providerName: string,
-): Promise<string[]> {
-  const decisions = await Promise.all(
-    Array.from({ length: getMaxWorkers(runtime.env) }, (_value, index) =>
-      service.start(providerName, { prompt: `occupy-${index}` }, ctx),
-    ),
-  );
+): Promise<Readonly<{ jobIds: string[]; permits: LaunchPermit[] }>> {
+  const requestLaunch = vi.spyOn(launchCoordinator, 'requestLaunch');
+  let decisions: Awaited<ReturnType<ExecutionService['start']>>[];
+  const permits: LaunchPermit[] = [];
+  try {
+    decisions = await Promise.all(
+      Array.from({ length: getMaxWorkers(runtime.env) }, (_value, index) =>
+        service.start(providerName, { prompt: `occupy-${index}` }, ctx),
+      ),
+    );
+    permits.push(
+      ...requestLaunch.mock.results.flatMap(({ type, value }) =>
+        type === 'return' && value !== 'queue_full' && value.type === 'immediate' ? [value.permit] : [],
+      ),
+    );
+  } finally {
+    requestLaunch.mockRestore();
+  }
 
   const jobIds: string[] = [];
   for (const decision of decisions) {
@@ -723,7 +738,8 @@ async function occupyProviderSlots(
     jobIds.push(decision.jobId);
   }
 
-  return jobIds;
+  if (permits.length !== jobIds.length) throw new Error('expected one issued permit for every occupying job');
+  return { jobIds, permits };
 }
 
 async function waitForTerminalEvent(
@@ -773,10 +789,6 @@ describe('ExecutionService', () => {
   afterEach(async () => {
     trackAllJobDirs();
     terminateAll();
-    for (const jobId of createdJobIds) {
-      cancelQueued(jobId);
-      releaseLaunch(jobId);
-    }
     await new Promise((resolve) => setTimeout(resolve, 0));
     closeServiceStoreDatabases();
     for (const jobId of createdJobIds) {
@@ -927,7 +939,7 @@ describe('ExecutionService', () => {
           subject,
         }),
       });
-      const occupied = await occupyProviderSlots(service, ctx, 'codex');
+      const { permits: occupied } = await occupyProviderSlots(service, ctx, 'codex');
       const callsAtCapacity = execute.mock.calls.length;
 
       const decision = await service.start('codex', { prompt: 'queued-account-a' }, ctx);
@@ -1341,11 +1353,8 @@ describe('ExecutionService', () => {
     );
 
     const service = createService(ctx);
-    for (const jobId of getActiveJobIds()) {
-      releaseLaunch(jobId);
-    }
     expect(queueDepth()).toBe(0);
-    const activeJobIds = await occupyProviderSlots(service, ctx, 'codex');
+    const { jobIds: activeJobIds } = await occupyProviderSlots(service, ctx, 'codex');
 
     const decision = await service.executeWorkflow(
       'codex',
@@ -1622,11 +1631,14 @@ describe('ExecutionService', () => {
     });
 
     expect(() =>
+      /* @intentional-private-access — queued terminal failures must not require a public mutation seam */
       (
         service as unknown as {
-          finishQueuedAbort(jobId: string, sessionId: string, message: string): void;
+          launchOrchestrator: {
+            finishQueuedAbort(jobId: string, sessionId: string, message: string): void;
+          };
         }
-      ).finishQueuedAbort(jobId, session.sessionId, 'queue_shutdown'),
+      ).launchOrchestrator.finishQueuedAbort(jobId, session.sessionId, 'queue_shutdown'),
     ).toThrow('disk full');
 
     expect(progressStore.readStatus(jobId)).toMatchObject({ phase: 'launching' });
@@ -2176,7 +2188,7 @@ describe('ExecutionService', () => {
         const { progressStore } =
           /* @intentional-private-access — seed or inspect execution internals with no public test seam */
           getInternals(service);
-        const occupyIds = await occupyProviderSlots(service, ctx, 'codex');
+        const { permits: occupyPermits } = await occupyProviderSlots(service, ctx, 'codex');
 
         const jobId = `recover-exec-${randomUUID()}`;
         const mgr = createSessionManager(ctx.projectRoot);
@@ -2204,8 +2216,9 @@ describe('ExecutionService', () => {
 
         expect(queueDepth()).toBeGreaterThanOrEqual(1);
 
-        const releasedJob = occupyIds[0];
-        releaseLaunch(releasedJob);
+        const releasedPermit = occupyPermits[0];
+        if (releasedPermit === undefined) throw new Error('expected an occupying permit');
+        releaseLaunch(releasedPermit);
 
         await new Promise((resolve) => setTimeout(resolve, 50));
 
@@ -2501,14 +2514,21 @@ describe('ExecutionService', () => {
           }),
         );
 
-        restoreActiveLaunch(jobId, 'codex');
-        service.completeRecoveredJob(
+        const restoredPermit = restoreActiveLaunch(jobId, 'codex', 'default');
+        expect(restoredPermit.reservationId).not.toBe('');
+        const completion = service.completeRecoveredJob(
           jobId,
           session.sessionId,
           { content: 'recovered done', durationMs: 0, outcome: { kind: 'completed' } },
           'completed',
-          { pool: 'default' },
+          { permit: restoredPermit },
         );
+        expect(completion).toMatchObject({
+          kind: 'completed',
+          sessionClaimRelease: 'released',
+          launchRelease: { kind: 'released', pool: 'default' },
+        });
+        expect(launchCoordinator.reservationFor(jobId)).toBeNull();
 
         const status = progressStore.readStatus(jobId);
         expect(status).toMatchObject({
@@ -2520,6 +2540,61 @@ describe('ExecutionService', () => {
 
         const updatedSession = sessionManager.readById(session.sessionId, { forceFresh: true });
         expect(updatedSession?.activeJobId).toBeUndefined();
+      });
+
+      it('returns successor ownership instead of reporting a transferred permit as completed', () => {
+        const service = createService(ctx);
+        const { progressStore, sessionManager } =
+          /* @intentional-private-access — seed or inspect execution internals with no public test seam */
+          getInternals(service);
+        const jobId = `transferred-recovered-${randomUUID()}`;
+        trackJob(jobId);
+        const session = allocateCodexSession(sessionManager, 'recover-transferred', 'gpt-5', ctx.projectRoot);
+        expect(sessionManager.claimForJobSync(session.sessionId, jobId)).toBe(true);
+        seedTestJobSession(progressStore, {
+          jobId,
+          sessionId: session.sessionId,
+          provider: 'codex',
+          projectRoot: ctx.projectRoot,
+          backendNamespace: session.backendNamespace,
+          initialPhase: 'running',
+        });
+        progressStore.appendLaunchRequested(
+          jobId,
+          makeLaunchRecord({
+            jobId,
+            sessionId: session.sessionId,
+            projectRoot: ctx.projectRoot,
+            backendNamespace: TEST_BACKEND_NAMESPACE,
+          }),
+        );
+        const restoredPermit = restoreActiveLaunch(jobId, 'codex', 'default');
+        const operationId = randomUUID();
+        expect(launchCoordinator.prepareProviderOperationBinding(restoredPermit, { jobId, operationId })).toEqual({
+          kind: 'prepared',
+        });
+        expect(launchCoordinator.commitProviderOperationBinding({ jobId, operationId })).toMatchObject({
+          kind: 'bound',
+        });
+
+        const completion = service.completeRecoveredJob(
+          jobId,
+          session.sessionId,
+          { content: 'recovered after transfer', durationMs: 0, outcome: { kind: 'completed' } },
+          'completed',
+          { permit: restoredPermit },
+        );
+
+        expect(completion).toEqual({
+          kind: 'transferred',
+          sessionClaimRelease: 'released',
+          pool: 'default',
+          holder: { kind: 'proxy-operation', operationId },
+        });
+        expect(launchCoordinator.reservationFor(jobId)).toMatchObject({
+          kind: 'active',
+          holder: { kind: 'proxy-operation', operationId },
+        });
       });
     });
 
@@ -3198,10 +3273,6 @@ describe('ExecutionService adversarial', () => {
   afterEach(async () => {
     trackAllJobDirs();
     terminateAll();
-    for (const jobId of createdJobIds) {
-      cancelQueued(jobId);
-      releaseLaunch(jobId);
-    }
     await new Promise((resolve) => setTimeout(resolve, 0));
     closeServiceStoreDatabases();
     for (const jobId of createdJobIds) {

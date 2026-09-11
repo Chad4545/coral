@@ -70,11 +70,12 @@ export type RecoveryDisposition =
       facts: readonly RecoverySettlementFact[];
       detail: string;
     }
-  | { kind: 'quarantine'; detail: string }
+  | { kind: 'quarantine'; detail: string; remedy?: RecoveryQuarantineRemedy }
   | {
       kind: 'deferred';
       continuation: { kind: string; key: string };
       detail: string;
+      remedy?: RecoveryQuarantineRemedy;
     }
   | {
       kind: 'deferred';
@@ -82,6 +83,8 @@ export type RecoveryDisposition =
       detail: string;
     }
   | { kind: 'fatal'; error: unknown };
+
+export type RecoveryQuarantineRemedy = RecoveryRecordRemedy;
 
 export type RecoveryProcessLocalCleanupResult =
   | { readonly kind: 'released' }
@@ -139,6 +142,7 @@ export type RecoveryQuarantineWrite = {
   readonly stage: 'scan' | 'hydrate' | 'settle';
   readonly errorMessage: string;
   readonly detail: string;
+  readonly remedy?: RecoveryQuarantineRemedy;
   readonly continuation?: { readonly kind: string; readonly key: string };
   readonly expectedRetry?: {
     readonly owner: string;
@@ -526,6 +530,7 @@ async function applyDisposition<Raw, Item>(
     stage: context.stage,
     errorMessage: context.error === undefined ? disposition.detail : errorMessage(context.error),
     detail: disposition.detail,
+    ...('remedy' in disposition && disposition.remedy !== undefined ? { remedy: disposition.remedy } : {}),
     ...(deferredBasis.kind === 'durable-continuation' ? { continuation: deferredBasis.continuation } : {}),
     ...(expectedRetry ? { expectedRetry } : {}),
   };
@@ -1004,3 +1009,4 @@ function finishReport<Item>(report: MutableReport<Item>): RecoveryReport<Item> {
 export const RecoveryContainment: RecoveryContainmentBoundary = Object.freeze({
   each,
 });
+import type { RecoveryRecordRemedy } from './provider-operation-remedy.js';
