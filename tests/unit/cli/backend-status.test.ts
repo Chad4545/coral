@@ -32,6 +32,8 @@ import type {
 import {
   handoffRoutingRecordSchemaRegistry,
   handoffRoutingStatusStoreSchema,
+  MAX_COMPLETED_HANDOFF_ROUTING_PAIRS,
+  MAX_RETIREMENT_TOMBSTONES,
   type HandoffRoutingStatusReadResult,
 } from '#src/coordinator/handoff-routing/status.js';
 import { incumbentIdentitySummarySchema } from '#src/coordinator/handoff-routing/policy.js';
@@ -944,6 +946,100 @@ describe('backend status local exit combination', () => {
 });
 
 describe('backend routing status', () => {
+  it('should keep every hold visible once history has reached the store ceilings', () => {
+    const terminals = Array.from({ length: MAX_COMPLETED_HANDOFF_ROUTING_PAIRS }, (_, index) => ({
+      kind: 'terminal' as const,
+      selection: null,
+      terminal: {
+        generation: HANDOFF_ROUTING_STATUS_GENERATION,
+        sequence: index + 1_000,
+        eventId: `terminal-event-${index}`,
+        invocationId: `terminal-${index}`,
+        observedAt: '2026-08-02T00:00:00.000Z',
+        eventKind: 'continuation-finalized' as const,
+        phase: 'terminal' as const,
+        selection: { kind: 'with-selection-sequence' as const, selectionSequence: index + 1 },
+        disposition: { kind: 'delegated-exit' as const, version: '0.10.9', exitCode: 7 },
+      },
+    }));
+    const compacted = Array.from({ length: MAX_RETIREMENT_TOMBSTONES }, (_, index) => ({
+      kind: 'retired' as const,
+      selection: null,
+      tombstone: {
+        generation: HANDOFF_ROUTING_STATUS_GENERATION,
+        sequence: index + 10,
+        invocationId: `settled-${index}`,
+        retirementCause: 'completed-pair-compaction' as const,
+        selectedDisposition: null,
+        terminalExisted: true,
+        resolutionReason: null,
+        observedAt: '2026-08-01T00:00:00.000Z',
+      },
+    }));
+    const routingStatus = {
+      kind: 'current' as const,
+      generation: HANDOFF_ROUTING_STATUS_GENERATION,
+      statuses: [
+        {
+          kind: 'unresolved' as const,
+          selection: {
+            generation: HANDOFF_ROUTING_STATUS_GENERATION,
+            sequence: 1,
+            eventId: 'needs-action-event',
+            invocationId: 'needs-action-invocation',
+            observedAt: '2026-08-01T00:00:00.000Z',
+            eventKind: 'routing-selected' as const,
+            phase: 'selection' as const,
+            owner: { pid: 101, incarnation: testIncarnation(101) },
+            disposition: {
+              kind: 'continue-current' as const,
+              basis: { kind: 'same-build-set' as const, buildSetId: '123e4567-e89b-42d3-a456-426614174000' },
+            },
+          },
+          ownerLiveness: { kind: 'absent' as const },
+        },
+        {
+          kind: 'retired' as const,
+          selection: null,
+          tombstone: {
+            generation: HANDOFF_ROUTING_STATUS_GENERATION,
+            sequence: 9,
+            invocationId: 'evicted-invocation',
+            retirementCause: 'selection-evicted-at-capacity' as const,
+            selectedDisposition: {
+              kind: 'continue-current' as const,
+              basis: { kind: 'same-build-set' as const, buildSetId: '123e4567-e89b-42d3-a456-426614174000' },
+            },
+            terminalExisted: false,
+            resolutionReason: null,
+            observedAt: '2026-08-01T00:00:00.000Z',
+          },
+        },
+        ...compacted,
+        ...terminals,
+      ],
+      retirementHistoryTruncated: {
+        kind: 'retirement-history-truncated' as const,
+        expiredIdentityCount: 0,
+        causes: { 'selection-evicted-at-capacity': 0, 'completed-pair-compaction': 0, 'operator-resolved': 0 },
+        minSelectionSequence: 0,
+        maxSelectionSequence: 0,
+        earliestSelectedAt: null,
+        latestSelectedAt: null,
+      },
+    } as unknown as Parameters<typeof formatHandoffRoutingStatus>[0];
+
+    const rendered = formatHandoffRoutingStatus(routingStatus) ?? '';
+
+    expect(rendered).toContain('needs-action-invocation');
+    expect(rendered, 'a hold that is not `unresolved` survives the collapse too').toContain('evicted-invocation');
+    expect(rendered, 'a compaction retirement is history').not.toContain('settled-0');
+    expect(rendered, 'a terminal is history, which is the case the field hit').not.toContain('terminal-0');
+    expect(rendered).toContain(
+      `Routing invocations already history, needing no action: ${MAX_RETIREMENT_TOMBSTONES + MAX_COMPLETED_HANDOFF_ROUTING_PAIRS}.`,
+    );
+  });
+
   it('renders invocation dispositions and aggregate retirement history in journal order', async () => {
     const routingStatus = {
       kind: 'current',

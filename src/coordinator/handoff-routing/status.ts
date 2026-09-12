@@ -1576,6 +1576,22 @@ function unclassifiedPersistedDispositionPolicy(
   }
 }
 
+/** A stored terminal disposition classifies as history; only a hold carries an obligation forward. */
+export function handoffRoutingInvocationClassification(
+  status: HandoffRoutingInvocationStatus,
+): PersistedDispositionClassification {
+  switch (status.kind) {
+    case 'unresolved':
+      return persistedHandoffDispositionPolicy(status.selection.disposition).classification;
+    case 'terminal':
+      return persistedHandoffDispositionPolicy(status.terminal.disposition).classification;
+    case 'retired':
+      return PERSISTED_DISPOSITION_CLASSIFICATIONS[status.tombstone.retirementCause];
+    default:
+      return assertNever(status);
+  }
+}
+
 export function persistedHandoffDispositionPolicy(
   disposition: PersistedHandoffDisposition,
 ): PersistedHandoffDispositionPolicy {

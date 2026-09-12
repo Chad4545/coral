@@ -9,6 +9,7 @@ import {
   type RetirementHistoryTruncated,
   type SelectedHandoffDisposition,
   type StoredTerminalDisposition,
+  handoffRoutingInvocationClassification,
 } from '../../coordinator/handoff-routing/status.js';
 import {
   liveHandoffResultObligation,
@@ -835,6 +836,8 @@ function formatStoredTerminalDisposition(disposition: StoredTerminalDisposition)
   }
 }
 
+const ROUTING_INVOCATION_RENDER_LIMIT = 20;
+
 function formatRoutingInvocationStatus(status: HandoffRoutingInvocationStatus): string {
   switch (status.kind) {
     case 'unresolved':
@@ -938,7 +941,12 @@ export function formatHandoffRoutingStatus(result: HandoffRoutingStatusReadResul
       ].join('\n');
     case 'content-dependent': {
       if (result.kind !== 'current') throw new Error('Current render policy is invalid.');
-      const sections = result.statuses.map(formatRoutingInvocationStatus);
+      // A hold may not be withheld, so the cap may only ever drop `history`.
+      const holds = result.statuses.filter((status) => handoffRoutingInvocationClassification(status) === 'hold');
+      const rendered = result.statuses.length <= ROUTING_INVOCATION_RENDER_LIMIT ? result.statuses : holds;
+      const sections = rendered.map(formatRoutingInvocationStatus);
+      const collapsed = result.statuses.length - rendered.length;
+      if (collapsed > 0) sections.push(`Routing invocations already history, needing no action: ${collapsed}.`);
       const truncatedHistory = formatRetirementHistoryTruncated(result.retirementHistoryTruncated);
       if (truncatedHistory !== null) sections.push(truncatedHistory);
       return sections.length === 0 ? null : sections.join('\n');
