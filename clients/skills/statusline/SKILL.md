@@ -47,6 +47,18 @@ Manage the coral HUD statusline for Claude Code.
    - `CONFIG_DIR/hud/coral-hud.mjs`
    - `CONFIG_DIR/hud/.coral-cache.json`
    - `CONFIG_DIR/hud/.coral-codex-enabled`
+   - `CONFIG_DIR/hud/.coral-git-cache.json`
+   - `CONFIG_DIR/hud/.coral-git.lock`
+   - `CONFIG_DIR/hud/.coral-sessions.json`
+   - `CONFIG_DIR/hud/.coral-backend-cache.json`
+   - `CONFIG_DIR/hud/.coral-claude.lock`
+   - `CONFIG_DIR/hud/.coral-backend.lock`
+   - regular files in `CONFIG_DIR/hud` whose basename matches exactly `^\.coral-cache\.json\.tmp-[0-9]+$`
+   - regular files in `CONFIG_DIR/hud` whose basename matches exactly `^\.coral-git-cache\.json\.tmp-[0-9]+$`
+   - regular files in `CONFIG_DIR/hud` whose basename matches exactly `^\.coral-sessions\.json\.tmp-[0-9]+$`
+   - regular files in `CONFIG_DIR/hud` whose basename matches exactly `^\.coral-backend-cache\.json\.tmp-[0-9]+$`
+   - regular files in `CONFIG_DIR/hud` whose basename matches exactly `^\.coral-codex-[0-9a-f]{12}-cache\.json\.tmp-[0-9]+$`
+   - regular files in `CODEX_DIR` whose basename matches exactly `^auth\.json\.tmp-[0-9]+$`
    - regular files in `CONFIG_DIR/hud` whose basename matches exactly `^\.coral-codex-[0-9a-f]{12}-cache\.json$`
    - regular files in `CONFIG_DIR/hud` whose basename matches exactly `^\.coral-codex-[0-9a-f]{12}\.lock$`
    Do not follow symlinks or delete any broader `.coral-*` pattern.
@@ -61,18 +73,11 @@ The install command reads this file and writes it to `CONFIG_DIR/hud/coral-hud.m
 
 ## Notes
 
-- `CONFIG_DIR` is the Claude config dir from the SessionStart context (see Config directory above); each config dir keeps its own HUD install and its own Codex opt-in flag
+- `CONFIG_DIR` is the Claude config dir from the SessionStart context (see Config directory above); each config dir keeps its own HUD install, its own Codex opt-in flag, and its own runtime files
 - If re-running install, overwrite the existing script (this updates the HUD to the latest version)
-- Claude rate limits are fetched from `api.anthropic.com/api/oauth/usage` using OAuth credentials
-- Enterprise/extra-usage plans have no 5h/weekly windows; instead the usage API returns `extra_usage` (a monthly dollar cap), shown in the limits slot as `mo: <pct> ($used/$limit)`
-- Codex limits, credits, and spend controls are fetched from `chatgpt.com/backend-api/wham/usage` (GET, no token cost); requires Codex login (`CODEX_DIR/auth.json`)
-- Layout: Line 1 shows Claude model/limits/context/session/activity; Line 2 conditionally shows Codex model/limits/credits; Line 3 conditionally shows Coral backend state
-- Skill detection reads the last 500KB of `transcript_path` JSONL and recognizes `Skill`/`proxy_Skill` tool-use blocks plus slash-command messages
-- Both fetches run in parallel
-- Claude API results are cached for 180 seconds on success, 30 seconds on error. HTTP 429 responses trigger exponential backoff from 2 minutes up to 10 minutes.
-- On error, the HUD preserves last-known-good rate-limit data until the error cache expires. The error indicator is shown only when no stale data exists.
-- Error indicators are explicit: `throttled: refreshes in Xm` for HTTP 429, `re-login required` for explicit 401/403 auth failures, and `API unavailable` for other fetch/refresh failures.
-- Missing or unsupported credentials stay silent; `re-login required` appears only for observable auth failures.
-- The session slot combines spend and duration when available, for example `$0.43 47m`.
-- Codex opt-in is controlled by `CONFIG_DIR/hud/.coral-codex-enabled` flag file; managed during install
-- If credentials are unavailable (e.g., API key users or Codex not installed), the respective rate limit section is silently omitted
+- Step 3 lists every path the script can create, plus one an older build could have stranded
+  (`CODEX_DIR/auth.json.tmp-<pid>`, which held credentials). Adding a path the script writes without
+  adding it there leaves a file behind on an uninstalled machine.
+- Nothing else about how the script behaves belongs in this file. It installs the script and removes
+  it; a second description of the script's runtime would be wrong the first time the script changed,
+  and nothing here would fail to say so.

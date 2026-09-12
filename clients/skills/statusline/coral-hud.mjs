@@ -1,31 +1,25 @@
 #!/usr/bin/env node
 
-// Coral HUD Statusline
-// Line 1: model │ limits │ ctx │ session │ skill
-// Line 2: codex model │ codex limits │ codex credits
-
 import {
   readFileSync,
-  readdirSync,
   existsSync,
   writeFileSync,
   mkdirSync,
   openSync,
   fstatSync,
   statSync,
+  readdirSync,
   readSync,
   closeSync,
   renameSync,
   unlinkSync,
 } from 'fs';
-import { isAbsolute, join, normalize } from 'path';
+import { dirname, isAbsolute, join, normalize } from 'path';
 import { homedir } from 'os';
 import { execSync } from 'child_process';
 import { createHash } from 'crypto';
 import { pathToFileURL } from 'url';
 
-// Claude's config dir, honoring CLAUDE_CONFIG_DIR (set when launching `claude`,
-// inherited by this statusLine subprocess). Falls back to ~/.claude.
 export function codexCacheKey(codexDir) {
   return `codex-${createHash('sha256').update(normalize(codexDir)).digest('hex').slice(0, 12)}`;
 }
@@ -68,16 +62,6 @@ const CYAN = '\x1b[36m';
 const MAGENTA = '\x1b[35m';
 const CODEX_USER_AGENT = 'codex_cli_rs/0.117.0';
 
-function getCodexClientId(idToken) {
-  try {
-    const payload = JSON.parse(Buffer.from(idToken.split('.')[1], 'base64url').toString());
-    const aud = payload.aud;
-    return Array.isArray(aud) ? aud[0] : aud;
-  } catch {
-    return null;
-  }
-}
-
 // --- stdin ---
 
 async function readStdin() {
@@ -98,18 +82,214 @@ async function readStdin() {
 
 // --- git ---
 
+// `--no-optional-locks` is required rather than preferred: without it `git status` refreshes and
+// rewrites `.git/index`, so concurrent renders contend for `.git/index.lock` inside the repository.
+// `execSync`'s timeout delivers a signal, and a process blocked in an uninterruptible filesystem
+// wait does not take one, so no elapsed bound here establishes that a probe is gone.
 function renderGitBranch(input) {
   const cwd = input.cwd || input.workspace?.current_dir || input.workspace?.project_dir;
   if (!cwd) return null;
+  const key = gitCacheKey(cwd);
+  const entry = readGitCache()[key] || null;
+  const now = Date.now();
+
+  if (entry && ((entry.ts <= now && now - entry.ts <= GIT_TTL_MS) || now < entry.backoffUntil))
+    return formatGitSegment(entry.value);
+
+  const claim = claimGitProbe(key, now);
+  if (claim === null) return formatGitSegment(entry?.value);
+
   try {
-    const opts = { encoding: 'utf8', stdio: ['pipe', 'pipe', 'ignore'], cwd, timeout: 2000 };
-    const branch =
-      execSync('git branch --show-current', opts).trim() || execSync('git rev-parse --short HEAD', opts).trim();
-    if (!branch) return null;
-    const dirty = execSync('git status --porcelain', opts).trim() ? `${YELLOW}*${RESET}` : '';
-    return `${CYAN}⎇ ${branch}${RESET}${dirty}`;
+    const value = probeGit(cwd);
+    writeGitEntry(key, { ts: Date.now(), value, backoffUntil: 0 });
+    return formatGitSegment(value);
+  } catch (error) {
+    // An answer that there is no repository here will still be true on the next render, so re-asking it
+    // at the cadence a branch name needs is what spends a subprocess per render forever.
+    if (probeAnswered(error)) {
+      writeGitEntry(key, { ts: Date.now(), value: null, backoffUntil: now + GIT_NEGATIVE_TTL_MS });
+      return null;
+    }
+    backOffRepo(key, now);
+    return formatGitSegment(entry?.value);
+  } finally {
+    releaseHudLock(claim);
+  }
+}
+
+// `status` is the child's own exit code and is a number only when git ran to completion. A spawn that
+// never produced a child — EAGAIN under fork pressure, EMFILE, a missing cwd — leaves it null, and
+// those are exactly the failures N concurrent renders create. Listing the non-answers instead makes
+// every unlisted one default to "answered", which is the wrong direction to be wrong in.
+export function probeAnswered(error) {
+  return typeof error?.status === 'number';
+}
+
+function probeGit(cwd) {
+  return parseGitStatus(
+    execSync('git --no-optional-locks status --porcelain=v2 --branch', {
+      encoding: 'utf8',
+      stdio: ['pipe', 'pipe', 'ignore'],
+      cwd,
+      timeout: GIT_TIMEOUT_MS,
+      killSignal: 'SIGKILL',
+    }),
+  );
+}
+
+export function parseGitStatus(out) {
+  let head = '';
+  let oid = '';
+  let dirty = false;
+  for (const line of out.split('\n')) {
+    if (line.startsWith('# branch.head ')) head = line.slice(14).trim();
+    else if (line.startsWith('# branch.oid ')) oid = line.slice(13).trim();
+    else if (line.length > 0 && !line.startsWith('#')) dirty = true;
+  }
+  // A repository with no commits reports `(initial)` as the oid, which names no revision.
+  const detached = head === '' || head === '(detached)';
+  const branch = detached ? (oid.startsWith('(') ? '' : oid.slice(0, 7)) : head;
+  return branch === '' ? null : { branch, dirty };
+}
+
+export function formatGitSegment(value) {
+  if (!value || typeof value.branch !== 'string' || value.branch === '') return null;
+  // `git check-ref-format` rejects refname bytes below \040 and \177, so this value cannot carry terminal controls.
+  return `${CYAN}⎇ ${value.branch}${RESET}${value.dirty ? `${YELLOW}*${RESET}` : ''}`;
+}
+
+// A hold that outlived its holder must name the repository it was probing, or the render that finds it
+// fences its own instead and leaves the stalled one free to be probed again. The holder cannot be
+// signalled, so the back-off expiring is the only exit this hold has.
+function claimGitProbe(key, now) {
+  const lockPath = hudFetchLockPath(CACHE_DIR, GIT_LOCK_KEY);
+  const held = readHudLockHold(lockPath);
+  if (held !== null) {
+    if (holdIsLive(held, now)) return null;
+    if (!deleteStaleHudLock(lockPath, held)) return null;
+    if (held.key !== null) {
+      const claim = claimHudLock(lockPath, held.key, now);
+      if (claim) {
+        try {
+          backOffRepo(held.key, now);
+        } finally {
+          releaseHudLock(claim);
+        }
+      }
+    }
+    return null;
+  }
+  return claimHudLock(lockPath, key, now);
+}
+
+// A record that cannot be read still proves a holder created the file, and its age is the only thing
+// it can still say. Reading that as no holder leaves the file in place while `wx` refuses to replace
+// it, which is a lock nothing can ever take again.
+function readHudLockHold(lockPath) {
+  let mtimeMs;
+  try {
+    mtimeMs = statSync(lockPath).mtimeMs;
   } catch {
     return null;
+  }
+  try {
+    const held = JSON.parse(readFileSync(lockPath, 'utf-8'));
+    if (Number.isFinite(held?.ts) && typeof held?.key === 'string' && typeof held?.nonce === 'string') return held;
+  } catch {}
+  return { ts: mtimeMs, key: null, nonce: null };
+}
+
+// A `ts` ahead of `now` is expired: treating a backward clock step as live leaves no exit until the
+// skew elapses, while the exclusive create bounds the extra probe it can admit.
+export function holdIsLive(held, now) {
+  return held.ts <= now && now - held.ts <= LOCK_STALE_MS;
+}
+
+function deleteStaleHudLock(lockPath, held) {
+  const current = readHudLockHold(lockPath);
+  const matches =
+    current !== null &&
+    (held.nonce !== null ? current.nonce === held.nonce : current.nonce === null && current.ts === held.ts);
+  if (!matches) return false;
+  deleteHudFile(lockPath);
+  return true;
+}
+
+// The exclusive create is the whole arbitration, so a stale lock is surrendered by whoever finds it
+// and claimed by a later render that finds none. Deleting and creating in one pass instead lets two
+// renders each delete the other's fresh claim and both proceed.
+function claimHudLock(lockPath, key, now) {
+  const nonce = `${process.pid}-${now}-${Math.random().toString(36).slice(2)}`;
+  try {
+    mkdirSync(CACHE_DIR, { recursive: true });
+    writeFileSync(lockPath, JSON.stringify({ ts: now, key, nonce }), { flag: 'wx', mode: 0o600 });
+    return { lockPath, nonce };
+  } catch {
+    return null;
+  }
+}
+
+// Releasing by path alone deletes whatever lock is there, including a successor's — and a vanished
+// file is not proof the lock is ours either.
+function releaseHudLock(claim) {
+  const held = readHudLockHold(claim.lockPath);
+  if (held === null || held.nonce !== claim.nonce) return;
+  deleteHudFile(claim.lockPath);
+}
+
+// `ts` dates the last value actually measured, so backing off must not advance it.
+function backOffRepo(key, now) {
+  const cache = readGitCache();
+  const entry = cache[key] || { ts: 0, value: null };
+  writeGitCache({ ...cache, [key]: { ...entry, backoffUntil: now + GIT_BACKOFF_MS } });
+}
+
+// Another render may have fenced a stalled repository between this one's read and its rename. A
+// back-off is that repository's only containment, so it is re-read here and carried forward rather
+// than being whatever this writer happened to observe earlier.
+function writeGitEntry(key, entry) {
+  const cache = readGitCache();
+  const now = Date.now();
+  const next = { [key]: entry };
+  for (const [cached, value] of Object.entries(cache)) {
+    if (cached === key) continue;
+    const fenced = now < (value?.backoffUntil || 0);
+    if (fenced || now - (value?.ts || 0) <= GIT_ENTRY_PRUNE_MS) next[cached] = value;
+  }
+  writeGitCache(next);
+}
+
+function deleteHudFile(path) {
+  try {
+    unlinkSync(path);
+  } catch {}
+}
+
+function gitCacheKey(cwd) {
+  return createHash('sha256').update(normalize(cwd)).digest('hex').slice(0, 12);
+}
+
+function readGitCache() {
+  try {
+    const raw = JSON.parse(readFileSync(GIT_CACHE_FILE, 'utf-8'));
+    return raw !== null && typeof raw === 'object' ? raw : {};
+  } catch {
+    return {};
+  }
+}
+
+function writeGitCache(all) {
+  publishJsonAtomically(GIT_CACHE_FILE, all);
+}
+
+function publishJsonAtomically(path, value) {
+  const tmpPath = `${path}.tmp-${process.pid}`;
+  try {
+    mkdirSync(dirname(path), { recursive: true });
+    writeFileSync(tmpPath, JSON.stringify(value), { mode: 0o600 });
+    renameSync(tmpPath, path);
+  } catch {
+    deleteHudFile(tmpPath);
   }
 }
 
@@ -193,18 +373,16 @@ function readTranscriptTail(transcriptPath) {
 function parseLastSkill(lines) {
   for (let i = lines.length - 1; i >= 0; i--) {
     const line = lines[i];
-    // Case 1: user-typed slash command → user message with <command-message> tag
     if (line.includes('command-message')) {
       try {
         const entry = JSON.parse(line);
         const content = entry?.message?.content;
         if (typeof content === 'string') {
           const m = content.match(/<command-message>([^<]+)<\/command-message>/);
-          if (m?.[1]) return m[1];
+          if (m?.[1]) return stripControlSequences(m[1]);
         }
       } catch {}
     }
-    // Case 2: Claude-invoked Skill tool_use (e.g. ralph calling /commit)
     if (line.includes('"tool_use"') && (line.includes('"Skill"') || line.includes('"proxy_Skill"'))) {
       try {
         const entry = JSON.parse(line);
@@ -217,7 +395,7 @@ function parseLastSkill(lines) {
             (block.name === 'Skill' || block.name === 'proxy_Skill') &&
             block.input?.skill
           ) {
-            return block.input.skill;
+            return stripControlSequences(block.input.skill);
           }
         }
       } catch {}
@@ -238,7 +416,7 @@ function parseRunningAgents(lines) {
       for (const block of content) {
         if (block.type === 'tool_use' && (block.name === 'Task' || block.name === 'proxy_Task') && block.id) {
           agentMap.set(block.id, {
-            subagent_type: block.input?.subagent_type || 'unknown',
+            subagent_type: stripControlSequences(block.input?.subagent_type || 'unknown'),
             startTime: ts,
           });
         }
@@ -252,24 +430,33 @@ function parseRunningAgents(lines) {
   return Array.from(agentMap.values()).filter((a) => !a.startTime || now - a.startTime.getTime() < STALE_AGENT_MS);
 }
 
-function extractUserText(raw) {
-  // Command invocation: extract /name + args as the original input
+// An escape that survives here is executed on every later render of the session, and is persisted into
+// the session cache and replayed after the transcript is gone, so control bytes are removed rather
+// than escaped.
+export function stripControlSequences(text) {
+  /* eslint-disable no-control-regex -- Removing terminal control bytes is the point. */
+  return text
+    .replace(/\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)/g, '')
+    .replace(/\x1b\[[0-9;?]*[ -/]*[@-~]/g, '')
+    .replace(/[\x00-\x1f\x7f\u0080-\u009f]/g, ' ');
+  /* eslint-enable no-control-regex */
+}
+
+export function extractUserText(raw) {
   const cmdMatch = raw.match(/<command-name>([^<]+)<\/command-name>/);
   if (cmdMatch) {
     const name = cmdMatch[1].trim();
     const argsMatch = raw.match(/<command-args>([^<]*)<\/command-args>/);
     const args = argsMatch?.[1]?.trim();
-    return args ? `${name} ${args}` : name;
+    return stripControlSequences(args ? `${name} ${args}` : name);
   }
-  // System-injected content — skip entirely
   if (
     /<task-notification>|<local-command|^Base directory for this skill:|^This session is being continued from|^Stop hook feedback:/i.test(
       raw,
     )
   )
     return null;
-  // Strip remaining XML tags (system-reminder etc.) and noise markers
-  const clean = raw.replace(/<[^>]+>/g, '').trim();
+  const clean = stripControlSequences(raw.replace(/<[^>]+>/g, '')).trim();
   if (!clean || /^\[Request interrupted|^\[Tool cancelled|^\[User cancelled/i.test(clean)) return null;
   return clean;
 }
@@ -307,8 +494,13 @@ function formatAgentCounts(agents) {
     .join(' ')}${RESET}`;
 }
 
-function renderActivityStr(agents, activity) {
-  const agentList = Array.isArray(agents) ? agents : Object.values(agents || {});
+export function renderActivityStr(agents, activity) {
+  const now = Date.now();
+  // A subagent whose completion never lands keeps its entry, and the cached entry stops being rewritten
+  // once the transcript size settles, so its own age is the only thing that can retire it.
+  const agentList = (Array.isArray(agents) ? agents : Object.values(agents || {})).filter(
+    (agent) => !agent.ts || now - agent.ts < STALE_AGENT_MS,
+  );
   if (agentList.length > 0) return formatAgentCounts(agentList);
   if (activity?.name && activity?.ts && Date.now() - activity.ts < ACTIVITY_TTL_MS) {
     return `${CYAN}${activity.name}${RESET}`;
@@ -373,22 +565,79 @@ const BACKEND_CACHE_FILE = join(CACHE_DIR, '.coral-backend-cache.json');
 const CODEX_FLAG_FILE = join(CACHE_DIR, '.coral-codex-enabled');
 const CACHE_TTL_MS = 180_000;
 const CACHE_FAIL_TTL_MS = 30_000;
+const NO_CREDENTIALS_KIND = 'noCredentials';
 const RATE_LIMIT_BASE_MS = 120_000;
 const RATE_LIMIT_MAX_MS = 600_000;
 const API_TIMEOUT_MS = 5_000;
 const LOCK_STALE_MS = 10_000;
 const CORAL_HEALTH_TTL_MS = 5_000;
 const CORAL_HEALTH_TIMEOUT_MS = 3_000;
+const GIT_CACHE_FILE = join(CACHE_DIR, '.coral-git-cache.json');
+// One lock for every repository, deliberately. Keying it per repository would let N repositories on
+// one network mount spawn N concurrent probes, which is the pile-up this segment exists to prevent.
+// The cost is that a stalled repository blanks the others' branch slot until its hold goes stale, and
+// that is accepted: this segment assists a reader and never gates anything.
+const GIT_LOCK_KEY = 'git';
+const GIT_TTL_MS = 5_000;
+const GIT_TIMEOUT_MS = 1_000;
+const GIT_BACKOFF_MS = 600_000;
+// A directory that is not a repository, and a git that will not run, stay that way; a branch name is
+// the only thing in this segment that can change between two renders.
+const GIT_NEGATIVE_TTL_MS = 300_000;
+const GIT_ENTRY_PRUNE_MS = 7 * 24 * 60 * 60_000;
+const ORPHANED_TEMP_MAX_AGE_MS = 5 * 60 * 1000;
+let orphanedTempsSwept = false;
+
+function sweepOldTempFiles(dir, isTempFile) {
+  let entries;
+  try {
+    entries = readdirSync(dir, { withFileTypes: true });
+  } catch {
+    return;
+  }
+
+  const oldest = Date.now() - ORPHANED_TEMP_MAX_AGE_MS;
+  for (const entry of entries) {
+    if (!entry.isFile() || !isTempFile(entry.name)) continue;
+    const path = join(dir, entry.name);
+    try {
+      if (statSync(path).mtimeMs < oldest) deleteHudFile(path);
+    } catch {}
+  }
+}
+
+// The Codex entry reclaims what an older build could leave: this one never writes `auth.json`, but a
+// build that did could be killed mid-write and strand a file holding a live access and refresh token.
+function sweepOrphanedTemps() {
+  if (orphanedTempsSwept) return;
+  orphanedTempsSwept = true;
+  sweepOldTempFiles(CACHE_DIR, (name) =>
+    /^(?:\.coral-(?:cache|git-cache|sessions|backend-cache)\.json|\.coral-codex-[0-9a-f]{12}-cache\.json)\.tmp-\d+$/u.test(
+      name,
+    ),
+  );
+  sweepOldTempFiles(CODEX_DIR, (name) => /^auth\.json\.tmp-\d+$/u.test(name));
+}
 
 // --- session state ---
 
 const SESSIONS_FILE = join(CACHE_DIR, '.coral-sessions.json');
 let _sessionsCache = null;
 
+function readSessionsFromDisk() {
+  try {
+    const raw = JSON.parse(readFileSync(SESSIONS_FILE, 'utf-8'));
+    return raw !== null && typeof raw === 'object' ? raw : {};
+  } catch {
+    return {};
+  }
+}
+
 function readSessions() {
   if (_sessionsCache) return _sessionsCache;
   try {
-    _sessionsCache = JSON.parse(readFileSync(SESSIONS_FILE, 'utf-8'));
+    const raw = JSON.parse(readFileSync(SESSIONS_FILE, 'utf-8'));
+    _sessionsCache = raw !== null && typeof raw === 'object' ? raw : {};
   } catch {
     _sessionsCache = {};
   }
@@ -401,18 +650,18 @@ function readSessionEntry(sessionId) {
 
 function writeSession(sessionId, data) {
   try {
-    const all = readSessions();
-    const existing = all[sessionId];
+    const existing = readSessions()[sessionId];
     if (existing && existing.ctx === data.ctx && existing.transcriptSize === data.transcriptSize) return;
+    // Every open session writes this one file. The rename publishes a whole document but does not make
+    // the read-modify-write around it atomic, so the merge has to start from what is on disk now — a
+    // snapshot taken when this process started drops every entry written since.
+    const all = readSessionsFromDisk();
     all[sessionId] = { ...data, ts: Date.now() };
     const now = Date.now();
     for (const key of Object.keys(all)) {
       if (now - (all[key]?.ts || 0) > SESSION_PRUNE_MS) delete all[key];
     }
-    mkdirSync(CACHE_DIR, { recursive: true });
-    const tmpPath = `${SESSIONS_FILE}.tmp-${process.pid}`;
-    writeFileSync(tmpPath, JSON.stringify(all), { mode: 0o600 });
-    renameSync(tmpPath, SESSIONS_FILE);
+    publishJsonAtomically(SESSIONS_FILE, all);
     _sessionsCache = all;
   } catch {}
 }
@@ -425,11 +674,10 @@ function readFullCache(key) {
   }
 }
 
+// Readers take no lock, so a reader in another session may open this file at any point during a
+// write. Only the rename makes what they open a whole document.
 function writeFullCache(all, key) {
-  try {
-    mkdirSync(CACHE_DIR, { recursive: true });
-    writeFileSync(key === undefined ? CACHE_FILE : hudCacheFile(CACHE_DIR, key), JSON.stringify(all), { mode: 0o600 });
-  } catch {}
+  publishJsonAtomically(key === undefined ? CACHE_FILE : hudCacheFile(CACHE_DIR, key), all);
 }
 
 function normalizeCacheEntry(raw) {
@@ -505,37 +753,20 @@ function readStaleCacheData(key) {
 
 function acquireFetchLock(key) {
   const lockPath = hudFetchLockPath(CACHE_DIR, key);
-  try {
-    const raw = readFileSync(lockPath, 'utf-8');
-    let isStale = true;
-    try {
-      const lockData = JSON.parse(raw);
-      isStale = Date.now() - lockData.ts > LOCK_STALE_MS;
-    } catch {} // corrupt/empty JSON → treat as stale
-    if (!isStale) return null;
-    try {
-      unlinkSync(lockPath);
-    } catch {}
-  } catch {} // ENOENT → no lock exists
-  try {
-    writeFileSync(lockPath, JSON.stringify({ ts: Date.now() }), { flag: 'wx', mode: 0o600 });
-    return lockPath;
-  } catch {
+  const now = Date.now();
+  const held = readHudLockHold(lockPath);
+  if (held !== null) {
+    if (!holdIsLive(held, now)) deleteStaleHudLock(lockPath, held);
     return null;
   }
-}
-
-function releaseFetchLock(lockPath) {
-  try {
-    unlinkSync(lockPath);
-  } catch {}
+  return claimHudLock(lockPath, key, now);
 }
 
 function readBackendSlot() {
   try {
     const raw = JSON.parse(readFileSync(BACKEND_CACHE_FILE, 'utf-8'));
     if (!raw || !Number.isFinite(raw.ts)) return null;
-    if (Date.now() - raw.ts > CORAL_HEALTH_TTL_MS) return null;
+    if (raw.ts > Date.now() || Date.now() - raw.ts > CORAL_HEALTH_TTL_MS) return null;
     return normalizeBackendSlot(raw);
   } catch {
     return null;
@@ -558,12 +789,9 @@ function readStaleBackendSlot() {
   }
 }
 
-function writeBackendSlot(slot, online) {
+function writeBackendSlot(slot) {
   try {
-    mkdirSync(CACHE_DIR, { recursive: true });
-    const tmp = `${BACKEND_CACHE_FILE}.tmp-${process.pid}`;
-    writeFileSync(tmp, JSON.stringify({ ts: Date.now(), ...slot, online }), { mode: 0o600 });
-    renameSync(tmp, BACKEND_CACHE_FILE);
+    publishJsonAtomically(BACKEND_CACHE_FILE, { ts: Date.now(), ...slot });
   } catch {}
 }
 
@@ -578,6 +806,7 @@ function getClaudeAccessToken() {
       const raw = execSync('/usr/bin/security find-generic-password -s "Claude Code-credentials" -w 2>/dev/null', {
         encoding: 'utf-8',
         timeout: 2000,
+        killSignal: 'SIGKILL',
       }).trim();
       if (raw) {
         const parsed = JSON.parse(raw);
@@ -585,7 +814,6 @@ function getClaudeAccessToken() {
       }
     } catch {}
   }
-  // File fallback
   try {
     const credPath = join(CLAUDE_DIR, '.credentials.json');
     const parsed = JSON.parse(readFileSync(credPath, 'utf-8'));
@@ -689,6 +917,10 @@ function parseCodexSpendControl(spendControl) {
   };
 }
 
+// Codex bills credits at 25 to the dollar; the usage API reports credits, and the statusline shows
+// dollars. Breaking this converts every figure on line 2 by a wrong factor with nothing to notice it.
+const CODEX_CREDITS_PER_USD = 25;
+
 function formatCreditBalanceUsd(raw, showZero) {
   if (typeof raw !== 'string') return null;
   const trimmed = raw.trim();
@@ -696,7 +928,7 @@ function formatCreditBalanceUsd(raw, showZero) {
 
   const numeric = Number(trimmed);
   if (Number.isFinite(numeric)) {
-    if (numeric > 0) return fmtUsd(numeric / 25);
+    if (numeric > 0) return fmtUsd(numeric / CODEX_CREDITS_PER_USD);
     if (showZero && numeric === 0) return fmtUsd(0);
     return null;
   }
@@ -707,7 +939,7 @@ function formatCreditBalanceUsd(raw, showZero) {
 function formatCreditValueUsd(value, showZero = false) {
   const numeric = typeof value === 'number' ? value : Number(value);
   if (!Number.isFinite(numeric)) return null;
-  if (numeric > 0) return fmtUsd(numeric / 25);
+  if (numeric > 0) return fmtUsd(numeric / CODEX_CREDITS_PER_USD);
   return showZero && numeric === 0 ? fmtUsd(0) : null;
 }
 
@@ -760,14 +992,29 @@ function formatErrorIndicator(cache) {
   }
 }
 
+// The two answers a caller can get after an error are not interchangeable: a badge shown over data that
+// still renders tells someone their login is broken while it is working.
 function cacheError(slot, errorKind, rateLimit = 0) {
   writeCacheSlot(slot, null, true, rateLimit, errorKind);
-  return formatErrorIndicator({ error: true, errorKind, ts: Date.now(), rateLimit });
+  const preserved = normalizeCacheEntry(readFullCache(slot)[slot]).data;
+  if (preserved != null) return { preserved };
+  return { indicator: formatErrorIndicator({ error: true, errorKind, ts: Date.now(), rateLimit }) };
+}
+
+function claudeCacheError(errorKind, rateLimit = 0) {
+  const outcome = cacheError('claude', errorKind, rateLimit);
+  return (outcome.preserved ? formatLimits(outcome.preserved) : null) ?? outcome.indicator;
+}
+
+function codexCacheError(errorKind, rateLimit = 0) {
+  const outcome = cacheError(CODEX_CACHE_SLOT, errorKind, rateLimit);
+  return outcome.preserved ? { kind: 'data', ...outcome.preserved } : { kind: 'error', message: outcome.indicator };
 }
 
 async function renderLimits() {
   const cached = readCacheSlot('claude');
   if (cached) {
+    if (cached.errorKind === NO_CREDENTIALS_KIND) return null;
     if (cached.error) {
       if (cached.data) return formatLimits(cached.data);
       return formatErrorIndicator(cached);
@@ -782,12 +1029,17 @@ async function renderLimits() {
   const timer = setTimeout(() => controller.abort(), API_TIMEOUT_MS);
   try {
     const token = getClaudeAccessToken();
-    if (!token) return null;
+    // Absence has to be recorded, or a machine that never logged in reaches the credential source on
+    // every render — on macOS that is a Keychain subprocess per render.
+    if (!token) {
+      writeCacheSlot('claude', null, true, 0, NO_CREDENTIALS_KIND);
+      return null;
+    }
 
     const resp = await fetchUsage(token, controller.signal);
-    if (resp?.unauthorized) return cacheError('claude', 'auth');
-    if (resp?.rateLimited) return cacheError('claude', 'rateLimit', readBackoffState('claude') + 1);
-    if (!resp) return cacheError('claude', 'generic');
+    if (resp?.unauthorized) return claudeCacheError('auth');
+    if (resp?.rateLimited) return claudeCacheError('rateLimit', readBackoffState('claude') + 1);
+    if (!resp) return claudeCacheError('generic');
 
     const data = {
       fiveHour: resp.five_hour?.utilization,
@@ -800,56 +1052,22 @@ async function renderLimits() {
     return formatLimits(data);
   } finally {
     clearTimeout(timer);
-    releaseFetchLock(lock);
+    releaseHudLock(lock);
   }
 }
 
 // --- Codex rate limits ---
 
+// `auth.json` belongs to the Codex CLI, which refreshes it. This reader takes the access token and
+// nothing else: the refresh token is not read, and a statusline may not rotate a credential a process
+// it does not coordinate with is holding — two writers of one token means whichever rotates second
+// invalidates the other, and the loser is logged out with nothing to say why.
 function readCodexCredentials() {
   try {
-    const authPath = join(CODEX_DIR, 'auth.json');
-    const parsed = JSON.parse(readFileSync(authPath, 'utf-8'));
-    const { id_token, access_token, refresh_token, account_id } = parsed.tokens || {};
-    if (!account_id) return null;
-    const clientId = getCodexClientId(id_token);
-    if (!clientId) return null;
-    return { accessToken: access_token, refreshToken: refresh_token, accountId: account_id, clientId };
-  } catch {
-    return null;
-  }
-}
-
-function writeBackCodexCredentials(creds, refreshed) {
-  try {
-    const authPath = join(CODEX_DIR, 'auth.json');
-    const parsed = JSON.parse(readFileSync(authPath, 'utf-8'));
-    parsed.tokens.access_token = refreshed.accessToken;
-    parsed.tokens.refresh_token = refreshed.refreshToken;
-    const tmpPath = authPath + '.tmp';
-    writeFileSync(tmpPath, JSON.stringify(parsed, null, 2), { mode: 0o600 });
-    renameSync(tmpPath, authPath);
-  } catch {}
-}
-
-async function refreshCodexToken(refreshTok, clientId, signal) {
-  try {
-    const resp = await fetch('https://auth.openai.com/oauth/token', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
-      body: new URLSearchParams({
-        grant_type: 'refresh_token',
-        client_id: clientId,
-        refresh_token: refreshTok,
-        scope: 'openid profile email',
-      }).toString(),
-      signal,
-    });
-    if (!resp.ok) return null;
-    const data = await resp.json();
-    const accessToken = data.access_token;
-    if (!accessToken) return null;
-    return { accessToken, refreshToken: data.refresh_token || null };
+    const parsed = JSON.parse(readFileSync(join(CODEX_DIR, 'auth.json'), 'utf-8'));
+    const { access_token, account_id } = parsed.tokens || {};
+    if (!account_id || !access_token) return null;
+    return { accessToken: access_token, accountId: account_id };
   } catch {
     return null;
   }
@@ -914,6 +1132,7 @@ async function renderCodexData() {
 
   const cached = readCacheSlot(CODEX_CACHE_SLOT);
   if (cached) {
+    if (cached.errorKind === NO_CREDENTIALS_KIND) return { kind: 'none' };
     if (cached.error) {
       if (cached.data) return { kind: 'data', ...cached.data };
       return { kind: 'error', message: formatErrorIndicator(cached) };
@@ -935,37 +1154,33 @@ async function renderCodexData() {
 
   try {
     const creds = readCodexCredentials();
-    if (!creds) return { kind: 'none' };
-
-    let token = creds.accessToken;
-    let result = await fetchCodexUsage(token, creds.accountId, controller.signal);
-
-    if (result?.unauthorized) {
-      const refreshed = await refreshCodexToken(creds.refreshToken, creds.clientId, controller.signal);
-      if (!refreshed) return { kind: 'error', message: cacheError(CODEX_CACHE_SLOT, 'generic') };
-      token = refreshed.accessToken;
-      if (refreshed.refreshToken) writeBackCodexCredentials(creds, refreshed);
-      result = await fetchCodexUsage(token, creds.accountId, controller.signal);
+    if (!creds) {
+      writeCacheSlot(CODEX_CACHE_SLOT, null, true, 0, NO_CREDENTIALS_KIND);
+      return { kind: 'none' };
     }
 
-    if (result?.unauthorized) return { kind: 'error', message: cacheError(CODEX_CACHE_SLOT, 'auth') };
-    if (result?.rateLimited)
-      return {
-        kind: 'error',
-        message: cacheError(CODEX_CACHE_SLOT, 'rateLimit', readBackoffState(CODEX_CACHE_SLOT) + 1),
-      };
+    const result = await fetchCodexUsage(creds.accessToken, creds.accountId, controller.signal);
+
+    // A refused token is either expired, which the Codex CLI clears on its own next run, or revoked.
+    // Nothing readable here separates them, so this renders nothing and asks again on the fail TTL
+    // rather than telling someone whose login works that it does not.
+    if (result?.unauthorized) {
+      writeCacheSlot(CODEX_CACHE_SLOT, null, true, 0, NO_CREDENTIALS_KIND);
+      return { kind: 'none' };
+    }
+    if (result?.rateLimited) return codexCacheError('rateLimit', readBackoffState(CODEX_CACHE_SLOT) + 1);
 
     if (result) {
       writeCacheSlot(CODEX_CACHE_SLOT, result);
       return { kind: 'data', ...result };
     }
 
-    return { kind: 'error', message: cacheError(CODEX_CACHE_SLOT, 'generic') };
+    return codexCacheError('generic');
   } catch {
-    return { kind: 'error', message: cacheError(CODEX_CACHE_SLOT, 'generic') };
+    return codexCacheError('generic');
   } finally {
     clearTimeout(timer);
-    releaseFetchLock(lock);
+    releaseHudLock(lock);
   }
 }
 
@@ -973,12 +1188,6 @@ async function renderCodexData() {
 
 // Coral daemon state is account-neutral; Claude credentials only select the
 // provider context for an individual request.
-function coralStateRoot() {
-  return join(homedir(), '.coral');
-}
-
-// The statusline is gated to the prod flavor by `hud-auto-update.mjs`, so we
-// read prod's runDir directly.
 function resolveBackendInfoPath() {
   const infoPath = coralBackendInfoPath(homedir());
   try {
@@ -995,15 +1204,25 @@ function resolveBackendInfoPath() {
   }
 }
 
-// Resolved dynamically on each cache-miss (not cached at module load)
 const REEF_INFO_PATH = join(CLAUDE_DIR, 'coral', 'reef.json');
 
 function readReefInfo() {
   try {
     const info = JSON.parse(readFileSync(REEF_INFO_PATH, 'utf-8'));
-    return info?.url ? info : null;
+    if (!isSafeReefUrl(info?.url)) return null;
+    return info;
   } catch {
     return null;
+  }
+}
+
+function isSafeReefUrl(value) {
+  if (typeof value !== 'string' || value !== stripControlSequences(value) || /\s/u.test(value)) return false;
+  try {
+    const url = new URL(value);
+    return (url.protocol === 'http:' || url.protocol === 'https:') && url.hostname !== '' && !url.username && !url.password;
+  } catch {
+    return false;
   }
 }
 
@@ -1035,15 +1254,6 @@ export function composeCoralThirdLine(coralLine, rightIndicator, lastUserMessage
 }
 
 async function renderCoralLine() {
-  // Migrate: remove retired backend slot from shared cache
-  try {
-    const shared = readFullCache();
-    if (shared.backend) {
-      delete shared.backend;
-      writeFullCache(shared);
-    }
-  } catch {}
-
   const cached = readBackendSlot();
   if (cached) return cached;
 
@@ -1064,17 +1274,14 @@ async function renderCoralLine() {
   }
 
   try {
-    // The bare `/health` ping carries no job counts; the live snapshot
-    // (active/queueDepth/liveDiscuss/textProjectionState) lives behind
-    // `?detailed=1`, gated by the boot token — mirror `coral-cli backend status`,
-    // including its discovered advertise host (e.g. `::1`), not a hardcoded loopback.
+    // Job counts live behind `?detailed=1` and the boot token; the bare `/health` ping carries none.
     const resp = await fetch(`http://${info.host ?? '127.0.0.1'}:${info.port}/health?detailed=1`, {
       headers: { 'X-Coral-Boot-Token': info.bootToken },
       signal: AbortSignal.timeout(CORAL_HEALTH_TIMEOUT_MS),
     });
     if (!resp.ok) {
       const slot = { line: `${DIM}coral${RESET}`, indicator: null };
-      writeBackendSlot(slot, false);
+      writeBackendSlot(slot);
       return slot;
     }
     const data = await resp.json();
@@ -1095,21 +1302,26 @@ async function renderCoralLine() {
     }
 
     const slot = { line: parts.join(' '), indicator };
-    writeBackendSlot(slot, true);
+    writeBackendSlot(slot);
     return slot;
   } catch {
     const slot = { line: `${DIM}coral${RESET}`, indicator: null };
-    writeBackendSlot(slot, false);
+    writeBackendSlot(slot);
     return slot;
   } finally {
-    releaseFetchLock(lock);
+    releaseHudLock(lock);
   }
 }
 
 // --- main ---
 
+// An OSC hyperlink wrapper occupies no columns and is as long as the URL inside it, so a width taken
+// without stripping it pushes every right-aligned slot left by that much.
+const ANSI_SGR_RE = /\x1b\[[0-9;]*m/g;
+const ANSI_OSC_RE = /\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)/g;
+
 function visualLen(str) {
-  return str.replace(/\x1b\[[0-9;]*m/g, '').length;
+  return str.replace(ANSI_SGR_RE, '').replace(ANSI_OSC_RE, '').length;
 }
 
 function padVisual(str, len) {
@@ -1125,25 +1337,28 @@ function alignColumns(a, b) {
 
 const CODEX_MODEL_DEFAULT = 'gpt-5.6-sol';
 
-// Read one key from a settings.json `env` block; undefined on any miss (no file,
-// bad JSON, absent/empty value).
-function readSettingsEnvValue(path, key) {
+// A project-local settings file is repository content, so this value arrives from whoever wrote the
+// repo rather than from the user reading it: it is printed every render and must carry no control
+// sequence and no width a clone gets to choose.
+export function readSettingsEnvValue(path, key) {
   try {
     const value = JSON.parse(readFileSync(path, 'utf-8'))?.env?.[key];
-    return typeof value === 'string' && value.length > 0 ? value : undefined;
+    if (typeof value !== 'string' || value.length === 0) return undefined;
+    const safe = stripControlSequences(value).trim().slice(0, 32);
+    return safe.length > 0 ? safe : undefined;
   } catch {
     return undefined;
   }
 }
 
-// Codex model shown on line 2. Read the effective CORAL_CODEX_MODEL fresh from
-// settings.json on every render so an edit (including unset) reflects without a
-// session restart — this statusLine subprocess inherits the parent session's
-// env, frozen at session start, so `process.env` would go stale. Precedence
-// mirrors Claude Code's settings merge: project-local > project > user; no
-// settings value means the built-in default. A shell-exported CORAL_CODEX_MODEL
-// is deliberately not consulted — it is a frozen session-start snapshot, so
-// honoring it would defeat "unset -> default".
+// This slot exists so the user can see which default they configured, so it is the settings value
+// itself and must not be resolved into the model a call will run. A request names its own model and
+// concurrent jobs in one project can each name a different one, so there is no single effective model
+// for a statusline to show, and nothing to ask the backend for.
+//
+// This statusLine subprocess inherits the parent session's env, frozen at session start, so
+// `process.env` cannot answer what CORAL_CODEX_MODEL is now and a shell-exported one may not be
+// consulted either — honoring that frozen snapshot would make unsetting the value impossible.
 function resolveCodexModelDisplay(input) {
   const projectDir = input.cwd || input.workspace?.current_dir || input.workspace?.project_dir;
   const paths = [];
@@ -1166,7 +1381,19 @@ async function main() {
     return;
   }
 
+  sweepOrphanedTemps();
+
   const safe = (p) => p.catch(() => null);
+  // A renderer that throws may cost its own slot and nothing else. Without this the three async
+  // renderers are contained and the synchronous ones are not, so one bad field blanks the statusline
+  // including everything already computed.
+  const slot = (render) => {
+    try {
+      return render();
+    } catch {
+      return null;
+    }
+  };
   const [limits, rawCodexData, coralSlot] = await Promise.all([
     safe(renderLimits()),
     safe(renderCodexData()),
@@ -1174,14 +1401,12 @@ async function main() {
   ]);
   const codexData = rawCodexData ?? { kind: 'none' };
 
-  // Column alignment: model name + limits (up to second |)
-  const claudeModel = renderModel(input);
-  const envModel = resolveCodexModelDisplay(input);
+  const claudeModel = slot(() => renderModel(input));
   let col1Claude, col1Codex, col2Claude, col2Codex;
   let codexCreditStr = null;
 
   if (codexData.kind === 'data') {
-    [col1Claude, col1Codex] = alignColumns(claudeModel, envModel);
+    [col1Claude, col1Codex] = alignColumns(claudeModel, slot(() => resolveCodexModelDisplay(input)));
     const codexLimits = formatLimits(codexData.codex);
     codexCreditStr = formatCodexCreditState(codexData.codex?.credits, codexData.codex?.spendControl, !codexLimits);
     [col2Claude, col2Codex] = alignColumns(limits, codexLimits);
@@ -1192,22 +1417,19 @@ async function main() {
     col2Codex = null;
   }
 
-  // Parse transcript once for activity + last user message
-  const transcript = parseTranscript(input);
+  const transcript = slot(() => parseTranscript(input)) ?? { activity: null, lastUserMessage: null };
 
-  // Line 1: Claude
   const line1 = [
     col1Claude,
     col2Claude,
-    renderContext(input),
-    renderSession(input),
-    renderGitBranch(input),
+    slot(() => renderContext(input)),
+    slot(() => renderSession(input)),
+    slot(() => renderGitBranch(input)),
     transcript.activity,
   ].filter(Boolean);
 
   let output = line1.join(SEP);
 
-  // Line 2: Codex
   if (codexData.kind === 'data') {
     if (col1Codex) col1Codex = `${GREEN}${col1Codex}${RESET}`;
     const line2 = [col1Codex, col2Codex, codexCreditStr].filter(Boolean);
@@ -1218,7 +1440,6 @@ async function main() {
     output += '\n' + codexData.message;
   }
 
-  // Line 3: Coral backend + right-aligned last user input
   if (coralSlot) {
     const coralLine = typeof coralSlot === 'string' ? coralSlot : coralSlot.line;
     const rightIndicator = typeof coralSlot === 'string' ? null : coralSlot.indicator;
@@ -1227,7 +1448,6 @@ async function main() {
     output += '\n' + coralFinal;
   }
 
-  // Write session state
   const sessionId = input.session_id;
   if (sessionId && transcript._session) {
     const ctx = input.context_window?.used_percentage ?? null;

@@ -85,7 +85,19 @@ try {
   if (!sessionId) process.exit(0);
 
   const statePath = getStatePath(projectDir, sessionId);
-  if (!existsSync(statePath)) process.exit(0);
+  const markerPath = getActiveMarkerPath(projectDir, sessionId);
+  if (!existsSync(statePath)) {
+    // A missing state file is also the ordinary shape of "this session never ran ralph", so the two
+    // cannot be told apart from the state file alone. The marker outlives it to name which one this
+    // is, and is consumed here so a lost loop is reported once instead of on every later Stop.
+    if (existsSync(markerPath)) {
+      deleteFile(markerPath);
+      writeHookOutput({
+        systemMessage: `Ralph loop state is gone (${statePath}), so the loop stopped without finishing. Re-run /coral:ralph to start it again.`,
+      });
+    }
+    process.exit(0);
+  }
 
   const state = readState(statePath);
   if (!state || !state.prompt) process.exit(0);
@@ -93,7 +105,7 @@ try {
   const stateDir = dirname(statePath);
 
   if (state.maxIterations > 0 && state.iteration >= state.maxIterations) {
-    endLoop(statePath, stateDir);
+    endLoop(statePath, markerPath, stateDir);
   }
 
   const assistantText = extractAssistantText(input.last_assistant_message)
@@ -101,13 +113,13 @@ try {
 
   const abortText = extractAbortText(assistantText);
   if (abortText && normalizeWhitespace(abortText) === ABORT_SENTINEL) {
-    endLoop(statePath, stateDir);
+    endLoop(statePath, markerPath, stateDir);
   }
 
   if (state.completionPromise) {
     const promiseText = extractPromiseText(assistantText);
     if (promiseText && normalizeWhitespace(promiseText) === normalizeWhitespace(state.completionPromise)) {
-      endLoop(statePath, stateDir);
+      endLoop(statePath, markerPath, stateDir);
     }
   }
 
@@ -138,9 +150,15 @@ function getStatePath(projectDir, sessionId) {
   return join(projectTmpDir(projectDir), `${STATE_FILE_PREFIX}${sessionId}.json`);
 }
 
+// Shares STATE_FILE_PREFIX so the existing stale sweep reclaims it on the same TTL as the state file.
+function getActiveMarkerPath(projectDir, sessionId) {
+  return join(projectTmpDir(projectDir), `${STATE_FILE_PREFIX}${sessionId}.active`);
+}
+
 function createStateFile(projectDir, sessionId) {
   const statePath = getStatePath(projectDir, sessionId);
   atomicWriteJson(statePath, DEFAULT_STATE);
+  atomicWriteJson(getActiveMarkerPath(projectDir, sessionId), { startedAt: Date.now() });
   return statePath;
 }
 
@@ -169,16 +187,20 @@ function deleteFile(path) {
   } catch {}
 }
 
-function endLoop(statePath, stateDir) {
+function endLoop(statePath, markerPath, stateDir) {
   deleteFile(statePath);
+  deleteFile(markerPath);
   sweepStale(stateDir, STATE_FILE_PREFIX, STATE_SWEEP_TTL_MS);
   process.exit(0);
 }
 
 // === Prompt injection ===
 
+// Stop exits when this path is absent, so text that authorizes removing it ends the loop before
+// its first iteration. This string may name the path and defer; it may not restate what to put in
+// the file, because a copy of another document's steps drifts without failing anything here.
 function buildAdditionalContext(statePath) {
-  return `Ralph loop state file created: ${statePath}. Read this file first, then edit it. In SKILL.md step 1: if plan mode, delete this file. If prompt mode, write your cleaned prompt (flags stripped) to the 'prompt' field, optionally override maxIterations and completionPromise.`;
+  return `Ralph loop state file: ${statePath}. Read it, then fill it in per SKILL.md step 1 — write the prompt field, and optionally maxIterations and completionPromise. This file drives loop continuation in every mode: leave it in place, and do not delete it.`;
 }
 
 function buildBlockReason(state, sessionId) {
