@@ -8,7 +8,10 @@ function errno(code: string): NodeJS.ErrnoException {
   return error;
 }
 
-function createLockDeps(now: () => number): {
+function createLockDeps(
+  now: () => number,
+  monotonicNow: () => bigint = () => BigInt(now()),
+): {
   deps: DirectoryLockDeps;
   directories: Map<string, number>;
   files: Set<string>;
@@ -31,14 +34,14 @@ function createLockDeps(now: () => number): {
   let failQuarantine = false;
   const deps: DirectoryLockDeps = {
     storage: {
-      mkdirSync: (path) => {
+      mkdirSync: (path: string) => {
         if (directories.has(path) || files.has(path)) {
           throw errno('EEXIST');
         }
         directories.set(path, now());
         directoryInodes.set(path, nextInode++);
       },
-      writeFileSync: (path, _data, options) => {
+      writeFileSync: (path: string, _data: unknown, options?: { readonly flag?: string }) => {
         const parent = dirname(path);
         if (!directories.has(parent)) {
           throw errno('ENOENT');
@@ -66,7 +69,7 @@ function createLockDeps(now: () => number): {
         files.add(path);
         fileMtimes.set(path, now());
       },
-      renameSync: (oldPath, newPath) => {
+      renameSync: (oldPath: string, newPath: string) => {
         if (failQuarantine && newPath.includes('.stale-')) {
           failQuarantine = false;
           throw errno('EACCES');
@@ -109,14 +112,14 @@ function createLockDeps(now: () => number): {
         [...files]
           .filter((file) => dirname(file) === path)
           .map((file) => file.slice(path.length + 1))) as DirectoryLockDeps['storage']['readdirSync'],
-      unlinkSync: (path) => {
+      unlinkSync: (path: string) => {
         if (!files.delete(path)) {
           throw errno('ENOENT');
         }
         fileMtimes.delete(path);
         removed.push(path);
       },
-      rmSync: (path) => {
+      rmSync: (path: string) => {
         removed.push(path);
         directories.delete(path);
         directoryInodes.delete(path);
@@ -133,7 +136,7 @@ function createLockDeps(now: () => number): {
           }
         }
       },
-      rmdirSync: (path) => {
+      rmdirSync: (path: string) => {
         for (const file of files) {
           if (dirname(file) === path) {
             throw errno('ENOTEMPTY');
@@ -180,9 +183,11 @@ function createLockDeps(now: () => number): {
           isFile: () => fileMtimeMs !== undefined,
         };
       }) as DirectoryLockDeps['storage']['statSync'],
-    },
+      syncDirectoryDurableSync: () => true,
+    } as unknown as DirectoryLockDeps['storage'],
     time: {
       now,
+      monotonicNow,
       sleep: vi.fn(async () => {}),
       setInterval: vi.fn(() => ({})),
       clearInterval: vi.fn(),
@@ -227,6 +232,15 @@ describe('directory fs lock', () => {
     release();
     expect(directories.has('/locks/session-1')).toBe(false);
     expect(removed.at(-1)).toBe('/locks/session-1');
+  });
+
+  it('backs every advertised lease actuator operation with its declared dependency shape', () => {
+    const { deps } = createLockDeps(() => 1000);
+    const release = acquireDirectoryLockSync('/locks/actuator-contract', deps, 100);
+
+    expect(() => release.actuator.syncDirectory('/locks')).not.toThrow();
+
+    release();
   });
 
   it('uses explicit sync deps for stale lock checks and removal', () => {
@@ -368,5 +382,25 @@ describe('directory fs lock', () => {
 
     await expect(promise).rejects.toBe(reason);
     expect(directories.has('/locks/busy-session')).toBe(true);
+  });
+
+  it('bounds a busy lock wait with monotonic time when wall time moves backward', async () => {
+    let wallTime = 10_000;
+    let monotonicTime = 0n;
+    const fixture = createLockDeps(
+      () => wallTime,
+      () => {
+        const observed = monotonicTime;
+        monotonicTime += 50n;
+        wallTime -= 1_000;
+        return observed;
+      },
+    );
+    fixture.directories.set('/locks/backward-wall-clock', wallTime);
+
+    await expect(acquireDirectoryLock('/locks/backward-wall-clock', fixture.deps, 100)).rejects.toThrow(
+      /Directory lock timeout/u,
+    );
+    expect(wallTime).toBeLessThan(10_000);
   });
 });

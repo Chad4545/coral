@@ -10,8 +10,6 @@ import {
 import {
   HandoffRunError,
   liveHandoffResultObligation,
-  consumeHandoffRunResult,
-  runHandoff,
   type HandoffPublicationIncident,
   type LiveHandoffResult,
   type NonEmptyReadonlyArray,
@@ -95,7 +93,8 @@ import {
   type GenerationReadiness,
 } from '../../store/generation-mutation-coordination.js';
 import { currentCoralStoreFormat } from '../../store-format.js';
-import { classifyStoreFile, type Database } from '../../store/db.js';
+import type { Database } from '../../store/db.js';
+import { inspectCurrentStore } from '../../store/epoch.js';
 import { openReadOnlyStoreDatabase } from '../../store/read-port.js';
 import {
   attributeUnreadableProviderOperations,
@@ -152,7 +151,7 @@ import { decodeHostRef, encodeHostRef } from '../../providers/host-ref-codec.js'
 import { getPluginRoot } from '../dispatch.js';
 import { emitError } from '../emit.js';
 import { errorCodeToExit } from '../errors.js';
-import { renderHandoffNotice, renderHandoffPublicationIncidents } from '../handoff-notice.js';
+import { renderHandoffPublicationIncidents } from '../handoff-notice.js';
 import {
   formatBackendStatusCommand,
   formatBackendStatus,
@@ -168,8 +167,15 @@ import {
   formatShutdown,
   RECOVERY_REVISION_FINGERPRINT_PREFIX,
   RECOVERY_REVISION_UNTIL_CLEARED,
+  type RecoveryQuarantineListResult,
 } from '../format/backend.js';
-import { formatStoreResetList, formatStoreResetReport } from '../format/store-reset.js';
+import {
+  constrainStoreResetRendererInput,
+  formatStoreEpochReport,
+  formatStoreResetList,
+  formatStoreResetRelease,
+  formatStoreResetReport,
+} from '../format/store-reset.js';
 import { clearHandoffRoutingStatusQuarantine, discardHandoffRoutingStatus } from '../routing-status-discard.js';
 import {
   createProviderProxyRoleTerminationCommandOperations,
@@ -460,12 +466,14 @@ export function handoffPublicationIncidentsExitContribution(
 }
 
 import { quarantineKbCommitLocal } from '../kb-commit-quarantine.js';
-import type { StoreResetTarget } from '../../store/operator-store-reset.js';
+import type { StoreResetReleaseTarget, StoreResetTarget } from '../../store/operator-store-reset.js';
 import {
+  boundStoreResetReleaseCliError,
   boundStoreResetCliError,
   discardStoreResetLocal,
   listStoreResetIncidentsLocal,
-  reportStoreResetIncidentLocal,
+  reportStoreResetLocal,
+  releaseStoreResetLocal,
 } from '../store-reset.js';
 
 function providerProxySetNoVerdictExitContribution(status: BackendStatusFull): 0 | 75 {
@@ -492,12 +500,30 @@ function directProviderProxySetHolderStatusExitContribution(
 const OFFLINE_OPERATOR_FLAVOR_HELP =
   'State flavor (prod or dev); required because the daemon that normally supplies it is down';
 const STORE_RESET_EVIDENCE_WARNING =
-  'Quarantined store-reset evidence is diagnostic-only and cannot restore active state.\n';
+  'Published a new store epoch; the previous epoch remains preserved until a later sweep or explicit release.\n';
 
 export interface StoreResetCommandOperations {
   list(target: StoreResetTarget): ReturnType<typeof listStoreResetIncidentsLocal>;
-  report(target: StoreResetTarget, incidentId: string): ReturnType<typeof reportStoreResetIncidentLocal>;
+  report(target: StoreResetTarget, reference: string): ReturnType<typeof reportStoreResetLocal>;
   discard(target: StoreResetTarget, flavor: BuildFlavor): ReturnType<typeof discardStoreResetLocal>;
+  release(
+    target: StoreResetReleaseTarget,
+    flavor: BuildFlavor,
+    incidentId: string,
+  ): ReturnType<typeof releaseStoreResetLocal>;
+}
+
+type StoreResetDiscardCommandResult = Extract<
+  Awaited<ReturnType<StoreResetCommandOperations['discard']>>,
+  { readonly kind: 'discarded' }
+>;
+
+function formatStoreResetDiscard(result: StoreResetDiscardCommandResult): string {
+  result = constrainStoreResetRendererInput(result);
+  if (result.previousEpoch === null) {
+    return `Initialized store epoch ${result.currentEpoch}.`;
+  }
+  return `Discarded store epoch ${result.previousEpoch}; initialized epoch ${result.currentEpoch}.`;
 }
 
 export interface KbCommitCommandOperations {
@@ -526,7 +552,7 @@ export interface HandoffRoutingStatusQuarantineCommandOperations {
 }
 
 export interface RecoveryQuarantineCommandOperations {
-  list(): readonly RecoveryQuarantineListEntry[];
+  list(): RecoveryQuarantineListResult;
   clear(request: RecoveryQuarantineClearRequest): Promise<RecoveryQuarantineClearResult>;
   discardProviderOperation?(
     request: UnreadableProviderOperationDiscardRequest,
@@ -989,7 +1015,7 @@ export function createBackendStatusCommandOperations(
   const runtime = createRealRuntime(resolveBuildFlavor(process.env));
   const statusPath = routingStatusPath(runtime);
   return {
-    inspectReadiness: () => inspectGenerationReadiness(runtime, currentCoralStoreFormat()),
+    inspectReadiness: () => inspectGenerationReadiness(runtime),
     getStatus: () => getBackendStatusFull(getPluginRoot()),
     getLiveHandoffResult,
     getRoutingStatus: () => readHandoffRoutingStatusWithOwnerObservations(runtime, statusPath),
@@ -1267,32 +1293,29 @@ function unreadableProviderOperationEntries(
 
 export function listRecoveryQuarantineLocal(
   runtime: RecoveryQuarantineReadRuntime = createRecoveryQuarantineRuntime(),
-): readonly RecoveryQuarantineListEntry[] {
-  const dbPath = runtime.paths.coral.store.dbFile;
-  const classification = classifyStoreFile(dbPath, runtime.storage, currentCoralStoreFormat());
-  // `absent` and `fresh` are the only classifications under which no row can exist. Every other one
-  // means rows this build cannot read may be there, and an empty list is then the opposite of what is
-  // true — an operator reading it concludes there is nothing to act on.
-  if (classification.kind === 'absent' || classification.kind === 'fresh') {
-    return [];
-  }
-  if (classification.kind !== 'compatible') {
-    throw new Error(
-      `Recovery quarantine cannot be inspected while the local store is ${classification.kind}. Run coral-cli backend status and start or repair the coordinator so it can perform the supported store transition, then retry recovery-quarantine list.`,
-    );
-  }
-
-  const db = openReadOnlyStoreDatabase(runtime, {
-    storeFormat: currentCoralStoreFormat(),
-  }) as unknown as Database;
+): RecoveryQuarantineListResult {
+  const current = inspectCurrentStore(runtime);
+  if (current.kind === 'absent') return [];
+  if (current.kind === 'unobservable') return { kind: 'unavailable', reason: 'unobservable' };
+  let db: Database | undefined;
   try {
+    db = openReadOnlyStoreDatabase(runtime, {
+      resolved: { path: current.epoch.path, epoch: current.epoch, epochCandidate: true },
+      storeFormat: currentCoralStoreFormat(),
+    }) as unknown as Database;
     const stored = RecoveryQuarantineStore.readOnly(db).list();
     return [...stored, ...unreadableProviderOperationEntries(db, stored)].sort((left, right) => {
       const boundary = left.boundary.localeCompare(right.boundary);
       return boundary === 0 ? left.subject.key.localeCompare(right.subject.key) : boundary;
     });
+  } catch {
+    return { kind: 'unavailable', reason: 'unobservable' };
   } finally {
-    db.close();
+    try {
+      db?.close();
+    } catch {
+      // Closing a read-only inspection must not replace its result.
+    }
   }
 }
 
@@ -1476,8 +1499,9 @@ export function registerBackendCommands(program: Command, operations: BackendCom
   const {
     storeReset = {
       list: listStoreResetIncidentsLocal,
-      report: reportStoreResetIncidentLocal,
+      report: reportStoreResetLocal,
       discard: discardStoreResetLocal,
+      release: releaseStoreResetLocal,
     },
     kbCommit = {
       quarantine: quarantineKbCommitLocal,
@@ -1928,10 +1952,10 @@ export function registerBackendCommands(program: Command, operations: BackendCom
       }
     });
 
-  const storeResetCommand = backend.command('store-reset').description('Inspect retained store-reset incidents');
+  const storeResetCommand = backend.command('store-reset').description('Inspect and operate on store epochs');
   storeResetCommand
     .command('list')
-    .description('List retained store-reset incidents and reportability')
+    .description('List current, preserved, and garbage store epochs plus legacy reset incidents')
     .requiredOption(
       '--target <target>',
       'Store generation to inspect (legacy or current; gen2 also accepted)',
@@ -1946,26 +1970,29 @@ export function registerBackendCommands(program: Command, operations: BackendCom
     });
   storeResetCommand
     .command('report')
-    .description('Generate a public-safe store-reset incident report')
-    .argument('<incident-id>', 'Canonical lowercase UUID shown by backend store-reset list')
+    .description('Report observable epoch facts or inspect a legacy incident')
+    .argument(
+      '<epoch-or-legacy-incident-id>',
+      'Positive numeric epoch or canonical legacy incident UUID shown by the list',
+    )
     .requiredOption(
       '--target <target>',
       'Store generation to inspect (legacy or current; gen2 also accepted)',
       parseStoreResetTarget,
     )
-    .action(async (incidentId: string, options: { target: StoreResetTarget }) => {
+    .action(async (reference: string, options: { target: StoreResetTarget }) => {
       try {
-        process.stdout.write(formatStoreResetReport(await storeReset.report(options.target, incidentId)));
+        const result = await storeReset.report(options.target, reference);
+        process.stdout.write(
+          result.kind === 'epoch' ? formatStoreEpochReport(result) : formatStoreResetReport(result.report),
+        );
       } catch (error: unknown) {
         emitError(boundStoreResetCliError(error));
       }
     });
   storeResetCommand
     .command('discard')
-    .description(
-      'Quarantine and replace an incompatible generated store; if a newer local Coral build is already selected ' +
-        'to own this store, the command runs there instead of here',
-    )
+    .description('Publish a fresh generated store epoch regardless of the current epoch classification')
     .requiredOption(
       '--target <target>',
       'Store generation to discard (current; gen2 also accepted, legacy is inspection-only)',
@@ -1975,52 +2002,8 @@ export function registerBackendCommands(program: Command, operations: BackendCom
     .action(async (options: { target: StoreResetTarget; flavor: BuildFlavor }) => {
       try {
         const result = await storeReset.discard(options.target, options.flavor);
-        if (result.kind === 'handoff') {
-          // The selection decision precedes every destructive step. Replaying the original argv lets the
-          // validated owner perform the requested reset without asking the operator to run another command.
-          const handoffResult = await runHandoff(
-            { kind: 'cli-invocation', argv: ['node', 'coral-cli', ...program.args] },
-            {
-              pluginRoot: getPluginRoot(),
-              activeSelectionTarget: result.target,
-              onSelectionPublicationIncident: (incident) => renderHandoffPublicationIncidents([incident]),
-            },
-          );
-          const continuation = consumeHandoffRunResult(handoffResult, (incidents) =>
-            renderHandoffPublicationIncidents(incidents.filter((incident) => incident.phase === 'terminal')),
-          );
-          if (continuation.kind === 'run-current') {
-            process.stderr.write(
-              'This Coral process could not finish draining stdout, so store-reset delegation was abandoned before any destructive step. Nothing was changed. Retry the command.\n',
-            );
-            process.exitCode = errorCodeToExit('transient');
-            return;
-          }
-          switch (continuation.outcome.kind) {
-            case 'handoff-success':
-              renderHandoffNotice(continuation.outcome);
-              return;
-            case 'handoff-exit':
-              process.stderr.write(`Coral ${continuation.version} ran the delegated store-reset command.\n`);
-              process.exitCode = continuation.outcome.exitCode;
-              return;
-            case 'handoff-signal':
-              process.stderr.write(`Coral ${continuation.version} ran the delegated store-reset command.\n`);
-              process.kill(process.pid, continuation.outcome.signal);
-              return;
-            default:
-              return assertNever(continuation.outcome);
-          }
-        }
-        process.stderr.write(STORE_RESET_EVIDENCE_WARNING);
-        if (result.incident === null) {
-          process.stdout.write(`Initialized ${result.target} ${result.flavor} store at ${result.storeDbPath}.\n`);
-          return;
-        }
-        const action = result.resumed ? 'Resumed' : 'Quarantined';
-        process.stdout.write(
-          `${action} store-reset incident '${result.incident.incidentId}' and initialized ${result.target} ${result.flavor} store at ${result.storeDbPath}.\n`,
-        );
+        if (result.previousEpoch !== null) process.stderr.write(STORE_RESET_EVIDENCE_WARNING);
+        process.stdout.write(`${formatStoreResetDiscard(result)}\n`);
       } catch (error: unknown) {
         if (error instanceof HandoffRunError) {
           renderHandoffPublicationIncidents(error.incidents.filter((incident) => incident.phase === 'terminal'));
@@ -2030,6 +2013,38 @@ export function registerBackendCommands(program: Command, operations: BackendCom
         emitError(error);
       }
     });
+  storeResetCommand
+    .command('release')
+    .description('Permanently remove one non-current store epoch')
+    .argument('<epoch>', 'Positive numeric epoch shown by backend store-reset list')
+    .requiredOption(
+      '--target <target>',
+      'Store generation containing the incident (current or gen2)',
+      parseStoreResetReleaseTarget,
+    )
+    .requiredOption('--flavor <flavor>', OFFLINE_OPERATOR_FLAVOR_HELP, parseFlavor)
+    .action(
+      async (
+        epoch: string,
+        options: {
+          target: StoreResetReleaseTarget;
+          flavor: BuildFlavor;
+        },
+      ) => {
+        try {
+          const result = await storeReset.release(options.target, options.flavor, epoch);
+          const output = `${formatStoreResetRelease(result)}\n`;
+          if (result.kind === 'released') {
+            process.stdout.write(output);
+            return;
+          }
+          process.stderr.write(output);
+          process.exitCode = result.kind === 'current' || result.kind === 'absent' ? 1 : errorCodeToExit('transient');
+        } catch (error: unknown) {
+          emitError(boundStoreResetReleaseCliError(error));
+        }
+      },
+    );
 
   const kbCommitCommand = backend.command('kb-commit').description('Operate on retained blocking KB commit evidence');
   kbCommitCommand.configureOutput({ writeErr: () => undefined });
@@ -2097,6 +2112,11 @@ function parseStoreResetTarget(value: string): StoreResetTarget {
   throw new InvalidArgumentError("Target must be 'legacy', 'current', or 'gen2'.");
 }
 
+function parseStoreResetReleaseTarget(value: string): StoreResetReleaseTarget {
+  if (value === 'current' || value === 'gen2') return value;
+  throw new InvalidArgumentError("Target must be 'current' or 'gen2'.");
+}
+
 function parseKbCommitId(value: string): string {
   if (isSafeKbCommitId(value)) return value;
   throw new InvalidArgumentError('KB commit ID must be one safe filesystem path segment.');
@@ -2114,14 +2134,23 @@ function unquoteRecoveryCoordinate(value: string): string {
   }
 }
 
+function recoveryQuarantineEntries(result: RecoveryQuarantineListResult): readonly RecoveryQuarantineListEntry[] {
+  if (Array.isArray(result)) return result as readonly RecoveryQuarantineListEntry[];
+  throw new RecoveryQuarantineContractError(
+    'Recovery quarantine coordinates are unavailable while the local store cannot be inspected.',
+    [{ kind: 'recovery-quarantine-clear', command: { kind: 'list' } }],
+  );
+}
+
 function parseRecoveryQuarantineClearOptions(
   options: {
     readonly boundary: string;
     readonly key: string;
     readonly revision: string;
   },
-  storedEntries: readonly RecoveryQuarantineListEntry[],
+  result: RecoveryQuarantineListResult,
 ): RecoveryQuarantineClearRequest {
+  const storedEntries = recoveryQuarantineEntries(result);
   const revision = unquoteRecoveryCoordinate(options.revision);
   const plainKey = unquoteRecoveryCoordinate(options.key);
   if (plainKey.includes('\u0000')) {
@@ -2156,8 +2185,9 @@ function parseRecoveryQuarantineClearOptions(
 
 function parseUnreadableProviderOperationDiscardOptions(
   options: Readonly<{ key: string; revision: string; allowReadable?: boolean }>,
-  storedEntries: readonly RecoveryQuarantineListEntry[],
+  result: RecoveryQuarantineListResult,
 ): UnreadableProviderOperationDiscardRequest {
+  const storedEntries = recoveryQuarantineEntries(result);
   const plainKey = unquoteRecoveryCoordinate(options.key);
   const decodedKey = decodeRecoveryQuarantineKey(options.key);
   const candidateKey = decodedKey.kind === 'decoded' ? decodedKey.key : plainKey;

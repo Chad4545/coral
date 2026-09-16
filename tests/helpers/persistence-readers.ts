@@ -1,4 +1,5 @@
-import { existsSync, mkdirSync, readFileSync, readdirSync } from 'node:fs';
+import { existsSync, lstatSync, mkdirSync, readFileSync, readdirSync } from 'node:fs';
+import { join } from 'node:path';
 
 import type { StoragePort } from '#src/infra/port-types.js';
 import { resolveBuildFlavor } from '#src/infra/build-flavor.js';
@@ -9,15 +10,19 @@ import { loadJobProjectionDetail, readJobEvents } from '#src/jobs/read-queries.j
 import { createDefaultStoreReadContext } from '#src/read-model/read-context.js';
 import { openTestStoreDb } from '#tests/helpers/store-db.js';
 
-const nodeStoreReaderStorage: Pick<StoragePort, 'existsSync' | 'mkdirSync' | 'readFileSync' | 'readdirSync'> = {
+const nodeStoreReaderStorage: Pick<
+  StoragePort,
+  'existsSync' | 'lstatSync' | 'mkdirSync' | 'readFileSync' | 'readdirSync'
+> = {
   readFileSync: (filePath, encoding) => readFileSync(filePath, encoding),
   readdirSync: readdirSync as StoragePort['readdirSync'],
   existsSync: (filePath) => existsSync(filePath),
+  lstatSync: lstatSync as StoragePort['lstatSync'],
   mkdirSync: (dirPath, options) => mkdirSync(dirPath, options),
 };
 
 function withReadonlyStore<T>(read: (db: Database) => T, fallback: T): T {
-  const dbPath = storePaths(resolveBuildFlavor(process.env)).dbFile;
+  const dbPath = join(storePaths(resolveBuildFlavor(process.env)).dbDir, 'store.db');
   if (!existsSync(dbPath)) {
     return fallback;
   }

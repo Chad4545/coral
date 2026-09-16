@@ -25,6 +25,7 @@ export interface CoordinatorDiscoveryRecord {
   version?: string;
   instanceId?: string;
   incarnation?: ProcessIncarnation;
+  storeEpoch?: string;
 }
 
 export interface BackendInfo extends CoordinatorDiscoveryRecord {
@@ -72,6 +73,10 @@ const coordinatorDiscoveryRecordSchema = z
     version: nonEmptyStringSchema.optional(),
     instanceId: nonEmptyStringSchema.optional(),
     incarnation: durableProcessIncarnationSchema.optional(),
+    storeEpoch: z
+      .string()
+      .regex(/^[1-9]\d*$/u)
+      .optional(),
   })
   // A build older than a future field must still read this record — `.strict()` would make that build's
   // `probeCoordinator` reject it outright the day a newer writer adds one, when every field it already
@@ -87,7 +92,7 @@ function discoveryFilePath(runtime: DiscoveryRuntime): string {
   return runtime.paths.coral.coordinator.infoFile;
 }
 
-export function writeDiscoveryRecord(record: CoordinatorDiscoveryRecord, runtime: DiscoveryWriterRuntime): void {
+export function writeDiscoveryRecord(record: CoordinatorDiscoveryRecord, runtime: DiscoveryWriterRuntime): boolean {
   const infoPath = discoveryFilePath(runtime);
   const incarnation =
     record.incarnation ??
@@ -104,7 +109,7 @@ export function writeDiscoveryRecord(record: CoordinatorDiscoveryRecord, runtime
 
   runtime.storage.mkdirSync(dirname(infoPath), { recursive: true });
   if (!runtime.storage.writeAtomicSync(infoPath, payload, { encoding: 'utf-8', mode: 0o600 })) {
-    return;
+    return false;
   }
   if (runtime.env.platform() !== 'win32') {
     try {
@@ -113,6 +118,7 @@ export function writeDiscoveryRecord(record: CoordinatorDiscoveryRecord, runtime
       // Best-effort.
     }
   }
+  return true;
 }
 
 /**
@@ -165,33 +171,15 @@ function readDiscoveryRecord(runtime: DiscoveryRuntime): CoordinatorDiscoveryRec
   return read.kind === 'record' ? read.record : null;
 }
 
-/**
- * The pid can be unobservable; so can the record itself.
- *
- * The record axis and the process axis fail independently, and neither one failing is the other one
- * answering. `readBackendInfo`'s `null` covers a missing file, an undecodable one, *and* a record omitting
- * `version`/`instanceId`, so anything gating on it reports a confident `not_running` from evidence it could
- * not read.
- *
- * Only an observed `'absent'` is an absence. There is no invariant test behind that sentence and one was
- * tried — see the rejection recorded in `tests/invariants/liveness-is-never-a-boolean.test.ts`. The rule is
- * held by these return types and by the tests that assert what each variant does, so a fourth site adding
- * itself is caught by review, not by a scan.
- */
 export type CoordinatorProbe =
-  /** A record exists and its pid names a live process. */
   | Readonly<{ kind: 'live'; record: CoordinatorDiscoveryRecord }>
-  /** No record was written, or the recorded pid decisively names no process. Either is a real absence. */
   | Readonly<{ kind: 'absent' }>
-  /**
-   * Nothing here is proof of absence, from either input. `unreadable-record` is a file that exists and could
-   * not be decoded; `unreadable-process` is a record whose pid could not be observed — that one carries its
-   * record deliberately, because the record holds the `bootToken` a contender needs to ask an incumbent to
-   * stand down, and discarding it over an unanswered probe is what makes "could not observe" read as "nobody
-   * is there".
-   */
   | Readonly<{ kind: 'unobservable'; reason: 'unreadable-record' }>
-  | Readonly<{ kind: 'unobservable'; reason: 'unreadable-process'; record: CoordinatorDiscoveryRecord }>;
+  | Readonly<{
+      kind: 'unobservable';
+      reason: 'unreadable-process' | 'recorded-process-absent';
+      record: CoordinatorDiscoveryRecord;
+    }>;
 
 /**
  * The record's `incarnation` is not compared here.
@@ -229,14 +217,14 @@ export function probeCoordinator(runtime: DiscoveryRuntime): CoordinatorProbe {
     case 'alive':
       return { kind: 'live', record };
     case 'absent':
-      return { kind: 'absent' };
+      return { kind: 'unobservable', reason: 'recorded-process-absent', record };
     case 'unknown':
       return { kind: 'unobservable', reason: 'unreadable-process', record };
   }
 }
 
-export function writeBackendInfo(info: BackendInfo, runtime: DiscoveryWriterRuntime): void {
-  writeDiscoveryRecord(info, runtime);
+export function writeBackendInfo(info: BackendInfo, runtime: DiscoveryWriterRuntime): boolean {
+  return writeDiscoveryRecord(info, runtime);
 }
 
 export function readBackendInfo(runtime: DiscoveryRuntime): BackendInfo | null {

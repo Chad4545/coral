@@ -277,6 +277,10 @@ export class InMemoryStorage implements StoragePort {
     return this.readFileSync(path, encoding);
   }
 
+  async readdir(path: string): Promise<string[]> {
+    return this.readdirSync(path);
+  }
+
   readFileSync(path: string, encoding: 'utf-8'): string {
     const normalized = normalizePathForStorage(path);
     const file = this.fileNode(normalized);
@@ -532,6 +536,10 @@ export class InMemoryStorage implements StoragePort {
     this.touchAncestors(normalized === '/' ? '/' : parentPath(normalized));
   }
 
+  async rm(path: string, options?: { recursive?: boolean; force?: boolean }): Promise<void> {
+    this.rmSync(path, options);
+  }
+
   rmdirSync(path: string): void {
     this.rmSync(path);
   }
@@ -596,6 +604,12 @@ export class InMemoryStorage implements StoragePort {
     throw createErrnoError('ENOENT', normalized);
   }
 
+  async lstat(path: string): Promise<StorageEntryKind & { readonly size: number }> {
+    const kind = this.lstatSync(path);
+    const stats = this.statSync(path);
+    return { ...kind, size: stats.size };
+  }
+
   realpathSync(path: string): string {
     const normalized = normalizePathForStorage(path);
     if (!this.files.has(normalized) && !this.directories.has(normalized)) {
@@ -617,6 +631,7 @@ export class InMemoryStorage implements StoragePort {
         return {
           dev: BigInt(file.dev),
           ino: BigInt(file.ino),
+          nlink: this.fileLinkCount(file),
           mode: REGULAR_FILE_TYPE_BITS | BigInt(posixMode(file.mode)),
           uid: SIMULATED_OWNER_UID,
           size: BigInt(file.content.length),
@@ -640,6 +655,7 @@ export class InMemoryStorage implements StoragePort {
       return {
         dev: BigInt(directory.dev),
         ino: BigInt(directory.ino),
+        nlink: 1n,
         mode: DIRECTORY_TYPE_BITS | BigInt(posixMode(directory.mode)),
         uid: SIMULATED_OWNER_UID,
         size: 0n,
@@ -665,6 +681,7 @@ export class InMemoryStorage implements StoragePort {
     return {
       dev: BigInt(file.dev),
       ino: BigInt(file.ino),
+      nlink: this.fileLinkCount(file),
       mode: REGULAR_FILE_TYPE_BITS | BigInt(posixMode(file.mode)),
       uid: SIMULATED_OWNER_UID,
       size: BigInt(file.content.length),
@@ -876,6 +893,10 @@ export class InMemoryStorage implements StoragePort {
     this.touchAncestors(parentPath(normalized));
   }
 
+  async unlink(path: string): Promise<void> {
+    this.unlinkSync(path);
+  }
+
   tryExclusiveWriteSync(
     path: string,
     data: StorageData,
@@ -947,6 +968,10 @@ export class InMemoryStorage implements StoragePort {
 
   syncDirectoryDurableSync(path: string): boolean {
     return this.directories.has(normalizePathForStorage(path));
+  }
+
+  async syncDirectoryDurable(path: string): Promise<boolean> {
+    return this.syncDirectoryDurableSync(path);
   }
 
   chmodSync(path: string, mode: number): void {
@@ -1155,6 +1180,14 @@ export class InMemoryStorage implements StoragePort {
   private fileNode(path: string): FileNode | undefined {
     const identity = this.files.get(normalizePathForStorage(path));
     return identity === undefined ? undefined : this.fileNodes.get(fileIdentityKey(identity));
+  }
+
+  private fileLinkCount(file: FileNode): bigint {
+    let count = 0n;
+    for (const identity of this.files.values()) {
+      if (identity.dev === file.dev && identity.ino === file.ino) count += 1n;
+    }
+    return count;
   }
 
   private createFile(path: string, content: Buffer, mode: number): FileNode {

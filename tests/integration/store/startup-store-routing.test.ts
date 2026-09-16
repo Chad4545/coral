@@ -1,108 +1,175 @@
 import { createHash } from 'node:crypto';
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { spawn } from 'node:child_process';
+import {
+  existsSync,
+  mkdirSync,
+  mkdtempSync,
+  readFileSync,
+  readdirSync,
+  realpathSync,
+  rmSync,
+  symlinkSync,
+  writeFileSync,
+} from 'node:fs';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
-import { DatabaseSync } from 'node:sqlite';
+import { fileURLToPath } from 'node:url';
 
-import { afterEach, describe, expect, it, vi } from 'vitest';
+import { build } from 'esbuild';
+import { afterEach, describe, expect, it } from 'vitest';
 
 import { CURRENT_STRICT_BUNDLE_MANIFEST_FILE } from '#src/infra/bundle-manifest-address.js';
 import type { StrictBundleManifest } from '#src/infra/bundle-manifest.js';
-import { createForeignTargetValidator, type ForeignTargetValidator } from '#src/infra/handoff-target.js';
+import { writeDiscoveryRecord } from '#src/infra/backend-discovery.js';
+import { acquireDirectoryLockSync } from '#src/infra/fs-lock.js';
+import { createForeignTargetValidator } from '#src/infra/handoff-target.js';
 import type { Runtime } from '#src/runtime/ports.js';
 import { createRealRuntime } from '#src/runtime/real.js';
 import {
   ACTIVE_STORE_SELECTION_VERSION,
+  ACTIVE_STORE_TRANSITION_VERSION,
   publishActiveStoreSelection,
+  publishActiveStoreTransition,
   readActiveStoreSelection,
+  resolveActiveStoreRecordPaths,
   type ActiveStoreSelection,
+  type ActiveStoreTransition,
 } from '#src/store/active-store-selection.js';
-import { createBackendStoreResetAuthority } from '#src/store/backend-store-reset.js';
+import { resolveGenerationBoundaryPaths } from '#src/store/generation-mutation-coordination.js';
 import {
-  parseStoreResetIncidentManifest,
-  STORE_RESET_MANIFEST_FILE_NAME,
-  STORE_RESET_QUARANTINE_DIRECTORY,
-} from '#src/store/reset-incident.js';
+  encodeResolvedStoreEpoch,
+  epochPath,
+  sweepStoreEpochs,
+  STORE_EPOCH_METADATA_FILE_NAME,
+} from '#src/store/epoch.js';
 import { routeOrOpenBackendStoreAtStartup } from '#src/store/startup-store-routing.js';
 import { currentCoralStoreFormat } from '#src/store-format.js';
+import { openTestStoreDatabase } from '#tests/helpers/store-db.js';
 
 const roots: string[] = [];
-const backendBundle = 'startup routing backend';
-const cliBundle = 'startup routing cli';
-const claudeAppserverBundle = 'startup routing claude appserver';
-const durableWrapperBundle = 'startup routing durable wrapper';
 const storeFormat = currentCoralStoreFormat();
 
 function manifest(version: string, buildSetId: string): StrictBundleManifest {
+  const digest = (value: string) => createHash('sha256').update(value).digest('hex').slice(0, 16);
   return {
     version,
     buildSetId,
-    bundleHash: createHash('sha256').update(backendBundle).digest('hex').slice(0, 16),
-    cliBundleHash: createHash('sha256').update(cliBundle).digest('hex').slice(0, 16),
-    claudeAppserverBundleHash: createHash('sha256').update(claudeAppserverBundle).digest('hex').slice(0, 16),
-    durableWrapperBundleHash: createHash('sha256').update(durableWrapperBundle).digest('hex').slice(0, 16),
+    bundleHash: digest('backend'),
+    cliBundleHash: digest('cli'),
+    claudeAppserverBundleHash: digest('appserver'),
+    durableWrapperBundleHash: digest('wrapper'),
     flavor: 'prod',
     storeFormatFingerprint: storeFormat.fingerprint,
   };
 }
 
-function selection(manifestValue: StrictBundleManifest, bundleDir: string): ActiveStoreSelection {
-  return {
-    version: ACTIVE_STORE_SELECTION_VERSION,
-    manifest: manifestValue,
-    bundleDir,
-    activeStoreFingerprint: manifestValue.storeFormatFingerprint,
-  };
-}
-
-function createBundle(root: string, manifestValue: StrictBundleManifest): string {
+function createBundle(root: string, build: StrictBundleManifest): string {
   const bundleDir = mkdtempSync(join(root, 'bundle-'));
-  writeFileSync(join(bundleDir, 'coral-backend.cjs'), backendBundle);
-  writeFileSync(join(bundleDir, 'coral-cli.cjs'), cliBundle);
-  writeFileSync(join(bundleDir, 'coral-claude-appserver.cjs'), claudeAppserverBundle);
-  writeFileSync(join(bundleDir, 'coral-durable-wrapper.cjs'), durableWrapperBundle);
-  writeFileSync(join(bundleDir, CURRENT_STRICT_BUNDLE_MANIFEST_FILE), JSON.stringify(manifestValue));
+  for (const [name, contents] of [
+    ['coral-backend.cjs', 'backend'],
+    ['coral-cli.cjs', 'cli'],
+    ['coral-claude-appserver.cjs', 'appserver'],
+    ['coral-durable-wrapper.cjs', 'wrapper'],
+  ] as const) {
+    writeFileSync(join(bundleDir, name), contents);
+  }
+  writeFileSync(join(bundleDir, CURRENT_STRICT_BUNDLE_MANIFEST_FILE), JSON.stringify(build));
   return bundleDir;
 }
 
-function harness(version = '2.0.0'): {
-  readonly runtime: Runtime;
-  readonly current: ActiveStoreSelection;
-  readonly authority: ReturnType<typeof createBackendStoreResetAuthority>;
-} {
+function selection(build: StrictBundleManifest, bundleDir: string): ActiveStoreSelection {
+  return {
+    version: ACTIVE_STORE_SELECTION_VERSION,
+    manifest: build,
+    bundleDir,
+    activeStoreFingerprint: build.storeFormatFingerprint,
+  };
+}
+
+function harness(version = '2.0.0'): { root: string; runtime: Runtime; current: ActiveStoreSelection } {
   const root = mkdtempSync(join(tmpdir(), 'coral-startup-store-routing-'));
   roots.push(root);
   const runtime = createRealRuntime('prod', { baseDir: root });
-  const currentManifest = manifest(version, '123e4567-e89b-42d3-a456-426614174000');
-  const current = selection(currentManifest, createBundle(root, currentManifest));
-  const authority = createBackendStoreResetAuthority(
-    runtime,
-    { acquiredViaHandoff: false },
-    {
-      namespace: 'startup-routing-test',
-      storeFormat: { ...storeFormat, productVersion: version },
-      build: currentManifest,
-    },
-  );
-  return { runtime, current, authority };
+  const build = manifest(version, '123e4567-e89b-42d3-a456-426614174000');
+  return { root, runtime, current: selection(build, createBundle(root, build)) };
 }
 
-function validatorThatMustNotRun(): ForeignTargetValidator {
-  return vi.fn(() => {
-    throw new Error('validator should not run');
+function publish(runtime: Runtime, selected: ActiveStoreSelection): void {
+  const lockRoot = mkdtempSync(join(tmpdir(), 'coral-startup-selection-publish-'));
+  roots.push(lockRoot);
+  const lease = acquireDirectoryLockSync(join(lockRoot, 'lease.lock'), {
+    storage: runtime.storage,
+    time: runtime.time,
   });
+  try {
+    publishActiveStoreSelection(runtime, selected, lease.actuator);
+  } finally {
+    lease();
+  }
 }
 
-async function route(
-  runtime: Runtime,
-  authority: ReturnType<typeof createBackendStoreResetAuthority>,
-  current: ActiveStoreSelection,
-  validateForeignTarget: ForeignTargetValidator,
-) {
+function publishEpoch(runtime: Runtime, epoch: string, build: StrictBundleManifest): void {
+  publishEpochAtRoot(runtime, runtime.paths.coral.store.dbDir, epoch, build);
+}
+
+function publishEpochAtRoot(runtime: Runtime, storeRoot: string, epoch: string, build: StrictBundleManifest): void {
+  const directory = join(storeRoot, `epoch-${epoch}`);
+  mkdirSync(directory, { recursive: true });
+  writeFileSync(join(directory, '.lock'), '');
+  const db = openTestStoreDatabase({ path: join(directory, 'store.db'), storage: runtime.storage, storeFormat });
+  db.exec('CREATE TABLE epoch_marker (epoch TEXT NOT NULL)');
+  db.prepare('INSERT INTO epoch_marker (epoch) VALUES (?)').run(epoch);
+  db.close();
+  writeFileSync(
+    join(directory, STORE_EPOCH_METADATA_FILE_NAME),
+    JSON.stringify({
+      supersedes: null,
+      classification: { kind: 'unavailable' },
+      build,
+      publishedAt: '2026-09-15T00:00:00.000Z',
+    }),
+  );
+}
+
+async function runStoreCapabilityFixture(root: string, store: string, version: string): Promise<{ epoch: string }> {
+  const fixture = fileURLToPath(new URL('../../fixtures/kb-daemon-store-capability.ts', import.meta.url));
+  const bundle = join(root, 'kb-daemon-store-capability.mjs');
+  await build({
+    entryPoints: [fixture],
+    outfile: bundle,
+    bundle: true,
+    format: 'esm',
+    platform: 'node',
+    target: 'node24',
+    loader: { '.sql': 'text' },
+    define: { __VERSION__: JSON.stringify(version) },
+    banner: { js: "import { createRequire } from 'node:module'; const require = createRequire(import.meta.url);" },
+  });
+  const child = spawn(process.execPath, [bundle], {
+    cwd: process.cwd(),
+    env: {
+      ...process.env,
+      CORAL_TEST_BASE_DIR: root,
+      CORAL_KB_DAEMON_STORE: store,
+    },
+    stdio: ['ignore', 'pipe', 'pipe'],
+  });
+  let stdout = '';
+  let stderr = '';
+  child.stdout.setEncoding('utf8').on('data', (chunk: string) => (stdout += chunk));
+  child.stderr.setEncoding('utf8').on('data', (chunk: string) => (stderr += chunk));
+  const exitCode = await new Promise<number | null>((resolve, reject) => {
+    child.once('error', reject);
+    child.once('exit', resolve);
+  });
+  if (exitCode !== 0) throw new Error(`Store capability fixture exited ${String(exitCode)}: ${stderr}`);
+  return JSON.parse(stdout) as { epoch: string };
+}
+
+async function route(runtime: Runtime, current: ActiveStoreSelection) {
   return routeOrOpenBackendStoreAtStartup({
     runtime,
-    authority,
-    validateForeignTarget,
+    validateForeignTarget: createForeignTargetValidator(),
     options: {
       storeFormat: { ...storeFormat, productVersion: current.manifest.version },
       currentSelection: current,
@@ -111,108 +178,280 @@ async function route(
 }
 
 afterEach(() => {
-  for (const root of roots.splice(0)) {
-    rmSync(root, { recursive: true, force: true });
-  }
+  for (const root of roots.splice(0)) rmSync(root, { recursive: true, force: true });
 });
 
-describe('startup-store-routing', () => {
-  it.each([
-    ['exact', '2.0.0', '123e4567-e89b-42d3-a456-426614174000'],
-    ['older', '1.0.0', '223e4567-e89b-42d3-a456-426614174000'],
-    ['equal version', '2.0.0+selected', '223e4567-e89b-42d3-a456-426614174000'],
-  ])(
-    'should open with the current build for an %s selection without target validation',
-    async (relation, version, buildSetId) => {
-      const { runtime, current, authority } = harness();
-      const selectedManifest = manifest(version, buildSetId);
-      const selected =
-        relation === 'exact'
-          ? current
-          : selection(selectedManifest, createBundle(dirname(current.bundleDir), selectedManifest));
-      publishActiveStoreSelection(runtime, selected);
-      const validator = validatorThatMustNotRun();
+describe('startup store routing', () => {
+  it('carries the opened epoch across readiness so changing metadata cannot redirect the sweep', async () => {
+    const { runtime, current } = harness();
+    publishEpoch(runtime, '1', current.manifest);
+    publishEpoch(runtime, '3', current.manifest);
+    const newerMetadata = join(runtime.paths.coral.store.dbDir, 'epoch-3', STORE_EPOCH_METADATA_FILE_NAME);
+    let metadataReads = 0;
+    const storage = new Proxy(runtime.storage, {
+      get(subject, property, receiver) {
+        if (property !== 'readFileSync') return Reflect.get(subject, property, receiver) as unknown;
+        return (path: string, encoding: 'utf-8'): string => {
+          if (path === newerMetadata && (metadataReads += 1) === 1) {
+            throw Object.assign(new Error('injected settlement EIO'), { code: 'EIO' });
+          }
+          return subject.readFileSync(path, encoding);
+        };
+      },
+    });
+    const routedRuntime = { ...runtime, storage };
 
-      const routing = await route(runtime, authority, current, validator);
+    const result = await route(routedRuntime, current);
+    expect(result.kind).toBe('open');
+    if (result.kind !== 'open') return;
+    writeDiscoveryRecord(
+      {
+        pid: runtime.env.pid(),
+        port: 1,
+        socketPath: join(runtime.paths.coral.coordinator.runDir, 'live.sock'),
+        bundleHash: current.manifest.bundleHash,
+        flavor: runtime.flavor,
+        namespace: 'startup-routing-test',
+        startedAt: Date.now(),
+        token: 'startup-routing-test',
+        bootToken: 'startup-routing-test',
+        storeEpoch: result.store.epoch,
+      },
+      runtime,
+    );
+    const sweepEpoch = result.store.epoch;
+    const sweep = sweepStoreEpochs(routedRuntime, runtime.paths.coral.store.dbDir, sweepEpoch);
+    const openDatabasePresent = existsSync(epochPath(runtime.paths.coral.store.dbDir, '1'));
+    result.db.close();
 
-      expect(routing.kind).toBe('open');
-      if (routing.kind === 'open') routing.db.close();
-      expect(validator).not.toHaveBeenCalled();
-      expect(readActiveStoreSelection(runtime)).toEqual({ kind: 'valid', selection: current });
+    expect(result).toMatchObject({
+      kind: 'open',
+      store: {
+        epoch: '1',
+        path: epochPath(runtime.paths.coral.store.dbDir, '1'),
+      },
+    });
+    expect(sweep).toBe('complete');
+    expect(openDatabasePresent).toBe(true);
+  });
+
+  it('hands the settled store capability to a real daemon process across a root retarget', async () => {
+    const { root, runtime, current } = harness();
+    const configuredRoot = runtime.paths.coral.store.dbDir;
+    const oldRoot = join(root, 'old-store-root');
+    const newRoot = join(root, 'new-store-root');
+    publishEpochAtRoot(runtime, oldRoot, '1', current.manifest);
+    publishEpochAtRoot(runtime, newRoot, '2', current.manifest);
+    mkdirSync(dirname(configuredRoot), { recursive: true });
+    symlinkSync(oldRoot, configuredRoot);
+    publish(runtime, current);
+
+    const result = await route(runtime, current);
+    expect(result.kind).toBe('open');
+    if (result.kind !== 'open') return;
+    const coordinatorEpoch = result.db.prepare<[], { epoch: string }>('SELECT epoch FROM epoch_marker').get()?.epoch;
+
+    rmSync(configuredRoot);
+    symlinkSync(newRoot, configuredRoot);
+    const daemon = await runStoreCapabilityFixture(
+      root,
+      encodeResolvedStoreEpoch(result.store),
+      current.manifest.version,
+    );
+    const daemonMarker = result.db.prepare<[], { value: string }>('SELECT value FROM daemon_marker').get()?.value;
+    const configuredTarget = realpathSync(configuredRoot) === newRoot ? 'new' : 'old';
+    result.db.close();
+
+    expect(coordinatorEpoch).toBe('1');
+    expect(daemon).toEqual({ epoch: '1' });
+    expect(daemonMarker).toBe('opened-by-daemon');
+    expect(configuredTarget).toBe('new');
+  });
+
+  it('publishes epoch one when no store epoch is proven', async () => {
+    const { runtime, current } = harness();
+    publish(runtime, current);
+
+    const result = await route(runtime, current);
+
+    expect(result.kind).toBe('open');
+    if (result.kind === 'open') result.db.close();
+    expect(existsSync(join(runtime.paths.coral.store.dbDir, 'epoch-1', 'store.db'))).toBe(true);
+  });
+
+  it('hands off to a valid newer selection without creating a store', async () => {
+    const { runtime, current } = harness('1.0.0');
+    const newer = manifest('2.0.0', '223e4567-e89b-42d3-a456-426614174000');
+    publish(runtime, selection(newer, createBundle(dirname(current.bundleDir), newer)));
+
+    const result = await route(runtime, current);
+
+    expect(result.kind).toBe('handoff');
+    expect(existsSync(join(runtime.paths.coral.store.dbDir, 'store.db'))).toBe(false);
+  });
+
+  it('retains invalid-selection evidence inside the generation coordination root', async () => {
+    const { runtime, current } = harness('1.0.0');
+    const newer = manifest('2.0.0', '223e4567-e89b-42d3-a456-426614174000');
+    publish(runtime, selection(newer, join(dirname(current.bundleDir), 'missing-bundle')));
+    const syncedDirectories: string[] = [];
+    const storage = new Proxy(runtime.storage, {
+      get(subject, property, receiver) {
+        if (property !== 'syncDirectoryDurableSync') return Reflect.get(subject, property, receiver) as unknown;
+        return (path: string): boolean => {
+          syncedDirectories.push(path);
+          return subject.syncDirectoryDurableSync(path);
+        };
+      },
+    });
+
+    const result = await route({ ...runtime, storage }, current);
+
+    expect(result.kind).toBe('reset-newer-invalid');
+    if (result.kind === 'reset-newer-invalid') result.db.close();
+    const retainedRoot = join(
+      resolveGenerationBoundaryPaths(runtime).coordinationRoot,
+      'retained-active-store-transitions',
+    );
+    expect(readdirSync(retainedRoot)).toHaveLength(1);
+    expect(syncedDirectories).toContain(retainedRoot);
+    expect(syncedDirectories).toContain(resolveGenerationBoundaryPaths(runtime).coordinationRoot);
+    expect(readActiveStoreSelection(runtime)).toEqual({ kind: 'valid', selection: current });
+  });
+
+  it.each(['current', 'v1'] as const)(
+    'supersedes a mismatched pre-existing %s transition and durably retains its evidence',
+    async (generation) => {
+      const { root, runtime, current } = harness('2.0.0');
+      publish(runtime, current);
+      const paths = resolveActiveStoreRecordPaths(runtime);
+      const staleBuild = manifest('1.0.0', '223e4567-e89b-42d3-a456-426614174000');
+      const staleTransition: ActiveStoreTransition = {
+        version: ACTIVE_STORE_TRANSITION_VERSION,
+        transitionId: '323e4567-e89b-42d3-a456-426614174000',
+        kind: 'selection-recovery',
+        evidence: { kind: 'selection-absent', storeEvidence: { kind: 'pending-classification' } },
+        currentManifest: staleBuild,
+        currentBundleDir: createBundle(root, staleBuild),
+      };
+      if (generation === 'current') {
+        const lockRoot = mkdtempSync(join(tmpdir(), 'coral-startup-transition-publish-'));
+        roots.push(lockRoot);
+        const lease = acquireDirectoryLockSync(join(lockRoot, 'lease.lock'), {
+          storage: runtime.storage,
+          time: runtime.time,
+        });
+        try {
+          publishActiveStoreTransition(runtime, staleTransition, lease.actuator);
+        } finally {
+          lease();
+        }
+      } else {
+        writeFileSync(paths.transitionV1File, 'legacy transition evidence');
+      }
+      const transitionFile = generation === 'current' ? paths.transitionFile : paths.transitionV1File;
+      const evidence = readFileSync(transitionFile);
+      const syncedDirectories: string[] = [];
+      const storage = new Proxy(runtime.storage, {
+        get(subject, property, receiver) {
+          if (property !== 'syncDirectoryDurableSync') return Reflect.get(subject, property, receiver) as unknown;
+          return (path: string): boolean => {
+            syncedDirectories.push(path);
+            return subject.syncDirectoryDurableSync(path);
+          };
+        },
+      });
+
+      const result = await route({ ...runtime, storage }, current);
+
+      expect(result.kind).toBe('open');
+      if (result.kind === 'open') result.db.close();
+      const retainedRoot = join(paths.coordinationRoot, 'retained-active-store-transitions');
+      const retained = readdirSync(retainedRoot);
+      expect(retained).toHaveLength(1);
+      const retainedFile = retained[0];
+      if (retainedFile === undefined) throw new Error('Superseded transition evidence was not retained.');
+      expect(readFileSync(join(retainedRoot, retainedFile))).toEqual(evidence);
+      expect(existsSync(transitionFile)).toBe(false);
+      expect(syncedDirectories).toContain(retainedRoot);
+      expect(syncedDirectories).toContain(paths.coordinationRoot);
     },
   );
 
-  it('should hand off to a validated newer selection without touching the store', async () => {
-    const { runtime, current, authority } = harness('1.0.0');
-    const selectedManifest = manifest('2.0.0', '223e4567-e89b-42d3-a456-426614174000');
-    const selected = selection(selectedManifest, createBundle(dirname(current.bundleDir), selectedManifest));
-    publishActiveStoreSelection(runtime, selected);
+  it('refuses a rejected current transition without discarding its evidence', async () => {
+    const { root, runtime, current } = harness();
+    publish(runtime, current);
+    const paths = resolveActiveStoreRecordPaths(runtime);
+    const evidencePath = join(root, 'linked-transition-evidence');
+    writeFileSync(evidencePath, 'linked transition evidence');
+    symlinkSync(evidencePath, paths.transitionFile);
 
-    const routing = await route(runtime, authority, current, createForeignTargetValidator());
-
-    expect(routing.kind).toBe('handoff');
-    expect(existsSync(runtime.paths.coral.store.dbFile)).toBe(false);
-    expect(readActiveStoreSelection(runtime)).toEqual({ kind: 'valid', selection: selected });
+    await expect(route(runtime, current)).rejects.toMatchObject({
+      code: 'active_store_coordination_invalid',
+      context: { record: 'transition', failureCode: 'record_link' },
+    });
+    expect(readFileSync(paths.transitionFile, 'utf8')).toBe('linked transition evidence');
   });
 
-  it('should recover an invalid newer target through the locked evidence protocol', async () => {
-    const { runtime, current, authority } = harness('1.0.0');
-    const selected = selection(
-      manifest('2.0.0', '223e4567-e89b-42d3-a456-426614174000'),
-      join(dirname(current.bundleDir), 'missing-selected-bundle'),
+  it('refuses an unsafe active-store coordination directory', async () => {
+    const { root, runtime, current } = harness();
+    const { coordinationRoot } = resolveActiveStoreRecordPaths(runtime);
+    const target = join(root, 'linked-coordination-root');
+    mkdirSync(dirname(coordinationRoot), { recursive: true });
+    mkdirSync(target);
+    symlinkSync(target, coordinationRoot);
+
+    await expect(route(runtime, current)).rejects.toMatchObject({
+      code: 'active_store_coordination_invalid',
+      context: { record: 'transition', failureCode: 'coordination_directory_link' },
+    });
+    expect(realpathSync(coordinationRoot)).toBe(target);
+  });
+
+  it('rejects retained transition success when its destination sync is unproven', async () => {
+    const { runtime, current } = harness('1.0.0');
+    const newer = manifest('2.0.0', '223e4567-e89b-42d3-a456-426614174000');
+    publish(runtime, selection(newer, join(dirname(current.bundleDir), 'missing-bundle')));
+    const retainedRoot = join(
+      resolveGenerationBoundaryPaths(runtime).coordinationRoot,
+      'retained-active-store-transitions',
     );
-    publishActiveStoreSelection(runtime, selected);
-
-    const routing = await route(runtime, authority, current, createForeignTargetValidator());
-
-    expect(routing).toMatchObject({
-      kind: 'reset-newer-invalid',
-      evidence: { failure: 'bundle-dir-unavailable' },
+    const storage = new Proxy(runtime.storage, {
+      get(subject, property, receiver) {
+        if (property !== 'syncDirectoryDurableSync') return Reflect.get(subject, property, receiver) as unknown;
+        return (path: string): boolean => (path === retainedRoot ? false : subject.syncDirectoryDurableSync(path));
+      },
     });
-    if (routing.kind === 'reset-newer-invalid') routing.db.close();
-    expect(readActiveStoreSelection(runtime)).toEqual({ kind: 'valid', selection: current });
-    expect(
-      existsSync(
-        join(runtime.paths.coral.store.dbDir, STORE_RESET_QUARANTINE_DIRECTORY, 'retained-active-store-transitions'),
-      ),
-    ).toBe(true);
-  });
 
-  it('should classify exact-selection store bytes and durably reset a newer store', async () => {
-    const { runtime, current, authority } = harness('1.0.0');
-    publishActiveStoreSelection(runtime, current);
-    const dbPath = runtime.paths.coral.store.dbFile;
-    mkdirSync(dirname(dbPath), { recursive: true });
-    const db = new DatabaseSync(dbPath);
-    db.exec(`
-      CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
-      CREATE TABLE sentinel_before_reset (id INTEGER PRIMARY KEY);
-      INSERT INTO sentinel_before_reset (id) VALUES (1);
-    `);
-    const insert = db.prepare('INSERT INTO meta (key, value) VALUES (?, ?)');
-    insert.run('store_format_fingerprint', storeFormat.fingerprint);
-    insert.run('store_product_version', '2.0.0');
-    db.close();
-
-    const routing = await route(runtime, authority, current, validatorThatMustNotRun());
-
-    expect(routing.kind).toBe('open');
-    if (routing.kind === 'open') routing.db.close();
-    const opened = new DatabaseSync(dbPath);
-    expect(
-      opened.prepare("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'sentinel_before_reset'").get(),
-    ).toBeUndefined();
-    opened.close();
-    const quarantine = join(runtime.paths.coral.store.dbDir, STORE_RESET_QUARANTINE_DIRECTORY);
-    const incident = runtime.storage
-      .readDirectoryBoundedSync(quarantine, 16)
-      .entries.find((entry) => entry !== '.staging');
-    if (incident === undefined) throw new Error('Expected a retained reset incident.');
-    expect(
-      parseStoreResetIncidentManifest(readFileSync(join(quarantine, incident, STORE_RESET_MANIFEST_FILE_NAME))),
-    ).toMatchObject({
-      schemaVersion: 3,
-      resetPolicyCause: 'newer-incompatible-invalid-target',
+    await expect(route({ ...runtime, storage }, current)).rejects.toMatchObject({
+      code: 'active_store_coordination_invalid',
+      context: { cause: expect.stringContaining('Failed to durably retain active-store transition') },
     });
   });
+
+  it('boots through the startup route when another process holds the adoption lock', async () => {
+    const { runtime, current } = harness();
+    const { adoptionLock } = resolveGenerationBoundaryPaths(runtime);
+    mkdirSync(dirname(adoptionLock), { recursive: true });
+    const lease = acquireDirectoryLockSync(adoptionLock, { storage: runtime.storage, time: runtime.time });
+    try {
+      const result = await route(runtime, current);
+
+      expect(result.kind).toBe('open');
+      if (result.kind === 'open') result.db.close();
+    } finally {
+      lease();
+    }
+  }, 10_000);
+
+  it('boots through the startup route when a dead owner leaves a fresh markerless adoption lock', async () => {
+    const { runtime, current } = harness();
+    const { adoptionLock } = resolveGenerationBoundaryPaths(runtime);
+    mkdirSync(adoptionLock, { recursive: true });
+
+    const result = await route(runtime, current);
+
+    expect(result.kind).toBe('open');
+    if (result.kind === 'open') result.db.close();
+  }, 10_000);
 });

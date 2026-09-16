@@ -1344,7 +1344,15 @@ function formatCapabilityRejected(result: Extract<ShutdownResult, { reason: 'cap
   ].join('\n');
 }
 
-export function formatRecoveryQuarantineList(entries: readonly RecoveryQuarantineListEntry[]): string {
+export type RecoveryQuarantineListResult =
+  | readonly RecoveryQuarantineListEntry[]
+  | Readonly<{ kind: 'unavailable'; reason: 'unobservable' }>;
+
+export function formatRecoveryQuarantineList(result: RecoveryQuarantineListResult): string {
+  if (!Array.isArray(result)) {
+    return 'Recovery quarantine inspection is unavailable because the current store could not be observed safely; no rows were read.';
+  }
+  const entries = result as readonly RecoveryQuarantineListEntry[];
   if (entries.length === 0) {
     return 'Recovery quarantine is empty.';
   }

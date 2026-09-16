@@ -4,8 +4,8 @@ import { isAbsolute, join, relative, sep } from 'node:path';
 import type { StrictBundleManifest } from '../infra/bundle-manifest.js';
 import {
   isCanonicalStoreResetIncidentId,
-  MAX_INCIDENT_ROOT_ENTRIES,
   MAX_INCIDENT_DIR_ENTRIES,
+  MAX_INCIDENT_ROOT_ENTRIES,
   MAX_REPORT_HASH_BYTES,
   MAX_RESET_MANIFEST_BYTES,
   parseStoreResetIncidentManifest,
@@ -15,10 +15,9 @@ import {
   STORE_RESET_MANIFEST_FILE_NAME,
   StoreResetManifestDecodeError,
   type StoreResetIncidentLocalReport,
-  type StoreResetIncidentListEntry,
-  type StoreResetIncidentListResult,
-  type StoreResetIncidentManifest,
+  type StoreResetPolicyCause,
   type StoreResetPublicReport,
+  type StoreResetReason,
 } from './reset-incident.js';
 import {
   sameStoreResetInspectionIdentity,
@@ -26,14 +25,22 @@ import {
   type StoreResetInspectionFs,
   type StoreResetInspectionStat,
 } from './reset-incident-inspection-fs.js';
-import type { StoreResetIncidentDiagnosticRunner } from './reset-incident-diagnostic.js';
 
-export class StoreResetIncidentLimitError extends Error {
-  constructor() {
-    super('Store reset incident listing limit exceeded.');
-    this.name = 'StoreResetIncidentLimitError';
-  }
-}
+export type LegacyStoreResetIncidentListEntry = Readonly<{
+  source: 'legacy-quarantine';
+  incidentId: string;
+  state: 'ready' | 'malformed' | 'unsupported' | 'build_mismatch' | 'unsafe' | 'unavailable';
+  resetAt: string | null;
+  reason: StoreResetReason | null;
+  resetPolicyCause: StoreResetPolicyCause | null;
+  fileCount: number | null;
+  bytes: number | null;
+}>;
+
+export type LegacyStoreResetIncidentListResult = Readonly<{
+  incidents: readonly LegacyStoreResetIncidentListEntry[];
+  truncated: boolean;
+}>;
 
 export type StoreResetIncidentReportFailure =
   | 'invalid_id'
@@ -58,75 +65,56 @@ class StoreResetIncidentReadError extends Error {
   }
 }
 
-function readManifestBytes(
+function readBoundedFileBytes(
   fs: StoreResetInspectionFs,
-  manifestPath: string,
+  path: string,
   before: StoreResetInspectionStat,
+  maxBytes: number,
 ): Uint8Array {
   let descriptor: StoreResetFileDescriptor | null = null;
-  let closeFailed = false;
-  let contents: Uint8Array | null = null;
+  let result: Uint8Array | null = null;
   let failure: StoreResetIncidentReadError | null = null;
   try {
-    descriptor = fs.open(manifestPath, fs.openFlags.readOnly);
+    descriptor = fs.open(path, fs.openFlags.readOnly);
     const opened = fs.fstat(descriptor);
     if (opened.kind !== 'file' || !sameStoreResetInspectionIdentity(before, opened)) {
       throw new StoreResetIncidentReadError('unsafe');
     }
-
-    if (opened.size > BigInt(MAX_RESET_MANIFEST_BYTES)) {
-      throw new StoreResetIncidentReadError('unavailable');
-    }
-    const expectedBytes = Number(opened.size);
-    const buffer = new Uint8Array(expectedBytes);
+    if (opened.size > BigInt(maxBytes)) throw new StoreResetIncidentReadError('unavailable');
+    const buffer = new Uint8Array(Number(opened.size));
     let offset = 0;
-    while (offset < expectedBytes) {
+    while (offset < buffer.length) {
       const read = fs.read(descriptor, buffer, offset, buffer.length - offset, offset);
-      if (read < 0 || read > buffer.length - offset) {
-        throw new StoreResetIncidentReadError('unavailable');
-      }
-      if (read === 0) {
-        throw new StoreResetIncidentReadError('unavailable');
-      }
+      if (read <= 0 || read > buffer.length - offset) throw new StoreResetIncidentReadError('unavailable');
       offset += read;
     }
-    const eofProbe = new Uint8Array(1);
-    if (fs.read(descriptor, eofProbe, 0, 1, offset) !== 0) {
+    if (fs.read(descriptor, new Uint8Array(1), 0, 1, offset) !== 0) {
       throw new StoreResetIncidentReadError('unavailable');
     }
-    const after = fs.lstat(manifestPath);
+    const after = fs.lstat(path);
     if (after === null || !sameStoreResetInspectionIdentity(opened, after)) {
       throw new StoreResetIncidentReadError('unsafe');
     }
-    contents = buffer;
+    result = buffer;
   } catch (error: unknown) {
-    if (error instanceof StoreResetIncidentReadError) {
-      failure = error;
-    } else {
-      failure = new StoreResetIncidentReadError('unavailable');
-    }
-  } finally {
-    if (descriptor !== null) {
-      try {
-        fs.close(descriptor);
-      } catch {
-        closeFailed = true;
-      }
+    failure = error instanceof StoreResetIncidentReadError ? error : new StoreResetIncidentReadError('unavailable');
+  }
+  if (descriptor !== null) {
+    try {
+      fs.close(descriptor);
+    } catch {
+      failure ??= new StoreResetIncidentReadError('unavailable');
     }
   }
-  if (closeFailed) {
-    throw new StoreResetIncidentReadError('unavailable');
-  }
-  if (failure !== null) {
-    throw failure;
-  }
-  if (contents === null) {
-    throw new StoreResetIncidentReadError('unavailable');
-  }
-  return contents;
+  if (failure !== null) throw failure;
+  if (result === null) throw new StoreResetIncidentReadError('unavailable');
+  return result;
 }
 
-function buildMatches(manifest: StoreResetIncidentManifest, expected: StrictBundleManifest): boolean {
+function buildMatches(
+  manifest: ReturnType<typeof parseStoreResetIncidentManifest>,
+  expected: StrictBundleManifest,
+): boolean {
   return (
     manifest.build.version === expected.version &&
     manifest.build.buildSetId === expected.buildSetId &&
@@ -136,129 +124,127 @@ function buildMatches(manifest: StoreResetIncidentManifest, expected: StrictBund
   );
 }
 
-function unavailableEntry(
-  incidentId: string,
-  state: Exclude<StoreResetIncidentListEntry['state'], 'ready'>,
-): StoreResetIncidentListEntry {
-  return {
-    incidentId,
-    state,
-    resetAt: null,
-    reason: null,
-    schemaVersion: null,
-    resetPolicyCause: null,
-    fileCount: null,
-  };
+function legacyDirectoryBytes(fs: StoreResetInspectionFs, root: string): number | null {
+  let total = 0;
+  let cursor: unknown = null;
+  try {
+    cursor = fs.openDirectory(root);
+    let count = 0;
+    while (true) {
+      const entry = fs.readDirectory(cursor);
+      if (entry === null) return total;
+      count += 1;
+      if (count > MAX_INCIDENT_DIR_ENTRIES) return null;
+      const stat = fs.lstat(join(root, entry.name));
+      if (stat === null || stat.kind !== 'file' || stat.size > BigInt(Number.MAX_SAFE_INTEGER - total)) return null;
+      total += Number(stat.size);
+    }
+  } catch {
+    return null;
+  } finally {
+    if (cursor !== null) fs.closeDirectory(cursor);
+  }
 }
 
-function readListEntry(
+function legacyListEntry(
   fs: StoreResetInspectionFs,
   root: string,
   incidentId: string,
   expectedBuild: StrictBundleManifest,
-): StoreResetIncidentListEntry {
+): LegacyStoreResetIncidentListEntry {
+  const base = { source: 'legacy-quarantine' as const, incidentId };
   const incidentPath = join(root, incidentId);
   const incidentStat = fs.lstat(incidentPath);
-  if (incidentStat === null || incidentStat.kind !== 'directory') {
-    return unavailableEntry(incidentId, incidentStat?.kind === 'symbolic-link' ? 'unsafe' : 'malformed');
+  if (incidentStat?.kind !== 'directory') {
+    return {
+      ...base,
+      state: incidentStat?.kind === 'symbolic-link' ? 'unsafe' : 'malformed',
+      resetAt: null,
+      reason: null,
+      resetPolicyCause: null,
+      fileCount: null,
+      bytes: null,
+    };
   }
-
+  const bytes = legacyDirectoryBytes(fs, incidentPath);
   const manifestPath = join(incidentPath, STORE_RESET_MANIFEST_FILE_NAME);
   const manifestStat = fs.lstat(manifestPath);
-  if (manifestStat === null) {
-    return unavailableEntry(incidentId, 'malformed');
-  }
-  if (manifestStat.kind !== 'file') {
-    return unavailableEntry(incidentId, manifestStat.kind === 'symbolic-link' ? 'unsafe' : 'malformed');
-  }
-
-  try {
-    const manifest = parseStoreResetIncidentManifest(readManifestBytes(fs, manifestPath, manifestStat));
-    if (manifest.incidentId !== incidentId) {
-      return unavailableEntry(incidentId, 'malformed');
-    }
-    if (!buildMatches(manifest, expectedBuild)) {
-      return unavailableEntry(incidentId, 'build_mismatch');
-    }
+  if (manifestStat?.kind !== 'file') {
     return {
-      incidentId,
-      state: 'ready',
+      ...base,
+      state: manifestStat?.kind === 'symbolic-link' ? 'unsafe' : 'malformed',
+      resetAt: null,
+      reason: null,
+      resetPolicyCause: null,
+      fileCount: null,
+      bytes,
+    };
+  }
+  try {
+    const manifest = parseStoreResetIncidentManifest(
+      readBoundedFileBytes(fs, manifestPath, manifestStat, MAX_RESET_MANIFEST_BYTES),
+    );
+    if (manifest.incidentId !== incidentId) throw new StoreResetManifestDecodeError('manifest_invalid_schema');
+    return {
+      ...base,
+      state: buildMatches(manifest, expectedBuild) ? 'ready' : 'build_mismatch',
       resetAt: manifest.resetAt,
       reason: manifest.reason,
-      schemaVersion: manifest.schemaVersion,
       resetPolicyCause:
         manifest.schemaVersion === STORE_RESET_INCIDENT_SCHEMA_VERSION ? manifest.resetPolicyCause : null,
       fileCount: manifest.files.length,
+      bytes,
     };
   } catch (error: unknown) {
-    if (error instanceof StoreResetIncidentReadError) {
-      return unavailableEntry(incidentId, error.state);
-    }
-    if (error instanceof StoreResetManifestDecodeError) {
-      return unavailableEntry(incidentId, error.code === 'manifest_invalid_schema' ? 'unsupported' : 'malformed');
-    }
-    return unavailableEntry(incidentId, 'unavailable');
+    return {
+      ...base,
+      state:
+        error instanceof StoreResetIncidentReadError
+          ? error.state
+          : error instanceof StoreResetManifestDecodeError && error.code === 'manifest_invalid_schema'
+            ? 'unsupported'
+            : 'malformed',
+      resetAt: null,
+      reason: null,
+      resetPolicyCause: null,
+      fileCount: null,
+      bytes,
+    };
   }
 }
 
-function compareEntries(left: StoreResetIncidentListEntry, right: StoreResetIncidentListEntry): number {
-  if (left.resetAt !== null && right.resetAt !== null && left.resetAt !== right.resetAt) {
-    return right.resetAt.localeCompare(left.resetAt);
-  }
-  if (left.resetAt !== null) return -1;
-  if (right.resetAt !== null) return 1;
-  return left.incidentId.localeCompare(right.incidentId);
-}
-
-export function listStoreResetIncidents(options: {
+export function listLegacyStoreResetIncidents(options: {
   readonly fs: StoreResetInspectionFs;
   readonly quarantineRoot: string;
   readonly expectedBuild: StrictBundleManifest;
-}): StoreResetIncidentListResult {
-  const rootStat = options.fs.lstat(options.quarantineRoot);
-  if (rootStat === null) {
-    return { incidents: [] };
+}): LegacyStoreResetIncidentListResult {
+  const root = options.fs.lstat(options.quarantineRoot);
+  if (root === null) return { incidents: [], truncated: false };
+  if (root.kind !== 'directory') {
+    throw new StoreResetIncidentReadError(root.kind === 'symbolic-link' ? 'unsafe' : 'unavailable');
   }
-  if (rootStat.kind !== 'directory') {
-    throw new StoreResetIncidentReadError(rootStat.kind === 'symbolic-link' ? 'unsafe' : 'unavailable');
-  }
-
-  const incidentIds: string[] = [];
+  const ids: string[] = [];
   let cursor: unknown = null;
-  let closeFailed = false;
+  let truncated = false;
   try {
     cursor = options.fs.openDirectory(options.quarantineRoot);
     let consumed = 0;
     while (true) {
       const entry = options.fs.readDirectory(cursor);
-      if (entry === null) {
-        break;
-      }
+      if (entry === null) break;
       consumed += 1;
       if (consumed > MAX_INCIDENT_ROOT_ENTRIES) {
-        throw new StoreResetIncidentLimitError();
+        truncated = true;
+        break;
       }
-      if (isCanonicalStoreResetIncidentId(entry.name)) {
-        incidentIds.push(entry.name);
-      }
+      if (isCanonicalStoreResetIncidentId(entry.name)) ids.push(entry.name);
     }
   } finally {
-    if (cursor !== null) {
-      try {
-        options.fs.closeDirectory(cursor);
-      } catch {
-        closeFailed = true;
-      }
-    }
+    if (cursor !== null) options.fs.closeDirectory(cursor);
   }
-  if (closeFailed) {
-    throw new StoreResetIncidentReadError('unavailable');
-  }
-
   return {
-    incidents: incidentIds
-      .map((incidentId) => readListEntry(options.fs, options.quarantineRoot, incidentId, options.expectedBuild))
-      .sort(compareEntries),
+    incidents: ids.map((id) => legacyListEntry(options.fs, options.quarantineRoot, id, options.expectedBuild)),
+    truncated,
   };
 }
 
@@ -270,33 +256,28 @@ function isContained(parent: string, candidate: string): boolean {
 function readIncidentDirectoryNames(fs: StoreResetInspectionFs, incidentPath: string): readonly string[] {
   const names: string[] = [];
   let cursor: unknown = null;
-  let closeFailed = false;
   try {
     cursor = fs.openDirectory(incidentPath);
     while (true) {
       const entry = fs.readDirectory(cursor);
-      if (entry === null) break;
+      if (entry === null) return names;
       names.push(entry.name);
-      if (names.length > MAX_INCIDENT_DIR_ENTRIES) {
-        throw new StoreResetIncidentReadError('unsafe');
-      }
+      if (names.length > MAX_INCIDENT_DIR_ENTRIES) throw new StoreResetIncidentReadError('unsafe');
     }
   } catch (error: unknown) {
     if (error instanceof StoreResetIncidentReadError) throw error;
     throw new StoreResetIncidentReadError('unavailable');
   } finally {
-    if (cursor !== null) {
-      try {
-        fs.closeDirectory(cursor);
-      } catch {
-        closeFailed = true;
-      }
-    }
+    if (cursor !== null) optionsSafeClose(fs, cursor);
   }
-  if (closeFailed) {
+}
+
+function optionsSafeClose(fs: StoreResetInspectionFs, cursor: unknown): void {
+  try {
+    fs.closeDirectory(cursor);
+  } catch {
     throw new StoreResetIncidentReadError('unavailable');
   }
-  return names;
 }
 
 function hashEvidenceFile(options: {
@@ -310,37 +291,24 @@ function hashEvidenceFile(options: {
   readonly consumed: number;
 } {
   const before = options.fs.lstat(options.path);
-  if (before === null) {
-    return { status: 'missing', consumed: 0 };
-  }
+  if (before === null) return { status: 'missing', consumed: 0 };
   if (before.kind !== 'file') {
     throw new StoreResetIncidentReadError(before.kind === 'symbolic-link' ? 'unsafe' : 'unavailable');
   }
-  if (before.size > BigInt(options.remainingBudget)) {
-    return { status: 'unavailable_limit', consumed: 0 };
-  }
-
-  let descriptor: StoreResetFileDescriptor | null = null;
-  let closeFailed = false;
-  let failure: StoreResetIncidentReadError | null = null;
-  let digest: string | null = null;
-  let consumed = 0;
+  if (before.size > BigInt(options.remainingBudget)) return { status: 'unavailable_limit', consumed: 0 };
+  const descriptor = options.fs.open(options.path, options.fs.openFlags.readOnly);
   try {
-    descriptor = options.fs.open(options.path, options.fs.openFlags.readOnly);
     const opened = options.fs.fstat(descriptor);
     if (opened.kind !== 'file' || !sameStoreResetInspectionIdentity(before, opened)) {
       throw new StoreResetIncidentReadError('unsafe');
     }
-
     const hash = createHash('sha256');
     const buffer = new Uint8Array(64 * 1024);
-    const expectedBytes = Number(opened.size);
-    while (consumed < expectedBytes) {
-      const requested = Math.min(buffer.length, expectedBytes - consumed);
+    let consumed = 0;
+    while (consumed < Number(opened.size)) {
+      const requested = Math.min(buffer.length, Number(opened.size) - consumed);
       const read = options.fs.read(descriptor, buffer, 0, requested, consumed);
-      if (read <= 0 || read > requested) {
-        throw new StoreResetIncidentReadError('unavailable');
-      }
+      if (read <= 0 || read > requested) throw new StoreResetIncidentReadError('unavailable');
       consumed += read;
       hash.update(buffer.subarray(0, read));
     }
@@ -351,25 +319,13 @@ function hashEvidenceFile(options: {
     if (after === null || !sameStoreResetInspectionIdentity(opened, after)) {
       throw new StoreResetIncidentReadError('unsafe');
     }
-    digest = hash.digest('hex');
-  } catch (error: unknown) {
-    failure = error instanceof StoreResetIncidentReadError ? error : new StoreResetIncidentReadError('unavailable');
+    return {
+      status: consumed === options.expectedSize && hash.digest('hex') === options.expectedHash ? 'match' : 'mismatch',
+      consumed,
+    };
   } finally {
-    if (descriptor !== null) {
-      try {
-        options.fs.close(descriptor);
-      } catch {
-        closeFailed = true;
-      }
-    }
+    options.fs.close(descriptor);
   }
-  if (closeFailed) throw new StoreResetIncidentReadError('unavailable');
-  if (failure !== null) throw failure;
-  if (digest === null) throw new StoreResetIncidentReadError('unavailable');
-  return {
-    status: consumed === options.expectedSize && digest === options.expectedHash ? 'match' : 'mismatch',
-    consumed,
-  };
 }
 
 export async function readStoreResetIncidentReport(options: {
@@ -377,12 +333,8 @@ export async function readStoreResetIncidentReport(options: {
   readonly quarantineRoot: string;
   readonly incidentId: string;
   readonly expectedBuild: StrictBundleManifest;
-  readonly diagnose?: StoreResetIncidentDiagnosticRunner;
 }): Promise<StoreResetIncidentReportResult> {
-  if (!isCanonicalStoreResetIncidentId(options.incidentId)) {
-    return { ok: false, state: 'invalid_id' };
-  }
-
+  if (!isCanonicalStoreResetIncidentId(options.incidentId)) return { ok: false, state: 'invalid_id' };
   try {
     const rootStat = options.fs.lstat(options.quarantineRoot);
     if (rootStat === null) return { ok: false, state: 'not_found' };
@@ -394,41 +346,25 @@ export async function readStoreResetIncidentReport(options: {
     const incidentStat = options.fs.lstat(incidentPath);
     if (incidentStat === null) return { ok: false, state: 'not_found' };
     if (incidentStat.kind !== 'directory') {
-      return {
-        ok: false,
-        state: incidentStat.kind === 'symbolic-link' ? 'unsafe' : 'unavailable',
-      };
+      return { ok: false, state: incidentStat.kind === 'symbolic-link' ? 'unsafe' : 'unavailable' };
     }
     const incidentRealPath = options.fs.realpath(incidentPath);
-    if (!isContained(rootRealPath, incidentRealPath)) {
-      return { ok: false, state: 'unsafe' };
-    }
-
+    if (!isContained(rootRealPath, incidentRealPath)) return { ok: false, state: 'unsafe' };
     const names = readIncidentDirectoryNames(options.fs, incidentPath);
     const allowedNames = new Set<string>([STORE_RESET_MANIFEST_FILE_NAME, ...STORE_RESET_EVIDENCE_FILE_NAMES]);
-    if (names.some((name) => !allowedNames.has(name))) {
-      return { ok: false, state: 'unsafe' };
-    }
-
+    if (names.some((name) => !allowedNames.has(name))) return { ok: false, state: 'unsafe' };
     const manifestPath = join(incidentPath, STORE_RESET_MANIFEST_FILE_NAME);
     const manifestStat = options.fs.lstat(manifestPath);
     if (manifestStat === null) return { ok: false, state: 'malformed' };
     if (manifestStat.kind !== 'file') {
-      return {
-        ok: false,
-        state: manifestStat.kind === 'symbolic-link' ? 'unsafe' : 'malformed',
-      };
+      return { ok: false, state: manifestStat.kind === 'symbolic-link' ? 'unsafe' : 'malformed' };
     }
-    const manifestRealPath = options.fs.realpath(manifestPath);
-    if (!isContained(incidentRealPath, manifestRealPath)) {
-      return { ok: false, state: 'unsafe' };
-    }
-
-    const manifest = parseStoreResetIncidentManifest(readManifestBytes(options.fs, manifestPath, manifestStat));
+    if (!isContained(incidentRealPath, options.fs.realpath(manifestPath))) return { ok: false, state: 'unsafe' };
+    const manifest = parseStoreResetIncidentManifest(
+      readBoundedFileBytes(options.fs, manifestPath, manifestStat, MAX_RESET_MANIFEST_BYTES),
+    );
     if (manifest.incidentId !== options.incidentId) return { ok: false, state: 'malformed' };
-    if (!buildMatches(manifest, options.expectedBuild)) {
-      return { ok: false, state: 'build_mismatch' };
-    }
+    if (!buildMatches(manifest, options.expectedBuild)) return { ok: false, state: 'build_mismatch' };
     const recordedNames = new Set(manifest.files.map((file) => file.name));
     if (
       names.some(
@@ -440,7 +376,6 @@ export async function readStoreResetIncidentReport(options: {
     ) {
       return { ok: false, state: 'unsafe' };
     }
-
     let remainingBudget = MAX_REPORT_HASH_BYTES;
     let remainingDeclaredBudget = MAX_REPORT_HASH_BYTES;
     const fileVerification: StoreResetIncidentLocalReport['fileVerification'][number][] = [];
@@ -465,24 +400,7 @@ export async function readStoreResetIncidentReport(options: {
       remainingBudget -= result.consumed;
       fileVerification.push({ name: file.name, status: result.status });
     }
-
-    const diagnostic =
-      options.diagnose === undefined
-        ? {
-            integrity: 'unavailable' as const,
-            termination: 'not_started' as const,
-            cleanup: 'not_required' as const,
-          }
-        : await options.diagnose({
-            fs: options.fs,
-            incidentPath,
-            manifest,
-          });
-    const local: StoreResetIncidentLocalReport = {
-      manifest,
-      fileVerification,
-      diagnostic,
-    };
+    const local: StoreResetIncidentLocalReport = { manifest, fileVerification };
     const incidentAfter = options.fs.lstat(incidentPath);
     const rootAfter = options.fs.lstat(options.quarantineRoot);
     if (
@@ -495,14 +413,9 @@ export async function readStoreResetIncidentReport(options: {
     }
     return { ok: true, report: projectStoreResetPublicReport(local) };
   } catch (error: unknown) {
-    if (error instanceof StoreResetIncidentReadError) {
-      return { ok: false, state: error.state };
-    }
+    if (error instanceof StoreResetIncidentReadError) return { ok: false, state: error.state };
     if (error instanceof StoreResetManifestDecodeError) {
-      return {
-        ok: false,
-        state: error.code === 'manifest_invalid_schema' ? 'unsupported' : 'malformed',
-      };
+      return { ok: false, state: error.code === 'manifest_invalid_schema' ? 'unsupported' : 'malformed' };
     }
     return { ok: false, state: 'unavailable' };
   }

@@ -18,7 +18,7 @@ import { isRecord } from '../../infra/json.js';
 import { nowIsoString } from '../../infra/time.js';
 import { deriveLaunchReadiness } from '../../jobs/launch-readiness.js';
 import type { EventStreamHandlers, HealthSnapshot, HttpHandlerPorts } from '../../transport/server-ports.js';
-import type { StoragePort } from '../../infra/port-types.js';
+import type { StoragePort, TimerHandle } from '../../infra/port-types.js';
 import {
   knownDiscussSources,
   loadDiscussDetail,
@@ -111,6 +111,7 @@ import {
 import type { KbDaemonRequestContextWire } from '../../kb-daemon/protocol.js';
 import { createKbDaemonHealthComponent } from '../runtime-components/kb-health-component.js';
 import { readCorpusState } from '../../kb/state/corpus-state.js';
+import { sweepStoreEpochsPostReady } from '../../store/epoch.js';
 import { markJobAsError } from '../../jobs/reconcile/recovery-effects.js';
 import type { JobProgressStore } from '../../jobs/contracts/job-store.js';
 import type {
@@ -1708,6 +1709,11 @@ export function createCoordinatorCore(
     });
   });
 
+  let storeEpochSweepAbort: AbortController | null = null;
+  let storeEpochSweepTimer: TimerHandle | null = null;
+  let settleScheduledStoreEpochSweep: (() => void) | null = null;
+  let storeEpochSweepSettlement = Promise.resolve();
+
   const lifecycleDeps: LifecycleDeps = {
     identity,
     storeFormat: options.storeFormat,
@@ -1732,6 +1738,35 @@ export function createCoordinatorCore(
     startProviderOperationReconciler: services.startProviderOperationReconciler,
     stopProviderOperationReconciler: services.stopProviderOperationReconciler,
     startupRecoveryBarrierPublisher: startupRecoveryBarrier.publication,
+    scheduleStoreEpochSweepFn: (openStore) => {
+      const controller = new AbortController();
+      storeEpochSweepAbort = controller;
+      storeEpochSweepSettlement = new Promise<void>((resolveSweep) => {
+        settleScheduledStoreEpochSweep = resolveSweep;
+      });
+      storeEpochSweepTimer = runtime.time.setTimeout(() => {
+        storeEpochSweepTimer = null;
+        void sweepStoreEpochsPostReady(runtime, openStore, { signal: controller.signal })
+          .catch((error: unknown) => {
+            world.log(`Store epoch retention sweep could not start: ${formatError(error)}\n`);
+          })
+          .finally(() => {
+            settleScheduledStoreEpochSweep?.();
+            settleScheduledStoreEpochSweep = null;
+          });
+      }, 0);
+      storeEpochSweepTimer.unref?.();
+    },
+    stopStoreEpochSweepFn: async () => {
+      storeEpochSweepAbort?.abort();
+      if (storeEpochSweepTimer !== null) {
+        runtime.time.clearTimeout(storeEpochSweepTimer);
+        storeEpochSweepTimer = null;
+        settleScheduledStoreEpochSweep?.();
+        settleScheduledStoreEpochSweep = null;
+      }
+      await storeEpochSweepSettlement;
+    },
     getDiscussStoreForSource: discuss.getDiscussStoreForSource,
     knownDiscussSources: () => knownDiscussSources(discuss.readHelpersDeps),
     getDiscussContext: discuss.getDiscussContext,

@@ -1,6 +1,16 @@
 import { DatabaseSync } from 'node:sqlite';
+import { spawnSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from 'node:fs';
+import {
+  existsSync,
+  mkdirSync,
+  mkdtempSync,
+  readFileSync,
+  readdirSync,
+  rmSync,
+  statSync,
+  writeFileSync,
+} from 'node:fs';
 import { tmpdir } from 'node:os';
 import { dirname, join, relative } from 'node:path';
 
@@ -10,11 +20,11 @@ import { backendLog } from '#src/infra/backend-log.js';
 import type { BuildFlavor } from '#src/infra/build-flavor.js';
 import type { Runtime } from '#src/runtime/ports.js';
 import { createRealRuntime } from '#src/runtime/real.js';
-import { createBackendStoreResetAuthority, openOrResetBackendStoreDb } from '#src/store/backend-store-reset.js';
-import { openStoreDatabase } from '#src/store/db.js';
+import { ACTIVE_STORE_SELECTION_VERSION } from '#src/store/active-store-selection.js';
+import { coordinateActiveStoreSelection } from '#src/store/active-store-selection-coordination.js';
+import { openTestStoreDatabase } from '#tests/helpers/store-db.js';
 import {
   formatLegacyGenerationIgnoredNotice,
-  acquireGenerationAdoptionLock,
   generationMutationCoordinationSeam,
   inspectGenerationReadiness,
   resolveGenerationBoundaryPaths,
@@ -30,31 +40,40 @@ function harness(flavor: BuildFlavor = 'prod'): { readonly runtime: Runtime } {
   return { runtime: createRealRuntime(flavor, { baseDir }) };
 }
 
+function generatedStorePath(runtime: Runtime): string {
+  return join(runtime.paths.coral.store.dbDir, 'epoch-1', 'store.db');
+}
+
 async function openGeneratedStore(runtime: Runtime): Promise<void> {
-  const authority = createBackendStoreResetAuthority(
-    runtime,
-    { acquiredViaHandoff: true },
-    {
-      namespace: 'generation-readiness-test',
-      build: {
-        version: STORE_FORMAT.productVersion,
-        buildSetId: '123e4567-e89b-42d3-a456-426614174000',
-        bundleHash: '0123456789abcdef',
-        cliBundleHash: '123456789abcdef0',
-        claudeAppserverBundleHash: '23456789abcdef01',
-        durableWrapperBundleHash: '3456789abcdef012',
-        flavor: runtime.flavor,
-        storeFormatFingerprint: STORE_FORMAT.fingerprint,
-      },
-      storeFormat: STORE_FORMAT,
+  const build = {
+    version: STORE_FORMAT.productVersion,
+    buildSetId: '123e4567-e89b-42d3-a456-426614174000',
+    bundleHash: '0123456789abcdef',
+    cliBundleHash: '123456789abcdef0',
+    claudeAppserverBundleHash: '23456789abcdef01',
+    durableWrapperBundleHash: '3456789abcdef012',
+    flavor: runtime.flavor,
+    storeFormatFingerprint: STORE_FORMAT.fingerprint,
+  };
+  const bundleDir = mkdtempSync(join(tmpdir(), 'coral-generation-readiness-bundle-'));
+  roots.push(bundleDir);
+  const result = await coordinateActiveStoreSelection(runtime, {
+    storeFormat: STORE_FORMAT,
+    currentSelection: {
+      version: ACTIVE_STORE_SELECTION_VERSION,
+      manifest: build,
+      bundleDir,
+      activeStoreFingerprint: build.storeFormatFingerprint,
     },
-  );
-  const adoption = await acquireGenerationAdoptionLock(runtime);
-  try {
-    openOrResetBackendStoreDb(runtime, authority, adoption, { storeFormat: STORE_FORMAT }).close();
-  } finally {
-    adoption();
-  }
+    dependencies: {
+      kind: 'startup',
+      validateSelectedTarget: () => {
+        throw new Error('Generation-readiness fixture never selects a foreign target.');
+      },
+    },
+  });
+  if (result.kind !== 'opened') throw new Error('Generation-readiness fixture unexpectedly handed off.');
+  result.db.close();
 }
 
 function createForeignLegacyStore(runtime: Runtime, productVersion?: string): string {
@@ -83,7 +102,7 @@ function createForeignLegacyStore(runtime: Runtime, productVersion?: string): st
 function createSameGenerationLegacyStore(runtime: Runtime): string {
   const paths = resolveGenerationBoundaryPaths(runtime);
   const dbFile = join(paths.legacyFlavorRoot, 'store', 'store.db');
-  openStoreDatabase({ path: dbFile, storage: runtime.storage, storeFormat: STORE_FORMAT }).close();
+  openTestStoreDatabase({ path: dbFile, storage: runtime.storage, storeFormat: STORE_FORMAT }).close();
   const db = new DatabaseSync(dbFile);
   try {
     db.exec(`
@@ -129,6 +148,26 @@ function hashTree(root: string): string {
   return hash.digest('hex');
 }
 
+function storeFileSnapshot(storeDir: string): readonly Readonly<{
+  name: string;
+  bytes: number;
+  mtimeNs: string;
+  sha256: string;
+}>[] {
+  return readdirSync(storeDir)
+    .sort()
+    .map((name) => {
+      const path = join(storeDir, name);
+      const stat = statSync(path, { bigint: true });
+      return {
+        name,
+        bytes: Number(stat.size),
+        mtimeNs: stat.mtimeNs.toString(),
+        sha256: createHash('sha256').update(readFileSync(path)).digest('hex'),
+      };
+    });
+}
+
 afterEach(() => {
   vi.restoreAllMocks();
   for (const root of roots.splice(0)) {
@@ -154,7 +193,7 @@ describe('generation readiness', () => {
       return exists(path);
     });
 
-    expect(inspectGenerationReadiness(runtime, STORE_FORMAT)).toEqual({ kind: 'generated-ready' });
+    expect(inspectGenerationReadiness(runtime)).toEqual({ kind: 'generated-ready' });
   });
 
   it('permits coordinator initialization when both generation targets are absent', async () => {
@@ -162,11 +201,11 @@ describe('generation readiness', () => {
     const paths = resolveGenerationBoundaryPaths(runtime);
     expect(existsSync(paths.generatedFlavorRoot)).toBe(false);
     expect(existsSync(paths.legacyFlavorRoot)).toBe(false);
-    expect(inspectGenerationReadiness(runtime, STORE_FORMAT)).toEqual({ kind: 'no-legacy' });
+    expect(inspectGenerationReadiness(runtime)).toEqual({ kind: 'no-legacy' });
 
     await openGeneratedStore(runtime);
 
-    expect(existsSync(runtime.paths.coral.store.dbFile)).toBe(true);
+    expect(existsSync(generatedStorePath(runtime))).toBe(true);
   });
 
   it('boots beside readable legacy history without importing it', async () => {
@@ -174,7 +213,7 @@ describe('generation readiness', () => {
     const legacyRoot = createSameGenerationLegacyStore(runtime);
     const warning = vi.spyOn(backendLog, 'warn').mockImplementation(() => {});
 
-    expect(inspectGenerationReadiness(runtime, STORE_FORMAT)).toMatchObject({
+    expect(inspectGenerationReadiness(runtime)).toMatchObject({
       kind: 'legacy-ignored',
       legacyPath: legacyRoot,
     });
@@ -183,34 +222,58 @@ describe('generation readiness', () => {
     // generation made the whole daemon unbootable until an operator migrated it.
     await openGeneratedStore(runtime);
 
-    expect(existsSync(runtime.paths.coral.store.dbFile)).toBe(true);
-    // The legacy rows stay where they are, and none of them appear in the new
-    // generation. A byte hash of the tree would be the wrong assertion here:
-    // classifying the legacy store opens it, and SQLite rewrites its sidecars.
+    expect(existsSync(generatedStorePath(runtime))).toBe(true);
     expect(legacyHistoryValue(join(legacyRoot, 'store', 'store.db'))).toBe('not-imported');
-    expect(legacyHistoryValue(runtime.paths.coral.store.dbFile)).toBeNull();
+    expect(legacyHistoryValue(generatedStorePath(runtime))).toBeNull();
     expect(readFileSync(join(legacyRoot, 'equipment', 'dormant.bin'), 'utf-8')).toBe('left-behind-equipment');
     expect(warning).toHaveBeenCalledWith(expect.stringContaining(legacyRoot));
-    expect(warning).toHaveBeenCalledWith(expect.stringContaining('left untouched'));
+    expect(warning).toHaveBeenCalledWith(expect.stringContaining('not inspected or changed'));
   });
 
-  it('boots beside a foreign legacy generation and reports its stored version', async () => {
+  it('boots beside a crashed legacy WAL store without changing any legacy file', async () => {
+    const { runtime } = harness();
+    const paths = resolveGenerationBoundaryPaths(runtime);
+    const storeDir = join(paths.legacyFlavorRoot, 'store');
+    const dbFile = join(storeDir, 'store.db');
+    mkdirSync(storeDir, { recursive: true });
+    const crashed = spawnSync(
+      process.execPath,
+      [
+        '--no-warnings',
+        '-e',
+        "const { DatabaseSync } = require('node:sqlite'); const db = new DatabaseSync(process.argv[1]); db.exec(\"PRAGMA journal_mode=WAL; PRAGMA wal_autocheckpoint=0; CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT NOT NULL); INSERT INTO meta VALUES ('store_product_version', '0.9.16'); CREATE TABLE history (value TEXT NOT NULL); INSERT INTO history VALUES ('crashed-wal');\"); process.kill(process.pid, 'SIGKILL');",
+        dbFile,
+      ],
+      { encoding: 'utf-8' },
+    );
+    expect(crashed.signal).toBe('SIGKILL');
+    rmSync(`${dbFile}-shm`, { force: true });
+    expect(readdirSync(storeDir).sort()).toEqual(['store.db', 'store.db-wal']);
+    const before = storeFileSnapshot(storeDir);
+    vi.spyOn(backendLog, 'warn').mockImplementation(() => {});
+
+    await openGeneratedStore(runtime);
+
+    const after = storeFileSnapshot(storeDir);
+    expect(after).toEqual(before);
+  });
+
+  it('boots beside a foreign legacy generation without inspecting its stored version', async () => {
     const { runtime } = harness();
     const legacyRoot = createForeignLegacyStore(runtime, '0.9.16');
     const before = hashTree(legacyRoot);
     const warning = vi.spyOn(backendLog, 'warn').mockImplementation(() => {});
 
-    expect(inspectGenerationReadiness(runtime, STORE_FORMAT)).toMatchObject({
+    expect(inspectGenerationReadiness(runtime)).toMatchObject({
       kind: 'legacy-ignored',
       legacyPath: legacyRoot,
-      storedProductVersion: '0.9.16',
     });
 
     await openGeneratedStore(runtime);
 
-    expect(existsSync(runtime.paths.coral.store.dbFile)).toBe(true);
+    expect(existsSync(generatedStorePath(runtime))).toBe(true);
     expect(hashTree(legacyRoot)).toBe(before);
-    expect(warning).toHaveBeenCalledWith(expect.stringContaining('0.9.16'));
+    expect(warning).toHaveBeenCalledWith(expect.stringContaining('contents were not inspected or changed'));
   });
 
   it('boots beside an unreadable legacy store rather than diagnosing it', async () => {
@@ -222,16 +285,14 @@ describe('generation readiness', () => {
     const before = hashTree(paths.legacyFlavorRoot);
     vi.spyOn(backendLog, 'warn').mockImplementation(() => {});
 
-    expect(inspectGenerationReadiness(runtime, STORE_FORMAT)).toMatchObject({
+    expect(inspectGenerationReadiness(runtime)).toMatchObject({
       kind: 'legacy-ignored',
       legacyPath: paths.legacyFlavorRoot,
-      // Unreadable is reported as unknown, never guessed.
-      storedProductVersion: null,
     });
 
     await openGeneratedStore(runtime);
 
-    expect(existsSync(runtime.paths.coral.store.dbFile)).toBe(true);
+    expect(existsSync(generatedStorePath(runtime))).toBe(true);
     expect(hashTree(paths.legacyFlavorRoot)).toBe(before);
   });
 
@@ -240,7 +301,7 @@ describe('generation readiness', () => {
     createSameGenerationLegacyStore(runtime);
     vi.spyOn(backendLog, 'warn').mockImplementation(() => {});
 
-    const completion = await generationMutationCoordinationSeam.completeReadiness(runtime, STORE_FORMAT, {
+    const completion = await generationMutationCoordinationSeam.completeReadiness(runtime, {
       kind: 'install',
       name: 'generation-readiness-test',
     });
@@ -250,17 +311,15 @@ describe('generation readiness', () => {
     completion.release();
   });
 
-  it('names both paths and the stored version in the notice', () => {
+  it('names both paths and the observation boundary in the notice', () => {
     const notice = formatLegacyGenerationIgnoredNotice({
       kind: 'legacy-ignored',
       legacyPath: '/home/u/.coral/data',
       generatedPath: '/home/u/.coral/gen2/data',
-      storedProductVersion: '0.9.16',
     });
 
     expect(notice).toContain('/home/u/.coral/data');
     expect(notice).toContain('/home/u/.coral/gen2/data');
-    expect(notice).toContain('0.9.16');
-    expect(notice).toContain('left untouched');
+    expect(notice).toContain('contents were not inspected or changed');
   });
 });

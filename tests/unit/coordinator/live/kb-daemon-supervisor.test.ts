@@ -197,6 +197,28 @@ describe('KB daemon supervisor', () => {
     });
   });
 
+  it('passes the coordinator-opened store epoch to the KB daemon', async () => {
+    const daemonProcess = new FakeDaemonProcess(115);
+    const { runtime, spawnCalls } = createRuntime([daemonProcess]);
+    const supervisor = createKbDaemonSupervisor({
+      runtime,
+      pluginRoot: '/plugin',
+      entrypoint: '/plugin/bridge/coral-backend.cjs',
+      command: '/node',
+    });
+
+    void supervisor.start({ storeRoot: '/store', epoch: '7', path: '/store/epoch-7/store.db' });
+    await flushMicrotasks();
+
+    expect(spawnCalls[0]?.envAdditions).toMatchObject({
+      CORAL_KB_DAEMON_STORE: JSON.stringify({
+        storeRoot: '/store',
+        epoch: '7',
+        path: '/store/epoch-7/store.db',
+      }),
+    });
+  });
+
   it('forwards every inherited CORAL_KB_* config var into the spawn env (composeChildEnv strips inherited CORAL_*)', async () => {
     const daemonProcess = new FakeDaemonProcess(111);
     const { runtime, spawnCalls } = createRuntime([daemonProcess], new VirtualTime(), {

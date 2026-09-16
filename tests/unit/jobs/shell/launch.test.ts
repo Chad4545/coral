@@ -39,6 +39,11 @@ import { pluginRootNamespace } from '#src/infra/plugin-identity.js';
 import { parseExpression as _parseExpression } from '#src/workflow/parser.js';
 import { buildWorkflowPlan } from '#src/workflow/plan.js';
 import { workflowPlanDeclaredEvent } from '#src/workflow/events.js';
+import { workflowRegistry } from '#src/workflow/events.js';
+import { sessionsRegistry } from '#src/sessions/events.js';
+import { discussRegistry } from '#src/discuss/event-registry.js';
+import { jobsRegistry } from '#src/jobs/events.js';
+import { composeReducers } from '#src/store/reducers.js';
 import {
   AgentNamespaceNotFoundError,
   AgentNotFoundError,
@@ -46,6 +51,11 @@ import {
   type AgentRef,
 } from '#src/jobs/agent-resolution.js';
 import { LaunchCoordinator } from '#src/coordinator/live/admission.js';
+import { createExecutionServices } from '#src/coordinator/composition/execution-services.js';
+import { LocalOperationRegistry } from '#src/coordinator/services/operation-registry.js';
+import { ProviderProxySetClaimMirror } from '#src/coordinator/services/provider-proxy-set/claim-mirror.js';
+import { ProviderProxySetLifecycleRef } from '#src/coordinator/services/provider-proxy-set/lifecycle-ref.js';
+import { createProviderProxySetContainmentProver } from '#src/coordinator/services/provider-proxy-set/containment-proof.js';
 import type { DurableProcessCleanup } from '#src/coordinator/live/durable-transport.js';
 import { ChildPrincipalRegistry } from '#src/coordinator/child-principal-registry.js';
 import { getMaxWorkers } from '#src/coordinator/live/worker-limits.js';
@@ -63,6 +73,7 @@ import { formatAbortResult } from '#src/cli/format/jobs.js';
 import { LaunchOrchestrator } from '#src/jobs/shell/launch.js';
 import { ProviderRegistry } from '#src/providers/registry.js';
 import { createEventBodyCodec } from '#src/store/event-body-codec.js';
+import { decodeStoredBody, encodeEventBody, StoreCodecError } from '#src/store/body-codec.js';
 import type { CommitEventsFn } from '#src/store/append.js';
 import {
   toProviderDefinition,
@@ -154,6 +165,51 @@ function createProgressStore(namespace = 'test-ns'): JobStore {
     eventBus,
     providers: permissiveProviderLookupPort,
   });
+}
+
+function createCompositionProgressStore(namespace = 'test-ns'): JobStore {
+  return new JobStore(namespace, runtime, createEventBodyCodec(), {
+    db: openTestStoreDb(runtime, ':memory:'),
+    eventBus,
+    providers: permissiveProviderLookupPort,
+    reducers: composeReducers(jobsRegistry, sessionsRegistry, discussRegistry, workflowRegistry),
+  });
+}
+
+function appendMalformedTerminalRow(progressStore: JobStore, jobId: string, sessionId: string): void {
+  const db = progressStore.getDb();
+  const current = db.prepare<[], { seq: number }>('SELECT COALESCE(MAX(seq), 0) AS seq FROM events').get();
+  db.prepare(
+    `INSERT INTO events
+       (seq, ts, type, stream_kind, stream_id, namespace, project, correlation_id, causation_seq, refs, body)
+     VALUES (?, ?, 'job.terminal.recorded', 'job', ?, ?, ?, NULL, NULL, ?, ?)`,
+  ).run(
+    (current?.seq ?? 0) + 1,
+    '2026-09-15T00:00:00.000Z',
+    jobId,
+    TEST_BACKEND_NAMESPACE,
+    fixtureCanonicalWorkDir('/tmp/malformed-terminal-project'),
+    JSON.stringify({ jobId, sessionId }),
+    encodeEventBody({ malformed: 'persisted terminal body' }),
+  );
+}
+
+function progressMessages(progressStore: JobStore, jobId: string): string[] {
+  return progressStore
+    .getDb()
+    .prepare<[string], EventsRow>(
+      `SELECT ${EVENT_COLUMNS}
+         FROM events
+        WHERE stream_kind = 'job'
+          AND stream_id = ?
+          AND type = 'job.progress.emitted'
+        ORDER BY seq ASC`,
+    )
+    .all(jobId)
+    .flatMap((row) => {
+      const body = decodeStoredBody(row, progressStore) as { message?: unknown };
+      return typeof body.message === 'string' ? [body.message] : [];
+    });
 }
 
 function loadPersistedRecoveryLaunch(progressStore: JobStore, jobId: string): JobLaunch {
@@ -284,6 +340,60 @@ function createService(
     coordinatorCommit: options.coordinatorCommit ?? createTestJobJournalDeps(progressStore, runtime).coordinatorCommit,
     ...(options.appServerProxyRoute === undefined ? {} : { appServerProxyRoute: options.appServerProxyRoute }),
   });
+}
+
+function createServiceThroughProductionComposition(
+  ctx: InvocationContext,
+  progressStore: JobStore,
+): { service: ExecutionService; stop: () => void } {
+  const providerRegistry = new ProviderRegistry();
+  const provider = toProviderDefinition(mockState.getNewProvider('codex'));
+  if (provider !== undefined) providerRegistry.register(provider);
+  const operationRegistry = new LocalOperationRegistry();
+  const providerProxyLifecycleRef = new ProviderProxySetLifecycleRef();
+  const childPrincipalRegistry = new ChildPrincipalRegistry(runtime.ids);
+  const services = createExecutionServices({
+    world: {
+      identity: {
+        buildSetId: '123e4567-e89b-42d3-a456-426614174000',
+        instanceId: '123e4567-e89b-42d3-a456-426614174001',
+      },
+      storeServicesRef: { tryGet: () => ({ progressStore }) },
+      operationRegistry,
+      providerProxyClaims: new ProviderProxySetClaimMirror(),
+      providerProxyLifecycleRef,
+      providerProxySetContainmentProver: createProviderProxySetContainmentProver({
+        ...runtime,
+        process: {
+          ...runtime.process,
+          readProcessIncarnation: () => null,
+          observeLiveness: () => 'unknown',
+        },
+      }),
+      reapRecordedContainment: () => {
+        throw new Error('production-composition launch cell unexpectedly reaped recorded containment');
+      },
+      providerHostManager: {},
+      launchCoordinator,
+      eventBus,
+      providerRegistry,
+      childPrincipalRegistry,
+      pluginRegistry: { discoverPluginRoot: () => null },
+      startupRecoveryBarrier: { hasPassed: () => true },
+    } as never,
+    runtime,
+    bundleHash: TEST_BACKEND_NAMESPACE,
+    backendNamespace: TEST_BACKEND_NAMESPACE,
+    settlementRefusalRecorder: { record: () => true },
+    createExecutionService: (serviceCtx, deps) => new ExecutionService(serviceCtx, deps),
+    onProviderProxyLifecycleFatal: (error) => {
+      throw error;
+    },
+  });
+  return {
+    service: services.getExecutionService(ctx) as ExecutionService,
+    stop: () => services.stopProviderOperationReconciler(),
+  };
 }
 
 function createResolvedAgent(ref: AgentRef, content: string) {
@@ -780,6 +890,247 @@ describe('ExecutionService launch', () => {
     expect(abortRegistry.has(jobId)).toBe(false);
     expect(launchCoordinator.getActiveJobIds()).not.toContain(jobId);
     expect(execute).not.toHaveBeenCalled();
+  });
+
+  it('durably releases malformed-status launch ownership through production execution-service composition', async () => {
+    let rejectProvider!: (error: Error) => void;
+    const providerResult = new Promise<TestProviderTurnResult>((_resolve, reject) => {
+      rejectProvider = reject;
+    });
+    const { provider } = makeProvider({ execute: () => providerResult });
+    mockState.getNewProvider.mockReturnValue(provider);
+    const progressStore = createCompositionProgressStore();
+    const composed = createServiceThroughProductionComposition(ctx, progressStore);
+    const { abortRegistry, sessionManager } = getInternals(composed.service);
+
+    try {
+      const decision = await composed.service.start('codex', { prompt: 'production malformed status' }, ctx);
+      expect(decision.status).toBe('running');
+      if (decision.status !== 'running') throw new Error('expected running launch');
+      trackJob(decision.jobId);
+      appendMalformedTerminalRow(progressStore, decision.jobId, decision.sessionId);
+      expect(() => progressStore.readStatus(decision.jobId)).toThrow(StoreCodecError);
+
+      rejectProvider(new Error('provider failed through production composition'));
+
+      await vi.waitFor(() => expect(abortRegistry.has(decision.jobId)).toBe(false));
+      await vi.waitFor(() => expect(sessionManager.get('codex', decision.sessionId)?.activeJobId).toBeUndefined());
+      expect(launchCoordinator.getActiveJobIds()).not.toContain(decision.jobId);
+      const disposition = progressMessages(progressStore, decision.jobId).at(-1);
+      expect(disposition).toContain('Released live job');
+      expect(disposition).toContain('provider failed through production composition');
+    } finally {
+      composed.stop();
+    }
+  });
+
+  it.each([
+    {
+      releaseResult: 'released' as const,
+      prepareClaim: (_sessionManager: SessionManager, _sessionId: string, _jobId: string) => {},
+      expectedMessage: 'Released live job',
+      expectedActiveJobId: undefined,
+    },
+    {
+      releaseResult: 'already_absent' as const,
+      prepareClaim: (sessionManager: SessionManager, sessionId: string, jobId: string) => {
+        expect(sessionManager.releaseJob(sessionId, jobId)).toBe('released');
+      },
+      expectedMessage: 'had no session claim to release',
+      expectedActiveJobId: undefined,
+    },
+    {
+      releaseResult: 'owned_by_another_job' as const,
+      prepareClaim: (sessionManager: SessionManager, sessionId: string, jobId: string) => {
+        expect(sessionManager.releaseJob(sessionId, jobId)).toBe('released');
+        expect(sessionManager.claimForJobSync(sessionId, 'foreign-job')).toBe(true);
+      },
+      expectedMessage: 'session claim was owned by another job',
+      expectedActiveJobId: 'foreign-job',
+    },
+  ])(
+    'atomically records the $releaseResult malformed-status disposition and consumes its release result',
+    async ({ releaseResult, prepareClaim, expectedMessage, expectedActiveJobId }) => {
+      let rejectProvider!: (error: Error) => void;
+      const providerResult = new Promise<TestProviderTurnResult>((_resolve, reject) => {
+        rejectProvider = reject;
+      });
+      const { provider } = makeProvider({ execute: () => providerResult });
+      mockState.getNewProvider.mockReturnValue(provider);
+      const progressStore = createCompositionProgressStore();
+      const baseRecoveryCommit = progressStore.commitUnreadableStatusRecovery.bind(progressStore);
+      let armed = false;
+      const committedBatches: string[][] = [];
+      vi.spyOn(progressStore, 'commitUnreadableStatusRecovery').mockImplementation((jobId, callback) =>
+        baseRecoveryCommit(jobId, (commit) => {
+          const types: string[] = [];
+          const append = ((input: { type: string }) => {
+            types.push(input.type);
+            return (commit.append as (next: typeof input) => unknown)(input);
+          }) as typeof commit.append;
+          const result = callback({ append });
+          if (armed) committedBatches.push(types);
+          return result;
+        }),
+      );
+      const service = createService(ctx, { progressStore });
+      const { abortRegistry, sessionManager } = getInternals(service);
+      const decision = await service.start('codex', { prompt: 'malformed latest event' }, ctx);
+      expect(decision.status).toBe('running');
+      if (decision.status !== 'running') throw new Error('expected running launch');
+      trackJob(decision.jobId);
+      prepareClaim(sessionManager, decision.sessionId, decision.jobId);
+      appendMalformedTerminalRow(progressStore, decision.jobId, decision.sessionId);
+      expect(() => progressStore.readStatus(decision.jobId)).toThrow(StoreCodecError);
+      armed = true;
+
+      rejectProvider(new Error('provider failed after malformed latest event'));
+
+      await vi.waitFor(() => expect(abortRegistry.has(decision.jobId)).toBe(false));
+      await vi.waitFor(() =>
+        expect(sessionManager.get('codex', decision.sessionId)?.activeJobId).toBe(expectedActiveJobId),
+      );
+      const disposition = progressMessages(progressStore, decision.jobId).at(-1);
+      expect(disposition).toContain(expectedMessage);
+      expect(disposition).toContain('provider failed after malformed latest event');
+      expect(committedBatches).toContainEqual(
+        releaseResult === 'released'
+          ? expect.arrayContaining(['job.progress.emitted', 'session.claim.released'])
+          : expect.arrayContaining(['job.progress.emitted']),
+      );
+    },
+  );
+
+  it('rolls back the claim release when the atomic malformed-status recovery commit crashes', async () => {
+    let rejectProvider!: (error: Error) => void;
+    const providerResult = new Promise<TestProviderTurnResult>((_resolve, reject) => {
+      rejectProvider = reject;
+    });
+    const { provider } = makeProvider({ execute: () => providerResult });
+    mockState.getNewProvider.mockReturnValue(provider);
+    const progressStore = createProgressStore();
+    const baseRecoveryCommit = progressStore.commitUnreadableStatusRecovery.bind(progressStore);
+    const crash = new Error('simulated process death during malformed-status recovery commit');
+    let armed = false;
+    let recoveryCommitObserved = false;
+    vi.spyOn(progressStore, 'commitUnreadableStatusRecovery').mockImplementation((jobId, callback) =>
+      baseRecoveryCommit(jobId, (commit) => {
+        const types: string[] = [];
+        const append = ((input: { type: string }) => {
+          types.push(input.type);
+          return (commit.append as (next: typeof input) => unknown)(input);
+        }) as typeof commit.append;
+        const result = callback({ append });
+        if (armed && types.includes('session.claim.released')) {
+          recoveryCommitObserved = true;
+          if (types.includes('job.progress.emitted')) throw crash;
+        }
+        return result;
+      }),
+    );
+    const service = createService(ctx, { progressStore });
+    const { abortRegistry, sessionManager } = getInternals(service);
+    vi.spyOn(progressStore, 'appendUnreadableStatusProgress').mockImplementation(() => {
+      throw crash;
+    });
+    const decision = await service.start('codex', { prompt: 'process death recovery cut' }, ctx);
+    expect(decision.status).toBe('running');
+    if (decision.status !== 'running') throw new Error('expected running launch');
+    trackJob(decision.jobId);
+    appendMalformedTerminalRow(progressStore, decision.jobId, decision.sessionId);
+    armed = true;
+
+    rejectProvider(new Error('provider failed before simulated process death'));
+
+    await vi.waitFor(() => expect(recoveryCommitObserved).toBe(true));
+    expect(progressMessages(progressStore, decision.jobId)).not.toContainEqual(
+      expect.stringContaining('provider failed before simulated process death'),
+    );
+    expect(sessionManager.get('codex', decision.sessionId)?.activeJobId).toBe(decision.jobId);
+    expect(abortRegistry.has(decision.jobId)).toBe(true);
+    expect(launchCoordinator.getActiveJobIds()).toContain(decision.jobId);
+  });
+
+  it('rolls back the claim release when the malformed-status disposition insert fails', async () => {
+    let rejectProvider!: (error: Error) => void;
+    const providerResult = new Promise<TestProviderTurnResult>((_resolve, reject) => {
+      rejectProvider = reject;
+    });
+    const { provider } = makeProvider({ execute: () => providerResult });
+    mockState.getNewProvider.mockReturnValue(provider);
+    const progressStore = createProgressStore();
+    const service = createService(ctx, { progressStore });
+    const { abortRegistry, sessionManager } = getInternals(service);
+    const decision = await service.start('codex', { prompt: 'recovery append failure' }, ctx);
+    expect(decision.status).toBe('running');
+    if (decision.status !== 'running') throw new Error('expected running launch');
+    trackJob(decision.jobId);
+    appendMalformedTerminalRow(progressStore, decision.jobId, decision.sessionId);
+    let recoveryInsertAttempted = false;
+    progressStore.getDb().function('mark_recovery_insert_attempt', () => {
+      recoveryInsertAttempted = true;
+      return 0;
+    });
+    progressStore.getDb().exec(`
+      CREATE TEMP TRIGGER fail_recovery_disposition
+      BEFORE INSERT ON events
+      WHEN NEW.type = 'job.progress.emitted'
+      BEGIN
+        SELECT mark_recovery_insert_attempt();
+        SELECT RAISE(ABORT, 'injected recovery disposition failure');
+      END;
+    `);
+
+    rejectProvider(new Error('provider failed before recovery append failure'));
+
+    await vi.waitFor(() => expect(recoveryInsertAttempted).toBe(true));
+    expect(sessionManager.get('codex', decision.sessionId)?.activeJobId).toBe(decision.jobId);
+    expect(abortRegistry.has(decision.jobId)).toBe(true);
+    expect(launchCoordinator.getActiveJobIds()).toContain(decision.jobId);
+  });
+
+  it('does not claim release or drop abort ownership when unreadable-status session release fails', async () => {
+    let rejectProvider!: (error: Error) => void;
+    const providerResult = new Promise<TestProviderTurnResult>((_resolve, reject) => {
+      rejectProvider = reject;
+    });
+    const { provider } = makeProvider({ execute: () => providerResult });
+    mockState.getNewProvider.mockReturnValue(provider);
+    const service = createService(ctx);
+    const { abortRegistry, progressStore, sessionManager } = getInternals(service);
+    const decision = await service.start('codex', { prompt: 'release write failure' }, ctx);
+    expect(decision.status).toBe('running');
+    if (decision.status !== 'running') throw new Error('expected running launch');
+    trackJob(decision.jobId);
+    const readStatus = progressStore.readStatus.bind(progressStore);
+    vi.spyOn(progressStore, 'readStatus').mockImplementation((jobId) => {
+      if (jobId === decision.jobId) {
+        throw new StoreCodecError('Malformed latest job event', {
+          seq: 41,
+          type: 'job.terminal.recorded',
+          streamKind: 'job',
+          streamId: jobId,
+          column: 'body',
+        });
+      }
+      return readStatus(jobId);
+    });
+    vi.spyOn(sessionManager, 'releaseJobWithRecoveryDisposition').mockImplementation(() => {
+      throw new Error('injected session journal write failure');
+    });
+
+    rejectProvider(new Error('provider failed before release write'));
+
+    await vi.waitFor(() =>
+      expect(progressMessages(progressStore, decision.jobId)).toContainEqual(
+        expect.stringContaining('injected session journal write failure'),
+      ),
+    );
+    const disposition = progressMessages(progressStore, decision.jobId).at(-1);
+    expect(disposition).toContain('was not released');
+    expect(disposition).not.toContain('Released live job');
+    expect(abortRegistry.has(decision.jobId)).toBe(true);
+    expect(sessionManager.get('codex', decision.sessionId)?.activeJobId).toBe(decision.jobId);
   });
 
   it.each([

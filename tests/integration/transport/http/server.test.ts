@@ -40,7 +40,8 @@ import { jobsRegistry } from '#src/jobs/events.js';
 import { commitJobInputs, commitJobTerminal } from '#tests/helpers/job-commits.js';
 import { composeReducers } from '#src/store/reducers.js';
 import { createEventBodyCodec } from '#src/store/event-body-codec.js';
-import { openTestStoreDb } from '#tests/helpers/store-db.js';
+import { openSettledTestStoreDb, openTestStoreDb } from '#tests/helpers/store-db.js';
+import { resolveCurrentStore } from '#src/store/epoch.js';
 import { SessionManager } from '#src/sessions/shell.js';
 import { sessionsRegistry } from '#src/sessions/events.js';
 import { workflowPlanDeclaredEvent, workflowRegistry } from '#src/workflow/events.js';
@@ -160,7 +161,7 @@ function createProgressStore(
   runtimeArg: Pick<Runtime, 'storage' | 'paths' | 'time' | 'env'> = runtime,
 ): JobStore {
   return new JobStore(namespace, runtimeArg, createEventBodyCodec(), {
-    db: openTestStoreDb(runtimeArg, runtimeArg.paths.coral.store.dbFile),
+    db: openTestStoreDb(runtimeArg, resolveCurrentStore(runtimeArg).path),
     reducers: composeReducers(jobsRegistry, sessionsRegistry, discussStoreRegistry, workflowRegistry),
     providers: permissiveProviderLookupPort,
   });
@@ -181,7 +182,7 @@ function createSessionManager(projectRoot: string): SessionManager {
     runtime,
     undefined,
     undefined,
-    openTestStoreDb(runtime, runtime.paths.coral.store.dbFile),
+    openTestStoreDb(runtime, resolveCurrentStore(runtime).path),
     permissiveProviderLookupPort,
   );
 }
@@ -471,6 +472,7 @@ describe('execution backend server', () => {
     mkdirSync(mockState.tmpRoot, { recursive: true });
     mockState.tmpHome = mkdtempSync(join(mockState.tmpRoot, 'home-'));
     runtime = createRealRuntime('prod');
+    openSettledTestStoreDb(runtime).close();
     JOBS_DIR = jobsDir(runtime.env);
     rmSync(JOBS_DIR, { recursive: true, force: true });
   });

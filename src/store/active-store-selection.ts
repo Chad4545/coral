@@ -7,9 +7,11 @@ import type { StrictBundleManifest } from '../infra/bundle-manifest.js';
 import { isNoEntryError } from '../infra/fs-errors.js';
 import { manifestsMatch, type InvalidTargetEvidence, type InvalidTargetFailure } from '../infra/handoff-target.js';
 import type { StorageBigIntStat, StorageEntryKind, StoragePort } from '../infra/port-types.js';
+import type { StorageActuator } from '../infra/storage-actuator.js';
 import { compareProductVersions } from '../infra/product-version.js';
 import type { Runtime } from '../runtime/ports.js';
 import { resolveGenerationBoundaryPaths } from './generation-mutation-coordination.js';
+import { observeStorePath } from './path-observation.js';
 
 export const ACTIVE_STORE_SELECTION_MAX_BYTES = 16 * 1024;
 export const ACTIVE_STORE_TRANSITION_MAX_BYTES = 32 * 1024;
@@ -575,10 +577,10 @@ function sameIdentity(left: StorageBigIntStat, right: StorageBigIntStat): boolea
   );
 }
 
-function ensureActiveStoreCoordinationDirectory(runtime: Runtime): void {
+function ensureActiveStoreCoordinationDirectory(runtime: Runtime, actuator: StorageActuator): void {
   const { coordinationRoot } = resolveActiveStoreRecordPaths(runtime);
-  if (!runtime.storage.existsSync(coordinationRoot)) {
-    runtime.storage.mkdirSync(coordinationRoot, { recursive: true });
+  if (observeStorePath(runtime.storage, coordinationRoot) === 'absent') {
+    actuator.makeDirectory(coordinationRoot, { recursive: true });
     const created = runtime.storage.lstatSync(coordinationRoot);
     if (created.isSymbolicLink()) {
       throw new ActiveStoreCoordinationWriteError(
@@ -592,7 +594,7 @@ function ensureActiveStoreCoordinationDirectory(runtime: Runtime): void {
         'Active-store coordination directory could not be created safely: path is not a directory.',
       );
     }
-    runtime.storage.chmodSync(coordinationRoot, 0o700);
+    actuator.setMode(coordinationRoot, 0o700);
   }
   const link = runtime.storage.lstatSync(coordinationRoot);
   if (link.isSymbolicLink()) {
@@ -613,7 +615,7 @@ function ensureActiveStoreCoordinationDirectory(runtime: Runtime): void {
       'Active-store coordination directory is not canonical.',
     );
   }
-  runtime.storage.chmodSync(coordinationRoot, 0o700);
+  actuator.setMode(coordinationRoot, 0o700);
   const stat = runtime.storage.statSync(coordinationRoot, { bigint: true });
   if (!stat.isDirectory()) {
     throw new ActiveStoreCoordinationWriteError(
@@ -621,9 +623,6 @@ function ensureActiveStoreCoordinationDirectory(runtime: Runtime): void {
       'Active-store coordination directory is not a directory.',
     );
   }
-  // Unix permission bits are not meaningful on win32 (chmod there only toggles the read-only attribute), so the
-  // private-mode assertion is platform-gated, mirroring `assertPrivateDirectory` in backend-store-reset.ts.
-  // Windows is not a supported Coral platform; this guard is defensive only.
   if (runtime.env.platform() !== 'win32' && (stat.mode & PERMISSION_BITS) !== 0o700n) {
     throw new ActiveStoreCoordinationWriteError(
       'coordination_directory_not_canonical',
@@ -632,69 +631,39 @@ function ensureActiveStoreCoordinationDirectory(runtime: Runtime): void {
   }
 }
 
-function publishActiveStoreRecord(runtime: Runtime, path: string, bytes: Uint8Array, record: string): void {
-  ensureActiveStoreCoordinationDirectory(runtime);
-  if (!runtime.storage.writeAtomicDurableSync(path, bytes, { mode: 0o600 })) {
+function publishActiveStoreRecord(
+  runtime: Runtime,
+  path: string,
+  bytes: Uint8Array,
+  record: string,
+  actuator: StorageActuator,
+): void {
+  ensureActiveStoreCoordinationDirectory(runtime, actuator);
+  if (!actuator.writeWholeFileDurable(path, bytes, { mode: 0o600 })) {
     throw new ActiveStoreCoordinationWriteError('record_unavailable', `${record} could not be published durably.`);
   }
 }
 
-export function publishActiveStoreSelection(runtime: Runtime, selection: ActiveStoreSelection): void {
+export function publishActiveStoreSelection(
+  runtime: Runtime,
+  selection: ActiveStoreSelection,
+  actuator: StorageActuator,
+): void {
   const paths = resolveActiveStoreRecordPaths(runtime);
   const v1Bytes = encodeActiveStoreSelectionV1(selection);
   const currentBytes = encodeActiveStoreSelection(selection);
-  publishActiveStoreRecord(runtime, paths.selectionV1File, v1Bytes, 'Active-store selection v1 projection');
-  publishActiveStoreRecord(runtime, paths.selectionFile, currentBytes, 'Active-store selection');
+  publishActiveStoreRecord(runtime, paths.selectionV1File, v1Bytes, 'Active-store selection v1 projection', actuator);
+  publishActiveStoreRecord(runtime, paths.selectionFile, currentBytes, 'Active-store selection', actuator);
 }
 
-export function publishActiveStoreTransition(runtime: Runtime, transition: ActiveStoreTransition): void {
+export function publishActiveStoreTransition(
+  runtime: Runtime,
+  transition: ActiveStoreTransition,
+  actuator: StorageActuator,
+): void {
   const paths = resolveActiveStoreRecordPaths(runtime);
   const currentBytes = encodeActiveStoreTransition(transition);
-  publishActiveStoreRecord(runtime, paths.transitionFile, currentBytes, 'Active-store transition');
-}
-
-function activeStoreTransitionIdentity(
-  runtime: Runtime,
-  path: string,
-  expectedIdentity?: StorageBigIntStat,
-): StorageBigIntStat | null {
-  if (!runtime.storage.existsSync(path)) return null;
-  const link = runtime.storage.lstatSync(path);
-  const stat = runtime.storage.statSync(path, { bigint: true });
-  if (
-    !link.isFile() ||
-    link.isSymbolicLink() ||
-    !stat.isFile() ||
-    (expectedIdentity !== undefined && !sameIdentity(stat, expectedIdentity))
-  ) {
-    throw new ActiveStoreCoordinationWriteError(
-      'record_changed',
-      'Active-store transition changed before durable clear.',
-    );
-  }
-  return stat;
-}
-
-function clearActiveStoreTransitionFile(runtime: Runtime, path: string, expectedIdentity?: StorageBigIntStat): void {
-  const identity = activeStoreTransitionIdentity(runtime, path, expectedIdentity);
-  if (identity === null) return;
-  runtime.storage.unlinkSync(path);
-  const coordinationRoot = resolveActiveStoreRecordPaths(runtime).coordinationRoot;
-  if (!runtime.storage.syncDirectoryDurableSync(coordinationRoot)) {
-    throw new ActiveStoreCoordinationWriteError(
-      'record_unavailable',
-      'Active-store transition clear could not be synchronized durably.',
-    );
-  }
-}
-
-export function clearActiveStoreTransition(runtime: Runtime, expectedIdentity?: StorageBigIntStat): void {
-  const paths = resolveActiveStoreRecordPaths(runtime);
-  clearActiveStoreTransitionFile(runtime, paths.transitionFile, expectedIdentity);
-}
-
-export function clearActiveStoreTransitionV1(runtime: Runtime, expectedIdentity: StorageBigIntStat): void {
-  clearActiveStoreTransitionFile(runtime, resolveActiveStoreRecordPaths(runtime).transitionV1File, expectedIdentity);
+  publishActiveStoreRecord(runtime, paths.transitionFile, currentBytes, 'Active-store transition', actuator);
 }
 
 type BoundedRecordReadResult =
@@ -812,12 +781,11 @@ function readOpenedRecord(
   return result;
 }
 
-function readBoundedRecord(
-  storage: StoragePort,
-  coordinationRoot: string,
-  path: string,
-  maxBytes: number,
-): BoundedRecordReadResult {
+type RecordPathInspection =
+  | Extract<BoundedRecordReadResult, { readonly kind: 'absent' | 'rejected' }>
+  | { readonly kind: 'present'; readonly stat: StorageBigIntStat };
+
+function inspectRecordPath(storage: StoragePort, coordinationRoot: string, path: string): RecordPathInspection {
   const coordination = inspectCoordinationDirectory(storage, coordinationRoot);
   if (coordination.kind !== 'present') return coordination;
 
@@ -837,6 +805,35 @@ function readBoundedRecord(
     return { kind: 'rejected', failureCode: 'record_unavailable' };
   }
   if (!pathBefore.isFile()) return { kind: 'rejected', failureCode: 'record_not_regular' };
+  return { kind: 'present', stat: pathBefore };
+}
+
+function readBoundedRecord(
+  storage: StoragePort,
+  coordinationRoot: string,
+  path: string,
+  maxBytes: number,
+): BoundedRecordReadResult {
+  const inspected = inspectRecordPath(storage, coordinationRoot, path);
+  if (inspected.kind !== 'present') return inspected;
+  const pathBefore = inspected.stat;
+  if ((pathBefore.mode & PERMISSION_BITS) !== PRIVATE_FILE_MODE) {
+    return { kind: 'rejected', failureCode: 'record_mode' };
+  }
+  if (pathBefore.size < 0n) return { kind: 'rejected', failureCode: 'record_unavailable' };
+  return readOpenedRecord(storage, path, pathBefore, maxBytes);
+}
+
+function readBoundedRecordForSettlement(
+  storage: StoragePort,
+  coordinationRoot: string,
+  path: string,
+  maxBytes: number,
+  actuator: StorageActuator,
+): BoundedRecordReadResult {
+  const inspected = inspectRecordPath(storage, coordinationRoot, path);
+  if (inspected.kind !== 'present') return inspected;
+  let pathBefore = inspected.stat;
   if ((pathBefore.mode & PERMISSION_BITS) !== PRIVATE_FILE_MODE) {
     const currentUid = process.getuid?.();
     const ownerUid = pathBefore.uid;
@@ -847,7 +844,7 @@ function readBoundedRecord(
       return { kind: 'rejected', failureCode: 'record_mode' };
     }
     try {
-      storage.chmodSync(path, Number(PRIVATE_FILE_MODE));
+      actuator.setMode(path, Number(PRIVATE_FILE_MODE));
       pathBefore = storage.statSync(path, { bigint: true });
     } catch {
       return { kind: 'rejected', failureCode: 'record_mode' };
@@ -906,9 +903,14 @@ type ActiveStoreSelectionV1ReadResult =
   | { readonly kind: 'malformed'; readonly evidence: ActiveStoreSelectionMalformedEvidence }
   | { readonly kind: 'rejected'; readonly failureCode: ActiveStoreRecordReadFailureCode };
 
-function readActiveStoreSelectionV1(runtime: Pick<Runtime, 'paths' | 'storage'>): ActiveStoreSelectionV1ReadResult {
+type ActiveStoreRecordReader = typeof readBoundedRecord;
+
+function readActiveStoreSelectionV1With(
+  runtime: Pick<Runtime, 'paths' | 'storage'>,
+  readRecord: ActiveStoreRecordReader,
+): ActiveStoreSelectionV1ReadResult {
   const paths = resolveActiveStoreRecordPaths(runtime);
-  const read = readBoundedRecord(
+  const read = readRecord(
     runtime.storage,
     paths.coordinationRoot,
     paths.selectionV1File,
@@ -928,9 +930,12 @@ function readActiveStoreSelectionV1(runtime: Pick<Runtime, 'paths' | 'storage'>)
   }
 }
 
-export function readActiveStoreSelection(runtime: Pick<Runtime, 'paths' | 'storage'>): ActiveStoreSelectionReadResult {
+function readActiveStoreSelectionWith(
+  runtime: Pick<Runtime, 'paths' | 'storage'>,
+  readRecord: ActiveStoreRecordReader,
+): ActiveStoreSelectionReadResult {
   const paths = resolveActiveStoreRecordPaths(runtime);
-  const read = readBoundedRecord(
+  const read = readRecord(
     runtime.storage,
     paths.coordinationRoot,
     paths.selectionFile,
@@ -950,11 +955,31 @@ export function readActiveStoreSelection(runtime: Pick<Runtime, 'paths' | 'stora
   }
 }
 
+export function readActiveStoreSelection(runtime: Pick<Runtime, 'paths' | 'storage'>): ActiveStoreSelectionReadResult {
+  return readActiveStoreSelectionWith(runtime, readBoundedRecord);
+}
+
 export function readActiveStoreSelectionForCoordination(
   runtime: Pick<Runtime, 'paths' | 'storage'>,
 ): ActiveStoreSelectionCoordinationReadResult {
-  const v1 = readActiveStoreSelectionV1(runtime);
-  const current = readActiveStoreSelection(runtime);
+  return readActiveStoreSelectionForCoordinationWith(runtime, readBoundedRecord);
+}
+
+export function readActiveStoreSelectionForSettlement(
+  runtime: Pick<Runtime, 'paths' | 'storage'>,
+  actuator: StorageActuator,
+): ActiveStoreSelectionCoordinationReadResult {
+  return readActiveStoreSelectionForCoordinationWith(runtime, (storage, root, path, maxBytes) =>
+    readBoundedRecordForSettlement(storage, root, path, maxBytes, actuator),
+  );
+}
+
+function readActiveStoreSelectionForCoordinationWith(
+  runtime: Pick<Runtime, 'paths' | 'storage'>,
+  readRecord: ActiveStoreRecordReader,
+): ActiveStoreSelectionCoordinationReadResult {
+  const v1 = readActiveStoreSelectionV1With(runtime, readRecord);
+  const current = readActiveStoreSelectionWith(runtime, readRecord);
   if (v1.kind === 'absent') return current;
   if (v1.kind === 'rejected') return v1;
   if (v1.kind === 'malformed') return { kind: 'rejected', failureCode: 'record_incoherent' };
@@ -970,11 +995,12 @@ export function readActiveStoreSelectionForCoordination(
   return { kind: 'v1', selection: v1.selection };
 }
 
-export function readActiveStoreTransition(
+function readActiveStoreTransitionWith(
   runtime: Pick<Runtime, 'paths' | 'storage'>,
+  readRecord: ActiveStoreRecordReader,
 ): ActiveStoreTransitionReadResult {
   const paths = resolveActiveStoreRecordPaths(runtime);
-  const read = readBoundedRecord(
+  const read = readRecord(
     runtime.storage,
     paths.coordinationRoot,
     paths.transitionFile,
@@ -994,11 +1020,27 @@ export function readActiveStoreTransition(
   }
 }
 
-export function readActiveStoreTransitionV1(
+export function readActiveStoreTransition(
   runtime: Pick<Runtime, 'paths' | 'storage'>,
+): ActiveStoreTransitionReadResult {
+  return readActiveStoreTransitionWith(runtime, readBoundedRecord);
+}
+
+export function readActiveStoreTransitionForSettlement(
+  runtime: Pick<Runtime, 'paths' | 'storage'>,
+  actuator: StorageActuator,
+): ActiveStoreTransitionReadResult {
+  return readActiveStoreTransitionWith(runtime, (storage, root, path, maxBytes) =>
+    readBoundedRecordForSettlement(storage, root, path, maxBytes, actuator),
+  );
+}
+
+function readActiveStoreTransitionV1With(
+  runtime: Pick<Runtime, 'paths' | 'storage'>,
+  readRecord: ActiveStoreRecordReader,
 ): ActiveStoreTransitionV1ReadResult {
   const paths = resolveActiveStoreRecordPaths(runtime);
-  const read = readBoundedRecord(
+  const read = readRecord(
     runtime.storage,
     paths.coordinationRoot,
     paths.transitionV1File,
@@ -1006,4 +1048,13 @@ export function readActiveStoreTransitionV1(
   );
   if (read.kind === 'absent' || read.kind === 'rejected') return read;
   return { kind: 'legacy' };
+}
+
+export function readActiveStoreTransitionV1ForSettlement(
+  runtime: Pick<Runtime, 'paths' | 'storage'>,
+  actuator: StorageActuator,
+): ActiveStoreTransitionV1ReadResult {
+  return readActiveStoreTransitionV1With(runtime, (storage, root, path, maxBytes) =>
+    readBoundedRecordForSettlement(storage, root, path, maxBytes, actuator),
+  );
 }

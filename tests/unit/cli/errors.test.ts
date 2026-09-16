@@ -134,21 +134,6 @@ describe('cli errors', () => {
       });
     });
 
-    it('drops documented setup-error context from the CLI envelope', () => {
-      const error = documentedCoralSetupError('store_reset_interrupted_foreign', {
-        flavor: 'prod',
-        cause: 'raw filesystem failure that must stay private',
-      });
-
-      expect(buildErrorEnvelope(error).envelope).toEqual({
-        error: true,
-        code: 'store_reset_interrupted_foreign',
-        message: 'Coral found an unrecognized entry in the interrupted backend store-reset staging area.',
-        remediation:
-          "Run 'coral-cli backend store-reset discard --target gen2 --flavor prod' to resume the interrupted reset under explicit operator control. Startup leaves the active store and staged incident unchanged.",
-      });
-    });
-
     it('prints a provider preflight fault cause from a structured transport error before dropping its context', () => {
       const cause = 'preflight implementation failed';
       const error = documentedCoralSetupError('provider_preflight_faulted', { provider: 'codex', cause });
@@ -201,20 +186,14 @@ describe('cli errors', () => {
     it.each([
       [
         'invalid_store_reset_incident_id',
-        'Incident ID must be a canonical lowercase UUID.',
-        'Run `coral-cli backend store-reset list --target <legacy|gen2>` and use the ID of an incident in the `ready` state.',
+        'Report target must be a positive numeric epoch or canonical lowercase legacy incident UUID.',
+        'Run `coral-cli backend store-reset list --target <legacy|gen2>` and use a listed epoch or the ID of a legacy incident in the `ready` state.',
         2,
       ],
       [
         'store_reset_incident_not_found',
-        'Store-reset incident not found.',
-        'Run `coral-cli backend store-reset list --target <legacy|gen2>`. If no incident is retained, file a Store-reset incident issue with this complete fixed error output; do not attach DB, WAL, SHM, or raw logs.',
-        1,
-      ],
-      [
-        'store_reset_incident_limit_exceeded',
-        'Too many retained store-reset entries to list safely.',
-        'File a Store-reset incident issue with this fixed error output; do not attach DB, WAL, SHM, or raw logs.',
+        'Store-reset report target not found.',
+        'Run `coral-cli backend store-reset list --target <legacy|gen2>` and retry with a listed epoch or legacy incident.',
         1,
       ],
       [
@@ -264,9 +243,6 @@ describe('cli errors', () => {
     it.each([
       ['legacy_foreign_generation', { legacyPath: '/legacy', version: '0.9.16' }, 409],
       ['legacy_source_not_quiescent', { holder: 'install:kiwi (pid 42)', flavor: 'prod' }, 409],
-      ['store_newer_incompatible', { version: '99.0.0', flavor: 'prod' }, 409],
-      ['store_older_incompatible', { version: '0.0.1', flavor: 'prod' }, 409],
-      ['store_corrupt_or_unsupported', { flavor: 'prod' }, 409],
       ['store_not_initialized', { path: '/store/store.db' }, 409],
       ['kb_commit_corrupt_or_unsupported', { commitId: 'blocking-commit', flavor: 'prod' }, 409],
       ['kb_commit_id_invalid', { commitId: '../bad' }, 400],
@@ -311,46 +287,6 @@ describe('cli errors', () => {
         buildErrorEnvelope(new BackendToolHttpError(response.message, response.statusCode, response.body)).exitCode,
       ).toBe(exitCode);
     });
-
-    it.each([
-      ['store_open_contended', 503, 75, 'The current-generation store could not be opened because it is in use.'],
-      [
-        'store_open_unclassified',
-        500,
-        70,
-        'Coral could not classify why the current-generation store could not be opened.',
-      ],
-    ] as const)(
-      'preserves the %s refusal and exit class through IPC and HTTP',
-      (code, statusCode, exitCode, message) => {
-        const context = { path: '/store/store.db', flavor: 'prod', cause: 'EACCES: permission denied' };
-        const setupError = documentedCoralSetupError(code, context);
-        const serialized = serializeCoralSetupError(setupError);
-        if (serialized === null) throw new Error(`Expected ${code} to serialize`);
-        const response = buildTransportErrorResponse(setupError);
-
-        expect(serialized.userMessage).toBe(message);
-        expect(serialized.userMessage).not.toContain('EACCES');
-        expect(serialized.context).toEqual(context);
-        expect(serialized.remediation).toContain(context.path);
-        expect(serialized.remediation).not.toContain(context.cause);
-        expect(serialized.remediation).not.toContain('store-reset discard');
-        expect(response.statusCode).toBe(statusCode);
-        expect(buildErrorEnvelope(setupError).exitCode).toBe(exitCode);
-        expect(
-          buildErrorEnvelope(
-            new IpcRpcError({
-              code: -32603,
-              message: serialized.userMessage,
-              data: serialized,
-            }),
-          ).exitCode,
-        ).toBe(exitCode);
-        expect(
-          buildErrorEnvelope(new BackendToolHttpError(response.message, response.statusCode, response.body)).exitCode,
-        ).toBe(exitCode);
-      },
-    );
 
     it.each([
       ['busy', 'All provider workers are busy'],
@@ -402,7 +338,6 @@ describe('cli errors', () => {
       ['kb_offline', undefined, 75],
       ['kb_unavailable', undefined, 75],
       ['kb_unavailable', 503, 75],
-      ['store_open_contended', undefined, 75],
       ['provider_host_inventory_unavailable', undefined, 75],
       ['backend_error', 503, 75],
       ['backend_unreachable', undefined, 69],
@@ -410,7 +345,6 @@ describe('cli errors', () => {
       ['child_credentials_incomplete', undefined, 77],
       ['internal', undefined, 70],
       ['internal_error', undefined, 70],
-      ['store_open_unclassified', undefined, 70],
       ['backend_error', 500, 70],
       ['unauthorized', 401, 1],
       ['session_not_found', 404, 1],

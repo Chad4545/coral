@@ -1,6 +1,15 @@
 import { currentCoralStoreFormat } from '#src/store-format.js';
 import { execFileSync } from 'node:child_process';
-import { copyFileSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync } from 'node:fs';
+import {
+  copyFileSync,
+  existsSync,
+  mkdirSync,
+  mkdtempSync,
+  readFileSync,
+  rmSync,
+  symlinkSync,
+  writeFileSync,
+} from 'node:fs';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { afterEach, describe, expect, it } from 'vitest';
@@ -14,7 +23,7 @@ import { jobsDir } from '#src/jobs/paths.js';
 import { pluginRootNamespace } from '#src/infra/plugin-identity.js';
 import type { JobStatus } from '#src/jobs/records.js';
 import { commitInputs } from '#tests/helpers/commit-inputs.js';
-import { openStoreDatabase } from '#src/store/db.js';
+import { openSettledTestStoreDb, openTestStoreDatabase } from '#tests/helpers/store-db.js';
 import { storePaths } from '#src/infra/path/store.js';
 import { composeReducers } from '#src/store/reducers.js';
 import { createEventBodyCodec } from '#src/store/event-body-codec.js';
@@ -33,8 +42,11 @@ const sourceDurableWrapperBundle = join(sourceBuildDir, 'coral-durable-wrapper.c
 const sourceManifestPath = join(sourceBuildDir, 'manifest.json');
 const sourceStrictManifestPath = join(sourceBuildDir, CURRENT_STRICT_BUNDLE_MANIFEST_FILE);
 const sourceManifest = JSON.parse(readFileSync(sourceManifestPath, 'utf-8')) as {
+  version: string;
+  buildSetId: string;
   bundleHash: string;
   flavor: BuildFlavor;
+  storeFormatFingerprint: string;
 };
 
 const tempRoots: string[] = [];
@@ -76,19 +88,39 @@ function createPluginFixture(): {
 
   const scratchCwd = mkdtempSync(join(tmpdir(), `coral-fixture-smoke-${sourceManifest.flavor}-`));
   tempRoots.push(scratchCwd);
-  const smokeDbPath = join(scratchCwd, 'fixture.db');
-  const smokeRuntime = createRealRuntime(sourceManifest.flavor);
-  openStoreDatabase({
+  const smokeHome = temporaryHomes.create(`coral-fixture-smoke-${sourceManifest.flavor}-home-`, sourceManifest.flavor);
+  const smokeRuntime = createRealRuntime(sourceManifest.flavor, { baseDir: join(smokeHome, '.coral') });
+  const smokeEpochDir = join(smokeRuntime.paths.coral.store.dbDir, 'epoch-1');
+  const smokeDbPath = join(smokeEpochDir, 'store.db');
+  mkdirSync(smokeEpochDir, { recursive: true });
+  writeFileSync(join(smokeEpochDir, '.lock'), '');
+  openTestStoreDatabase({
     path: smokeDbPath,
     storage: smokeRuntime.storage,
     storeFormat: currentCoralStoreFormat(),
   }).close();
+  writeFileSync(
+    join(smokeEpochDir, 'epoch.json'),
+    JSON.stringify({
+      supersedes: null,
+      classification: { kind: 'unavailable' },
+      build: {
+        version: sourceManifest.version,
+        buildSetId: sourceManifest.buildSetId,
+        bundleHash: sourceManifest.bundleHash,
+        flavor: sourceManifest.flavor,
+        storeFormatFingerprint: sourceManifest.storeFormatFingerprint,
+      },
+      publishedAt: '2026-09-15T00:00:00.000Z',
+    }),
+  );
   const smokeOut = execFileSync(
     'node',
     [join(root, 'bridge', 'coral-backend.cjs'), '--smoke-open-store', '--path', smokeDbPath],
     {
       cwd: scratchCwd,
       encoding: 'utf-8',
+      env: { ...process.env, ...temporaryHomes.environment(smokeHome) },
     },
   );
   if (smokeOut.trim() !== 'ok') {
@@ -107,7 +139,7 @@ function createCoordinatorHome(sharedStoreDir: string): TemporaryHome {
 }
 
 function seedCompletedJobs(
-  storePath: string,
+  home: TemporaryHome,
   bundleHash: string,
   jobs: ReadonlyArray<{ jobId: string; namespace: string; projectRoot: string }>,
 ): void {
@@ -115,12 +147,8 @@ function seedCompletedJobs(
   for (const { projectRoot } of jobs) {
     mkdirSync(projectRoot, { recursive: true });
   }
-  const runtime = createRealRuntime(sourceManifest.flavor);
-  const db = openStoreDatabase({
-    storeFormat: currentCoralStoreFormat(),
-    path: storePath,
-    storage: runtime.storage,
-  });
+  const runtime = createRealRuntime(sourceManifest.flavor, { baseDir: join(home, '.coral') });
+  const db = openSettledTestStoreDb(runtime);
 
   try {
     for (const { jobId, namespace, projectRoot } of jobs) {
@@ -258,8 +286,7 @@ describe('namespace coexistence integration', () => {
     const firstJobId = `coexist-first-${Date.now()}-${Math.random().toString(16).slice(2, 8)}`;
     const secondJobId = `coexist-second-${Date.now()}-${Math.random().toString(16).slice(2, 8)}`;
     const projectRoot = join(firstHome, 'shared-project');
-    const sharedStorePath = storePaths(sourceManifest.flavor, { baseDir: join(firstHome, '.coral') }).dbFile;
-    seedCompletedJobs(sharedStorePath, sourceManifest.bundleHash, [
+    seedCompletedJobs(firstHome, sourceManifest.bundleHash, [
       { jobId: firstJobId, namespace: firstNamespace, projectRoot },
       { jobId: secondJobId, namespace: secondNamespace, projectRoot },
     ]);

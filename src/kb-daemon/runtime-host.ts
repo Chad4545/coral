@@ -54,7 +54,8 @@ import {
 } from '../kb/capability/constants.js';
 import { parsePrincipalWire } from '../security/principal-wire.js';
 import { waitForCorpusReadiness } from './services/readiness.js';
-import { openWritableStoreDbNoReset, type Database } from '../store/db.js';
+import type { Database } from '../store/db.js';
+import { openWritableStoreDbNoReset, type ResolvedStoreEpoch } from '../store/epoch.js';
 import { currentCoralStoreFormat } from '../store-format.js';
 import type { KbDaemonExpansionRequest, KbDaemonExpansionResult } from './protocol.js';
 import { cleanupRetiredExpansion } from './expansion/retirement.js';
@@ -76,6 +77,7 @@ type KbDaemonWriteRuntimeOptions = {
   onJournalEvents?: (appended: readonly AppendedEvent[]) => void;
   onCorpusMutation?: (publication: KbCorpusPublication) => void;
   kiwiAnalyzer?: KiwiSearchAnalyzerPort;
+  store?: ResolvedStoreEpoch;
 };
 
 type WritableStatement<TParams extends unknown[] = unknown[], TRow = unknown> = {
@@ -369,6 +371,7 @@ export function createKbDaemonWriteRuntimeHost(options: KbDaemonWriteRuntimeOpti
         options.db ??
         (openWritableStoreDbNoReset(runtime, {
           storeFormat: currentCoralStoreFormat(),
+          ...(options.store === undefined ? {} : { resolved: options.store }),
         }) as unknown as WritableDatabase);
       const activeDb = db;
       const backendNamespace = options.backendNamespace ?? pluginRootNamespace(options.pluginRoot);

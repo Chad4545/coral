@@ -7,9 +7,7 @@ import type {
 
 export type StoreResetInspectionFaultScript = {
   readonly maxReadBytes?: number;
-  readonly maxWriteBytes?: number;
   readonly zeroReadCall?: number;
-  readonly zeroWriteCall?: number;
   readonly failFileClose?: boolean;
   readonly failDirectoryClose?: boolean;
   readonly lstat?: (
@@ -36,7 +34,6 @@ export function scriptedStoreResetInspectionFs(
   script: StoreResetInspectionFaultScript,
 ): StoreResetInspectionFs {
   let readCalls = 0;
-  let writeCalls = 0;
   let lstatCalls = 0;
   let fstatCalls = 0;
   let realpathCalls = 0;
@@ -81,20 +78,9 @@ export function scriptedStoreResetInspectionFs(
       if (script.zeroReadCall === readCalls) return 0;
       return base.read(descriptor, buffer, offset, Math.min(length, script.maxReadBytes ?? length), position);
     },
-    write(descriptor: StoreResetFileDescriptor, buffer, offset, length, position) {
-      writeCalls += 1;
-      if (script.zeroWriteCall === writeCalls) return 0;
-      return base.write(descriptor, buffer, offset, Math.min(length, script.maxWriteBytes ?? length), position);
-    },
     close(descriptor: StoreResetFileDescriptor) {
       base.close(descriptor);
       if (script.failFileClose) throw new Error('scripted file close failure');
-    },
-    mkdtemp(prefix) {
-      return base.mkdtemp(prefix);
-    },
-    removeTreeGuarded(path, expected) {
-      return base.removeTreeGuarded(path, expected);
     },
   };
 }

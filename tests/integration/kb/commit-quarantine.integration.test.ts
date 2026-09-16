@@ -15,7 +15,6 @@ import {
   resolveGenerationBoundaryPaths,
   tryAcquireGenerationWriterLease,
 } from '#src/store/generation-mutation-coordination.js';
-import { currentCoralStoreFormat } from '#src/store-format.js';
 import { bindSocket } from '#src/transport/ipc/server.js';
 import { testIncarnation } from '#tests/helpers/process-incarnation.js';
 
@@ -83,7 +82,7 @@ describe('KB commit quarantine', () => {
       'commits',
       commitId,
     );
-    const readiness = await generationMutationCoordinationSeam.completeReadiness(runtime, currentCoralStoreFormat(), {
+    const readiness = await generationMutationCoordinationSeam.completeReadiness(runtime, {
       kind: 'kb-child',
       name: 'orphaned-kb-daemon',
     });
@@ -231,7 +230,7 @@ describe('KB commit quarantine', () => {
     const projectionRoot = join(runtime.paths.coral.kbRuntime.root, KB_RUNTIME_AUTHORITY.corpusProjection);
     const otherCommit = join(projectionRoot, 'commits', 'other-commit');
     const unrelatedKbFile = join(runtime.paths.coral.kbRuntime.root, 'unrelated.txt');
-    const storeFile = runtime.paths.coral.store.dbFile;
+    const storeFile = join(runtime.paths.coral.store.dbDir, 'store.db');
     mkdirSync(otherCommit, { recursive: true });
     mkdirSync(dirname(storeFile), { recursive: true });
     writeFileSync(join(otherCommit, 'commit.json'), 'other', 'utf-8');

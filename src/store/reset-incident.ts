@@ -13,7 +13,6 @@ export const STORE_RESET_INCIDENT_SCHEMA_VERSION = STORE_RESET_INCIDENT_SCHEMA_G
 export const STORE_RESET_RETAINED_INCIDENT_SCHEMA_VERSION = STORE_RESET_INCIDENT_SCHEMA_GENERATIONS.retainedReadable[0];
 
 export const STORE_RESET_QUARANTINE_DIRECTORY = 'store-reset-quarantine';
-export const STORE_RESET_STAGING_DIRECTORY = '.staging';
 export const STORE_RESET_MANIFEST_FILE_NAME = 'reset-manifest.json';
 
 export const MAX_RESET_MANIFEST_BYTES = 64 * 1024;
@@ -21,12 +20,6 @@ export const MAX_RESET_MANIFEST_JSON_DEPTH = 8;
 export const MAX_INCIDENT_ROOT_ENTRIES = 4_096;
 export const MAX_INCIDENT_DIR_ENTRIES = 5;
 export const MAX_REPORT_HASH_BYTES = 1024 * 1024 * 1024;
-export const MAX_SQLITE_DIAGNOSTIC_BYTES = 256 * 1024 * 1024;
-export const SQLITE_EXECUTION_DEADLINE_MS = 5_000;
-export const SQLITE_TERMINATION_GRACE_MS = 1_000;
-export const SQLITE_FORCE_CLOSE_DEADLINE_MS = 1_000;
-export const SQLITE_CHILD_STDOUT_MAX_BYTES = 64;
-export const SQLITE_CHILD_STDERR_MAX_BYTES = 4 * 1024;
 
 export const STORE_RESET_EVIDENCE_FILE_NAMES = ['store.db', 'store.db-wal', 'store.db-shm', 'store.db.format'] as const;
 
@@ -110,47 +103,12 @@ export type StoreResetIncidentManifest = StoreResetIncidentManifestV2 | StoreRes
 
 export type StoreResetHashVerification = 'match' | 'mismatch' | 'missing' | 'unavailable_limit' | 'unavailable';
 
-export type StoreResetDiagnosticIntegrity = 'ok' | 'failed' | 'unavailable';
-export type StoreResetDiagnosticTermination = 'not_started' | 'completed' | 'terminated' | 'termination_unconfirmed';
-export type StoreResetDiagnosticCleanup = 'not_required' | 'removed' | 'cleanup_unavailable';
-
 export type StoreResetIncidentLocalReport = {
   readonly manifest: StoreResetIncidentManifest;
   readonly fileVerification: readonly {
     readonly name: StoreResetEvidenceFileName;
     readonly status: StoreResetHashVerification;
   }[];
-  readonly diagnostic: {
-    readonly integrity: StoreResetDiagnosticIntegrity;
-    readonly termination: StoreResetDiagnosticTermination;
-    readonly cleanup: StoreResetDiagnosticCleanup;
-  };
-};
-
-export type StoreResetIncidentListEntry =
-  | {
-      readonly incidentId: string;
-      readonly state: 'ready';
-      readonly resetAt: string;
-      readonly reason: StoreResetReason;
-      readonly schemaVersion:
-        | typeof STORE_RESET_RETAINED_INCIDENT_SCHEMA_VERSION
-        | typeof STORE_RESET_INCIDENT_SCHEMA_VERSION;
-      readonly resetPolicyCause: StoreResetPolicyCause | null;
-      readonly fileCount: number;
-    }
-  | {
-      readonly incidentId: string;
-      readonly state: 'malformed' | 'unsupported' | 'build_mismatch' | 'unsafe' | 'unavailable';
-      readonly resetAt: null;
-      readonly reason: null;
-      readonly schemaVersion: null;
-      readonly resetPolicyCause: null;
-      readonly fileCount: null;
-    };
-
-export type StoreResetIncidentListResult = {
-  readonly incidents: readonly StoreResetIncidentListEntry[];
 };
 
 const STORE_RESET_PUBLIC_REPORT_BRAND: unique symbol = Symbol('StoreResetPublicReport');
@@ -181,11 +139,6 @@ export type StoreResetPublicReport = {
     readonly sha256: string;
     readonly verification: StoreResetHashVerification;
   }[];
-  readonly diagnostic: {
-    readonly integrity: StoreResetDiagnosticIntegrity;
-    readonly termination: StoreResetDiagnosticTermination;
-    readonly cleanup: StoreResetDiagnosticCleanup;
-  };
   readonly [STORE_RESET_PUBLIC_REPORT_BRAND]: true;
 };
 
@@ -861,11 +814,6 @@ export function projectStoreResetPublicReport(local: StoreResetIncidentLocalRepo
         }),
       ),
     ),
-    diagnostic: Object.freeze({
-      integrity: local.diagnostic.integrity,
-      termination: local.diagnostic.termination,
-      cleanup: local.diagnostic.cleanup,
-    }),
     [STORE_RESET_PUBLIC_REPORT_BRAND]: true as const,
   });
 }

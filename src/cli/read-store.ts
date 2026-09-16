@@ -1,7 +1,8 @@
 import { createRealRuntime } from '../runtime/real.js';
 import { readBuildFlavor } from '../infra/bundle-manifest.js';
 import { CoralStore } from '../read-model/coral-store.js';
-import { openStoreDatabase, type Database } from '../store/db.js';
+import { openMemoryStoreDatabase, type Database } from '../store/db.js';
+import { resolveCurrentStore } from '../store/epoch.js';
 import { openReadOnlyStoreDatabase } from '../store/read-port.js';
 import { createDefaultStoreReadContext } from '../read-model/read-context.js';
 import { resolvePluginRoot } from './plugin-root.js';
@@ -55,6 +56,10 @@ class ReadCoralStoreRegistry {
     }
   }
 
+  close(): void {
+    this.closeCached();
+  }
+
   private closeCached(): void {
     if (!this.cached) {
       return;
@@ -96,23 +101,23 @@ export function flushPendingReadStoreNote(outputFormat: 'text' | 'json'): void {
   defaultRegistry.flushPendingNote(outputFormat);
 }
 
+export function closeSharedReadCoralStore(): void {
+  defaultRegistry.close();
+}
+
 export function openReadCoralStore(projectRoot: string): ReadCoralStoreHandle {
   const pluginRoot = resolvePluginRoot();
   const flavor = readBuildFlavor(pluginRoot ?? projectRoot);
   const runtime = createRealRuntime(flavor);
-  const dbPath = runtime.paths.coral.store.dbFile;
-  const hasStore = runtime.storage.existsSync(dbPath);
+  const resolved = resolveCurrentStore(runtime);
+  const hasStore = resolved.epoch !== null;
 
   const db = hasStore
     ? (openReadOnlyStoreDatabase(runtime, {
         storeFormat: currentCoralStoreFormat(),
+        resolved,
       }) as unknown as Database)
-    : openStoreDatabase({
-        path: ':memory:',
-        storage: runtime.storage,
-        storeFormat: currentCoralStoreFormat(),
-        flavor: runtime.flavor,
-      });
+    : openMemoryStoreDatabase(currentCoralStoreFormat());
 
   return {
     store: new CoralStore(db, createDefaultStoreReadContext(), {
@@ -120,7 +125,7 @@ export function openReadCoralStore(projectRoot: string): ReadCoralStoreHandle {
       projectRoot,
       ...(pluginRoot ? { pluginRoot } : {}),
     }),
-    ...(hasStore ? {} : { note: `(no store at ${dbPath} — showing empty results)` }),
+    ...(hasStore ? {} : { note: '(no current store — showing empty results)' }),
     close: () => db.close(),
   };
 }

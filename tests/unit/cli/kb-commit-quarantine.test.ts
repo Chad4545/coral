@@ -10,11 +10,14 @@ import { emitError } from '#src/cli/emit.js';
 import { buildErrorEnvelope } from '#src/cli/errors.js';
 
 const storeReset: StoreResetCommandOperations = {
-  list: () => ({ incidents: [] }),
+  list: () => ({ epochs: [], holders: [], residues: [], legacyIncidents: [], truncated: false }),
   report: async () => {
     throw new Error('not used');
   },
   discard: async () => {
+    throw new Error('not used');
+  },
+  release: async () => {
     throw new Error('not used');
   },
 };

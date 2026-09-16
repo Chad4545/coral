@@ -1,7 +1,12 @@
 import { resolve } from 'node:path';
 import type { Database } from '../store/db.js';
 
-import { commit as commitJournalEvents, type CommitContext, type CommitEventsFn } from '../store/append.js';
+import {
+  commit as commitJournalEvents,
+  type CommitContext,
+  type CommitEventsFn,
+  type UnreadableJobStatusRecoveryCommitFn,
+} from '../store/append.js';
 import type { ProviderLookupPort } from '../providers/catalog.js';
 import type { CoralEventInput } from '../store/envelope.js';
 import { isNoEntryError } from '../infra/fs-errors.js';
@@ -35,6 +40,7 @@ import type {
   SessionArtifactHandleRecordOptions,
   SessionArtifactHandleRecordResult,
   SessionJobClaimReleaseResult,
+  SessionJobRecoveryDispositionCommitResult,
 } from './contracts.js';
 import { sessionsRegistry } from './events.js';
 import type {
@@ -74,6 +80,7 @@ type SessionStoreEventBody =
 
 export type SessionManagerOptions = {
   db: Database;
+  commitUnreadableJobStatusRecovery?: UnreadableJobStatusRecoveryCommitFn;
 };
 
 function toSessionNamespace(dir: string, ids: Pick<IdPort, 'sha256'>): string {
@@ -279,6 +286,7 @@ export class SessionManager {
   private readonly time: TimePort;
   private readonly ids: IdPort;
   private readonly commitEvents: CommitEventsFn;
+  private readonly commitUnreadableJobStatusRecovery?: UnreadableJobStatusRecoveryCommitFn;
   private readonly releaseEmitter: SessionReleasedEmitter;
   private readonly scopeKey: string;
   private readonly db: Database;
@@ -299,6 +307,8 @@ export class SessionManager {
     commitEvents: CommitEventsFn,
     releaseEmitter: SessionReleasedEmitter | undefined,
     db: Database,
+    providers?: undefined,
+    commitUnreadableJobStatusRecovery?: UnreadableJobStatusRecoveryCommitFn,
   );
   constructor(
     workingDirectory: string,
@@ -307,6 +317,7 @@ export class SessionManager {
     releaseEmitter: SessionReleasedEmitter | undefined,
     db: Database,
     providers?: ProviderLookupPort,
+    commitUnreadableJobStatusRecovery?: UnreadableJobStatusRecoveryCommitFn,
   ) {
     this.time = runtime.time;
     this.ids = runtime.ids;
@@ -319,6 +330,7 @@ export class SessionManager {
     } else {
       this.commitEvents = commitEvents;
     }
+    this.commitUnreadableJobStatusRecovery = commitUnreadableJobStatusRecovery;
     this.releaseEmitter = releaseEmitter ?? (() => {});
     this.scopeKey = toSessionNamespace(workingDirectory, this.ids);
   }
@@ -330,7 +342,15 @@ export class SessionManager {
     releaseEmitter: SessionReleasedEmitter,
     options: SessionManagerOptions,
   ): SessionManager {
-    return new SessionManager(workingDirectory, runtime, commitEvents, releaseEmitter, options.db);
+    return new SessionManager(
+      workingDirectory,
+      runtime,
+      commitEvents,
+      releaseEmitter,
+      options.db,
+      undefined,
+      options.commitUnreadableJobStatusRecovery,
+    );
   }
 
   private populateCache(sessionId: string, entry: ProviderSession): void {
@@ -810,37 +830,75 @@ export class SessionManager {
     return true;
   }
 
-  releaseJob(sessionId: string, jobId: string): SessionJobClaimReleaseResult {
-    const entry = this.readEntry(sessionId);
-    if (!entry || entry.activeJobId === undefined) return 'already_absent';
-    if (entry.activeJobId !== jobId) return 'owned_by_another_job';
-    const now = nowIsoString(this.time);
-    const clearedLease =
-      entry.continuationLease?.status === 'claimed' && entry.continuationLease.resumedJobId === jobId
-        ? clearLease(entry.continuationLease, { sessionId, jobId, outcome: 'resumed_released' }, now)
-        : null;
-    const releasedEntry: ProviderSession = {
-      ...withoutActiveJobId(entry),
-      lastUsedAt: now,
-      version: this.bumpVersion(entry),
-    };
-    if (clearedLease === null) {
-      this.appendEntryEvent(releasedEntry, sessionClaimReleasedEvent(releasedEntry, jobId));
-    } else {
-      const clearedEntry: ProviderSession = {
-        ...releasedEntry,
-        continuationLease: clearedLease,
-        version: this.bumpVersion(releasedEntry),
-      };
-      this.commitEvents((c) => {
-        c.append(sessionClaimReleasedEvent(releasedEntry, jobId));
-        c.append(sessionContinuationLeaseClearedEvent(clearedEntry, clearedLease));
+  private commitJobRelease(
+    sessionId: string,
+    jobId: string,
+    appendDisposition?: <Scope>(commit: CommitContext<Scope>, releaseResult: SessionJobClaimReleaseResult) => void,
+    commitEvents: CommitEventsFn = this.commitEvents,
+  ): SessionJobRecoveryDispositionCommitResult {
+    let releaseResult: SessionJobClaimReleaseResult = 'already_absent';
+    let committedEntry: ProviderSession | undefined;
+    const appended =
+      commitEvents((commit) => {
+        const entry = this.readEntry(sessionId, { forceFresh: true });
+        if (!entry || entry.activeJobId === undefined) {
+          appendDisposition?.(commit, releaseResult);
+          return undefined;
+        }
+        if (entry.activeJobId !== jobId) {
+          releaseResult = 'owned_by_another_job';
+          appendDisposition?.(commit, releaseResult);
+          return undefined;
+        }
+
+        releaseResult = 'released';
+        const now = nowIsoString(this.time);
+        const clearedLease =
+          entry.continuationLease?.status === 'claimed' && entry.continuationLease.resumedJobId === jobId
+            ? clearLease(entry.continuationLease, { sessionId, jobId, outcome: 'resumed_released' }, now)
+            : null;
+        const releasedEntry: ProviderSession = {
+          ...withoutActiveJobId(entry),
+          lastUsedAt: now,
+          version: this.bumpVersion(entry),
+        };
+        committedEntry =
+          clearedLease === null
+            ? releasedEntry
+            : {
+                ...releasedEntry,
+                continuationLease: clearedLease,
+                version: this.bumpVersion(releasedEntry),
+              };
+        appendDisposition?.(commit, releaseResult);
+        commit.append(sessionClaimReleasedEvent(releasedEntry, jobId));
+        if (clearedLease !== null) {
+          commit.append(sessionContinuationLeaseClearedEvent(committedEntry, clearedLease));
+        }
         return undefined;
-      });
-      this.populateCache(sessionId, clearedEntry);
+      }) ?? [];
+
+    if (committedEntry !== undefined) {
+      this.populateCache(sessionId, committedEntry);
+      this.releaseEmitter({ sessionId, jobId });
     }
-    this.releaseEmitter({ sessionId, jobId });
-    return 'released';
+    return { releaseResult, appended };
+  }
+
+  releaseJob(sessionId: string, jobId: string): SessionJobClaimReleaseResult {
+    return this.commitJobRelease(sessionId, jobId).releaseResult;
+  }
+
+  releaseJobWithRecoveryDisposition(
+    sessionId: string,
+    jobId: string,
+    appendDisposition: <Scope>(commit: CommitContext<Scope>, releaseResult: SessionJobClaimReleaseResult) => void,
+  ): SessionJobRecoveryDispositionCommitResult {
+    const commitRecovery = this.commitUnreadableJobStatusRecovery;
+    if (commitRecovery === undefined) {
+      throw new Error('Unreadable job-status recovery commit is not configured.');
+    }
+    return this.commitJobRelease(sessionId, jobId, appendDisposition, (cb) => commitRecovery(jobId, cb));
   }
 
   /** Provider-scoped lookup. Returns null if sessionId not found or provider mismatch. */

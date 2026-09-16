@@ -1,5 +1,5 @@
 import { createHash } from 'node:crypto';
-import { existsSync, mkdtempSync, readFileSync, rmSync } from 'node:fs';
+import { existsSync, mkdtempSync, readFileSync, rmSync, statSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
@@ -8,7 +8,8 @@ import { afterEach, describe, expect, it } from 'vitest';
 import { validateProductVersion } from '#src/infra/product-version.js';
 import { createRealRuntime } from '#src/runtime/real.js';
 import { currentCoralStoreFormat } from '#src/store-format.js';
-import { classifyStoreFile, openStoreDatabase } from '#src/store/db.js';
+import { classifyStoreFile } from '#src/store/db.js';
+import { openTestStoreDatabase } from '#tests/helpers/store-db.js';
 import type { StoreFormatDescription, StoreFormatFingerprint } from '#src/store/format-fingerprint.js';
 import { totalChanges } from '#tests/helpers/test-db.js';
 
@@ -101,7 +102,9 @@ describe('store format classification', () => {
     const before = sha256File(dbPath);
     const storage = createRealRuntime('prod', { baseDir: join(root, 'runtime') }).storage;
 
-    expect(() => openStoreDatabase({ path: dbPath, storage, storeFormat: format('1.0.0'), readonly: true })).toThrow();
+    expect(() =>
+      openTestStoreDatabase({ path: dbPath, storage, storeFormat: format('1.0.0'), readonly: true }),
+    ).toThrow();
     expect(sha256File(dbPath)).toBe(before);
   });
 
@@ -121,15 +124,17 @@ describe('store format classification', () => {
     });
   });
 
-  it('classifies an equal valid fingerprint with no version row as legacy-adoptable', () => {
-    const { dbPath } = tempPath('legacy-adoptable.db');
+  it('classifies an equal valid fingerprint with no version row as unsupported', () => {
+    const { dbPath } = tempPath('missing-version.db');
     createStore(dbPath, { fingerprint: CURRENT_FINGERPRINT });
 
     expect(classify(dbPath, format('1.0.0'))).toEqual({
-      kind: 'legacy-adoptable',
+      kind: 'corrupt-or-unsupported',
       currentFingerprint: CURRENT_FINGERPRINT,
       currentProductVersion: '1.0.0',
       storedFingerprint: CURRENT_FINGERPRINT,
+      storedProductVersion: null,
+      storedProductVersionState: 'absent',
     });
   });
 
@@ -165,7 +170,7 @@ describe('store format classification', () => {
 
     expect(classify(dbPath, format('1.2.3+current'))).toMatchObject({
       kind: 'compatible',
-      storedProductVersion: '1.2.3+stored',
+      storedProductVersion: '1.2.3',
     });
   });
 
@@ -220,9 +225,9 @@ describe('store format classification', () => {
       const current = format(currentVersion);
       const storage = createRealRuntime('prod', { baseDir: join(root, 'runtime') }).storage;
 
-      expect(() => openStoreDatabase({ path: dbPath, storage, storeFormat: current })).toThrow();
+      expect(() => openTestStoreDatabase({ path: dbPath, storage, storeFormat: current })).toThrow();
       expect(sha256File(dbPath)).toBe(before);
-      expect(() => openStoreDatabase({ path: dbPath, storage, storeFormat: current, readonly: true })).toThrow();
+      expect(() => openTestStoreDatabase({ path: dbPath, storage, storeFormat: current, readonly: true })).toThrow();
       expect(sha256File(dbPath)).toBe(before);
     },
   );
@@ -232,7 +237,7 @@ describe('store format classification', () => {
     const current = format('1.2.3');
     const storage = createRealRuntime('prod', { baseDir: join(root, 'runtime') }).storage;
 
-    const db = openStoreDatabase({ path: dbPath, storage, storeFormat: current });
+    const db = openTestStoreDatabase({ path: dbPath, storage, storeFormat: current });
     db.close();
 
     const stored = new DatabaseSync(dbPath, { readOnly: true });
@@ -255,7 +260,7 @@ describe('store format classification', () => {
     createStore(dbPath, { fingerprint: CURRENT_FINGERPRINT, productVersion: '1.2.0' });
     const storage = createRealRuntime('prod', { baseDir: join(root, 'runtime') }).storage;
 
-    expect(() => openStoreDatabase({ path: dbPath, storage, storeFormat: format('1.1.0') })).toThrow();
+    expect(() => openTestStoreDatabase({ path: dbPath, storage, storeFormat: format('1.1.0') })).toThrow();
     expect(readStoredProductVersion(dbPath)).toBe('1.2.0');
   });
 
@@ -264,7 +269,7 @@ describe('store format classification', () => {
     createStore(dbPath, { fingerprint: CURRENT_FINGERPRINT, productVersion: '1.0.0' });
     const storage = createRealRuntime('prod', { baseDir: join(root, 'runtime') }).storage;
 
-    openStoreDatabase({ path: dbPath, storage, storeFormat: format('1.1.0') }).close();
+    openTestStoreDatabase({ path: dbPath, storage, storeFormat: format('1.1.0') }).close();
 
     expect(readStoredProductVersion(dbPath)).toBe('1.1.0');
   });
@@ -274,7 +279,7 @@ describe('store format classification', () => {
     createStore(dbPath, { fingerprint: CURRENT_FINGERPRINT, productVersion: '1.0.0+stored' });
     const storage = createRealRuntime('prod', { baseDir: join(root, 'runtime') }).storage;
 
-    const db = openStoreDatabase({ path: dbPath, storage, storeFormat: format('1.0.0+current') });
+    const db = openTestStoreDatabase({ path: dbPath, storage, storeFormat: format('1.0.0+current') });
     try {
       expect(totalChanges(db)).toBe(0);
     } finally {
@@ -283,16 +288,22 @@ describe('store format classification', () => {
     expect(readStoredProductVersion(dbPath)).toBe('1.0.0+stored');
   });
 
-  it('refuses an ordinary legacy-adoptable open without stamping it', () => {
-    const { root, dbPath } = tempPath('legacy-adoptable-high-water.db');
+  it('refuses a store with no product version without replacing its inode', () => {
+    const { root, dbPath } = tempPath('missing-version-high-water.db');
     createStore(dbPath, { fingerprint: CURRENT_FINGERPRINT });
     const storage = createRealRuntime('prod', { baseDir: join(root, 'runtime') }).storage;
-    const before = sha256File(dbPath);
+    const before = statSync(dbPath, { bigint: true });
 
-    expect(() => openStoreDatabase({ path: dbPath, storage, storeFormat: format('1.1.0') })).toThrow();
+    expect(() =>
+      openTestStoreDatabase({ path: dbPath, storage, storeFormat: format('1.1.0'), readonly: true }),
+    ).toThrow();
+    expect(readStoredProductVersion(dbPath)).toBeUndefined();
+
+    expect(() => openTestStoreDatabase({ path: dbPath, storage, storeFormat: format('1.1.0') })).toThrow();
 
     expect(readStoredProductVersion(dbPath)).toBeUndefined();
-    expect(sha256File(dbPath)).toBe(before);
+    const after = statSync(dbPath, { bigint: true });
+    expect({ dev: after.dev, ino: after.ino }).toEqual({ dev: before.dev, ino: before.ino });
   });
 
   it('never raises the product version during a read-only open', () => {
@@ -300,7 +311,7 @@ describe('store format classification', () => {
     createStore(dbPath, { fingerprint: CURRENT_FINGERPRINT, productVersion: '1.0.0' });
     const storage = createRealRuntime('prod', { baseDir: join(root, 'runtime') }).storage;
 
-    openStoreDatabase({ path: dbPath, storage, storeFormat: format('1.1.0'), readonly: true }).close();
+    openTestStoreDatabase({ path: dbPath, storage, storeFormat: format('1.1.0'), readonly: true }).close();
 
     expect(readStoredProductVersion(dbPath)).toBe('1.0.0');
   });

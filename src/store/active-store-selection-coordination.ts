@@ -1,13 +1,12 @@
+import { join } from 'node:path';
+
 import { writeAuditEvent } from '../infra/audit-log.js';
 import { backendLog } from '../infra/backend-log.js';
-import {
-  readBoundedAdjacentManifest,
-  strictBundleManifestSchema,
-  type StrictBundleManifest,
-} from '../infra/bundle-manifest.js';
+import { readBoundedAdjacentManifest, strictBundleManifestSchema } from '../infra/bundle-manifest.js';
 import { assertNever } from '../infra/error-format.js';
 import type { ForeignTargetValidator, InvalidTargetEvidence, ValidatedHandoffTarget } from '../infra/handoff-target.js';
 import type { StorageBigIntStat } from '../infra/port-types.js';
+import type { StorageActuator } from '../infra/storage-actuator.js';
 import { documentedCoralSetupError } from '../runtime/errors.js';
 import type { Runtime } from '../runtime/ports.js';
 import {
@@ -16,89 +15,72 @@ import {
   ACTIVE_STORE_TRANSITION_VERSION,
   classifyActiveStoreSelection,
   classifyActiveStoreSelectionV1,
-  clearActiveStoreTransition,
-  clearActiveStoreTransitionV1,
   encodeActiveStoreSelection,
   publishActiveStoreSelection,
   publishActiveStoreTransition,
-  readActiveStoreSelectionForCoordination,
-  readActiveStoreTransition,
-  readActiveStoreTransitionV1,
+  type readActiveStoreSelectionForCoordination,
+  readActiveStoreSelectionForSettlement,
+  readActiveStoreTransitionForSettlement,
+  readActiveStoreTransitionV1ForSettlement,
   resolveActiveStoreSelectionV1,
   resolveActiveStoreRecordPaths,
   type ActiveStoreRecordReadFailureCode,
   type ActiveStoreSelection,
+  type ActiveStoreSelectionCoordinationReadResult,
   type ActiveStoreTransition,
   type ActiveStoreTransitionEvidence,
   type ActiveStoreTransitionFailureCode,
-  type NewerStoreEvidence,
 } from './active-store-selection.js';
+import type { Database } from './db.js';
+import { settleStoreEpoch, type ResolvedStoreEpoch } from './epoch.js';
+import type { StoreFormatDescription } from './format-fingerprint.js';
 import {
-  acquireBackendStoreResetLock,
-  assertBackendStoreResetAuthority,
-  classifyBackendStoreFailure,
-  documentedBackendStoreClassificationFailure,
-  publishClassifiedBackendStoreResetIncident,
-  refuseIncompatibleBackendStore,
-  resolveBackendStoreFileSet,
-  resumeAutomaticBackendStoreResetIncident,
-  resumeBackendStoreResetIncidentForOperator,
-  retainTransitionFileInStoreResetQuarantine,
-  STEADY_STATE_BUSY_TIMEOUT_MS,
-  type BackendStoreFileSet,
-  type BackendStoreResetAuthority,
-  type BackendStoreResetIncident,
-  type BackendStoreResetLockLease,
-  type NewerStoreResetPolicy,
-  type OpenOrResetBackendStoreOptions,
-} from './backend-store-reset.js';
-import { classifyStoreFile, openStoreDatabase, type Database } from './db.js';
-import type { StoreFormatClassification } from './format-fingerprint.js';
-import {
-  acquireGenerationAdoptionLock,
   formatLegacyGenerationIgnoredNotice,
   inspectGenerationReadiness,
+  tryAcquireGenerationAdoptionLock,
   type GenerationAdoptionLockLease,
-  type GenerationMaintenanceLease,
 } from './generation-mutation-coordination.js';
 
 export type ActiveStoreSelectionProtocolResult =
-  | { readonly kind: 'opened'; readonly db: Database }
+  | ({ readonly kind: 'opened' } & ActiveStoreSettlement)
   | { readonly kind: 'handoff'; readonly target: ValidatedHandoffTarget };
 
-export type ActiveStoreSelectionRecoveryOutcome = Readonly<{
-  incident: BackendStoreResetIncident | null;
-  resumed: boolean;
+export type ActiveStoreSettlement = Readonly<{
+  db: Database;
+  store: ResolvedStoreEpoch;
+  invalidTargetEvidence: InvalidTargetEvidence | null;
 }>;
 
 export type ActiveStoreSelectionStartupDependencies = Readonly<{
   kind: 'startup';
   validateSelectedTarget: ForeignTargetValidator;
-  recordInvalidTargetRecovery?: (evidence: InvalidTargetEvidence) => void;
 }>;
 
 export type ActiveStoreSelectionOperatorDependencies = Readonly<{
   kind: 'operator';
   validateSelectedTarget: ForeignTargetValidator;
-  acquireStoreRecoveryLease?: () => Promise<GenerationMaintenanceLease>;
-  openPreparedStore?: (adoption: GenerationAdoptionLockLease) => Database;
-  recordRecoveryOutcome?: (outcome: ActiveStoreSelectionRecoveryOutcome) => void;
 }>;
 
 export type ActiveStoreSelectionProtocolDependencies =
   | ActiveStoreSelectionStartupDependencies
   | ActiveStoreSelectionOperatorDependencies;
 
-export type ActiveStoreSelectionProtocolOptions = OpenOrResetBackendStoreOptions & {
+export type ActiveStoreSelectionProtocolOptions = {
+  readonly path?: string;
+  readonly startupBusyTimeoutMs?: number;
+  readonly steadyStateBusyTimeoutMs?: number;
+  readonly storeFormat: StoreFormatDescription;
   readonly currentSelection: ActiveStoreSelection;
   readonly dependencies: ActiveStoreSelectionProtocolDependencies;
 };
 
 type ActiveStoreCoordinationRecord = 'selection' | 'transition';
 type ActiveStoreCoordinationFailureCode = ActiveStoreRecordReadFailureCode;
-type ActiveStoreTransitionClearEvidence =
-  | { readonly kind: 'clear'; readonly sourceIdentity?: StorageBigIntStat }
-  | { readonly kind: 'source-missing' };
+type RetainedTransitionEvidence = Readonly<{
+  evidencePath: string;
+  evidenceByteLength: number | null;
+  sourceIdentity: StorageBigIntStat;
+}>;
 
 function createActiveStoreTransition(
   runtime: Runtime,
@@ -125,131 +107,50 @@ function transitionMatchesCurrent(transition: ActiveStoreTransition, currentSele
   return classifyActiveStoreSelection(transitionSelection, currentSelection) === 'exact';
 }
 
-function classifyStoreForProtocol(
-  runtime: Runtime,
-  files: BackendStoreFileSet,
-  options: ActiveStoreSelectionProtocolOptions,
-): StoreFormatClassification {
-  try {
-    return classifyStoreFile(files.dbFile, runtime.storage, options.storeFormat);
-  } catch (error: unknown) {
-    const failure = classifyBackendStoreFailure(error, options.storeFormat);
-    switch (failure.kind) {
-      case 'corrupt-or-unsupported':
-        return failure.classification;
-      case 'unavailable':
-      case 'unclassified':
-        throw documentedBackendStoreClassificationFailure(runtime, files, failure);
-      default:
-        return assertNever(failure);
-    }
-  }
-}
-
-function newerStoreEvidence(
-  classification: Extract<StoreFormatClassification, { readonly kind: 'newer-incompatible' }>,
-): NewerStoreEvidence {
-  return {
-    kind: 'newer-incompatible',
-    currentFingerprint: classification.currentFingerprint,
-    currentProductVersion: classification.currentProductVersion,
-    storedFingerprint: classification.storedFingerprint,
-    storedProductVersion: classification.storedProductVersion,
-  };
-}
-
-function transitionWithNewerStoreEvidence(
-  transition: ActiveStoreTransition,
-  evidence: NewerStoreEvidence,
-): ActiveStoreTransition {
-  switch (transition.evidence.kind) {
-    case 'valid-target-invalid':
-    case 'selection-absent':
-    case 'selection-malformed':
-      return {
-        ...transition,
-        evidence: { ...transition.evidence, storeEvidence: evidence },
-      };
-    case 'current-selection-newer-store':
-      return {
-        ...transition,
-        evidence: { ...transition.evidence, newerStoreEvidence: evidence },
-      };
-    default:
-      return assertNever(transition.evidence);
-  }
-}
-
-function selectedManifestForTransition(transition: ActiveStoreTransition): StrictBundleManifest | null {
-  if (
-    transition.evidence.kind === 'valid-target-invalid' ||
-    transition.evidence.kind === 'current-selection-newer-store'
-  ) {
-    return transition.evidence.priorSelection.manifest;
-  }
-  return null;
-}
-
-function resetPolicyForTransition(transition: ActiveStoreTransition): NewerStoreResetPolicy {
-  const selectedManifest = selectedManifestForTransition(transition);
-  const validationCode =
-    transition.evidence.kind === 'valid-target-invalid'
-      ? transition.evidence.invalidTargetEvidence.failure
-      : transition.evidence.kind === 'selection-malformed'
-        ? transition.evidence.failureCode
-        : transition.evidence.kind;
-  return {
-    cause: 'newer-incompatible-invalid-target',
-    evidence: {
-      validationFailure: { code: validationCode },
-      observedTarget: {
-        version: selectedManifest?.version ?? null,
-        buildSetId: selectedManifest?.buildSetId ?? null,
-        bundleHash: selectedManifest?.bundleHash ?? null,
-        flavor: selectedManifest?.flavor ?? null,
-        storeFormatFingerprint: selectedManifest?.storeFormatFingerprint ?? null,
-      },
-    },
-  };
-}
-
 function retainActiveStoreTransition(
   runtime: Runtime,
-  options: ActiveStoreSelectionProtocolOptions,
-  adoption: GenerationAdoptionLockLease,
+  actuator: StorageActuator,
   transitionFile = resolveActiveStoreRecordPaths(runtime).transitionFile,
-): ReturnType<typeof retainTransitionFileInStoreResetQuarantine> | null {
-  const files = resolveBackendStoreFileSet(runtime, options);
+): RetainedTransitionEvidence | null {
+  let sourceIdentity: StorageBigIntStat;
   try {
-    return retainTransitionFileInStoreResetQuarantine(runtime, files, transitionFile, adoption);
+    sourceIdentity = runtime.storage.lstatSync(transitionFile, { bigint: true });
   } catch (error: unknown) {
-    if (
-      error instanceof Error &&
-      'code' in error &&
-      error.code === 'ENOENT' &&
-      !runtime.storage.existsSync(transitionFile)
-    ) {
-      return null;
-    }
-    throw documentedCoralSetupError({
-      code: 'store_reset_quarantine_failed',
-      reason: 'active_store_transition_evidence',
-      cause: error instanceof Error ? error.message : String(error),
-    });
+    if (error instanceof Error && 'code' in error && error.code === 'ENOENT') return null;
+    throw error;
   }
+  const { coordinationRoot } = resolveActiveStoreRecordPaths(runtime);
+  const retainedRoot = join(coordinationRoot, 'retained-active-store-transitions');
+  const evidencePath = join(retainedRoot, `${runtime.ids.uuid()}.json`);
+  actuator.makeDirectory(retainedRoot, { recursive: true, mode: 0o700 });
+  actuator.rename(transitionFile, evidencePath);
+  const retainedSynced = actuator.syncDirectory(retainedRoot);
+  const sourceSynced = actuator.syncDirectory(coordinationRoot);
+  if (!retainedSynced || !sourceSynced) {
+    refuseActiveStoreCoordination(
+      runtime,
+      'transition',
+      'record_unavailable',
+      `Failed to durably retain active-store transition at '${evidencePath}'.`,
+    );
+  }
+  return {
+    evidencePath,
+    evidenceByteLength: sourceIdentity.size <= BigInt(Number.MAX_SAFE_INTEGER) ? Number(sourceIdentity.size) : null,
+    sourceIdentity,
+  };
 }
 
 function retainInvalidSelectionRecovery(
   runtime: Runtime,
-  options: ActiveStoreSelectionProtocolOptions,
   transition: ActiveStoreTransition,
-  adoption: GenerationAdoptionLockLease,
-): ActiveStoreTransitionClearEvidence {
+  actuator: StorageActuator,
+): void {
   if (transition.evidence.kind !== 'valid-target-invalid' && transition.evidence.kind !== 'selection-malformed') {
-    return { kind: 'clear' };
+    return;
   }
-  const retained = retainActiveStoreTransition(runtime, options, adoption);
-  if (retained === null) return { kind: 'source-missing' };
+  const retained = retainActiveStoreTransition(runtime, actuator);
+  if (retained === null) return;
   writeAuditEvent(
     'invalid-selection-recovery',
     {
@@ -261,18 +162,16 @@ function retainInvalidSelectionRecovery(
           : transition.evidence.failureCode,
       evidencePath: retained.evidencePath,
       evidenceByteLength: retained.evidenceByteLength,
-      evidenceSha256: retained.evidenceSha256,
       currentVersion: transition.currentManifest.version,
       currentBuildSetId: transition.currentManifest.buildSetId,
     },
     'warn',
   );
-  return { kind: 'clear', sourceIdentity: retained.sourceIdentity };
 }
 
-function inspectCurrentGeneration(runtime: Runtime, options: OpenOrResetBackendStoreOptions): void {
+function inspectCurrentGeneration(runtime: Runtime, options: ActiveStoreSelectionProtocolOptions): void {
   if (options.path !== undefined) return;
-  const readiness = inspectGenerationReadiness(runtime, options.storeFormat);
+  const readiness = inspectGenerationReadiness(runtime);
   switch (readiness.kind) {
     case 'generated-ready':
     case 'no-legacy':
@@ -285,151 +184,34 @@ function inspectCurrentGeneration(runtime: Runtime, options: OpenOrResetBackendS
   }
 }
 
-function authorizeClassifiedStore(
+async function settleActiveStore(
   runtime: Runtime,
-  authority: BackendStoreResetAuthority,
-  files: BackendStoreFileSet,
-  classification: StoreFormatClassification,
-  transition: ActiveStoreTransition | null,
-  resetLock: BackendStoreResetLockLease,
-): BackendStoreResetIncident | undefined {
-  if (classification.kind === 'older-incompatible' || classification.kind === 'corrupt-or-unsupported') {
-    const incident = publishClassifiedBackendStoreResetIncident(runtime, authority, files, classification, resetLock);
-    if (incident === undefined) {
-      throw documentedCoralSetupError({
-        code: 'store_reset_quarantine_failed',
-        reason: 'classified_evidence_missing',
-        flavor: runtime.flavor,
-      });
-    }
-    return incident;
-  }
-  if (classification.kind === 'newer-incompatible') {
-    const incident =
-      transition === null
-        ? undefined
-        : publishClassifiedBackendStoreResetIncident(
-            runtime,
-            authority,
-            files,
-            classification,
-            resetLock,
-            resetPolicyForTransition(transition),
-          );
-    if (incident === undefined) {
-      throw documentedCoralSetupError({
-        code: 'store_reset_quarantine_failed',
-        reason: 'classified_evidence_missing',
-        flavor: runtime.flavor,
-      });
-    }
-    return incident;
-  }
-  refuseIncompatibleBackendStore(runtime, files, classification);
-  return undefined;
-}
-
-function openProtocolStore(
-  runtime: Runtime,
-  options: ActiveStoreSelectionProtocolOptions,
-  files: BackendStoreFileSet,
-): Database {
-  const db = openStoreDatabase({
-    path: files.dbFile,
-    storage: runtime.storage,
-    storeFormat: options.storeFormat,
-    flavor: runtime.flavor,
-    busyTimeoutMs: options.startupBusyTimeoutMs ?? options.busyTimeoutMs,
-  });
-  db.exec(`PRAGMA busy_timeout = ${options.steadyStateBusyTimeoutMs ?? STEADY_STATE_BUSY_TIMEOUT_MS}`);
-  return db;
-}
-
-function recoverActiveStoreTransition(
-  runtime: Runtime,
-  authority: BackendStoreResetAuthority,
   options: ActiveStoreSelectionProtocolOptions,
   initialTransition: ActiveStoreTransition | null,
-  adoption: GenerationAdoptionLockLease,
-): Database {
-  const files = resolveBackendStoreFileSet(runtime, options);
+  adoption: GenerationAdoptionLockLease | null,
+): Promise<ActiveStoreSettlement> {
   inspectCurrentGeneration(runtime, options);
-  let resetLock: BackendStoreResetLockLease | null = acquireBackendStoreResetLock(runtime, files, adoption);
+  const settled = settleStoreEpoch(runtime, {
+    path: options.path,
+    storeFormat: options.storeFormat,
+    build: options.currentSelection.manifest,
+    startupBusyTimeoutMs: options.startupBusyTimeoutMs,
+    steadyStateBusyTimeoutMs: options.steadyStateBusyTimeoutMs,
+  });
   try {
-    const resumed =
-      options.dependencies.kind === 'operator'
-        ? resumeBackendStoreResetIncidentForOperator(runtime, files, resetLock)
-        : resumeAutomaticBackendStoreResetIncident(runtime, authority, files, resetLock);
-    const classification = classifyStoreForProtocol(runtime, files, options);
-    let transition = initialTransition;
-    if (classification.kind === 'newer-incompatible') {
-      const evidence = newerStoreEvidence(classification);
-      transition =
-        transition === null
-          ? createActiveStoreTransition(runtime, options.currentSelection, {
-              kind: 'current-selection-newer-store',
-              priorSelection: options.currentSelection,
-              newerStoreEvidence: evidence,
-            })
-          : transitionWithNewerStoreEvidence(transition, evidence);
-      publishTransitionOrRefuse(runtime, transition);
+    if (initialTransition !== null && adoption !== null) {
+      retainInvalidSelectionRecovery(runtime, initialTransition, adoption.actuator);
     }
-
-    if (transition?.evidence.kind === 'valid-target-invalid' && options.dependencies.kind === 'startup') {
-      options.dependencies.recordInvalidTargetRecovery?.(transition.evidence.invalidTargetEvidence);
-    }
-    const published = authorizeClassifiedStore(runtime, authority, files, classification, transition, resetLock);
-    const openPreparedStore =
-      options.dependencies.kind === 'operator' ? options.dependencies.openPreparedStore : undefined;
-    let db: Database;
-    if (openPreparedStore === undefined) {
-      db = openProtocolStore(runtime, options, files);
-    } else {
-      resetLock.release();
-      resetLock = null;
-      adoption.assertOwned();
-      db = openPreparedStore(adoption);
-    }
-    try {
-      if (options.dependencies.kind === 'operator') {
-        options.dependencies.recordRecoveryOutcome?.({
-          incident: resumed ?? published ?? null,
-          resumed: resumed !== null,
-        });
-      }
-      if (transition !== null) {
-        // The live transition is cleared only after its invalid-selection basis has been copied into the
-        // reset-quarantine durability boundary. Coordinator logging is deliberately not evidence authority.
-        const clearEvidence = retainInvalidSelectionRecovery(runtime, options, transition, adoption);
-        if (clearEvidence.kind === 'clear') {
-          clearActiveStoreTransition(runtime, clearEvidence.sourceIdentity);
-        }
-      }
-      return db;
-    } catch (error: unknown) {
-      db.close();
-      throw error;
-    }
-  } finally {
-    resetLock?.release();
-  }
-}
-
-async function recoverActiveStoreSelection(
-  runtime: Runtime,
-  authority: BackendStoreResetAuthority,
-  options: ActiveStoreSelectionProtocolOptions,
-  transition: ActiveStoreTransition | null,
-  adoption: GenerationAdoptionLockLease,
-): Promise<Database> {
-  const recoveryLease =
-    options.dependencies.kind === 'operator' ? await options.dependencies.acquireStoreRecoveryLease?.() : undefined;
-  try {
-    adoption.assertOwned();
-    recoveryLease?.assertOwned();
-    return recoverActiveStoreTransition(runtime, authority, options, transition, adoption);
-  } finally {
-    recoveryLease?.release();
+    return {
+      ...settled,
+      invalidTargetEvidence:
+        initialTransition?.evidence.kind === 'valid-target-invalid'
+          ? initialTransition.evidence.invalidTargetEvidence
+          : null,
+    };
+  } catch (error: unknown) {
+    settled.db.close();
+    throw error;
   }
 }
 
@@ -460,9 +242,9 @@ function coordinationWriteFailureCode(error: unknown): ActiveStoreCoordinationFa
 // Coordination-directory creation and durable-write failures originate deep in active-store-selection.ts
 // (`ensureActiveStoreCoordinationDirectory` / `publishActiveStoreRecord`); without this translation they would
 // bubble up as unremediated `internal` errors instead of the documented `active_store_coordination_invalid` code.
-function publishSelectionOrRefuse(runtime: Runtime, selection: ActiveStoreSelection): void {
+function publishSelectionOrRefuse(runtime: Runtime, selection: ActiveStoreSelection, actuator: StorageActuator): void {
   try {
-    publishActiveStoreSelection(runtime, selection);
+    publishActiveStoreSelection(runtime, selection, actuator);
   } catch (error: unknown) {
     refuseActiveStoreCoordination(
       runtime,
@@ -473,9 +255,13 @@ function publishSelectionOrRefuse(runtime: Runtime, selection: ActiveStoreSelect
   }
 }
 
-function publishTransitionOrRefuse(runtime: Runtime, transition: ActiveStoreTransition): void {
+function publishTransitionOrRefuse(
+  runtime: Runtime,
+  transition: ActiveStoreTransition,
+  actuator: StorageActuator,
+): void {
   try {
-    publishActiveStoreTransition(runtime, transition);
+    publishActiveStoreTransition(runtime, transition, actuator);
   } catch (error: unknown) {
     refuseActiveStoreCoordination(
       runtime,
@@ -499,23 +285,7 @@ function supersedeActiveStoreTransition(
 ): void {
   const paths = resolveActiveStoreRecordPaths(runtime);
   const transitionFile = generation === 'current' ? paths.transitionFile : paths.transitionV1File;
-  const retained = retainActiveStoreTransition(runtime, options, adoption, transitionFile);
-  if (retained !== null) {
-    try {
-      if (generation === 'current') {
-        clearActiveStoreTransition(runtime, retained.sourceIdentity);
-      } else {
-        clearActiveStoreTransitionV1(runtime, retained.sourceIdentity);
-      }
-    } catch (error: unknown) {
-      refuseActiveStoreCoordination(
-        runtime,
-        'transition',
-        coordinationWriteFailureCode(error),
-        error instanceof Error ? error.message : 'Active-store transition clear failed with a non-Error value.',
-      );
-    }
-  }
+  const retained = retainActiveStoreTransition(runtime, adoption.actuator, transitionFile);
   writeAuditEvent(
     'active-store-transition-superseded',
     {
@@ -525,7 +295,6 @@ function supersedeActiveStoreTransition(
         : {
             evidencePath: retained.evidencePath,
             evidenceByteLength: retained.evidenceByteLength,
-            evidenceSha256: retained.evidenceSha256,
           }),
       currentVersion: options.currentSelection.manifest.version,
       currentBuildSetId: options.currentSelection.manifest.buildSetId,
@@ -565,33 +334,81 @@ function transitionForSelectionEvidence(
 
 async function recoverCurrentSelectionFromEvidence(
   runtime: Runtime,
-  authority: BackendStoreResetAuthority,
   options: ActiveStoreSelectionProtocolOptions,
   transition: ActiveStoreTransition,
   adoption: GenerationAdoptionLockLease,
 ): Promise<Extract<ActiveStoreSelectionProtocolResult, { kind: 'opened' }>> {
-  publishTransitionOrRefuse(runtime, transition);
-  publishSelectionOrRefuse(runtime, options.currentSelection);
+  publishTransitionOrRefuse(runtime, transition, adoption.actuator);
+  publishSelectionOrRefuse(runtime, options.currentSelection, adoption.actuator);
   return {
     kind: 'opened',
-    db: await recoverActiveStoreSelection(runtime, authority, options, transition, adoption),
+    ...(await settleActiveStore(runtime, options, transition, adoption)),
   };
+}
+
+type NormalizedActiveStoreSelection =
+  | Readonly<{ kind: 'selected-newer'; selection: ActiveStoreSelection }>
+  | Readonly<{ kind: 'settle-current'; publishCurrent: boolean }>;
+
+function normalizeActiveStoreSelection(
+  runtime: Runtime,
+  currentSelection: ActiveStoreSelection,
+  selection: Extract<ActiveStoreSelectionCoordinationReadResult, { readonly kind: 'valid' | 'v1' }>,
+): NormalizedActiveStoreSelection {
+  if (selection.kind === 'valid') {
+    const relation = classifyActiveStoreSelection(selection.selection, currentSelection);
+    return relation === 'selected-newer'
+      ? { kind: 'selected-newer', selection: selection.selection }
+      : { kind: 'settle-current', publishCurrent: relation !== 'exact' };
+  }
+
+  const relation = classifyActiveStoreSelectionV1(selection.selection, currentSelection);
+  if (relation !== 'selected-newer') return { kind: 'settle-current', publishCurrent: true };
+
+  const adjacent = readBoundedAdjacentManifest(selection.selection.bundleDir);
+  const parsed = adjacent.ok ? strictBundleManifestSchema.safeParse(adjacent.value) : null;
+  const resolved = parsed?.success ? resolveActiveStoreSelectionV1(selection.selection, parsed.data) : null;
+  if (resolved === null) {
+    refuseActiveStoreCoordination(runtime, 'selection', 'record_incoherent');
+  }
+  return { kind: 'selected-newer', selection: resolved };
+}
+
+async function handoffOrRecoverSelectedStore(
+  runtime: Runtime,
+  options: ActiveStoreSelectionProtocolOptions,
+  selection: ActiveStoreSelection,
+  adoption: GenerationAdoptionLockLease,
+): Promise<ActiveStoreSelectionProtocolResult> {
+  const validation = options.dependencies.validateSelectedTarget(selection.bundleDir, selection.manifest);
+  adoption.assertOwned();
+  if (validation.kind === 'validated') {
+    return { kind: 'handoff', target: validation.target };
+  }
+  const transition = transitionForSelectionEvidence(
+    runtime,
+    options.currentSelection,
+    { kind: 'valid', selection },
+    validation.evidence,
+  );
+  return await recoverCurrentSelectionFromEvidence(runtime, options, transition, adoption);
 }
 
 export async function coordinateActiveStoreSelection(
   runtime: Runtime,
-  authority: BackendStoreResetAuthority,
   options: ActiveStoreSelectionProtocolOptions,
 ): Promise<ActiveStoreSelectionProtocolResult> {
   if (options.path === ':memory:') {
     throw new Error('Active-store selection coordination requires a real filesystem store path.');
   }
-  assertBackendStoreResetAuthority(runtime, authority, options);
   encodeActiveStoreSelection(options.currentSelection);
-  const adoption = await acquireGenerationAdoptionLock(runtime);
+  const adoption = await tryAcquireGenerationAdoptionLock(runtime);
+  if (adoption === null) {
+    return { kind: 'opened', ...(await settleActiveStore(runtime, options, null, null)) };
+  }
   try {
     adoption.assertOwned();
-    const transitionV1Read = readActiveStoreTransitionV1(runtime);
+    const transitionV1Read = readActiveStoreTransitionV1ForSettlement(runtime, adoption.actuator);
     if (transitionV1Read.kind === 'legacy') {
       supersedeActiveStoreTransition(runtime, options, adoption, 'transition_current_build_mismatch', 'v1');
     } else if (transitionV1Read.kind === 'rejected') {
@@ -601,13 +418,13 @@ export async function coordinateActiveStoreSelection(
         refuseActiveStoreCoordination(runtime, 'transition', transitionV1Read.failureCode);
       }
     }
-    const transitionRead = readActiveStoreTransition(runtime);
+    const transitionRead = readActiveStoreTransitionForSettlement(runtime, adoption.actuator);
     if (transitionRead.kind === 'valid') {
       if (transitionMatchesCurrent(transitionRead.transition, options.currentSelection)) {
-        publishSelectionOrRefuse(runtime, options.currentSelection);
+        publishSelectionOrRefuse(runtime, options.currentSelection, adoption.actuator);
         return {
           kind: 'opened',
-          db: await recoverActiveStoreSelection(runtime, authority, options, transitionRead.transition, adoption),
+          ...(await settleActiveStore(runtime, options, transitionRead.transition, adoption)),
         };
       }
       supersedeActiveStoreTransition(runtime, options, adoption, 'transition_current_build_mismatch');
@@ -621,66 +438,23 @@ export async function coordinateActiveStoreSelection(
       }
     }
 
-    const selection = readActiveStoreSelectionForCoordination(runtime);
+    const selection = readActiveStoreSelectionForSettlement(runtime, adoption.actuator);
     if (selection.kind === 'rejected') {
       refuseActiveStoreCoordination(runtime, 'selection', selection.failureCode);
     }
     if (selection.kind === 'absent' || selection.kind === 'malformed') {
       const transition = transitionForSelectionEvidence(runtime, options.currentSelection, selection);
-      return await recoverCurrentSelectionFromEvidence(runtime, authority, options, transition, adoption);
+      return await recoverCurrentSelectionFromEvidence(runtime, options, transition, adoption);
     }
 
-    if (selection.kind === 'v1') {
-      if (classifyActiveStoreSelectionV1(selection.selection, options.currentSelection) === 'selected-newer') {
-        const adjacent = readBoundedAdjacentManifest(selection.selection.bundleDir);
-        const parsed = adjacent.ok ? strictBundleManifestSchema.safeParse(adjacent.value) : null;
-        const resolved = parsed?.success ? resolveActiveStoreSelectionV1(selection.selection, parsed.data) : null;
-        if (resolved === null) {
-          refuseActiveStoreCoordination(runtime, 'selection', 'record_incoherent');
-        }
-        const validation = options.dependencies.validateSelectedTarget(resolved.bundleDir, resolved.manifest);
-        adoption.assertOwned();
-        if (validation.kind === 'validated') {
-          return { kind: 'handoff', target: validation.target };
-        }
-        const transition = transitionForSelectionEvidence(
-          runtime,
-          options.currentSelection,
-          { kind: 'valid', selection: resolved },
-          validation.evidence,
-        );
-        return await recoverCurrentSelectionFromEvidence(runtime, authority, options, transition, adoption);
-      }
-      publishSelectionOrRefuse(runtime, options.currentSelection);
-      return {
-        kind: 'opened',
-        db: await recoverActiveStoreSelection(runtime, authority, options, null, adoption),
-      };
+    const normalized = normalizeActiveStoreSelection(runtime, options.currentSelection, selection);
+    if (normalized.kind === 'selected-newer') {
+      return await handoffOrRecoverSelectedStore(runtime, options, normalized.selection, adoption);
     }
-
-    const relation = classifyActiveStoreSelection(selection.selection, options.currentSelection);
-    if (relation === 'selected-newer') {
-      const validation = options.dependencies.validateSelectedTarget(
-        selection.selection.bundleDir,
-        selection.selection.manifest,
-      );
-      adoption.assertOwned();
-      if (validation.kind === 'validated') {
-        return { kind: 'handoff', target: validation.target };
-      }
-      const transition = transitionForSelectionEvidence(
-        runtime,
-        options.currentSelection,
-        selection,
-        validation.evidence,
-      );
-      return await recoverCurrentSelectionFromEvidence(runtime, authority, options, transition, adoption);
+    if (normalized.publishCurrent) {
+      publishSelectionOrRefuse(runtime, options.currentSelection, adoption.actuator);
     }
-
-    if (relation !== 'exact') {
-      publishSelectionOrRefuse(runtime, options.currentSelection);
-    }
-    return { kind: 'opened', db: await recoverActiveStoreSelection(runtime, authority, options, null, adoption) };
+    return { kind: 'opened', ...(await settleActiveStore(runtime, options, null, adoption)) };
   } finally {
     adoption();
   }

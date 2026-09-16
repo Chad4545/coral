@@ -1,12 +1,11 @@
 import { DatabaseSync, type StatementSync } from 'node:sqlite';
-import { dirname, resolve } from 'node:path';
+import { dirname } from 'node:path';
 
 import type { BuildFlavor } from '../infra/build-flavor.js';
 import type { StoragePort } from '../infra/port-types.js';
 import { compareProductVersions, validateProductVersion } from '../infra/product-version.js';
-import type { Runtime } from '../runtime/ports.js';
 import { documentedCoralSetupError } from '../runtime/errors.js';
-import type { ReadonlyDatabase, ReadonlyStatement } from './read-port.js';
+import type { ReadonlyDatabase, ReadonlyStatement } from './read-types.js';
 import {
   isStoreFormatFingerprint,
   STORE_FORMAT_FINGERPRINT_META_KEY,
@@ -15,6 +14,7 @@ import {
   type StoreFormatDescription,
   type StoreFormatFingerprint,
 } from './format-fingerprint.js';
+import { observeStorePath } from './path-observation.js';
 
 const STORE_FORMAT_SIDECAR_SUFFIX = '.format';
 
@@ -56,7 +56,7 @@ export interface Database extends Omit<DatabaseSync, 'prepare'> {
 
 type ReadonlyStoreOptions = {
   readonly path: string;
-  readonly storage: Pick<StoragePort, 'existsSync'>;
+  readonly storage: Pick<StoragePort, 'lstatSync'>;
   readonly storeFormat: StoreFormatDescription;
   readonly flavor?: BuildFlavor;
   readonly readonly: true;
@@ -71,6 +71,18 @@ type WritableStoreOptions = {
   readonly readonly?: false;
   readonly busyTimeoutMs?: number;
 };
+
+type AuthorizedWritableStoreOptions = WritableStoreOptions;
+
+export type WritableStoreOpenDecision =
+  | { readonly kind: 'opened'; readonly db: Database }
+  | {
+      readonly kind: 'incompatible';
+      readonly classification: Extract<
+        StoreFormatClassification,
+        { readonly kind: 'older-incompatible' | 'newer-incompatible' | 'corrupt-or-unsupported' }
+      >;
+    };
 
 export type OpenStoreOptions = ReadonlyStoreOptions | WritableStoreOptions;
 
@@ -142,6 +154,10 @@ function corruptOrUnsupported(
   currentProductVersion: string,
   storedFingerprint: string | null,
   storedProductVersion: string | null,
+  storedProductVersionState: Extract<
+    StoreFormatClassification,
+    { kind: 'corrupt-or-unsupported' }
+  >['storedProductVersionState'],
 ): StoreFormatClassification {
   return {
     kind: 'corrupt-or-unsupported',
@@ -149,10 +165,14 @@ function corruptOrUnsupported(
     currentProductVersion,
     storedFingerprint,
     storedProductVersion,
+    storedProductVersionState,
   };
 }
 
-export function classifyStoreFormat(db: Database, current: StoreFormatClassificationTarget): StoreFormatClassification {
+function validatedStoreFormatTarget(current: StoreFormatClassificationTarget): {
+  readonly fingerprint: StoreFormatFingerprint;
+  readonly productVersion: string;
+} {
   const currentFingerprint = current.fingerprint;
   if (!isStoreFormatFingerprint(currentFingerprint)) {
     throw new TypeError(`Invalid current store format fingerprint: ${currentFingerprint}`);
@@ -161,38 +181,47 @@ export function classifyStoreFormat(db: Database, current: StoreFormatClassifica
   if (currentProductVersion === null) {
     throw new TypeError(`Invalid current Coral product version: ${current.productVersion}`);
   }
+  return { fingerprint: currentFingerprint, productVersion: currentProductVersion };
+}
+
+export function classifyStoreFormat(db: Database, current: StoreFormatClassificationTarget): StoreFormatClassification {
+  const { fingerprint: currentFingerprint, productVersion: currentProductVersion } =
+    validatedStoreFormatTarget(current);
 
   if (!hasUserTable(db)) return { kind: 'fresh' };
 
   const fingerprintMetadata = readStoredMetadataValue(db, STORE_FORMAT_FINGERPRINT_META_KEY);
   const versionMetadata = readStoredMetadataValue(db, STORE_PRODUCT_VERSION_META_KEY);
   const storedFingerprint = stringMetadataValue(fingerprintMetadata);
-  const storedProductVersion = stringMetadataValue(versionMetadata);
+  const rawStoredProductVersion = stringMetadataValue(versionMetadata);
+  const storedProductVersion =
+    rawStoredProductVersion === null ? null : validateProductVersion(rawStoredProductVersion);
+  const storedProductVersionState =
+    versionMetadata.kind === 'absent'
+      ? ('absent' as const)
+      : storedProductVersion === null
+        ? ('invalid' as const)
+        : ('valid' as const);
 
   if (!isStoreFormatFingerprint(storedFingerprint)) {
-    return corruptOrUnsupported(currentFingerprint, currentProductVersion, storedFingerprint, storedProductVersion);
+    return corruptOrUnsupported(
+      currentFingerprint,
+      currentProductVersion,
+      storedFingerprint,
+      storedProductVersion,
+      storedProductVersionState,
+    );
   }
 
   if (versionMetadata.kind === 'absent') {
-    return storedFingerprint === currentFingerprint
-      ? {
-          kind: 'legacy-adoptable',
-          currentFingerprint,
-          currentProductVersion,
-          storedFingerprint,
-        }
-      : corruptOrUnsupported(currentFingerprint, currentProductVersion, storedFingerprint, null);
+    return corruptOrUnsupported(currentFingerprint, currentProductVersion, storedFingerprint, null, 'absent');
   }
 
   if (storedProductVersion === null) {
-    return corruptOrUnsupported(currentFingerprint, currentProductVersion, storedFingerprint, null);
-  }
-  const validStoredProductVersion = validateProductVersion(storedProductVersion);
-  if (validStoredProductVersion === null) {
-    return corruptOrUnsupported(currentFingerprint, currentProductVersion, storedFingerprint, storedProductVersion);
+    return corruptOrUnsupported(currentFingerprint, currentProductVersion, storedFingerprint, null, 'invalid');
   }
 
-  const precedence = compareProductVersions(validStoredProductVersion, currentProductVersion);
+  const precedence = compareProductVersions(storedProductVersion, currentProductVersion);
   const identity = {
     currentFingerprint,
     currentProductVersion,
@@ -202,26 +231,37 @@ export function classifyStoreFormat(db: Database, current: StoreFormatClassifica
   if (precedence > 0) return { kind: 'newer-incompatible', ...identity };
   if (storedFingerprint === currentFingerprint) return { kind: 'compatible', ...identity };
   if (precedence < 0) return { kind: 'older-incompatible', ...identity };
-  return { kind: 'corrupt-or-unsupported', ...identity };
+  return { kind: 'corrupt-or-unsupported', storedProductVersionState: 'valid', ...identity };
 }
 
 export function classifyStoreFile(
   path: string,
-  storage: Pick<StoragePort, 'existsSync'>,
+  storage: Pick<StoragePort, 'lstatSync' | 'openSqliteDatabaseSync'>,
   current: StoreFormatClassificationTarget,
+  acquireLock: (() => () => void) | null = null,
 ): StoreFormatClassification {
-  if (path !== ':memory:' && !storage.existsSync(path)) return { kind: 'absent' };
-  const db = new DatabaseSync(path, { readOnly: path !== ':memory:' }) as unknown as Database;
+  if (path !== ':memory:' && observeStorePath(storage, path) === 'absent') return { kind: 'absent' };
+  if (path !== ':memory:' && storage.lstatSync(path).isSymbolicLink()) {
+    const target = validatedStoreFormatTarget(current);
+    return corruptOrUnsupported(target.fingerprint, target.productVersion, null, null, 'unavailable');
+  }
+  const releaseLock = acquireLock?.();
+  let db: ReturnType<typeof storage.openSqliteDatabaseSync> | undefined;
   try {
-    return classifyStoreFormat(db, current);
+    db = storage.openSqliteDatabaseSync(path, { readOnly: path !== ':memory:' });
+    return classifyStoreFormat(db as unknown as Database, current);
   } finally {
-    db.close();
+    try {
+      db?.close();
+    } finally {
+      releaseLock?.();
+    }
   }
 }
 
-function writeStoreFormatSidecar(options: WritableStoreOptions): void {
+function writeStoreFormatSidecar(options: AuthorizedWritableStoreOptions, db: Database): void {
   if (options.path === ':memory:') return;
-  const sidecarPath = `${options.path}${STORE_FORMAT_SIDECAR_SUFFIX}`;
+  const sidecarPath = `${db.location() ?? options.path}${STORE_FORMAT_SIDECAR_SUFFIX}`;
   if (
     !options.storage.writeAtomicDurableSync(sidecarPath, `${options.storeFormat.fingerprint}\n`, {
       encoding: 'utf-8',
@@ -232,7 +272,7 @@ function writeStoreFormatSidecar(options: WritableStoreOptions): void {
   }
 }
 
-function storeSchemaOutdatedError(
+export function storeSchemaOutdatedError(
   path: string,
   classification: StoreFormatClassification,
   current: StoreFormatDescription,
@@ -257,7 +297,7 @@ export function applyBundledStoreSchema(db: Database, storeFormat: StoreFormatDe
     db.exec(storeFormat.manifest.ddl);
     const existing = stringMetadataValue(readStoredMetadataValue(db, STORE_FORMAT_FINGERPRINT_META_KEY));
     if (existing !== null && existing !== storeFormat.fingerprint) {
-      throw new Error(`Refusing to apply schema over store format '${existing}'.`);
+      throw new StoreFormatChangedDuringAdoptionError(existing);
     }
     db.prepare<[string, string]>(`INSERT OR IGNORE INTO meta (key, value) VALUES (?, ?)`).run(
       STORE_FORMAT_FINGERPRINT_META_KEY,
@@ -278,6 +318,17 @@ export function applyBundledStoreSchema(db: Database, storeFormat: StoreFormatDe
   }
 }
 
+export class StoreFormatChangedDuringAdoptionError extends Error {
+  readonly storedFingerprint: string;
+
+  constructor(storedFingerprint: string) {
+    super(`Store format changed during adoption to '${storedFingerprint}'.`);
+    this.name = 'StoreFormatChangedDuringAdoptionError';
+    this.storedFingerprint = storedFingerprint;
+    Object.setPrototypeOf(this, StoreFormatChangedDuringAdoptionError.prototype);
+  }
+}
+
 function raiseStoredProductVersion(db: Database, currentProductVersion: string): void {
   withImmediate(db, () => {
     const storedProductVersion = stringMetadataValue(readStoredMetadataValue(db, STORE_PRODUCT_VERSION_META_KEY));
@@ -291,55 +342,68 @@ function raiseStoredProductVersion(db: Database, currentProductVersion: string):
   });
 }
 
-export function openStoreDatabase(options: OpenStoreOptions): Database {
-  const readonly = options.readonly ?? false;
-
-  if (readonly && options.path !== ':memory:' && !options.storage.existsSync(options.path)) {
-    throw documentedCoralSetupError('store_not_initialized', { path: options.path });
-  }
-
-  if (options.readonly !== true && options.path !== ':memory:') {
+export function openWritableStoreDatabase(options: AuthorizedWritableStoreOptions): WritableStoreOpenDecision {
+  if (options.path !== ':memory:') {
     options.storage.mkdirSync(dirname(options.path), { recursive: true });
   }
 
-  const db = new DatabaseSync(options.path, { readOnly: readonly }) as unknown as Database;
-
+  const db = new DatabaseSync(options.path) as unknown as Database;
   try {
-    if (readonly) {
+    const classification = classifyStoreFormat(db, options.storeFormat);
+    if (classification.kind === 'compatible') {
       applyJournalPragmas(db, {
-        kind: 'readonly',
+        kind: 'writable',
         busyTimeoutMs: options.busyTimeoutMs,
       });
+      raiseStoredProductVersion(db, options.storeFormat.productVersion);
+      writeStoreFormatSidecar(options, db);
+      return { kind: 'opened', db };
     }
-
-    const classification = classifyStoreFormat(db, options.storeFormat);
-    if (classification.kind === 'legacy-adoptable') {
-      // Only explicit adoption may stamp legacy metadata.
-      throw storeSchemaOutdatedError(options.path, classification, options.storeFormat, options.flavor);
-    }
-    if (classification.kind === 'compatible') {
-      if (!readonly) {
-        applyJournalPragmas(db, {
-          kind: 'writable',
-          busyTimeoutMs: options.busyTimeoutMs,
-        });
-        raiseStoredProductVersion(db, options.storeFormat.productVersion);
-      }
-      if (options.readonly !== true) writeStoreFormatSidecar(options);
-      return db;
-    }
-
-    if (readonly) {
-      throw storeSchemaOutdatedError(options.path, classification, options.storeFormat, options.flavor);
-    }
-
-    if (classification.kind === 'fresh') {
+    if (classification.kind === 'fresh' || classification.kind === 'absent') {
       applyJournalPragmas(db, {
         kind: 'writable',
         busyTimeoutMs: options.busyTimeoutMs,
       });
       applyBundledStoreSchema(db, options.storeFormat);
-      writeStoreFormatSidecar(options as WritableStoreOptions);
+      writeStoreFormatSidecar(options, db);
+      return { kind: 'opened', db };
+    }
+    db.close();
+    return { kind: 'incompatible', classification };
+  } catch (error) {
+    try {
+      db.close();
+    } catch {
+      // Revocation may already have closed the authority-owned handle.
+    }
+    throw error;
+  }
+}
+
+export function openStoreDatabase(options: OpenStoreOptions): Database {
+  const readonly = options.readonly ?? false;
+
+  if (!readonly) {
+    const writable = options as WritableStoreOptions;
+    const decision = openWritableStoreDatabase(writable);
+    if (decision.kind === 'opened') return decision.db;
+    throw storeSchemaOutdatedError(options.path, decision.classification, options.storeFormat, options.flavor);
+  }
+
+  if (options.path !== ':memory:' && observeStorePath(options.storage, options.path) === 'absent') {
+    throw documentedCoralSetupError('store_not_initialized', { path: options.path });
+  }
+
+  const db = new DatabaseSync(options.path, { readOnly: true }) as unknown as Database;
+
+  try {
+    applyJournalPragmas(db, {
+      kind: 'readonly',
+      busyTimeoutMs: options.busyTimeoutMs,
+    });
+
+    const classification = classifyStoreFormat(db, options.storeFormat);
+    if (classification.kind === 'compatible') {
       return db;
     }
 
@@ -350,38 +414,16 @@ export function openStoreDatabase(options: OpenStoreOptions): Database {
   }
 }
 
-type BackendStorePathOptions = {
-  readonly path?: string;
-  readonly busyTimeoutMs?: number;
-  readonly storeFormat: StoreFormatDescription;
-};
-
-function resolveStoreDbPath(runtime: Pick<Runtime, 'paths'>, options: BackendStorePathOptions): string {
-  if (options.path === ':memory:') {
-    return ':memory:';
+export function openMemoryStoreDatabase(storeFormat: StoreFormatDescription, busyTimeoutMs?: number): Database {
+  const db = new DatabaseSync(':memory:') as unknown as Database;
+  try {
+    applyJournalPragmas(db, { kind: 'writable', busyTimeoutMs });
+    applyBundledStoreSchema(db, storeFormat);
+    return db;
+  } catch (error: unknown) {
+    db.close();
+    throw error;
   }
-  return resolve(options.path ?? runtime.paths.coral.store.dbFile);
-}
-
-export function openWritableStoreDbNoReset(
-  runtime: Pick<Runtime, 'flavor' | 'paths' | 'storage'>,
-  options: BackendStorePathOptions,
-): Database {
-  const storeDbPath = resolveStoreDbPath(runtime, options);
-  // An absent store is not an outdated one: only the coordinator creates it, so
-  // a non-daemon opener that creates it here would satisfy adoption's
-  // "generation tree has no store" guard and strand the legacy tree forever.
-  if (storeDbPath === ':memory:' || !runtime.storage.existsSync(storeDbPath)) {
-    throw documentedCoralSetupError('store_not_initialized', { path: storeDbPath });
-  }
-
-  return openStoreDatabase({
-    path: storeDbPath,
-    storage: runtime.storage,
-    storeFormat: options.storeFormat,
-    flavor: runtime.flavor,
-    busyTimeoutMs: options.busyTimeoutMs,
-  });
 }
 
 /**

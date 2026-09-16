@@ -48,29 +48,17 @@ type StoredStoreFormatIdentity = CurrentStoreFormatIdentity & {
   readonly storedProductVersion: string;
 };
 
-/**
- * Classification of an on-disk store against the current executable contract:
- * `absent` has no database file; `fresh` has no user tables; `compatible` has
- * the current fingerprint and a valid non-newer version; `legacy-adoptable`
- * has the current fingerprint but no product-version row; `older-incompatible`
- * and `newer-incompatible` have valid versions on the corresponding side of
- * current SemVer precedence; `corrupt-or-unsupported` covers missing, malformed,
- * or equal-version/different-fingerprint metadata that cannot be ordered safely.
- */
 export type StoreFormatClassification =
   | { readonly kind: 'absent' }
   | { readonly kind: 'fresh' }
   | (StoredStoreFormatIdentity & { readonly kind: 'compatible' })
-  | (CurrentStoreFormatIdentity & {
-      readonly kind: 'legacy-adoptable';
-      readonly storedFingerprint: StoreFormatFingerprint;
-    })
   | (StoredStoreFormatIdentity & { readonly kind: 'older-incompatible' })
   | (StoredStoreFormatIdentity & { readonly kind: 'newer-incompatible' })
   | (CurrentStoreFormatIdentity & {
       readonly kind: 'corrupt-or-unsupported';
       readonly storedFingerprint: string | null;
       readonly storedProductVersion: string | null;
+      readonly storedProductVersionState: 'valid' | 'absent' | 'invalid' | 'unavailable';
     });
 
 export const STORE_FORMAT_FINGERPRINT_META_KEY = 'store_format_fingerprint';

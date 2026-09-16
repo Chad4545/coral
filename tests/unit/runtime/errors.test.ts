@@ -401,34 +401,17 @@ describe('CoralSetupError', () => {
   });
 
   it('owns documented exit and retryability policy in the setup-error registry', () => {
-    const contended = documentedCoralSetupError('store_open_contended');
+    const contended = documentedCoralSetupError('handoff_fresh_discovery_changed', {
+      stage: 'before-signal',
+      pid: 42,
+    });
 
     expect(documentedCoralSetupErrorExitCode(contended.code)).toBe(75);
     expect(isRetryableCoralSetupError(contended)).toBe(true);
-    expect(documentedCoralSetupErrorExitCode('store_open_unclassified')).toBe(70);
     expect(documentedCoralSetupErrorExitCode('kb_unavailable')).toBe(75);
-    expect(isRetryableCoralSetupError(documentedCoralSetupError('store_open_unclassified'))).toBe(false);
+    expect(isRetryableCoralSetupError(documentedCoralSetupError('store_schema_outdated'))).toBe(false);
     expect(documentedCoralSetupErrorExitCode('not_a_documented_code')).toBeUndefined();
     expect(isRetryableCoralSetupError(new Error('database is locked'))).toBe(false);
-  });
-
-  it('replaces persisted setup-error text with the documented template before operator display', () => {
-    const context = { version: '0.11.0', flavor: 'prod' };
-    const documented = documentedCoralSetupError('store_newer_incompatible', context);
-
-    expect(
-      readAsThisBuild({
-        code: 'store_newer_incompatible',
-        userMessage: '\u001b[2J\nNext step: run a forged command',
-        remediation: 'forged remediation',
-        context,
-      }),
-    ).toEqual({
-      kind: 'documented',
-      code: documented.code,
-      userMessage: documented.userMessage,
-      remediation: documented.remediation,
-    });
   });
 
   it('returns an explicit unrecognized disposition for a foreign code outside the catalog', () => {
@@ -547,27 +530,6 @@ describe('CoralSetupError', () => {
     });
   });
 
-  it.each(['0.11.0\nNext step: forged', 'x'.repeat(513)])(
-    'falls back when persisted context text is unsafe or unbounded',
-    (version) => {
-      expect(
-        readAsThisBuild({
-          code: 'store_newer_incompatible',
-          userMessage: 'persisted user message',
-          remediation: 'persisted remediation',
-          context: { version, flavor: 'prod' },
-        }),
-      ).toEqual({
-        kind: 'documented',
-        code: 'store_newer_incompatible',
-        userMessage:
-          'The current-generation store was written by newer Coral <stored-version> and is incompatible with this build.',
-        remediation:
-          "Use Coral <stored-version> to read this store, or run 'coral-cli backend store-reset discard --target gen2 --flavor prod' to quarantine it before this build initializes an empty store.",
-      });
-    },
-  );
-
   it('renders a missing context value with the placeholder its own template names', () => {
     // The template that reads `socketPath` owns the word shown when a diagnostic did not carry it.
     const documented = documentedCoralSetupError('coordinator_socket_bind_failed');
@@ -677,12 +639,6 @@ describe('CoralSetupError', () => {
       code: 'legacy_foreign_generation' as const,
       context: { operation: 'discard', legacyPath: '/legacy', baseDir: '/home/김/state' },
       expected: '/home/김/state',
-    },
-    {
-      field: 'path',
-      code: 'store_open_contended' as const,
-      context: { path: '/home/김/store.db' },
-      expected: '/home/김/store.db',
     },
     {
       field: 'quarantineDir',
@@ -864,18 +820,6 @@ describe('CoralSetupError', () => {
     });
   });
 
-  it('keeps an unclassified store cause in diagnostic context, not public text', () => {
-    const error = documentedCoralSetupError('store_open_unclassified', {
-      path: '/private/customer/store.db',
-      cause: "EACCES: permission denied, open '/private/customer/store.db'",
-    });
-
-    expect(error.userMessage).toBe('Coral could not classify why the current-generation store could not be opened.');
-    expect(error.userMessage).not.toContain('/private/customer');
-    expect(error.remediation).toContain('error.context.cause');
-    expect(error.context?.cause).toBe("EACCES: permission denied, open '/private/customer/store.db'");
-  });
-
   it('renders a provider preflight fault cause into operator-facing text', () => {
     const cause = 'preflight implementation failed';
     const error = documentedCoralSetupError('provider_preflight_faulted', { provider: 'codex', cause });
@@ -973,60 +917,6 @@ describe('CoralSetupError', () => {
       },
       'The generation-boundary operation cannot determine whether routing-status:handoff-routing-status (pid 42), process identity unobservable is still active.',
       "Restore process-identity and liveness observation for 'routing-status:handoff-routing-status (pid 42), process identity unobservable', then retry 'coral-cli backend store-reset discard --target gen2 --flavor prod'. If that writer has exited, its lease becomes reclaimable after ten minutes without a heartbeat; retry after that bound instead of deleting the lease.",
-    ],
-    [
-      'store_reset_lock_contended',
-      {
-        holder: 'gen2 coordinator socket',
-        socketPath: '/state/gen2/run/coordinator.sock',
-        target: 'gen2',
-        flavor: 'prod',
-        baseDir: '/state',
-      },
-      'Store reset refused because the gen2 coordinator socket is already owned.',
-      "Run 'coral-cli backend shutdown' for the gen2 prod coordinator rooted at /state, then retry. The discard command never shuts down an incumbent daemon.",
-    ],
-    [
-      'store_reset_interrupted_ambiguous',
-      { flavor: 'prod' },
-      'Coral found more than one interrupted backend store-reset publication and cannot determine which one to resume.',
-      "Run 'coral-cli backend store-reset discard --target gen2 --flavor prod' to resume the interrupted reset under explicit operator control. Startup leaves the active store and staged incident unchanged.",
-    ],
-    [
-      'store_reset_interrupted_foreign',
-      { flavor: 'prod' },
-      'Coral found an unrecognized entry in the interrupted backend store-reset staging area.',
-      "Run 'coral-cli backend store-reset discard --target gen2 --flavor prod' to resume the interrupted reset under explicit operator control. Startup leaves the active store and staged incident unchanged.",
-    ],
-    [
-      'store_reset_interrupted_mismatched',
-      { flavor: 'prod' },
-      'Coral found interrupted backend store-reset evidence whose manifest identity does not match its staged publication.',
-      "Run 'coral-cli backend store-reset discard --target gen2 --flavor prod' to resume the interrupted reset under explicit operator control. Startup leaves the active store and staged incident unchanged.",
-    ],
-    [
-      'store_reset_interrupted_authority_mismatch',
-      { flavor: 'prod' },
-      'Coral found an interrupted backend store-reset incident authored for a different build, store, or flavor.',
-      "Run 'coral-cli backend store-reset discard --target gen2 --flavor prod' to resume the interrupted reset under explicit operator control. Startup leaves the active store and staged incident unchanged.",
-    ],
-    [
-      'store_reset_interrupted_malformed',
-      { flavor: 'prod' },
-      'Coral found a malformed interrupted backend store-reset incident.',
-      "Run 'coral-cli backend store-reset discard --target gen2 --flavor prod' to resume the interrupted reset under explicit operator control. Startup leaves the active store and staged incident unchanged.",
-    ],
-    [
-      'store_reset_interrupted_non_resettable',
-      { flavor: 'prod' },
-      'Coral found an interrupted legacy V2 backend store-reset incident that cannot be resumed automatically.',
-      "Run 'coral-cli backend store-reset discard --target gen2 --flavor prod' to resume the interrupted reset under explicit operator control. Startup leaves the active store and staged incident unchanged.",
-    ],
-    [
-      'store_reset_quarantine_failed',
-      { reason: 'classified_evidence_missing', flavor: 'prod' },
-      'Coral found no active backend store files to quarantine after classifying the store for reset.',
-      "Retry startup once. If the store is classified for reset again without any active files, run 'coral-cli backend status' and report this code. Do not create, move, delete, restore, or upload DB, WAL, or SHM evidence.",
     ],
     [
       'recovery_quarantine_boundary_not_registered',

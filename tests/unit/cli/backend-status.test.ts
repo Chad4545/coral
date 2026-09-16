@@ -1,4 +1,7 @@
 import { Command } from 'commander';
+import { mkdtempSync, rmSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 import {
@@ -10,6 +13,8 @@ import {
   type StoreResetCommandOperations,
 } from '#src/cli/commands/backend.js';
 import type { Runtime } from '#src/runtime/ports.js';
+import { createRealRuntime } from '#src/runtime/real.js';
+import { releaseStoreReset } from '#src/store/operator-store-reset.js';
 import type { createIpcClient, IpcClient } from '#src/transport/ipc/client.js';
 import {
   formatBackendStatus,
@@ -18,11 +23,7 @@ import {
   formatProviderProxySetContainResult,
 } from '#src/cli/format/backend.js';
 import { formatHandoffPublicationIncident } from '#src/cli/format/handoff-publication.js';
-import {
-  documentedCoralSetupError,
-  type DocumentedCoralSetupErrorCode,
-  type SetupErrorAuthorIdentity,
-} from '#src/runtime/errors.js';
+import type { SetupErrorAuthorIdentity } from '#src/runtime/errors.js';
 import type {
   HandoffContinuationReason,
   HandoffPublicationIncident,
@@ -124,11 +125,14 @@ function runningStatusFromHealthPayload(payload: unknown): Extract<BackendStatus
 }
 
 const storeReset: StoreResetCommandOperations = {
-  list: () => ({ incidents: [] }),
+  list: () => ({ epochs: [], holders: [], residues: [], legacyIncidents: [], truncated: false }),
   report: async () => {
     throw new Error('not used');
   },
   discard: async () => {
+    throw new Error('not used');
+  },
+  release: async () => {
     throw new Error('not used');
   },
 };
@@ -137,6 +141,7 @@ const noDirectProviderProxySetHolders = async () => [] as const;
 
 let stdout = '';
 let stderr = '';
+const storeResetRoots: string[] = [];
 
 beforeEach(() => {
   stdout = '';
@@ -154,6 +159,116 @@ beforeEach(() => {
 afterEach(() => {
   vi.restoreAllMocks();
   process.exitCode = undefined;
+  for (const root of storeResetRoots.splice(0)) rmSync(root, { recursive: true, force: true });
+});
+
+describe('backend store-reset discard output', () => {
+  it('does not print the absolute store root', async () => {
+    const program = new Command();
+    program.exitOverride();
+    registerBackendCommands(program, {
+      storeReset: {
+        ...storeReset,
+        discard: async () => ({
+          kind: 'discarded',
+          target: 'gen2',
+          flavor: 'prod',
+          baseDir: '/sensitive/store/root',
+          previousEpoch: '4',
+          currentEpoch: '5',
+        }),
+      },
+    });
+
+    await program.parseAsync([
+      'node',
+      'coral-cli',
+      'backend',
+      'store-reset',
+      'discard',
+      '--target',
+      'gen2',
+      '--flavor',
+      'prod',
+    ]);
+
+    expect(stdout).toBe('Discarded store epoch 4; initialized epoch 5.\n');
+    expect(stdout).not.toContain('/sensitive/store/root');
+  });
+});
+
+describe('backend store-reset release failures', () => {
+  function programForRelease(runtime: Runtime, releaseSocket: () => Promise<void>): Command {
+    const program = new Command();
+    program.exitOverride();
+    registerBackendCommands(program, {
+      storeReset: {
+        ...storeReset,
+        release: (target, _flavor, epoch) =>
+          releaseStoreReset({
+            target,
+            runtime,
+            epoch,
+            acquireSocketGuard: async () => ({ release: releaseSocket }),
+          }),
+      },
+    });
+    return program;
+  }
+
+  async function runRelease(program: Command): Promise<void> {
+    await program.parseAsync([
+      'node',
+      'coral-cli',
+      'backend',
+      'store-reset',
+      'release',
+      '1',
+      '--target',
+      'gen2',
+      '--flavor',
+      'prod',
+    ]);
+  }
+
+  it('does not label a raw generation-lock parent EACCES as a reporting failure', async () => {
+    const baseDir = mkdtempSync(join(tmpdir(), 'coral-release-cli-eacces-'));
+    storeResetRoots.push(baseDir);
+    const baseRuntime = createRealRuntime('prod', { baseDir });
+    const runtime = {
+      ...baseRuntime,
+      storage: new Proxy(baseRuntime.storage, {
+        get(subject, property, receiver) {
+          if (property !== 'mkdirSync') return Reflect.get(subject, property, receiver) as unknown;
+          return () => {
+            throw Object.assign(new Error('generation lock parent creation refused'), { code: 'EACCES' });
+          };
+        },
+      }),
+    };
+
+    await runRelease(programForRelease(runtime, async () => undefined));
+
+    expect(stderr).toContain('Store-reset release failed. [code=store_reset_release_failed]');
+    expect(stderr).not.toContain('Store-reset reporting failed');
+    expect(process.exitCode).toBe(70);
+  });
+
+  it('does not label a throwing socket-lock release as a reporting failure', async () => {
+    const baseDir = mkdtempSync(join(tmpdir(), 'coral-release-cli-lock-release-'));
+    storeResetRoots.push(baseDir);
+    const runtime = createRealRuntime('prod', { baseDir });
+
+    await runRelease(
+      programForRelease(runtime, async () => {
+        throw new Error('socket lock release failed');
+      }),
+    );
+
+    expect(stderr).toContain('Store-reset release failed. [code=store_reset_release_failed]');
+    expect(stderr).not.toContain('Store-reset reporting failed');
+    expect(process.exitCode).toBe(70);
+  });
 });
 
 describe('backend shutdown recovery commands', () => {
@@ -379,7 +494,6 @@ describe('backend status generation readiness', () => {
         kind: 'legacy-ignored',
         legacyPath: '/state/data',
         generatedPath: '/state/gen2/data',
-        storedProductVersion: '0.9.16',
       }),
       getStatus: async () => ({ status: 'no_record_no_socket' }),
       getLiveHandoffResult: () => null,
@@ -393,7 +507,7 @@ describe('backend status generation readiness', () => {
     await program.parseAsync(['node', 'coral-cli', 'backend', 'status']);
 
     expect(stderr).toBe(
-      'Legacy Coral history remains at /state/data (stored Coral version 0.9.16) and is left untouched. This generation initializes its own state at /state/gen2/data.\n',
+      'Legacy Coral history remains at /state/data; its contents were not inspected or changed. This generation initializes its own state at /state/gen2/data.\n',
     );
     expect(stdout).toContain('No coordinator discovery record and no coordinator socket');
   });
@@ -2104,14 +2218,6 @@ describe('backend startup diagnostic classification', () => {
   // The records below carry no build identity, so authorship stays unprovable however this build proves its own.
   const provenSelfIdentity = (): SetupErrorAuthorIdentity => ({ bundleHash: '0123456789abcdef', namespace: 'ns-self' });
 
-  const authored = (
-    code: DocumentedCoralSetupErrorCode,
-    context?: Record<string, unknown>,
-  ): { userMessage: string; remediation: string } => {
-    const error = documentedCoralSetupError(code, context);
-    return { userMessage: error.userMessage, remediation: error.remediation };
-  };
-
   it('classifies a recent failure without returning serialized exception text', () => {
     expect(
       statusFromStartupDiagnostic(
@@ -2140,77 +2246,6 @@ describe('backend startup diagnostic classification', () => {
       status: 'recent_failure',
       phase: 'startup_failed',
       retryable: false,
-    });
-  });
-
-  it('accepts and carries a retryable startup diagnostic', () => {
-    expect(
-      statusFromStartupDiagnostic(
-        {
-          schemaVersion: 1,
-          phase: 'startup_failed',
-          state: 'stopped_with_diagnostic',
-          retryable: true,
-          pid: 4242,
-          recordedAt: '2026-08-02T11:59:30.000Z',
-          exitCode: 75,
-          error: {
-            kind: 'coral_setup_error',
-            code: 'store_open_contended',
-            userMessage: 'The current-generation store could not be opened because it is in use.',
-            remediation: 'Wait for the other store user to release the SQLite lock, then retry.',
-          },
-        },
-        now,
-        provenSelfIdentity,
-      ),
-    ).toEqual({
-      status: 'recent_failure',
-      phase: 'startup_failed',
-      retryable: true,
-      setupError: {
-        kind: 'documented',
-        code: 'store_open_contended',
-        userMessage: authored('store_open_contended').userMessage,
-        remediation: authored('store_open_contended').remediation,
-      },
-    });
-  });
-
-  it('carries the authored cause and remediation of a documented setup failure', () => {
-    expect(
-      statusFromStartupDiagnostic(
-        {
-          schemaVersion: 1,
-          phase: 'startup_failed',
-          state: 'stopped_with_diagnostic',
-          retryable: false,
-          pid: 4242,
-          recordedAt: '2026-08-02T11:59:30.000Z',
-          exitCode: 1,
-          error: {
-            kind: 'coral_setup_error',
-            code: 'store_newer_incompatible',
-            userMessage:
-              'The current-generation store was written by newer Coral 0.11.0 and is incompatible with this build.',
-            remediation:
-              "Use Coral 0.11.0 to read this store, or run 'coral-cli backend store-reset discard --target gen2 --flavor prod'.",
-            context: { flavor: 'prod', version: '0.11.0' },
-          },
-        },
-        now,
-        provenSelfIdentity,
-      ),
-    ).toEqual({
-      status: 'recent_failure',
-      phase: 'startup_failed',
-      retryable: false,
-      setupError: {
-        kind: 'documented',
-        code: 'store_newer_incompatible',
-        userMessage: authored('store_newer_incompatible', { flavor: 'prod', version: '0.11.0' }).userMessage,
-        remediation: authored('store_newer_incompatible', { flavor: 'prod', version: '0.11.0' }).remediation,
-      },
     });
   });
 

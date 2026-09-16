@@ -9,11 +9,12 @@ import { resolveBuildFlavor } from '../../infra/build-flavor.js';
 import { createRealRuntime } from '../../runtime/real.js';
 import { documentedCoralSetupError } from '../../runtime/errors.js';
 import type { Runtime } from '../../runtime/ports.js';
-import { openWritableStoreDbNoReset } from '../../store/db.js';
+import { openWritableStoreDbNoReset } from '../../store/epoch.js';
 import { currentCoralStoreFormat } from '../../store-format.js';
 import { isDirectoryLockTimeoutError } from '../../infra/fs-lock.js';
 import { acquirePackageOperationLock } from '../../expansion/package-lock.js';
 import { PACKAGE_OPERATION_LOCK_TIMEOUT_MS } from '../../infra/package-operation-lock.js';
+import type { StorageActuator } from '../../infra/storage-actuator.js';
 import {
   acquireGenerationWriterLeaseAfterReadiness,
   generationMutationCoordinationSeam,
@@ -146,14 +147,9 @@ async function runGenerationCoordinatedMutation(
   kind: GenerationMutationKind,
   generationCoordination: GenerationMutationCoordination,
   lockTimeoutMs: number | undefined,
-  mutate: (assertLocksOwned: () => void) => Promise<InstallResponse>,
+  mutate: (assertLocksOwned: () => void, actuator: StorageActuator) => Promise<InstallResponse>,
 ): Promise<InstallResponse> {
-  const writerLease = await acquireGenerationWriterLeaseAfterReadiness(
-    generationCoordination,
-    runtime,
-    currentCoralStoreFormat(),
-    { kind, name },
-  );
+  const writerLease = await acquireGenerationWriterLeaseAfterReadiness(generationCoordination, runtime, { kind, name });
   try {
     writerLease.assertOwned();
     let releasePackageLock: Awaited<ReturnType<typeof acquirePackageOperationLock>>;
@@ -176,7 +172,7 @@ async function runGenerationCoordinatedMutation(
         releasePackageLock.assertOwned();
       };
       assertLocksOwned();
-      const result = await mutate(assertLocksOwned);
+      const result = await mutate(assertLocksOwned, writerLease.directoryLock.actuator);
       assertLocksOwned();
       return result;
     } finally {

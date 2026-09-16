@@ -4,13 +4,18 @@ import {
   coordinateActiveStoreSelection,
   type ActiveStoreSelectionProtocolOptions,
 } from './active-store-selection-coordination.js';
-import type { BackendStoreResetAuthority } from './backend-store-reset.js';
 import type { Database } from './db.js';
+import type { ResolvedStoreEpoch } from './epoch.js';
+
+type OpenedStartupBackendStore = Readonly<{
+  db: Database;
+  store: ResolvedStoreEpoch;
+}>;
 
 export type StartupBackendStoreRoutingResult =
-  | { readonly kind: 'open'; readonly db: Database }
+  | ({ readonly kind: 'open' } & OpenedStartupBackendStore)
   | { readonly kind: 'handoff'; readonly target: ValidatedHandoffTarget; readonly source: 'active-selection' }
-  | { readonly kind: 'reset-newer-invalid'; readonly evidence: InvalidTargetEvidence; readonly db: Database };
+  | ({ readonly kind: 'reset-newer-invalid'; readonly evidence: InvalidTargetEvidence } & OpenedStartupBackendStore);
 
 export type StartupActiveStoreSelectionOptions = Omit<ActiveStoreSelectionProtocolOptions, 'dependencies'> & {
   readonly dependencies?: never;
@@ -18,7 +23,6 @@ export type StartupActiveStoreSelectionOptions = Omit<ActiveStoreSelectionProtoc
 
 export type RouteOrOpenBackendStoreAtStartupInput = Readonly<{
   runtime: Runtime;
-  authority: BackendStoreResetAuthority;
   options: StartupActiveStoreSelectionOptions;
   validateForeignTarget: ForeignTargetValidator;
 }>;
@@ -26,23 +30,24 @@ export type RouteOrOpenBackendStoreAtStartupInput = Readonly<{
 export async function routeOrOpenBackendStoreAtStartup(
   input: RouteOrOpenBackendStoreAtStartupInput,
 ): Promise<StartupBackendStoreRoutingResult> {
-  let invalidTargetEvidence: InvalidTargetEvidence | null = null;
-  const result = await coordinateActiveStoreSelection(input.runtime, input.authority, {
+  const result = await coordinateActiveStoreSelection(input.runtime, {
     ...input.options,
     dependencies: {
       kind: 'startup',
       validateSelectedTarget: input.validateForeignTarget,
-      recordInvalidTargetRecovery: (evidence) => {
-        invalidTargetEvidence = evidence;
-      },
     },
   });
 
   if (result.kind === 'handoff') {
     return { kind: 'handoff', target: result.target, source: 'active-selection' };
   }
-  if (invalidTargetEvidence !== null) {
-    return { kind: 'reset-newer-invalid', evidence: invalidTargetEvidence, db: result.db };
+  if (result.invalidTargetEvidence !== null) {
+    return {
+      kind: 'reset-newer-invalid',
+      evidence: result.invalidTargetEvidence,
+      db: result.db,
+      store: result.store,
+    };
   }
-  return { kind: 'open', db: result.db };
+  return { kind: 'open', db: result.db, store: result.store };
 }

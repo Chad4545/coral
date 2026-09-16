@@ -51,6 +51,23 @@ afterEach(() => {
 });
 
 describe('generation mutation writer identity', () => {
+  it('allows synchronous maintenance work to refresh its exclusion lease', async () => {
+    const runtime = coordinationRuntime(4240, testIncarnation(4240), 'alive');
+    const writeFileSync = runtime.storage.writeFileSync.bind(runtime.storage);
+    let refreshWrites = 0;
+    runtime.storage.writeFileSync = (path, data, options) => {
+      if (String(path).includes('claim-refresh-')) refreshWrites += 1;
+      writeFileSync(path, data, options);
+    };
+    const maintenance = await acquireGenerationMaintenanceLease(runtime);
+    try {
+      maintenance.maintain();
+      expect(refreshWrites).toBe(1);
+    } finally {
+      maintenance.release();
+    }
+  });
+
   it('reclaims an abandoned maintenance lease after its heartbeat goes stale', async () => {
     const pid = 4241;
     const incarnation = testIncarnation(pid);
@@ -183,14 +200,14 @@ describe('generation mutation writer identity', () => {
     const pid = 4246;
     const incarnation = testIncarnation(pid);
     const writerRuntime = coordinationRuntime(pid, incarnation, 'alive');
-    let now = writerRuntime.time.now();
+    let monotonicNow = writerRuntime.time.monotonicNow();
     const maintenanceRuntime: Runtime = {
       ...writerRuntime,
       time: {
         ...writerRuntime.time,
-        now: () => now,
+        monotonicNow: () => monotonicNow,
         sleep: async (milliseconds: number) => {
-          now += milliseconds;
+          monotonicNow += BigInt(milliseconds);
         },
       },
     };
@@ -214,14 +231,14 @@ describe('generation mutation writer identity', () => {
     const pid = 4244;
     const incarnation = testIncarnation(pid);
     const writerRuntime = coordinationRuntime(pid, incarnation, 'alive');
-    let now = writerRuntime.time.now();
+    let monotonicNow = writerRuntime.time.monotonicNow();
     const maintenanceRuntime: Runtime = {
       ...writerRuntime,
       time: {
         ...writerRuntime.time,
-        now: () => now,
+        monotonicNow: () => monotonicNow,
         sleep: async (milliseconds: number) => {
-          now += milliseconds;
+          monotonicNow += BigInt(milliseconds);
         },
       },
       process: {
@@ -235,6 +252,35 @@ describe('generation mutation writer identity', () => {
       await expect(acquireGenerationMaintenanceLease(maintenanceRuntime, 25)).rejects.toMatchObject({
         code: 'legacy_source_writer_observation_unknown',
       });
+    } finally {
+      lease.release();
+    }
+  });
+
+  it('bounds maintenance exclusion with monotonic time when wall time moves backward', async () => {
+    const pid = 4248;
+    const incarnation = testIncarnation(pid);
+    const writerRuntime = coordinationRuntime(pid, incarnation, 'alive');
+    const lease = writer(writerRuntime);
+    let wallTime = writerRuntime.time.now();
+    let monotonicNow = writerRuntime.time.monotonicNow();
+    const maintenanceRuntime: Runtime = {
+      ...writerRuntime,
+      time: {
+        ...writerRuntime.time,
+        now: () => wallTime,
+        monotonicNow: () => monotonicNow,
+        sleep: async (milliseconds: number) => {
+          wallTime -= 60_000;
+          monotonicNow += BigInt(milliseconds);
+        },
+      },
+    };
+    try {
+      await expect(acquireGenerationMaintenanceLease(maintenanceRuntime, 25)).rejects.toMatchObject({
+        code: 'legacy_source_not_quiescent',
+      });
+      expect(wallTime).toBeLessThan(writerRuntime.time.now());
     } finally {
       lease.release();
     }

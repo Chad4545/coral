@@ -83,9 +83,14 @@ import type {
   DurableProvisionalProcessSubject,
   Runtime,
 } from '../../runtime/ports.js';
-import type { SessionInitialLaunchPort, SessionJobClaimPort } from '../../sessions/contracts.js';
+import type {
+  SessionInitialLaunchPort,
+  SessionJobClaimPort,
+  SessionJobClaimReleaseResult,
+} from '../../sessions/contracts.js';
 import type { CoralEventInput } from '../../store/envelope.js';
 import type { CommitEventsFn } from '../../store/append.js';
+import { StoreCodecError } from '../../store/body-codec.js';
 import { consumeJobStream } from './continuity-consumer.js';
 import { appendJobTerminalRecorded, failedTerminalOutcome } from '../terminal/recording.js';
 import { SessionClaimError } from '../../sessions/claim-error.js';
@@ -117,7 +122,14 @@ import { readProviderOperationJobLaunchEventSeq } from '../provider-operation-st
 
 const QUEUE_FULL_MESSAGE = 'All slots and queue are full. Try again later.';
 type LauncherJobEventBody = JobQueueAdmittedBody | JobQueueQueuedBody | JobAbortedBody;
-type JobExecutionDisposition = 'settled' | 'suspended' | 'handed-off' | 'proxied' | 'terminalized' | SettlementRefusal;
+type JobExecutionDisposition =
+  | 'settled'
+  | 'suspended'
+  | 'handed-off'
+  | 'proxied'
+  | 'terminalized'
+  | 'recovery-held'
+  | SettlementRefusal;
 type QueuedPermitOutcome = Readonly<{ kind: 'admitted'; permit: LaunchPermit }> | Readonly<{ kind: 'aborted' }>;
 
 function releasesLaunchPermit(disposition: JobExecutionDisposition): boolean {
@@ -128,6 +140,7 @@ function releasesLaunchPermit(disposition: JobExecutionDisposition): boolean {
       return true;
     case 'handed-off':
     case 'proxied':
+    case 'recovery-held':
       return false;
   }
   switch (disposition.cause) {
@@ -772,14 +785,17 @@ export class LaunchOrchestrator implements ProviderOperationCleanupOwner {
     error: unknown,
   ): void {
     const signal = this.deps.abortRegistry.getSignal(jobId) ?? new AbortController().signal;
+    let disposition: JobExecutionDisposition = 'terminalized';
     try {
-      this.handleProviderJobError(jobId, sessionId, signal, error);
+      disposition = this.handleProviderJobError(jobId, sessionId, signal, error);
     } catch (finalizationError: unknown) {
       backendLog.error(
         `Failed to terminalize committed provider launch ${jobId}: ${errorMessage(finalizationError)}`,
         finalizationError,
       );
     }
+
+    if (disposition === 'recovery-held') return;
 
     // Every cleanup is deliberately idempotent.
     this.deps.abortRegistry.remove(jobId);
@@ -848,7 +864,7 @@ export class LaunchOrchestrator implements ProviderOperationCleanupOwner {
           return;
         }
         try {
-          this.handleProviderJobError(jobId, sessionId, signal, error);
+          disposition = this.handleProviderJobError(jobId, sessionId, signal, error);
         } catch (finalizeError: unknown) {
           if (finalizeError instanceof TerminalWriteError) {
             backendLog.error(finalizeError.message, finalizeError.cause);
@@ -940,7 +956,7 @@ export class LaunchOrchestrator implements ProviderOperationCleanupOwner {
           return;
         }
         try {
-          this.handleProviderJobError(jobId, sessionId, signal, error);
+          disposition = this.handleProviderJobError(jobId, sessionId, signal, error);
         } catch (finalizeError: unknown) {
           if (finalizeError instanceof TerminalWriteError) {
             backendLog.error(finalizeError.message, finalizeError.cause);
@@ -968,8 +984,8 @@ export class LaunchOrchestrator implements ProviderOperationCleanupOwner {
 
   private releaseTerminalJob(jobId: string, sessionId: string): void {
     const { abortRegistry, sessionManager } = this.deps;
-    abortRegistry.remove(jobId);
     void sessionManager.releaseJob(sessionId, jobId);
+    abortRegistry.remove(jobId);
   }
 
   private elapsedJobDurationMs(jobId: string): number {
@@ -1227,10 +1243,58 @@ export class LaunchOrchestrator implements ProviderOperationCleanupOwner {
     }
   }
 
-  private handleProviderJobError(jobId: string, sessionId: string, signal: AbortSignal, error: unknown): void {
-    const currentStatus = this.deps.progressStore.readStatus(jobId);
+  private unreadableStatusDisposition(
+    releaseResult: SessionJobClaimReleaseResult,
+    jobId: string,
+    providerError: unknown,
+    statusError: StoreCodecError,
+  ): string {
+    const context = `after provider failure (${errorMessage(providerError)}) because its latest persisted event could not be decoded (${statusError.message})`;
+    switch (releaseResult) {
+      case 'released':
+        return `Released live job ${jobId} without a terminal ${context}.`;
+      case 'already_absent':
+        return `Live job ${jobId} had no session claim to release ${context}.`;
+      case 'owned_by_another_job':
+        return `Live job ${jobId} was not released ${context}; its session claim was owned by another job.`;
+    }
+  }
+
+  private handleProviderJobError(
+    jobId: string,
+    sessionId: string,
+    signal: AbortSignal,
+    error: unknown,
+  ): JobExecutionDisposition {
+    let currentStatus;
+    try {
+      currentStatus = this.deps.progressStore.readStatus(jobId);
+    } catch (statusError: unknown) {
+      if (statusError instanceof StoreCodecError) {
+        try {
+          this.deps.sessionManager.releaseJobWithRecoveryDisposition(sessionId, jobId, (commit, releaseResult) => {
+            this.deps.progressStore.appendUnreadableStatusProgressInCommit(
+              commit,
+              jobId,
+              sessionId,
+              this.unreadableStatusDisposition(releaseResult, jobId, error, statusError),
+            );
+          });
+          this.deps.abortRegistry.remove(jobId);
+        } catch (releaseError: unknown) {
+          this.appendUnreadableStatusDisposition(
+            jobId,
+            sessionId,
+            `Live job ${jobId} was not released after provider failure (${errorMessage(error)}) because its latest persisted event could not be decoded (${statusError.message}), and releasing its session claim failed (${errorMessage(releaseError)}). The abort registration and session claim remain held.`,
+          );
+          return 'recovery-held';
+        }
+        return 'terminalized';
+      }
+      throw statusError;
+    }
     if (!currentStatus || isTerminalPhase(currentStatus.phase)) {
-      return;
+      return 'terminalized';
     }
 
     if (error instanceof CliBusyError) {
@@ -1242,7 +1306,7 @@ export class LaunchOrchestrator implements ProviderOperationCleanupOwner {
         globalLimit: error.detail.globalLimit,
       });
       this.releaseTerminalJob(jobId, sessionId);
-      return;
+      return 'terminalized';
     }
 
     if (error instanceof ProviderHostUnserviceableError) {
@@ -1279,12 +1343,12 @@ export class LaunchOrchestrator implements ProviderOperationCleanupOwner {
         throw new TerminalWriteError(jobId, terminalError);
       }
       this.releaseTerminalJob(jobId, sessionId);
-      return;
+      return 'terminalized';
     }
 
     if (signal.aborted || isAbortError(error)) {
       this.finishAbortedJob(jobId, sessionId, 'signal_abort');
-      return;
+      return 'terminalized';
     }
 
     if (error instanceof ProviderBindingRuntimeError) {
@@ -1301,7 +1365,7 @@ export class LaunchOrchestrator implements ProviderOperationCleanupOwner {
           },
         },
       });
-      return;
+      return 'terminalized';
     }
 
     this.failJob(jobId, sessionId, {
@@ -1315,6 +1379,18 @@ export class LaunchOrchestrator implements ProviderOperationCleanupOwner {
         },
       },
     });
+    return 'terminalized';
+  }
+
+  private appendUnreadableStatusDisposition(jobId: string, sessionId: string, message: string): void {
+    try {
+      this.deps.progressStore.appendUnreadableStatusProgress(jobId, sessionId, message);
+    } catch (appendError: unknown) {
+      backendLog.error(
+        `Failed to persist unreadable-status disposition for ${jobId}: ${errorMessage(appendError)}`,
+        appendError,
+      );
+    }
   }
 
   private markJobQueued(jobId: string, sessionId: string, queuePosition: number): void {

@@ -1,4 +1,3 @@
-import { currentCoralStoreFormat } from '#src/store-format.js';
 import { spawnSync } from 'node:child_process';
 import {
   copyFileSync,
@@ -20,7 +19,8 @@ import { pluginRootNamespace } from '#src/infra/plugin-identity.js';
 import { memoDir } from '#src/kb/paths.js';
 import { createRealRuntime } from '#src/runtime/real.js';
 import { CoralStore } from '#src/read-model/coral-store.js';
-import { openStoreDatabase } from '#src/store/db.js';
+import { currentCoralStoreFormat } from '#src/store-format.js';
+import { openSettledTestStoreDb, openTestStoreDatabase } from '#tests/helpers/store-db.js';
 import { storePaths } from '#src/infra/path/store.js';
 import { createDefaultStoreReadContext } from '#src/read-model/read-context.js';
 import { formatJobsList, renderJobsList } from '#src/cli/format/jobs.js';
@@ -193,12 +193,8 @@ Second line
 }
 
 function seedStore(fixture: Fixture): void {
-  const runtime = createRealRuntime('prod');
-  const db = openStoreDatabase({
-    storeFormat: currentCoralStoreFormat(),
-    path: storePaths(fixture.flavor, { baseDir: join(fixture.home, '.coral') }).dbFile,
-    storage: runtime.storage,
-  });
+  const runtime = createRealRuntime('prod', { baseDir: join(fixture.home, '.coral') });
+  const db = openSettledTestStoreDb(runtime);
 
   try {
     db.prepare(
@@ -291,9 +287,9 @@ function runCliSubprocess(
 
 async function expectedOutput(fixture: Fixture, testCase: ReadCommandCase): Promise<string> {
   const runtime = createRealRuntime('prod');
-  const db = openStoreDatabase({
+  const db = openTestStoreDatabase({
     storeFormat: currentCoralStoreFormat(),
-    path: storePaths(fixture.flavor, { baseDir: join(fixture.home, '.coral') }).dbFile,
+    path: join(storePaths(fixture.flavor, { baseDir: join(fixture.home, '.coral') }).dbDir, 'epoch-1', 'store.db'),
     storage: runtime.storage,
     readonly: true,
   });
@@ -411,8 +407,6 @@ describe('cli library-direct reads', () => {
 
     const fixture = createFixture();
     const artifacts = coordinatorArtifacts(fixture);
-    const expectedStorePath = storePaths(fixture.flavor, { baseDir: join(fixture.home, '.coral') }).dbFile;
-
     const result = runCliSubprocess(fixture, ['jobs']);
     if (result.error) {
       throw result.error;
@@ -420,9 +414,7 @@ describe('cli library-direct reads', () => {
 
     expect(result.status, result.stderr).toBe(0);
     expect(result.stderr).toBe('');
-    expect(result.stdout).toBe(
-      `No jobs match live phases\n(no store at ${expectedStorePath} — showing empty results)\n`,
-    );
+    expect(result.stdout).toBe('No jobs match live phases\n(no current store — showing empty results)\n');
     expect(readProbeAttempts(fixture)).toEqual([]);
     expect(existsSync(artifacts.infoFile)).toBe(false);
     expect(existsSync(artifacts.socketPath)).toBe(false);

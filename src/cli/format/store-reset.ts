@@ -1,4 +1,21 @@
-import type { StoreResetIncidentListResult, StoreResetPublicReport } from '../../store/reset-incident.js';
+import type { StoreResetPublicReport } from '../../store/reset-incident.js';
+import type { StoreResetReleasePresentation } from '../../store/operator-store-reset.js';
+import type { StoreEpochMetadataDisposition } from '../../store/epoch.js';
+import type { StoreResetListResult, StoreResetReportResult } from '../store-reset.js';
+import { assertNever } from '../../infra/error-format.js';
+
+export function constrainStoreResetRendererInput<Value>(value: Value): Value {
+  if (typeof value === 'string') {
+    return JSON.stringify(value).slice(1, -1).replaceAll('|', '\\u007c').replaceAll('`', '\\u0060') as Value;
+  }
+  if (Array.isArray(value)) return value.map(constrainStoreResetRendererInput) as Value;
+  if (value !== null && typeof value === 'object') {
+    return Object.fromEntries(
+      Object.entries(value).map(([key, entry]) => [key, constrainStoreResetRendererInput(entry)]),
+    ) as Value;
+  }
+  return value;
+}
 
 function code(value: string): string {
   return `\`${value}\``;
@@ -8,7 +25,36 @@ function observed(value: string | null): string {
   return value === null ? 'not observed' : code(value);
 }
 
+function formatEpochMetadata(disposition: StoreEpochMetadataDisposition): string {
+  switch (disposition.kind) {
+    case 'missing':
+    case 'malformed':
+      return disposition.kind;
+    case 'unreadable':
+      return 'unreadable';
+    case 'valid':
+      return JSON.stringify({
+        supersedes: disposition.value.supersedes,
+        classification: { kind: disposition.value.classification.kind },
+        build: disposition.value.build,
+        publishedAt: disposition.value.publishedAt,
+      });
+    default:
+      return assertNever(disposition);
+  }
+}
+
+function releaseInstruction(target: 'legacy' | 'gen2'): readonly string[] {
+  return target === 'gen2'
+    ? [
+        'To permanently remove a non-current epoch:',
+        'command=coral-cli backend store-reset release --target gen2 --flavor <prod|dev> <epoch>',
+      ]
+    : [];
+}
+
 export function formatStoreResetReport(report: StoreResetPublicReport): string {
+  report = constrainStoreResetRendererInput(report);
   const lines = [
     '# Coral store-reset incident report',
     '',
@@ -46,12 +92,6 @@ export function formatStoreResetReport(report: StoreResetPublicReport): string {
       (file) => `| ${code(file.name)} | ${file.sizeBytes} | ${code(file.sha256)} | ${code(file.verification)} |`,
     ),
     '',
-    '## SQLite diagnostic',
-    '',
-    `- Integrity: ${code(report.diagnostic.integrity)}`,
-    `- Termination: ${code(report.diagnostic.termination)}`,
-    `- Cleanup: ${code(report.diagnostic.cleanup)}`,
-    '',
     '## Next step',
     '',
     'Paste this complete output into the Store-reset incident issue form in the Coral GitHub repository.',
@@ -62,24 +102,117 @@ export function formatStoreResetReport(report: StoreResetPublicReport): string {
   return lines.join('\n');
 }
 
-export function formatStoreResetList(result: StoreResetIncidentListResult, target: 'legacy' | 'gen2'): string {
-  if (result.incidents.length === 0) {
-    return [
-      `No ${target} store-reset incidents.`,
-      'File a Store-reset incident issue with this complete output; do not attach DB, WAL, SHM, or raw logs.',
-    ].join('\n');
+export function formatStoreEpochReport(result: Extract<StoreResetReportResult, { readonly kind: 'epoch' }>): string {
+  result = constrainStoreResetRendererInput(result);
+  return [
+    '# Coral store epoch report',
+    '',
+    `- Epoch: ${code(String(result.epoch.epoch))}`,
+    `- Role: ${code(result.epoch.role)}`,
+    `- Bytes: ${result.epoch.bytes ?? 'unknown'}`,
+    `- Publication reason: ${code(result.epoch.publicationReason.kind)}`,
+    `- Superseded store Coral version: ${result.epoch.supersededStoreVersion === null ? 'not observed' : code(result.epoch.supersededStoreVersion)}`,
+    `- Epoch metadata: ${code(formatEpochMetadata(result.epoch.epochJson))}`,
+    `- Database: ${code(`epoch-${result.epoch.epoch}/store.db`)}`,
+    '',
+    '## SQLite inspection',
+    '',
+    `command=sqlite3 ${code(`<store-root>/epoch-${result.epoch.epoch}/store.db`)} ${code('PRAGMA quick_check(1)')}`,
+    '',
+    'No file was uploaded. Do not attach DB, WAL, SHM, raw logs, credentials, settings, or environment files.',
+    '',
+  ].join('\n');
+}
+
+export function formatStoreResetList(result: StoreResetListResult, target: 'legacy' | 'gen2'): string {
+  result = constrainStoreResetRendererInput(result);
+  target = constrainStoreResetRendererInput(target);
+  if (
+    result.epochs.length === 0 &&
+    result.holders.length === 0 &&
+    result.residues.length === 0 &&
+    result.legacyIncidents.length === 0
+  ) {
+    return [`No ${target} store epochs or legacy store-reset incidents.`, ...releaseInstruction(target)].join('\n');
   }
   return [
-    'Incident ID | Reset at | Schema | Reason | Reset policy | State | Files',
-    ...result.incidents.map((incident) =>
-      incident.state === 'ready'
-        ? `${incident.incidentId} | ${incident.resetAt} | V${incident.schemaVersion} | ${incident.reason} | ${incident.resetPolicyCause ?? 'legacy-v2'} | ${incident.state} | ${incident.fileCount}`
-        : `${incident.incidentId} | - | - | - | - | ${incident.state} | -`,
+    'Epoch | Role | Bytes | Publication reason | Superseded store Coral version | Epoch metadata',
+    ...result.epochs.map(
+      (epoch) =>
+        `${epoch.epoch} | ${epoch.role} | ${epoch.bytes ?? 'unknown'} | ${epoch.publicationReason.kind} | ${epoch.supersededStoreVersion ?? 'none'} | ${formatEpochMetadata(epoch.epochJson)}`,
     ),
+    ...(result.holders.length === 0
+      ? []
+      : [
+          '',
+          'Holder ID | Epoch | PID | State',
+          ...result.holders.map(
+            (holder) => `${holder.id} | ${holder.epoch ?? 'unknown'} | ${holder.pid ?? 'unknown'} | ${holder.state}`,
+          ),
+        ]),
+    ...(result.residues.length === 0
+      ? []
+      : [
+          '',
+          'Residue | Bytes | State',
+          ...result.residues.map((residue) => `${residue.name} | ${residue.bytes ?? 'unknown'} | ${residue.state}`),
+        ]),
+    ...(result.legacyIncidents.length === 0
+      ? []
+      : [
+          '',
+          'Legacy incident ID | State | Reset at | Reason | Files | Bytes',
+          ...result.legacyIncidents.map(
+            (incident) =>
+              `${incident.incidentId} | ${incident.state} | ${incident.resetAt ?? '-'} | ${incident.reason ?? '-'} | ${incident.fileCount ?? '-'} | ${incident.bytes ?? 'unknown'}`,
+          ),
+        ]),
     '',
-    'States: ready produces a Markdown report; malformed, unsupported, build_mismatch, unsafe, and unavailable produce a fixed public-safe error.',
-    `Next: coral-cli backend store-reset report --target ${target} <ready-incident-id>`,
-    'For a non-ready incident, run the same report command with its ID and paste the fixed error output into the issue form.',
-    'Non-ready evidence remains retained. Do not move, restore, delete, or upload DB, WAL, or SHM files.',
+    ...(result.truncated ? ['Legacy quarantine listing was truncated at its safety bound.'] : []),
+    ...(result.legacyIncidents.some((incident) => incident.state === 'ready')
+      ? [
+          'Legacy ready incidents remain reportable.',
+          `command=coral-cli backend store-reset report --target ${target} <ready-incident-id>`,
+        ]
+      : []),
+    ...(target === 'gen2' && result.epochs.length > 0
+      ? [
+          'To report an epoch without opening SQLite:',
+          'command=coral-cli backend store-reset report --target gen2 <epoch>',
+        ]
+      : []),
+    ...releaseInstruction(target),
   ].join('\n');
+}
+
+export function formatStoreResetRelease(result: StoreResetReleasePresentation): string {
+  result = constrainStoreResetRendererInput(result);
+  switch (result.kind) {
+    case 'released':
+      return `Released store epoch ${result.epoch} from ${result.target} ${result.flavor}.`;
+    case 'release-metadata-unobservable':
+      return `Store epoch ${result.epoch} was not released from ${result.target} ${result.flavor} because epoch or coordinator metadata could not be observed; inspect backend store-reset list, restore metadata readability, and retry.`;
+    case 'release-holder-live':
+      return `Store epoch ${result.epoch} was not released from ${result.target} ${result.flavor} because a live holder remains; wait for the holder to exit, then retry.`;
+    case 'release-holder-unobservable':
+      return `Store epoch ${result.epoch} was not released from ${result.target} ${result.flavor} because a holder record was unobservable; inspect backend store-reset list. This command clears a malformed record, while an unreadable liveness probe must become observable before retrying.`;
+    case 'release-holder-cleanup-failed':
+      return `Store epoch ${result.epoch} was not released from ${result.target} ${result.flavor} because earlier holder cleanup failed; target deletion was not attempted. Check store-directory permissions and retry.`;
+    case 'release-deletion-failed':
+      return `Store epoch ${result.epoch} deletion failed in ${result.target} ${result.flavor}; check store-directory permissions and retry.`;
+    case 'release-lock-release-failed':
+      return `Store epoch ${result.epoch} was removed from ${result.target} ${result.flavor}, but releasing its exclusive epoch lock failed; the store-directory durability barrier completed. Check store-directory permissions and retry.`;
+    case 'release-pre-deletion-durability-sync-failed':
+      return `Store epoch ${result.epoch} was not removed from ${result.target} ${result.flavor} because syncing earlier holder cleanup failed; inspect backend store-reset list and retry.`;
+    case 'release-absent-durability-sync-failed':
+      return `Store epoch ${result.epoch} was already absent from ${result.target} ${result.flavor}, but syncing the store directory failed; inspect backend store-reset list and retry.`;
+    case 'release-durability-sync-failed':
+      return `Store epoch ${result.epoch} was removed from ${result.target} ${result.flavor}, but syncing the store directory failed; inspect backend store-reset list and retry.`;
+    case 'absent':
+      return `Store epoch ${result.epoch} is absent from ${result.target} ${result.flavor}.`;
+    case 'current':
+      return `Store epoch ${result.epoch} is current and was not released from ${result.target} ${result.flavor}.`;
+    default:
+      return assertNever(result);
+  }
 }

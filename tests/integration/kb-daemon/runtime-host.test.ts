@@ -1,4 +1,4 @@
-import { mkdtempSync, rmSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 
@@ -17,7 +17,9 @@ import { ConsumerDriver } from '#src/projection-consumers/index.js';
 import { createRealRuntime } from '#src/runtime/real.js';
 import type { Runtime } from '#src/runtime/ports.js';
 import type { Database } from '#src/store/db.js';
-import { openTestStoreDb } from '#tests/helpers/store-db.js';
+import { resolvedStoreEpoch, STORE_EPOCH_METADATA_FILE_NAME } from '#src/store/epoch.js';
+import { currentCoralStoreFormat } from '#src/store-format.js';
+import { openSettledTestStoreDb, openTestStoreDb } from '#tests/helpers/store-db.js';
 import { testProjectPrincipal } from '#tests/helpers/principal.js';
 import { fixtureCanonicalWorkDir } from '#tests/helpers/canonical-work-dir.js';
 
@@ -108,6 +110,53 @@ describe('KB daemon runtime host', () => {
     vi.restoreAllMocks();
     vi.unstubAllEnvs();
     vi.useRealTimers();
+  });
+
+  it('opens the epoch selected by its parent even when newer metadata is readable', async () => {
+    const root = createTempRoot();
+    vi.stubEnv('CLAUDE_CONFIG_DIR', join(root, '.claude'));
+    const runtime = createRealRuntime('prod', { baseDir: root });
+    const storeFormat = currentCoralStoreFormat();
+    for (const epoch of ['1', '3']) {
+      const directory = join(runtime.paths.coral.store.dbDir, `epoch-${epoch}`);
+      mkdirSync(directory, { recursive: true });
+      writeFileSync(join(directory, '.lock'), '');
+      const db = openTestStoreDb(runtime, join(directory, 'store.db'));
+      db.exec('CREATE TABLE epoch_marker (epoch TEXT NOT NULL)');
+      db.prepare('INSERT INTO epoch_marker (epoch) VALUES (?)').run(epoch);
+      db.close();
+      writeFileSync(
+        join(directory, STORE_EPOCH_METADATA_FILE_NAME),
+        JSON.stringify({
+          supersedes: null,
+          classification: { kind: 'unavailable' },
+          build: {
+            version: storeFormat.productVersion,
+            buildSetId: '123e4567-e89b-42d3-a456-426614174000',
+            bundleHash: '0123456789abcdef',
+            flavor: 'prod',
+            storeFormatFingerprint: storeFormat.fingerprint,
+          },
+          publishedAt: '2026-09-15T00:00:00.000Z',
+        }),
+      );
+    }
+    const host = createKbDaemonWriteRuntimeHost({
+      pluginRoot: join(root, 'plugin'),
+      backendNamespace: 'test-namespace',
+      bundleHash: 'test-bundle',
+      curateUsageBudget: { isExhausted: async () => false },
+      runtime,
+      store: resolvedStoreEpoch(runtime.paths.coral.store.dbDir, '1'),
+    });
+
+    try {
+      await host.withKb(({ db }) => {
+        expect(db.prepare<[], { epoch: string }>('SELECT epoch FROM epoch_marker').get()?.epoch).toBe('1');
+      });
+    } finally {
+      await host.dispose().catch(() => undefined);
+    }
   });
 
   it('cleans orphaned source import runtime artifacts during boot', async () => {
@@ -227,7 +276,7 @@ describe('KB daemon runtime host', () => {
     const root = createTempRoot();
     vi.stubEnv('CLAUDE_CONFIG_DIR', join(root, '.claude'));
     const runtime = createRealRuntime('prod', { baseDir: root });
-    openTestStoreDb(runtime, runtime.paths.coral.store.dbFile).close();
+    openSettledTestStoreDb(runtime).close();
     const pluginRoot = join(root, 'plugin');
     const runtimeDir = runtime.paths.coral.kbRuntime.root;
     const host = createKbDaemonWriteRuntimeHost({

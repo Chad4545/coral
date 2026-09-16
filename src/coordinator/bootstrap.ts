@@ -1,6 +1,9 @@
 declare const __IS_CORAL_BACKEND_MAIN__: boolean | undefined;
 declare const __PLUGIN_ROOT__: string | undefined;
 
+import { resolve } from 'node:path';
+import { z } from 'zod';
+
 import { auditBootstrapFailure, writeBootstrapDiagnostic, writeStartupErrorSentinel } from './bootstrap-diagnostics.js';
 import { BackendAlreadyRunningError } from './handoff.js';
 import {
@@ -25,6 +28,7 @@ import { resolveStrictBundleIdentity } from '../infra/bundle-manifest.js';
 import { parseProviderRoleArgv, type ProviderRole } from '../provider-proxy/role-argv.js';
 import { runProviderRoleMain } from '../provider-proxy/role-main.js';
 import { currentCoralStoreFormat } from '../store-format.js';
+import { generationMutationCoordinationSeam } from '../store/generation-mutation-coordination.js';
 import {
   processIncarnationProbeRegistrySize,
   snapshotProcessIncarnationProbeSubjects,
@@ -119,6 +123,22 @@ function createBootstrapProbeExitGate(): Readonly<{
 
 const bootstrapProbeExitGate = createBootstrapProbeExitGate();
 
+export function createCoordinatorShutdownSignalHandler(options: {
+  readonly shutdown: (reason: 'sigterm' | 'sigint') => Promise<unknown>;
+  readonly recordExitCode: (code: number) => void;
+  readonly onRepeatedSignal?: () => void;
+}): (reason: 'sigterm' | 'sigint') => void {
+  let signalCount = 0;
+  return (reason) => {
+    signalCount += 1;
+    if (signalCount > 1) {
+      options.recordExitCode(1);
+      options.onRepeatedSignal?.();
+    }
+    void options.shutdown(reason).catch(() => {});
+  };
+}
+
 async function handleSmokeOpenStore(argv: readonly string[]): Promise<number> {
   const pathIdx = argv.indexOf('--path');
   if (pathIdx === -1 || !argv[pathIdx + 1]) {
@@ -127,30 +147,49 @@ async function handleSmokeOpenStore(argv: readonly string[]): Promise<number> {
   }
 
   try {
-    const storePath = argv[pathIdx + 1];
-    const { openWritableStoreDbNoReset } = await import('../store/db.js');
     const runtime = createRealRuntime(resolveBuildFlavor(process.env));
-    const db = openWritableStoreDbNoReset(runtime, {
-      path: storePath,
-      storeFormat: currentCoralStoreFormat(),
+    const { openWritableStoreDbNoReset, resolveProvenStoreEpochAtPath } = await import('../store/epoch.js');
+    const smokeStorePathInput = z
+      .string()
+      .refine((path) => resolve(path) === path, 'path is not a canonical absolute path');
+    const parsed = smokeStorePathInput.safeParse(argv[pathIdx + 1]);
+    if (!parsed.success) {
+      throw new Error(`smoke open-store path refused: ${parsed.error.issues.map(({ message }) => message).join('; ')}`);
+    }
+    const store = resolveProvenStoreEpochAtPath(runtime.storage, runtime.paths.coral.store.dbDir, parsed.data);
+    if (store === null) {
+      throw new Error('smoke open-store path refused: path is not a proven canonical positive store epoch');
+    }
+    const writerLease = await generationMutationCoordinationSeam.acquireWriterLease(runtime, {
+      kind: 'routing-status',
+      name: 'smoke-open-store',
     });
 
     try {
-      db.exec('BEGIN IMMEDIATE');
-      db.exec('CREATE TEMP TABLE coral_smoke_open_store (ok INTEGER NOT NULL CHECK (ok = 1))');
-      db.exec('INSERT INTO coral_smoke_open_store (ok) VALUES (1)');
-      const readBack = db.prepare<[], { ok: number }>('SELECT ok FROM coral_smoke_open_store').get();
-      db.exec('DROP TABLE coral_smoke_open_store');
-      db.exec('COMMIT');
-      if (readBack?.ok !== 1) {
-        backendLog.error('smoke read-back failed');
-        return 1;
-      }
+      const db = openWritableStoreDbNoReset(runtime, {
+        resolved: store,
+        storeFormat: currentCoralStoreFormat(),
+      });
 
-      process.stdout.write('ok\n');
-      return 0;
+      try {
+        db.exec('BEGIN IMMEDIATE');
+        db.exec('CREATE TEMP TABLE coral_smoke_open_store (ok INTEGER NOT NULL CHECK (ok = 1))');
+        db.exec('INSERT INTO coral_smoke_open_store (ok) VALUES (1)');
+        const readBack = db.prepare<[], { ok: number }>('SELECT ok FROM coral_smoke_open_store').get();
+        db.exec('DROP TABLE coral_smoke_open_store');
+        db.exec('COMMIT');
+        if (readBack?.ok !== 1) {
+          backendLog.error('smoke read-back failed');
+          return 1;
+        }
+
+        process.stdout.write('ok\n');
+        return 0;
+      } finally {
+        db.close();
+      }
     } finally {
-      db.close();
+      writerLease.release();
     }
   } catch (error: unknown) {
     const message = errorMessage(error);
@@ -319,12 +358,13 @@ export async function main(): Promise<number> {
       },
     });
 
-    process.on('SIGTERM', () => {
-      void coordinator.shutdown('sigterm').catch(() => {});
+    const handleShutdownSignal = createCoordinatorShutdownSignalHandler({
+      shutdown: coordinator.shutdown,
+      recordExitCode: bootstrapProbeExitGate.recordExitCode,
+      onRepeatedSignal: () => backendLog.warn('Repeated shutdown signal received; eventual safe exit is now nonzero.'),
     });
-    process.on('SIGINT', () => {
-      void coordinator.shutdown('sigint').catch(() => {});
-    });
+    process.on('SIGTERM', () => handleShutdownSignal('sigterm'));
+    process.on('SIGINT', () => handleShutdownSignal('sigint'));
 
     const info = await coordinator.start();
     backendLog.info(`Running on ${info.host}:${info.port}`);

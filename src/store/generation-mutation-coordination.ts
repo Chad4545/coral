@@ -5,16 +5,16 @@ import { assertNever } from '../infra/error-format.js';
 import { isNoEntryError } from '../infra/fs-errors.js';
 import {
   acquireDirectoryLock,
+  createDirectoryLockParent,
   isDirectoryLockTimeoutError,
   tryAcquireDirectoryLock,
-  type DirectoryLockLease,
+  type ActuatedDirectoryLockLease,
 } from '../infra/fs-lock.js';
 import { recordedProcessIdentitySchema, type RecordedProcessIdentity } from '../infra/process-containment.js';
-import { validateProductVersion } from '../infra/product-version.js';
+import type { StorageActuator } from '../infra/storage-actuator.js';
 import { documentedCoralSetupError } from '../runtime/errors.js';
 import type { Runtime } from '../runtime/ports.js';
-import { classifyStoreFile } from './db.js';
-import type { StoreFormatClassification, StoreFormatDescription } from './format-fingerprint.js';
+import { observeStorePath } from './path-observation.js';
 
 export type GenerationMutationKind = 'install' | 'update' | 'uninstall' | 'kb-child' | 'routing-status';
 
@@ -23,6 +23,7 @@ export interface GenerationReadinessCompletion {
 }
 
 export interface GenerationWriterLease {
+  readonly directoryLock: ActuatedDirectoryLockLease;
   assertOwned(): void;
   release(): void;
 }
@@ -33,13 +34,8 @@ export type GenerationWriterLeaseAttempt =
   | Readonly<{ kind: 'contended' }>;
 
 export interface GenerationMutationCoordination {
-  // `storeFormat` is threaded in rather than defaulted to `currentCoralStoreFormat()`:
-  // that default made this store module import `src/store-format.ts`, which drags the
-  // whole provider registry into the simulation's sealed import graph and breaks
-  // `npm run build`. Callers in the CLI already hold the description.
   completeReadiness(
     runtime: Runtime,
-    storeFormat: StoreFormatDescription,
     mutation: { readonly kind: GenerationMutationKind; readonly name: string },
   ): Promise<GenerationReadinessCompletion>;
   acquireWriterLease(
@@ -76,11 +72,11 @@ export type GenerationReadiness =
       readonly kind: 'legacy-ignored';
       readonly legacyPath: string;
       readonly generatedPath: string;
-      readonly storedProductVersion: string | null;
     };
 
 export interface GenerationMaintenanceLease {
   assertOwned(): void;
+  maintain(): void;
   release(): void;
 }
 
@@ -91,7 +87,7 @@ export interface GenerationAdoptionLease {
 
 const GENERATION_ADOPTION_LOCK_BRAND: unique symbol = Symbol('GenerationAdoptionLockLease');
 
-export type GenerationAdoptionLockLease = DirectoryLockLease & {
+export type GenerationAdoptionLockLease = ActuatedDirectoryLockLease & {
   readonly [GENERATION_ADOPTION_LOCK_BRAND]: true;
 };
 
@@ -120,39 +116,19 @@ export function resolveGenerationBoundaryPaths(runtime: Pick<Runtime, 'paths'>):
 
 export function inspectGenerationReadiness(
   runtime: Pick<Runtime, 'flavor' | 'paths' | 'storage'>,
-  storeFormat: StoreFormatDescription,
 ): GenerationReadiness {
   const paths = resolveGenerationBoundaryPaths(runtime);
-  if (runtime.storage.existsSync(paths.generatedFlavorRoot)) {
+  if (observeStorePath(runtime.storage, paths.generatedFlavorRoot) === 'present') {
     return { kind: 'generated-ready' };
   }
-  if (!runtime.storage.existsSync(paths.legacyFlavorRoot)) {
+  if (observeStorePath(runtime.storage, paths.legacyFlavorRoot) === 'absent') {
     return { kind: 'no-legacy' };
   }
-
-  // The stored version is read for the notice only. Nothing branches on whether
-  // this build could read the legacy store, because nothing imports it — an
-  // unreadable one is reported as unknown rather than diagnosed.
-  const storedProductVersion = ((): string | null => {
-    try {
-      const classification: StoreFormatClassification = classifyStoreFile(
-        join(paths.legacyFlavorRoot, 'store', 'store.db'),
-        runtime.storage,
-        storeFormat,
-      );
-      return 'storedProductVersion' in classification && classification.storedProductVersion !== null
-        ? validateProductVersion(classification.storedProductVersion)
-        : null;
-    } catch {
-      return null;
-    }
-  })();
 
   return {
     kind: 'legacy-ignored',
     legacyPath: paths.legacyFlavorRoot,
     generatedPath: paths.generatedFlavorRoot,
-    storedProductVersion,
   };
 }
 
@@ -160,9 +136,8 @@ export function formatLegacyGenerationIgnoredNotice(
   readiness: Extract<GenerationReadiness, { readonly kind: 'legacy-ignored' }>,
 ): string {
   return (
-    `Legacy Coral history remains at ${readiness.legacyPath} (stored Coral version ` +
-    `${readiness.storedProductVersion ?? 'unknown'}) and is left untouched. This generation initializes ` +
-    `its own state at ${readiness.generatedPath}.`
+    `Legacy Coral history remains at ${readiness.legacyPath}; its contents were not inspected or changed. ` +
+    `This generation initializes its own state at ${readiness.generatedPath}.`
   );
 }
 
@@ -195,35 +170,42 @@ export function generationNotQuiescentError(
 }
 
 function ensureCoordinationRoot(runtime: Runtime, paths: GenerationBoundaryPaths): void {
-  runtime.storage.mkdirSync(paths.writersRoot, { recursive: true });
+  createDirectoryLockParent(runtime.storage, paths.writersRoot);
 }
 
 export async function acquireGenerationAdoptionLock(
   runtime: Runtime,
   timeoutMs = GENERATION_COORDINATION_TIMEOUT_MS,
 ): Promise<GenerationAdoptionLockLease> {
+  const lease = await tryAcquireGenerationAdoptionLock(runtime, timeoutMs);
+  if (lease !== null) return lease;
   const paths = resolveGenerationBoundaryPaths(runtime);
-  runtime.storage.mkdirSync(paths.generationRoot, { recursive: true });
+  throw generationNotQuiescentError(runtime, `adoption lock at ${paths.adoptionLock}`, 'writer-live');
+}
+
+export async function tryAcquireGenerationAdoptionLock(
+  runtime: Runtime,
+  timeoutMs = GENERATION_COORDINATION_TIMEOUT_MS,
+): Promise<GenerationAdoptionLockLease | null> {
+  const paths = resolveGenerationBoundaryPaths(runtime);
+  createDirectoryLockParent(runtime.storage, paths.generationRoot);
   try {
     const lease = await acquireDirectoryLock(paths.adoptionLock, directoryLockDeps(runtime), timeoutMs);
     Object.defineProperty(lease, GENERATION_ADOPTION_LOCK_BRAND, { value: true });
     return lease as GenerationAdoptionLockLease;
   } catch (error: unknown) {
-    if (isDirectoryLockTimeoutError(error)) {
-      throw generationNotQuiescentError(runtime, `adoption lock at ${paths.adoptionLock}`, 'writer-live');
-    }
+    if (isDirectoryLockTimeoutError(error)) return null;
     throw error;
   }
 }
 
 export async function acquireGenerationAdoptionLease(
   runtime: Runtime,
-  storeFormat: StoreFormatDescription,
   timeoutMs = GENERATION_COORDINATION_TIMEOUT_MS,
 ): Promise<GenerationAdoptionLease> {
   const releaseAdoption = await acquireGenerationAdoptionLock(runtime, timeoutMs);
   try {
-    const readiness = inspectGenerationReadiness(runtime, storeFormat);
+    const readiness = inspectGenerationReadiness(runtime);
     switch (readiness.kind) {
       case 'generated-ready':
       case 'no-legacy':
@@ -301,8 +283,8 @@ type GenerationWriterBlocker = Readonly<{
   observation: 'alive' | 'unknown';
 }>;
 
-function removeWriterLease(runtime: Runtime, paths: GenerationBoundaryPaths, entry: string): void {
-  runtime.storage.rmSync(join(paths.writersRoot, entry), { recursive: true, force: true });
+function removeWriterLease(paths: GenerationBoundaryPaths, entry: string, held: StorageActuator): void {
+  held.remove(join(paths.writersRoot, entry), { recursive: true, force: true });
 }
 
 function reclaimStaleWriterLease(runtime: Runtime, paths: GenerationBoundaryPaths, entry: string): boolean {
@@ -312,7 +294,11 @@ function reclaimStaleWriterLease(runtime: Runtime, paths: GenerationBoundaryPath
   return true;
 }
 
-function removeDeadWriterLeases(runtime: Runtime, paths: GenerationBoundaryPaths): GenerationWriterBlocker[] {
+function removeDeadWriterLeases(
+  runtime: Runtime,
+  paths: GenerationBoundaryPaths,
+  held: StorageActuator,
+): GenerationWriterBlocker[] {
   const blockers: GenerationWriterBlocker[] = [];
   for (const entry of writerEntries(runtime, paths)) {
     const holder = writerHolder(runtime, paths, entry);
@@ -331,7 +317,7 @@ function removeDeadWriterLeases(runtime: Runtime, paths: GenerationBoundaryPaths
         runtime.env.platform() as NodeJS.Platform,
       );
       if (incarnation !== null && incarnation !== holder.identity.incarnation) {
-        removeWriterLease(runtime, paths, entry);
+        removeWriterLease(paths, entry, held);
         continue;
       }
       liveness = runtime.process.observeLiveness(holder.identity.pid);
@@ -341,7 +327,7 @@ function removeDeadWriterLeases(runtime: Runtime, paths: GenerationBoundaryPaths
 
     switch (liveness) {
       case 'absent':
-        removeWriterLease(runtime, paths, entry);
+        removeWriterLease(paths, entry, held);
         continue;
       case 'alive':
         if (incarnation === holder.identity.incarnation) {
@@ -377,13 +363,14 @@ function acquireWriterLeaseUnderAdmission(
   const releaseWriter = tryAcquireDirectoryLock(leasePath, directoryLockDeps(runtime));
   if (releaseWriter === null) return { kind: 'contended' };
   const identityPath = join(leasePath, WRITER_IDENTITY_FILE);
+  const held = releaseWriter.actuator;
   let released = false;
   const release = () => {
     if (released) return;
     released = true;
     try {
       releaseWriter.assertOwned();
-      runtime.storage.unlinkSync(identityPath);
+      held.unlink(identityPath);
     } catch {
       // Ownership is the authority to remove identity.json; the path may belong to a successor after loss.
     }
@@ -394,7 +381,7 @@ function acquireWriterLeaseUnderAdmission(
     }
   };
   try {
-    runtime.storage.writeFileSync(identityPath, JSON.stringify(identity), {
+    held.writeWholeFile(identityPath, JSON.stringify(identity), {
       encoding: 'utf-8',
       mode: 0o600,
     });
@@ -405,6 +392,7 @@ function acquireWriterLeaseUnderAdmission(
   return {
     kind: 'acquired',
     lease: {
+      directoryLock: releaseWriter,
       assertOwned: releaseWriter.assertOwned,
       release,
     },
@@ -427,8 +415,8 @@ export function tryAcquireGenerationWriterLease(
 }
 
 export const generationMutationCoordinationSeam: GenerationMutationCoordination = {
-  async completeReadiness(runtime, storeFormat) {
-    return acquireGenerationAdoptionLease(runtime, storeFormat);
+  async completeReadiness(runtime) {
+    return acquireGenerationAdoptionLease(runtime);
   },
   async acquireWriterLease(runtime, mutation) {
     const paths = resolveGenerationBoundaryPaths(runtime);
@@ -460,20 +448,33 @@ export async function acquireGenerationMaintenanceLease(
 ): Promise<GenerationMaintenanceLease> {
   const paths = resolveGenerationBoundaryPaths(runtime);
   ensureCoordinationRoot(runtime, paths);
-  const releaseAdmission = await acquireDirectoryLock(paths.admissionLock, directoryLockDeps(runtime), timeoutMs);
-  let releaseMaintenance: DirectoryLockLease;
+  const deadline = runtime.time.monotonicNow() + BigInt(timeoutMs);
+  const remainingBudget = (): number => {
+    const remaining = deadline - runtime.time.monotonicNow();
+    return remaining > 0n ? Number(remaining) : 0;
+  };
+  const releaseAdmission = await acquireDirectoryLock(
+    paths.admissionLock,
+    directoryLockDeps(runtime),
+    remainingBudget(),
+  );
+  let releaseMaintenance: ActuatedDirectoryLockLease;
   try {
-    releaseMaintenance = await acquireDirectoryLock(paths.maintenanceLock, directoryLockDeps(runtime), timeoutMs);
+    releaseMaintenance = await acquireDirectoryLock(
+      paths.maintenanceLock,
+      directoryLockDeps(runtime),
+      remainingBudget(),
+    );
   } finally {
     releaseAdmission();
   }
 
-  const deadline = runtime.time.now() + timeoutMs;
   try {
+    const held = releaseMaintenance.actuator;
     while (true) {
-      const blockers = removeDeadWriterLeases(runtime, paths);
+      const blockers = removeDeadWriterLeases(runtime, paths, held);
       if (blockers.length === 0) break;
-      if (runtime.time.now() >= deadline) {
+      if (runtime.time.monotonicNow() >= deadline) {
         throw generationNotQuiescentError(
           runtime,
           blockers.map((blocker) => blocker.description).join(', '),
@@ -484,10 +485,15 @@ export async function acquireGenerationMaintenanceLease(
     }
 
     let owned = true;
+    const assertOwned = (): void => {
+      if (!owned) throw new Error('Generation maintenance lease is no longer owned.');
+      releaseMaintenance.assertOwned();
+    };
     return {
-      assertOwned() {
-        if (!owned) throw new Error('Generation maintenance lease is no longer owned.');
-        releaseMaintenance.assertOwned();
+      assertOwned,
+      maintain() {
+        if (!owned) assertOwned();
+        releaseMaintenance.maintain();
       },
       release() {
         if (!owned) return;
@@ -504,10 +510,9 @@ export async function acquireGenerationMaintenanceLease(
 export async function acquireGenerationWriterLeaseAfterReadiness(
   coordination: GenerationMutationCoordination,
   runtime: Runtime,
-  storeFormat: StoreFormatDescription,
   mutation: { readonly kind: GenerationMutationKind; readonly name: string },
 ): Promise<GenerationWriterLease> {
-  const readiness = await coordination.completeReadiness(runtime, storeFormat, mutation);
+  const readiness = await coordination.completeReadiness(runtime, mutation);
   readiness.release();
   return coordination.acquireWriterLease(runtime, mutation);
 }

@@ -75,10 +75,10 @@ import type { RecoveryCapableService } from '../jobs/reconcile/contracts.js';
 import type { ProjectRequestPort } from './contracts.js';
 import type { TypedEventBus } from './event-bus.js';
 import type { IpcListener, ListenIpcServerResult, PublishedIpcSocketAddress } from '../transport/ipc/server.js';
-import { createBackendStoreResetAuthority } from '../store/backend-store-reset.js';
 import { resolveRunningBundleDir } from '../infra/bundle-manifest.js';
 import type { ValidatedHandoffTarget } from '../infra/handoff-target.js';
 import type { Database } from '../store/db.js';
+import type { ResolvedStoreEpoch } from '../store/epoch.js';
 import {
   acquireProviderOperationMutationAdmission,
   type ProviderOperationMutationAdmission,
@@ -285,21 +285,8 @@ export function verifiedIncumbentFromDiscovery(
 }
 
 /**
- * The same question asked of a probe rather than a record: which of the probe's four outcomes still leaves an
- * incumbent to contend with.
- *
- * Two of the four outcomes are only correct for a stated reason:
- *
- * - `unreadable-process` keeps its record. The probe not answering is not the incumbent not existing, and the
- *   record carries the `bootToken` a contender needs to ask it to stand down. `verifiedIncumbentFromDiscovery`
- *   then refuses on its own terms if the record cannot be tied to the socket, which is the check that belongs
- *   here — not a pid probe standing in for it.
- * - `unreadable-record` has no record to agree with, so `null` is the only value available. It is not a claim
- *   that nobody is there: `probeCoordinator` warns, while coordinator startup separately refuses the
- *   undecodable pre-bind discovery disposition.
- *
- * The switch is exhaustive on purpose. A fifth `CoordinatorProbe` shape leaves `record` unassigned and fails
- * the build, rather than defaulting into the `null` that reads as "no incumbent".
+ * The switch is exhaustive on purpose. A new `CoordinatorProbe` shape leaves `record` unassigned and fails
+ * the typecheck.
  */
 export function verifiedIncumbentFromProbe(
   probe: CoordinatorProbe,
@@ -311,7 +298,7 @@ export function verifiedIncumbentFromProbe(
       record = probe.record;
       break;
     case 'unobservable':
-      record = probe.reason === 'unreadable-process' ? probe.record : null;
+      record = probe.reason === 'unreadable-record' ? null : probe.record;
       break;
     case 'absent':
       record = null;
@@ -797,10 +784,12 @@ export type LifecycleDeps = {
    * so carrier readers cannot advance the startup boundary themselves.
    */
   readonly startupRecoveryBarrierPublisher?: Readonly<{ publish(): void }>;
+  readonly scheduleStoreEpochSweepFn?: (openStore: ResolvedStoreEpoch) => void;
+  readonly stopStoreEpochSweepFn?: () => Promise<void>;
   readonly getDiscussStoreForSource: (source: string) => DiscussSessionStore;
   readonly knownDiscussSources: () => Set<string>;
   readonly getDiscussContext: (ctx: InvocationContext) => DiscussContext;
-  readonly writeBackendInfoFn: (info: BackendInfo) => void;
+  readonly writeBackendInfoFn: (info: BackendInfo) => boolean | void;
   readonly removeBackendInfoIfOwnerFn: (instanceId: string) => void;
   readonly cleanupStaleJobsFn: (currentBundleHash: string, signal: AbortSignal) => void | Promise<void>;
   readonly markJobsAsErrorFn: (message: string, signal: AbortSignal) => void | Promise<void>;
@@ -1045,7 +1034,9 @@ async function runLifecycleStartup({
       storeFormatFingerprint: deps.storeFormat.fingerprint,
     };
     const preinjectedStoreServices = storeServicesRef.tryGet();
+    const shouldScheduleStoreEpochSweep = preinjectedStoreServices === null;
     let storeDb: Database;
+    let openedStore: ResolvedStoreEpoch | null = null;
     if (preinjectedStoreServices !== null) {
       // Production starts with an empty service ref. Test composition may pre-inject an in-memory store, which
       // has no filesystem selection or reset state to coordinate and must not consume deterministic IDs.
@@ -1054,15 +1045,6 @@ async function runLifecycleStartup({
       }
       storeDb = preinjectedStoreServices.storeDb;
     } else {
-      const resetAuthority = createBackendStoreResetAuthority(
-        runtime,
-        { acquiredViaHandoff: bound?.acquiredViaHandoff ?? false },
-        {
-          namespace,
-          storeFormat: deps.storeFormat,
-          build: currentBuild,
-        },
-      );
       const currentBundleDir = resolveRunningBundleDir(identity.pluginRoot);
       if (currentBundleDir === null) {
         throw documentedCoralSetupError({
@@ -1072,7 +1054,6 @@ async function runLifecycleStartup({
       }
       const routing = await routeOrOpenBackendStoreAtStartup({
         runtime,
-        authority: resetAuthority,
         validateForeignTarget: validateForeignHandoffTarget,
         options: {
           storeFormat: deps.storeFormat,
@@ -1094,6 +1075,7 @@ async function runLifecycleStartup({
         );
       }
       storeDb = routing.db;
+      openedStore = routing.store;
     }
     let storeServices: CoordinatorStoreServices;
     try {
@@ -1145,7 +1127,7 @@ async function runLifecycleStartup({
     signal.throwIfAborted();
     runtimeState.setStartedAt(now());
     const startedAt = runtimeState.getStartedAt();
-    writeBackendInfoFn({
+    const discoveryPublished = writeBackendInfoFn({
       pid: backendPid,
       port,
       host,
@@ -1159,9 +1141,14 @@ async function runLifecycleStartup({
       namespace,
       instanceId,
       startedAt,
+      ...(openedStore === null ? {} : { storeEpoch: openedStore.epoch }),
     });
+    if (discoveryPublished === false) {
+      throw new Error('Coordinator discovery publication failed.');
+    }
     runtimeState.setLifecycle('kernel-ready');
     runtimeState.setLaunchFenceActive(true);
+    if (shouldScheduleStoreEpochSweep && openedStore !== null) deps.scheduleStoreEpochSweepFn?.(openedStore);
     const serverInfo = {
       port,
       host,
@@ -1234,7 +1221,7 @@ async function runLifecycleStartup({
     runtimeState.setLifecycle('running');
     state.started = true;
     void kbDaemonSupervisor
-      ?.start()
+      ?.start(openedStore ?? undefined)
       .then((health) => {
         if (health.phase !== 'online') {
           return;
@@ -1515,6 +1502,7 @@ export function createLifecycle(
           disposeLifecycleReactor,
           hooks,
           discussStores,
+          stopStoreEpochSweepFn: deps.stopStoreEpochSweepFn,
           log,
           isShutdownObligationAbandoned: (subject) => state.operatorAbandonedShutdownObligations.has(subject),
           ...(acceptProcessExitRemainder === undefined ? {} : { acceptProcessExitRemainder }),
