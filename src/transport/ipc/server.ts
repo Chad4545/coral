@@ -31,7 +31,7 @@ import {
   rpcCatalog,
   type RpcMethodSpec,
 } from '../rpc/catalog.js';
-import { operationalRouteSpecs, type IpcOperationalSpec } from '../rpc/operational-catalog.js';
+import { readIpcOperationalSpec, type IpcOperationalSpec } from '../rpc/operational-catalog.js';
 import {
   shutdownObligationAbandonMethod,
   shutdownObligationAbandonRequestSchema,
@@ -49,14 +49,11 @@ import type { Capability } from '../../security/capability.js';
 import type { Principal } from '../../security/principal.js';
 import { authorize } from '../../security/policy/authorize.js';
 import { buildTransportErrorResponse } from '../error-response.js';
+import { lifecycleRefusalResult } from '../lifecycle-refusal.js';
 
 const INVALID_JSON_RESPONSE = {
   code: 'invalid_request',
   message: 'Invalid JSON body',
-};
-const BACKEND_SHUTTING_DOWN_RESPONSE = {
-  code: 'backend_shutting_down',
-  message: 'Backend shutting down',
 };
 const SHUTDOWN_UNAUTHORIZED_RESPONSE = {
   code: 'shutdown_unauthorized',
@@ -255,16 +252,6 @@ export function ipcAdapter(spec: RpcMethodSpec<unknown, unknown>, rpcPorts: Http
 
 export function buildCoordinatorIpcDispatchTable(rpcPorts: HttpHandlerPorts): readonly IpcDispatchEntry[] {
   return rpcCatalog.map((spec) => ipcAdapter(spec, rpcPorts));
-}
-
-function isIpcOperationalSpec(spec: (typeof operationalRouteSpecs)[number]): spec is IpcOperationalSpec {
-  return spec.transport === 'ipc';
-}
-
-const IPC_OPERATIONAL_SPECS: readonly IpcOperationalSpec[] = operationalRouteSpecs.filter(isIpcOperationalSpec);
-
-function readIpcOperationalSpec(method: string): IpcOperationalSpec | null {
-  return IPC_OPERATIONAL_SPECS.find((spec) => spec.ipc.method === method) ?? null;
 }
 
 function acceptedDrainingRecovery(method: string): boolean {
@@ -766,7 +753,7 @@ async function dispatchFrame(
 
   if (operationalSpec) {
     if (operationalSpec.requiresRunningLifecycle && backendUnavailable) {
-      await finishUnaryResponse({ kind: 'response', id: request.id, result: BACKEND_SHUTTING_DOWN_RESPONSE });
+      await finishUnaryResponse({ kind: 'response', id: request.id, result: lifecycleRefusalResult });
       return;
     }
 
@@ -871,7 +858,7 @@ async function dispatchFrame(
   }
 
   if (backendUnavailable && !drainingRecoveryIngress) {
-    await finishUnaryResponse({ kind: 'response', id: request.id, result: BACKEND_SHUTTING_DOWN_RESPONSE });
+    await finishUnaryResponse({ kind: 'response', id: request.id, result: lifecycleRefusalResult });
     return;
   }
 

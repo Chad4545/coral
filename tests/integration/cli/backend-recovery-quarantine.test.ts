@@ -15,6 +15,7 @@ import {
   type StoreResetCommandOperations,
 } from '#src/cli/commands/backend.js';
 import { collectCommandCoverage } from '#src/cli/classify.js';
+import { buildErrorEnvelope } from '#src/cli/errors.js';
 import {
   formatRecoveryQuarantineClear,
   formatRecoveryQuarantineList,
@@ -38,7 +39,7 @@ import { PROVIDER_OPERATION_RECORD_VERSION } from '#src/store/provider-operation
 import { encodeProviderOperationRecord } from '#src/store/provider-operation-record.js';
 import { insertProviderOperation, readProviderOperation } from '#src/store/provider-operation-journal.js';
 import * as ipcEnsure from '#src/transport/ipc/ensure.js';
-import { IpcRpcError } from '#src/transport/ipc/client.js';
+import { IpcLifecycleRefusal, IpcRequestTimeout, IpcRpcError } from '#src/transport/ipc/client.js';
 import { executeRenderedCommand, operatorArtifactLines } from '#tests/helpers/rendered-command.js';
 import { providerOperationRecord } from '#tests/unit/store/provider-operation-fixtures.js';
 
@@ -742,11 +743,6 @@ describe('backend recovery-quarantine commands', () => {
       stream: 'stderr',
     },
     {
-      result: { key: 'raw-key', revision: `sha256:${'a'.repeat(64)}`, kind: 'coordinator-draining' },
-      exitCode: 75,
-      stream: 'stderr',
-    },
-    {
       result: { key: 'raw-key', revision: `sha256:${'a'.repeat(64)}`, kind: 'unsupported-coordinator-result' },
       exitCode: 75,
       stream: 'stderr',
@@ -1234,11 +1230,6 @@ describe('backend recovery-quarantine commands', () => {
       kind: 'unsupported-coordinator' as const,
     },
     {
-      name: 'coordinator draining',
-      respond: () => Promise.resolve({ code: 'backend_shutting_down', message: 'Backend shutting down' }),
-      kind: 'coordinator-draining' as const,
-    },
-    {
       name: 'future exact-coordinate result',
       respond: () =>
         Promise.resolve({
@@ -1292,6 +1283,43 @@ describe('backend recovery-quarantine commands', () => {
       coordinate,
       expect.objectContaining({ timeoutMs: TOOL_TIMEOUT_MS }),
     );
+  });
+
+  it('raises a reached coordinator lifecycle refusal rather than reporting the coordinator unreachable', async () => {
+    const socketPath = '/tmp/coral-discard-refusal.sock';
+    const method = 'coordinator.recovery_quarantine.discard_provider_operation';
+    const request = vi.fn(() => Promise.reject(new IpcLifecycleRefusal(socketPath, method)));
+    vi.spyOn(ipcEnsure, 'ensure').mockResolvedValue({ request } as never);
+    const coordinate = { key: 'raw-key', revision: `sha256:${'a'.repeat(64)}` };
+
+    const raised = await createRecoveryQuarantineCommandOperations()
+      .discardProviderOperation?.(coordinate)
+      .then(
+        (result: unknown) => result,
+        (error: unknown) => error,
+      );
+
+    expect(raised).toBeInstanceOf(IpcLifecycleRefusal);
+    expect(raised).toMatchObject({ code: 'backend_shutting_down', method, socketPath });
+    expect(buildErrorEnvelope(raised).exitCode).toBe(75);
+  });
+
+  it('raises a reached coordinator lifecycle refusal from the quarantine clear mutation', async () => {
+    const socketPath = '/tmp/coral-clear-refusal.sock';
+    const method = 'coordinator.recovery_quarantine.clear';
+    const request = vi.fn(() => Promise.reject(new IpcLifecycleRefusal(socketPath, method)));
+    vi.spyOn(ipcEnsure, 'ensure').mockResolvedValue({ request } as never);
+
+    const raised = await createRecoveryQuarantineCommandOperations()
+      .clear({ boundary: 'workflow-recovery', key: 'workflow-1', revision: 'revision-1' })
+      .then(
+        (result: unknown) => result,
+        (error: unknown) => error,
+      );
+
+    expect(raised).toBeInstanceOf(IpcLifecycleRefusal);
+    expect(raised).toMatchObject({ code: 'backend_shutting_down', method, socketPath });
+    expect(buildErrorEnvelope(raised).exitCode).toBe(75);
   });
 
   it('preserves a coordinator adoption refusal as the discard command result', async () => {
@@ -1382,7 +1410,7 @@ describe('backend recovery-quarantine commands', () => {
 
   it('should report an IPC timeout without calling it unreachable', async () => {
     vi.spyOn(ipcEnsure, 'ensure').mockResolvedValue({
-      request: vi.fn().mockRejectedValue(new Error('IPC request timed out after 30000ms')),
+      request: vi.fn().mockRejectedValue(new IpcRequestTimeout('IPC request timed out after 30000ms')),
     } as never);
     const recoveryQuarantine = createRecoveryQuarantineCommandOperations();
     vi.spyOn(recoveryQuarantine, 'list').mockReturnValue([]);

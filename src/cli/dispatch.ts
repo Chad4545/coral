@@ -68,7 +68,7 @@ import { CONTEXT_ENV_KEY, TRANSPORT_CONTEXT_FIELDS } from '../transport/context-
 import type { AbortResult } from '../jobs/contracts/abort-registry.js';
 import { HEALTH_TIMEOUT_MS, TOOL_TIMEOUT_MS } from '../transport/http/sse.js';
 import type { IpcSubscription, IpcSubscriptionOptions } from '../transport/ipc/client.js';
-import { ensure, type RawCoordinatorHealth } from '../transport/ipc/ensure.js';
+import { ensure, issueWithSuccessorAfterLifecycleRefusal, type RawCoordinatorHealth } from '../transport/ipc/ensure.js';
 import { childPrincipalAuthFromEnv, childPrincipalAuthOptions } from '../transport/ipc/child-principal-auth.js';
 import { CORAL_KB_ENABLE_ENV, KB_DISABLED_REASON, resolveKbEnabled } from '../infra/kb-toggle.js';
 import { filterForwardableCoralEnv } from '../infra/env-sanitize.js';
@@ -484,7 +484,10 @@ export function makeClient(projectRoot: string, command: Command): CliCommandCli
     if (ipcAuth !== undefined) return;
     if (!resolveKbEnabled(process.env[CORAL_KB_ENABLE_ENV])) return;
     try {
-      const client = await ensure(getPluginRoot());
+      // The admission passed here must stay the strictest this client will issue, so a draining incumbent
+      // never serves the reconciliation: the health read below decides whether the coordinator this process
+      // is about to use has KB disabled, and a coordinator on its way out is not that coordinator.
+      const client = await ensure('transport.kb.restart', getPluginRoot());
       const health = await client.health<RawCoordinatorHealth>({ timeoutMs: HEALTH_TIMEOUT_MS });
       const kbDisabled = (health.components ?? []).some(
         (s) => s.id === 'kb' && s.phase === 'offline' && s.reason === KB_DISABLED_REASON,
@@ -507,14 +510,15 @@ export function makeClient(projectRoot: string, command: Command): CliCommandCli
   const request = async <TResult>(method: string, params?: unknown): Promise<TResult> => {
     const authOptions = ipcAuthOptions();
     await reconcileKbBoot();
-    const client = await ensure(resolvePluginRoot());
     // A response envelope with no `result` key decodes rather than failing, so an absent result reaches this
     // as `undefined` as well as `null`, and both must refuse — neither is a value a caller may dereference.
     // see jsonRpcResponseEnvelopeSchema in src/transport/ipc/json-rpc.ts
-    const result = await client.request<TResult | null | undefined>(method, params, {
-      timeoutMs: TOOL_TIMEOUT_MS,
-      ...authOptions,
-    });
+    const result = await issueWithSuccessorAfterLifecycleRefusal<TResult | null | undefined>(
+      method,
+      resolvePluginRoot(),
+      (client) =>
+        client.request<TResult | null | undefined>(method, params, { timeoutMs: TOOL_TIMEOUT_MS, ...authOptions }),
+    );
     if (result === null || result === undefined) {
       throw new BackendUnreachableError(
         `Coral coordinator did not answer ${method}. Run \`coral-cli backend status\` and retry.`,
@@ -534,7 +538,7 @@ export function makeClient(projectRoot: string, command: Command): CliCommandCli
 
     const authOptions = ipcAuthOptions();
     await reconcileKbBoot();
-    const client = await ensure(resolvePluginRoot());
+    const client = await ensure(method, resolvePluginRoot());
     return client.subscribe<TResult>(method, params, {
       timeoutMs: HEALTH_TIMEOUT_MS,
       ...options,

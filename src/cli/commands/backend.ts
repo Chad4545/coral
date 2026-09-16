@@ -111,14 +111,22 @@ import { shutdownBackend, type ShutdownReason } from '../../transport/http/backe
 import {
   shutdownObligationAbandonMethod,
   shutdownObligationAbandonResultSchema,
+  shutdownObligationSubjects,
   shutdownObligationSubjectSchema,
   type ShutdownObligationAbandonResult,
   type ShutdownObligationSubject,
 } from '../../obligation/shutdown-abandonment.js';
 import { TOOL_TIMEOUT_MS } from '../../transport/http/sse.js';
 import { childPrincipalAuthFromEnv, childPrincipalAuthOptions } from '../../transport/ipc/child-principal-auth.js';
-import { createIpcClient, IpcRpcError, type IpcClient } from '../../transport/ipc/client.js';
-import { ensure } from '../../transport/ipc/ensure.js';
+import {
+  createIpcClient,
+  IpcDrainRequestUnanswered,
+  IpcLifecycleRefusal,
+  IpcRequestTimeout,
+  IpcRpcError,
+  type IpcClient,
+} from '../../transport/ipc/client.js';
+import { ensure, issueWithSuccessorAfterLifecycleRefusal } from '../../transport/ipc/ensure.js';
 import {
   recoveryQuarantineClearRequestSchema,
   recoveryQuarantineClearResultSchema,
@@ -344,14 +352,6 @@ function formatProviderProxySetContainNoVerdict(
         'Effect: no process signal was sent and no representation release was started.',
         'Next step: upgrade or restart into this Coral build, then run coral-cli backend status before retrying the exact token.',
       ].join('\n');
-    case 'coordinator-draining':
-      return [
-        `No containment verdict for ${token}: the coordinator is shutting down.`,
-        'Observed: the coordinator refused the request before dispatch while draining.',
-        'Not observed: enforcer state or recorded-target state.',
-        'Effect: no process signal was sent and no representation release was started.',
-        'Next step: wait for the successor coordinator, then run coral-cli backend status before retrying the exact token.',
-      ].join('\n');
     case 'unsupported-coordinator-result':
       return [
         `No containment verdict for ${token}: this build does not understand the coordinator's containment result.`,
@@ -388,14 +388,6 @@ function formatUnreadableProviderOperationDiscardNoVerdict(
         'Not observed: raw-row contents or quarantine state.',
         'Effect: no raw row, due pointer, or quarantine evidence was removed.',
         'Next step: upgrade or restart into this Coral build, then run coral-cli backend recovery-quarantine list before retrying only a currently printed command.',
-      ].join('\n');
-    case 'coordinator-draining':
-      return [
-        `No discard verdict for ${coordinate}: the coordinator is shutting down.`,
-        'Observed: the coordinator refused the request before dispatch while draining.',
-        'Not observed: raw-row contents or quarantine state.',
-        'Effect: no raw row, due pointer, or quarantine evidence was removed.',
-        'Next step: wait for the successor coordinator, then run coral-cli backend recovery-quarantine list before deciding whether to retry.',
       ].join('\n');
     case 'unsupported-coordinator-result':
       return [
@@ -564,7 +556,7 @@ export type UnreadableProviderOperationDiscardCommandResult =
   | UnreadableProviderOperationDiscardResult
   | (UnreadableProviderOperationDiscardRequest &
       Readonly<{
-        kind: 'unsupported-coordinator' | 'coordinator-draining' | 'unsupported-coordinator-result' | 'timeout';
+        kind: 'unsupported-coordinator' | 'unsupported-coordinator-result' | 'timeout';
       }>);
 
 export interface ProviderHostCommandOperations {
@@ -573,16 +565,11 @@ export interface ProviderHostCommandOperations {
   evict(request: ProviderHostSelectorRequest): Promise<ProviderHostEvictResponse>;
 }
 
-type ProviderProxySetContainNoVerdictKind =
-  | 'unsupported-coordinator'
-  | 'unsupported-coordinator-result'
-  | 'coordinator-draining'
-  | 'timeout';
+type ProviderProxySetContainNoVerdictKind = 'unsupported-coordinator' | 'unsupported-coordinator-result' | 'timeout';
 
 const PROVIDER_PROXY_SET_CONTAIN_NO_VERDICT_KINDS: ReadonlySet<string> = new Set([
   'unsupported-coordinator',
   'unsupported-coordinator-result',
-  'coordinator-draining',
   'timeout',
 ] satisfies readonly ProviderProxySetContainNoVerdictKind[]);
 
@@ -1329,12 +1316,12 @@ export function createRecoveryQuarantineCommandOperations(signal?: AbortSignal):
 
 export function createProviderHostCommandOperations(
   options: {
-    getClient?: () => Promise<Pick<IpcClient, 'request'>>;
+    getClient?: (method: string) => Promise<Pick<IpcClient, 'request'>>;
   } = {},
 ): ProviderHostCommandOperations {
-  const getClient = options.getClient ?? (async () => ensure(getPluginRoot()));
+  const getClient = options.getClient ?? (async (method: string) => ensure(method, getPluginRoot()));
   const request = async (method: string, params: unknown): Promise<unknown> => {
-    const client = await getClient();
+    const client = await getClient(method);
     return client.request(method, params, childPrincipalAuthOptions(childPrincipalAuthFromEnv()));
   };
   return {
@@ -1358,42 +1345,54 @@ export function createProviderProxySetCommandOperations(
     getClient?: () => Promise<Pick<IpcClient, 'request'>>;
   } = {},
 ): ProviderProxySetCommandOperations {
-  const getClient = options.getClient ?? (async () => ensure(getPluginRoot()));
+  // One client serves both contain spec names: the boolean fallback re-issues on the same client, which is
+  // sound only while `ipcRouteLifecycleAdmission` answers the same for both names.
+  const containOnClient = async (
+    client: Pick<IpcClient, 'request'>,
+    request: ProviderProxySetContainRequest,
+  ): Promise<ProviderProxySetContainCommandResult> => {
+    const requestOptions = {
+      timeoutMs: TOOL_TIMEOUT_MS,
+      ...childPrincipalAuthOptions(childPrincipalAuthFromEnv()),
+    };
+    let response: unknown;
+    let booleanContract = false;
+    try {
+      response = await client.request(providerProxySetContainRpcSpec.name, request, requestOptions);
+    } catch (error: unknown) {
+      if (!(error instanceof IpcRpcError) || error.rpcCode !== -32601) throw error;
+      booleanContract = true;
+      response = await client.request(
+        providerProxySetContainBooleanRpcSpec.name,
+        providerProxySetContainBooleanRequestSchema.parse({
+          setIdentity: request.setIdentity,
+          abandonWithoutAbsence: request.mode === 'abandon',
+        }),
+        requestOptions,
+      );
+    }
+    const parsed = booleanContract
+      ? providerProxySetContainBooleanResponseSchema.safeParse(response)
+      : providerProxySetContainResponseSchema.safeParse(response);
+    if (parsed.success && providerProxySetContainResultMatchesAddress(parsed.data, request.setIdentity)) {
+      return parsed.data;
+    }
+    return { kind: 'unsupported-coordinator-result', setIdentity: request.setIdentity };
+  };
+  // An injected client is the whole reach and carries no successor: only the default path can obtain one,
+  // because only it knows the address and the identity a successor would have to prove.
+  const injectedClient = options.getClient;
   return {
     contain: async (input) => {
       const request = providerProxySetContainRequestSchema.parse(input);
       try {
-        const client = await getClient();
-        const requestOptions = {
-          timeoutMs: TOOL_TIMEOUT_MS,
-          ...childPrincipalAuthOptions(childPrincipalAuthFromEnv()),
-        };
-        let response: unknown;
-        let booleanContract = false;
-        try {
-          response = await client.request(providerProxySetContainRpcSpec.name, request, requestOptions);
-        } catch (error: unknown) {
-          if (!(error instanceof IpcRpcError) || error.rpcCode !== -32601) throw error;
-          booleanContract = true;
-          response = await client.request(
-            providerProxySetContainBooleanRpcSpec.name,
-            providerProxySetContainBooleanRequestSchema.parse({
-              setIdentity: request.setIdentity,
-              abandonWithoutAbsence: request.mode === 'abandon',
-            }),
-            requestOptions,
-          );
-        }
-        if (isRecord(response) && response.code === 'backend_shutting_down') {
-          return { kind: 'coordinator-draining', setIdentity: request.setIdentity };
-        }
-        const parsed = booleanContract
-          ? providerProxySetContainBooleanResponseSchema.safeParse(response)
-          : providerProxySetContainResponseSchema.safeParse(response);
-        if (parsed.success && providerProxySetContainResultMatchesAddress(parsed.data, request.setIdentity)) {
-          return parsed.data;
-        }
-        return { kind: 'unsupported-coordinator-result', setIdentity: request.setIdentity };
+        return injectedClient === undefined
+          ? await issueWithSuccessorAfterLifecycleRefusal(
+              providerProxySetContainRpcSpec.name,
+              getPluginRoot(),
+              (client) => containOnClient(client, request),
+            )
+          : await containOnClient(await injectedClient(), request);
       } catch (error: unknown) {
         if (error instanceof IpcRpcError && error.rpcCode === -32601) {
           return { kind: 'unsupported-coordinator', setIdentity: request.setIdentity };
@@ -1492,7 +1491,11 @@ export function formatShutdownObligationAbandonResult(result: ShutdownObligation
 function parseShutdownObligationSubject(value: string): ShutdownObligationSubject {
   const parsed = shutdownObligationSubjectSchema.safeParse(value);
   if (parsed.success) return parsed.data;
-  throw new InvalidArgumentError(`Unknown shutdown obligation subject: ${value}`);
+  // The refusal is the only place the operator learns the set, so it names every member: no other command
+  // reports which subject a held shutdown offered.
+  throw new InvalidArgumentError(
+    `Unknown shutdown obligation subject: ${value}. One of: ${shutdownObligationSubjects.join(', ')}.`,
+  );
 }
 
 export function registerBackendCommands(program: Command, operations: BackendCommandOperations = {}): void {
@@ -1692,7 +1695,11 @@ export function registerBackendCommands(program: Command, operations: BackendCom
   shutdownRecoveryCommand
     .command('abandon')
     .description('Durably abandon one exact obligation offered by the current held shutdown')
-    .argument('<subject>', 'Exact subject shown by the held shutdown', parseShutdownObligationSubject)
+    .argument(
+      '<subject>',
+      `One of: ${shutdownObligationSubjects.join(', ')}. A subject the held shutdown did not offer is refused.`,
+      parseShutdownObligationSubject,
+    )
     .action(async (subject: ShutdownObligationSubject) => {
       try {
         const result = await shutdownRecovery.abandon(subject);
@@ -1915,7 +1922,6 @@ export function registerBackendCommands(program: Command, operations: BackendCom
             process.exitCode = errorCodeToExit(result.code);
             return;
           case 'unsupported-coordinator':
-          case 'coordinator-draining':
           case 'unsupported-coordinator-result':
           case 'timeout':
             process.stderr.write(`${formatUnreadableProviderOperationDiscardNoVerdict(result)}\n`);
@@ -2242,7 +2248,7 @@ async function clearRecoveryQuarantineWithCoordinator(
   signal?.throwIfAborted();
   try {
     const auth = childPrincipalAuthOptions(childPrincipalAuthFromEnv());
-    const client = await ensure(getPluginRoot());
+    const client = await ensure('coordinator.recovery_quarantine.clear', getPluginRoot());
     const response = await client.request<unknown>('coordinator.recovery_quarantine.clear', parsedRequest, {
       timeoutMs: TOOL_TIMEOUT_MS,
       ...auth,
@@ -2258,6 +2264,10 @@ async function clearRecoveryQuarantineWithCoordinator(
   } catch (error: unknown) {
     if (signal?.aborted === true) {
       throw signal.reason;
+    }
+    // A coordinator that refused this mutation is reachable, so it may not be reported as unreachable.
+    if (error instanceof IpcLifecycleRefusal) {
+      throw error;
     }
     if (error instanceof IpcRpcError || error instanceof RecoveryQuarantineContractError) {
       throw error;
@@ -2290,15 +2300,12 @@ async function discardUnreadableProviderOperationWithCoordinator(
   signal?.throwIfAborted();
   try {
     const auth = childPrincipalAuthOptions(childPrincipalAuthFromEnv());
-    const client = await ensure(getPluginRoot());
+    const client = await ensure('coordinator.recovery_quarantine.discard_provider_operation', getPluginRoot());
     const response = await client.request<unknown>(
       'coordinator.recovery_quarantine.discard_provider_operation',
       parsedRequest,
       { timeoutMs: TOOL_TIMEOUT_MS, ...auth },
     );
-    if (isRecord(response) && response.code === 'backend_shutting_down') {
-      return { ...parsedRequest, kind: 'coordinator-draining' };
-    }
     const result = unreadableProviderOperationDiscardResultSchema.safeParse(response);
     if (
       result.success &&
@@ -2311,6 +2318,8 @@ async function discardUnreadableProviderOperationWithCoordinator(
     return { ...parsedRequest, kind: 'unsupported-coordinator-result' };
   } catch (error: unknown) {
     if (signal?.aborted === true) throw signal.reason;
+    // A coordinator that refused this mutation is reachable, so it may not be reported as unreachable.
+    if (error instanceof IpcLifecycleRefusal) throw error;
     if (error instanceof IpcRpcError && error.rpcCode === -32601) {
       return { ...parsedRequest, kind: 'unsupported-coordinator' };
     }
@@ -2383,6 +2392,11 @@ function emitRecoveryQuarantineError(error: unknown): void {
 }
 
 function isIpcRequestTimeout(error: unknown): boolean {
+  // The drain bound's unanswered outcome is the same no-verdict as an unbounded expiry — whether the method
+  // ran is unknown — so an op with a typed timeout answer must not let it escape as an unattributed failure.
+  if (error instanceof IpcDrainRequestUnanswered || error instanceof IpcRequestTimeout) return true;
+  // A foreign failure carries no class to test — neither a timeout message on an alien `Error` nor a
+  // `context.cause` string — so the pattern is the only test for those.
   const timeoutPattern = /timed out|deadline (?:already )?exceeded/iu;
   if (error instanceof Error && timeoutPattern.test(error.message)) return true;
   return (

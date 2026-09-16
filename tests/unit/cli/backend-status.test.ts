@@ -51,6 +51,7 @@ import type { HealthSnapshot } from '#src/transport/server-ports.js';
 import { newRawDatabase } from '#tests/helpers/test-db.js';
 import { encodeProviderProxySetAddress } from '#src/provider-proxy/set-address.js';
 import { executeRenderedCommand } from '#tests/helpers/rendered-command.js';
+import { shutdownObligationSubjects } from '#src/obligation/shutdown-abandonment.js';
 
 const TEST_TIME = { now: () => Date.parse('2026-08-03T00:00:00.000Z') };
 const HANDOFF_ROUTING_STATUS_GENERATION = handoffRoutingStatusGeneration(handoffRoutingStatusStoreSchema());
@@ -418,6 +419,37 @@ describe('backend shutdown recovery commands', () => {
     expect(stdout).toBe('');
     expect(stderr).toContain('current held shutdown did not offer that exact action');
     expect(process.exitCode).toBe(1);
+  });
+
+  it('names every accepted subject when an unknown one is given', async () => {
+    const shutdownRecovery: ShutdownRecoveryCommandOperations = {
+      abandon: vi.fn<ShutdownRecoveryCommandOperations['abandon']>(),
+      status: () => ({ kind: 'absent', path: '/run/shutdown-abandonment-status.v1.json' }),
+    };
+    const program = new Command();
+    program.exitOverride();
+    registerBackendCommands(program, { storeReset, shutdownRecovery });
+
+    await expect(
+      program.parseAsync(['node', 'coral-cli', 'backend', 'shutdown-recovery', 'abandon', 'not-a-held-obligation']),
+    ).rejects.toThrow('not-a-held-obligation');
+
+    for (const subject of shutdownObligationSubjects) {
+      expect(stderr).toContain(subject);
+    }
+    expect(shutdownRecovery.abandon).not.toHaveBeenCalled();
+
+    // The lifecycle-refusal remediation sends the operator to `--help` for the set, so it has to be there.
+    const helpProgram = new Command();
+    helpProgram.exitOverride();
+    registerBackendCommands(helpProgram, { storeReset, shutdownRecovery });
+    await expect(
+      helpProgram.parseAsync(['node', 'coral-cli', 'backend', 'shutdown-recovery', 'abandon', '--help']),
+    ).rejects.toThrow();
+
+    for (const subject of shutdownObligationSubjects) {
+      expect(stdout).toContain(subject);
+    }
   });
 
   it('returns undetermined when durable status cannot be read or written', async () => {

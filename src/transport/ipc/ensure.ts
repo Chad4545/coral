@@ -20,8 +20,20 @@ import { BackendUnreachableError } from '../../infra/http-errors.js';
 import { isNoEntryError } from '../../infra/fs-errors.js';
 import { isRecord } from '../../infra/json.js';
 import { readBuildFlavor, readBundleHash, resolveStrictBundleIdentity } from '../../infra/bundle-manifest.js';
-import { createIpcClient, type IpcClient } from './client.js';
+import {
+  createIpcClient,
+  IpcDrainRequestUnanswered,
+  IpcLifecycleRefusal,
+  IpcRequestTimeout,
+  type IpcClient,
+  type IpcRequestOptions,
+} from './client.js';
 import { bindSocket } from './server.js';
+import {
+  ipcRouteLifecycleAdmission,
+  ipcRouteRefusalDisposition,
+  type RouteLifecycleAdmission,
+} from '../rpc/operational-catalog.js';
 import type { TransportRuntimeComponentStatus } from '../server-ports.js';
 import type { TimePort } from '../../infra/port-types.js';
 import {
@@ -159,13 +171,45 @@ type StartupErrorSentinel = {
   readonly error: unknown;
 };
 
+/**
+ * A draining incumbent may not be given a unary request budget longer than the time it has left to hold the
+ * address: once `HANDOFF_DRAIN_TIMEOUT_MS` has passed with no answer, a caller's remaining exits are the
+ * refusal and the successor, and neither becomes reachable by waiting out `TOOL_TIMEOUT_MS`. The bound caps
+ * and never extends a caller's own budget, and it answers for its own expiry: a request this bound cut short
+ * was not refused and was not completed, so it may not leave as an unattributed failure. Subscriptions are
+ * not bounded here: no subscribed route is admitted while draining.
+ */
+function drainBoundedClient(client: IpcClient): IpcClient {
+  return {
+    ...client,
+    request: async <TResult>(method: string, params?: unknown, options?: IpcRequestOptions) => {
+      // A caller budget of zero or less means unbounded to `requestIpcMethod`, so it may not be carried into
+      // the minimum: the smaller number would be the one that removes the bound.
+      const callerMs = options?.timeoutMs;
+      const callerBudgetBinds = typeof callerMs === 'number' && callerMs > 0 && callerMs < HANDOFF_DRAIN_TIMEOUT_MS;
+      const budgetMs = callerBudgetBinds ? callerMs : HANDOFF_DRAIN_TIMEOUT_MS;
+      try {
+        return await client.request<TResult>(method, params, { ...options, timeoutMs: budgetMs });
+      } catch (error: unknown) {
+        // Only this bound's own expiry is renamed: a smaller caller budget that ran out was never bounded here.
+        if (error instanceof IpcRequestTimeout && !callerBudgetBinds) {
+          throw new IpcDrainRequestUnanswered(client.socketPath, method, budgetMs);
+        }
+        throw error;
+      }
+    },
+  };
+}
+
 function summarizeBackend(
   info: VerifiedBackendInfo,
+  health: RawCoordinatorHealth,
   timePort: TimePort,
   authMode: EnsuredClientAuthMode,
 ): EnsuredIpcClient {
   const auth = authMode === 'boot' ? { kind: 'boot' as const, token: info.bootToken } : undefined;
-  return Object.assign(createIpcClient(info.socketPath, timePort, auth), {
+  const client = createIpcClient(info.socketPath, timePort, auth);
+  return Object.assign(health.status === 'draining' ? drainBoundedClient(client) : client, {
     instanceId: info.instanceId,
     bundleHash: info.bundleHash,
     flavor: info.flavor,
@@ -269,10 +313,13 @@ const verifiedBackendInfoSchema = z
   .passthrough();
 
 /**
- * Treat both coarse `'ok'` and lifecycle phases (`'kernel-ready'`,
- * `'running'`) as "the daemon is ready to serve requests".
+ * A draining coordinator serves only a route the operational catalog admits while draining, and `'starting'`
+ * serves nothing: an invocation handed a coordinator that has not finished booting has no route at all.
  */
-function isReadyStatus(status: RawCoordinatorHealth['status']): boolean {
+function isServingStatus(status: RawCoordinatorHealth['status'], admission: RouteLifecycleAdmission): boolean {
+  if (status === 'draining') {
+    return admission === 'running-or-draining';
+  }
   return status === 'ok' || status === 'kernel-ready' || status === 'running';
 }
 
@@ -356,10 +403,18 @@ function mergeDiscoveryWithHealth(info: VerifiedBackendInfo, health: RawCoordina
   };
 }
 
-export function mayInvocationBeServedByIncumbent(health: RawCoordinatorHealth | null): health is RawCoordinatorHealth {
-  return health !== null && health.status !== 'draining';
+export function mayInvocationBeServedByIncumbent(
+  health: RawCoordinatorHealth | null,
+  admission: RouteLifecycleAdmission,
+): health is RawCoordinatorHealth {
+  return health !== null && (admission === 'running-or-draining' || health.status !== 'draining');
 }
 
+/**
+ * Replacement is not the route's question and may not be parameterised by its admission: a route admitted
+ * while draining still needs the draining incumbent replaced once reaching it has failed, and an admission
+ * that called a draining incumbent irreplaceable would leave that invocation nothing to fall back to.
+ */
 export function mayProcessReplaceIncumbent(health: RawCoordinatorHealth | null): boolean {
   return health === null || health.status === 'draining';
 }
@@ -677,14 +732,31 @@ async function probeSocketReleased(socketPath: string): Promise<boolean> {
   }
 }
 
+/**
+ * The release wait's own way of ending, and the only one an invocation already holding a lifecycle refusal may
+ * answer with that refusal instead: every other `BackendUnreachableError` on the replacement path describes
+ * something other than the refusing incumbent keeping the address.
+ */
+class CoordinatorSocketReleaseTimeout extends BackendUnreachableError {
+  /** The budget actually waited, so a caller restating the observation cannot name a budget it did not spend. */
+  readonly budgetMs: number;
+
+  constructor(message: string, budgetMs: number) {
+    super(message);
+    this.name = 'CoordinatorSocketReleaseTimeout';
+    this.budgetMs = budgetMs;
+  }
+}
+
 async function waitForSocketRelease(socketPath: string, timeoutMs: number, timePort: TimePort): Promise<void> {
   const deadline = timePort.now() + timeoutMs;
   while (timePort.now() < deadline) {
     if (await probeSocketReleased(socketPath)) return;
     await timePort.sleep(STARTUP_POLL_MS);
   }
-  throw new BackendUnreachableError(
+  throw new CoordinatorSocketReleaseTimeout(
     'Timed out waiting for Coral coordinator socket release. Run `coral-cli backend status` to check coordinator health.',
+    timeoutMs,
   );
 }
 
@@ -733,6 +805,9 @@ async function waitForBackendReady(
   const currentAttempt = waitContext.kind === 'current-attempt';
   const readyDeadline = timePort.now() + timeoutMs;
   let terminalOutcome: SpawnedCoordinatorTerminal | null = null;
+  // What this wait produces is the successor to a draining incumbent, so no route's admission may end it on a
+  // draining coordinator: that would hand back the incumbent as its own replacement.
+  const admission: RouteLifecycleAdmission = 'running';
 
   while (currentAttempt || timePort.now() < readyDeadline) {
     const info = readDiscoverySnapshot(paths);
@@ -742,14 +817,21 @@ async function waitForBackendReady(
     const observedHealth = answeredHealth(observedReading);
     const observedPid: number | undefined = observedHealth?.pid ?? info?.pid;
     let servingIncumbent: ReadyCoordinatorEvidence | null = null;
-    if (info && mayInvocationBeServedByIncumbent(observedHealth) && isReadyStatus(observedHealth.status)) {
+    if (
+      info &&
+      mayInvocationBeServedByIncumbent(observedHealth, admission) &&
+      isServingStatus(observedHealth.status, admission)
+    ) {
       const authenticatedHealth = await readIdentityCheckedAuthenticatedHealth(
         info,
         expectedSocketPath,
         observedHealth,
         timePort,
       );
-      if (mayInvocationBeServedByIncumbent(authenticatedHealth) && isReadyStatus(authenticatedHealth.status)) {
+      if (
+        mayInvocationBeServedByIncumbent(authenticatedHealth, admission) &&
+        isServingStatus(authenticatedHealth.status, admission)
+      ) {
         servingIncumbent = { info: mergeDiscoveryWithHealth(info, authenticatedHealth), health: authenticatedHealth };
         if (waitContext.kind !== 'current-attempt') {
           return servingIncumbent;
@@ -794,9 +876,9 @@ async function waitForBackendReady(
         return servingIncumbent;
       }
       // A terminal child that left no refusal is not evidence the address is dead: the incumbent it conceded
-      // to may still be in `starting`, which is not a ready status and so cannot produce a serving incumbent
+      // to may still be in `starting`, which is not a serving status and so cannot produce a serving incumbent
       // here.
-      if (mayInvocationBeServedByIncumbent(observedHealth)) {
+      if (mayInvocationBeServedByIncumbent(observedHealth, admission)) {
         return waitForBackendReady(
           paths,
           desired,
@@ -832,7 +914,7 @@ async function waitForExistingIncumbentReady(
   initialHealth: RawCoordinatorHealth,
   timeoutMs: number,
   timePort: TimePort,
-): Promise<VerifiedBackendInfo> {
+): Promise<ReadyCoordinatorEvidence> {
   const incumbent = existingIncumbentIdentity(initialHealth);
   const deadline = timePort.now() + timeoutMs;
   let health: RawCoordinatorHealth | null = initialHealth;
@@ -852,8 +934,10 @@ async function waitForExistingIncumbentReady(
     if (info !== null && !discoveryMatchesExistingIncumbent(info, socketPath, incumbent)) {
       throw childCoordinatorUnavailable('coordinator discovery does not match the observed parent');
     }
-    if (info !== null && isReadyStatus(health.status)) {
-      return mergeDiscoveryWithHealth(info, health);
+    // A child may neither start nor replace a coordinator, so no route's admission may let a draining parent
+    // serve it: the refusal it would then carry names an exit the child cannot take.
+    if (info !== null && isServingStatus(health.status, 'running')) {
+      return { info: mergeDiscoveryWithHealth(info, health), health };
     }
 
     await timePort.sleep(STARTUP_POLL_MS);
@@ -892,15 +976,21 @@ async function ensureChildIncumbent(
   if (health === null) {
     throw childCoordinatorUnavailable('its parent coordinator is unreachable');
   }
-  const info = await waitForExistingIncumbentReady(paths, socketPath, health, KERNEL_READY_DEADLINE_MS, timePort);
-  return summarizeBackend(info, timePort, 'none');
+  const ready = await waitForExistingIncumbentReady(paths, socketPath, health, KERNEL_READY_DEADLINE_MS, timePort);
+  return summarizeBackend(ready.info, ready.health, timePort, 'none');
 }
 
+/**
+ * `null` releases the invocation to the replacement path, and only an incumbent observed `starting` may be
+ * held in the startup wait instead: a coordinator that is not starting does not become servable by waiting,
+ * and spending the startup budget on one ends in a timeout no operator can act on.
+ */
 async function reuseServingIncumbent(
   paths: CoordinatorPaths,
   socketPath: string,
   desired: DesiredCoordinator,
   health: RawCoordinatorHealth,
+  admission: RouteLifecycleAdmission,
   timePort: TimePort,
 ): Promise<EnsuredIpcClient | null> {
   const info = readDiscoverySnapshot(paths);
@@ -909,9 +999,19 @@ async function reuseServingIncumbent(
     if (authenticatedHealth === null) {
       return null;
     }
-    if (isReadyStatus(authenticatedHealth.status)) {
-      return summarizeBackend(mergeDiscoveryWithHealth(info, authenticatedHealth), timePort, 'boot');
+    if (isServingStatus(authenticatedHealth.status, admission)) {
+      return summarizeBackend(
+        mergeDiscoveryWithHealth(info, authenticatedHealth),
+        authenticatedHealth,
+        timePort,
+        'boot',
+      );
     }
+    if (authenticatedHealth.status !== 'starting') {
+      return null;
+    }
+  } else if (health.status !== 'starting') {
+    return null;
   }
 
   const ready = await waitForBackendReady(
@@ -922,7 +1022,7 @@ async function reuseServingIncumbent(
     { kind: 'existing-starting' },
     socketPath,
   );
-  return summarizeBackend(ready.info, timePort, 'boot');
+  return summarizeBackend(ready.info, ready.health, timePort, 'boot');
 }
 
 async function prepareTopLevelSpawn(
@@ -948,17 +1048,15 @@ async function spawnTopLevelCoordinator(
     spawnedAt: spawned.spawnedAt,
     terminal: spawned.terminal,
   });
-  return summarizeBackend(ready.info, timePort, 'boot');
+  return summarizeBackend(ready.info, ready.health, timePort, 'boot');
 }
 
 async function ensureTopLevelCoordinator(
-  root: string,
-  flavor: 'prod' | 'dev',
-  paths: CoordinatorPaths,
-  socketPath: string,
-  health: RawCoordinatorHealth | null,
-  timePort: TimePort,
+  reach: CoordinatorReach,
+  admission: RouteLifecycleAdmission,
 ): Promise<EnsuredIpcClient> {
+  const { root, flavor, paths, timePort } = reach;
+  const { socketPath, health } = reach.observation;
   const strictIdentity = resolveStrictBundleIdentity();
   const manifest = strictIdentity.ok ? strictIdentity.manifest : null;
   const bundleHash = manifest?.bundleHash ?? readBundleHash(root);
@@ -970,8 +1068,8 @@ async function ensureTopLevelCoordinator(
     namespace,
   };
   let replacementEvidence = health;
-  if (mayInvocationBeServedByIncumbent(health)) {
-    const incumbent = await reuseServingIncumbent(paths, socketPath, desired, health, timePort);
+  if (mayInvocationBeServedByIncumbent(health, admission)) {
+    const incumbent = await reuseServingIncumbent(paths, socketPath, desired, health, admission, timePort);
     if (incumbent !== null) {
       return incumbent;
     }
@@ -981,11 +1079,10 @@ async function ensureTopLevelCoordinator(
     // Re-probe and retry once before conceding: spawning a fresh coordinator
     // against a still-serving incumbent is exactly how two builds end up
     // racing `bindWithHandoff` for the same socket. `mayProcessReplaceIncumbent`
-    // is the same predicate `mayInvocationBeServedByIncumbent` complements —
-    // it is the explicit gate for "is spawning even on the table here".
+    // is the explicit gate for "is spawning even on the table here".
     replacementEvidence = answeredHealth(await readRawCoordinatorHealth(createIpcClient(socketPath, timePort)));
-    if (mayInvocationBeServedByIncumbent(replacementEvidence)) {
-      const retried = await reuseServingIncumbent(paths, socketPath, desired, replacementEvidence, timePort);
+    if (mayInvocationBeServedByIncumbent(replacementEvidence, admission)) {
+      const retried = await reuseServingIncumbent(paths, socketPath, desired, replacementEvidence, admission, timePort);
       if (retried !== null) {
         return retried;
       }
@@ -1032,20 +1129,118 @@ async function observeCoordinator(
 }
 
 /**
- * Ensure a Coral coordinator daemon is running. The kernel's exclusive-bind
- * semantics on the IPC socket remain the single arbiter of the canonical
- * incumbent.
+ * What one observation of this namespace's coordinator produced, held together so the admission a route needs
+ * is the only thing left to choose. A second entry point that re-derived these would be a second reach, and
+ * the identity check it performs is the whole reason a refused invocation may not simply dial the record.
  */
-export async function ensure(pluginRoot?: string, timePort?: TimePort): Promise<EnsuredIpcClient> {
+type CoordinatorReach = Readonly<{
+  root: string;
+  flavor: 'prod' | 'dev';
+  runtime: Runtime;
+  paths: CoordinatorPaths;
+  timePort: TimePort;
+  observation: CoordinatorObservation;
+}>;
+
+async function reachCoordinator(
+  pluginRoot: string | undefined,
+  timePort: TimePort | undefined,
+): Promise<CoordinatorReach> {
   const root = resolvePluginRoot(pluginRoot);
   const flavor = readBuildFlavor(root);
   const runtime = createRealRuntime(flavor);
   const ipcTime = timePort ?? runtime.time;
   const paths = runtime.paths.coral.coordinator;
-  const observation = await observeCoordinator(runtime, paths, ipcTime);
+  return {
+    root,
+    flavor,
+    runtime,
+    paths,
+    timePort: ipcTime,
+    observation: await observeCoordinator(runtime, paths, ipcTime),
+  };
+}
 
-  if (isCoralChildEnvironment(runtime.env.fullSnapshot())) {
-    return ensureChildIncumbent(paths, observation.socketPath, observation.health, ipcTime);
+/**
+ * Reach the coordinator this namespace has, starting one when none is serving. The kernel's exclusive-bind
+ * semantics on the IPC socket remain the single arbiter of the canonical incumbent.
+ *
+ * The invocation's method, not an admission, is what a caller passes: whether a draining incumbent may serve
+ * it is the operational catalog's answer, and a caller able to state that answer itself is a caller able to
+ * disagree with the server that enforces it.
+ */
+export async function ensure(method: string, pluginRoot?: string, timePort?: TimePort): Promise<EnsuredIpcClient> {
+  const reach = await reachCoordinator(pluginRoot, timePort);
+  if (isCoralChildEnvironment(reach.runtime.env.fullSnapshot())) {
+    return ensureChildIncumbent(reach.paths, reach.observation.socketPath, reach.observation.health, reach.timePort);
   }
-  return ensureTopLevelCoordinator(root, flavor, paths, observation.socketPath, observation.health, ipcTime);
+  return ensureTopLevelCoordinator(reach, ipcRouteLifecycleAdmission(method));
+}
+
+/**
+ * Obtain the successor a refused invocation may re-issue against. The reach is entered again rather than
+ * spawned past: the coordinator that refused may have finished releasing, or a running one may have taken the
+ * address meanwhile, and either is the successor. The admission is `'running'` whatever the route admits —
+ * handing the refusing incumbent back as its own successor is the one answer that cannot discharge anything.
+ *
+ * Release that never comes is answered with the refusal itself: the operator needs to know which method was
+ * refused, and `backend_unreachable` names neither the method nor an exit from the hold.
+ */
+async function ensureSuccessorAfterLifecycleRefusal(
+  refusal: IpcLifecycleRefusal,
+  pluginRoot?: string,
+  timePort?: TimePort,
+): Promise<EnsuredIpcClient> {
+  const reach = await reachCoordinator(pluginRoot, timePort);
+  // A child may neither start nor replace a coordinator, so it has no successor to obtain and the refusal is
+  // the whole answer. Reaching a draining parent is already refused before any request, so a child holding
+  // one of these arrived by a route this function must not widen.
+  if (isCoralChildEnvironment(reach.runtime.env.fullSnapshot())) {
+    throw refusal;
+  }
+  try {
+    return await ensureTopLevelCoordinator(reach, 'running');
+  } catch (error: unknown) {
+    if (error instanceof CoordinatorSocketReleaseTimeout) {
+      throw refusal.stillHoldingAddress(error.budgetMs);
+    }
+    // Whatever else failed here was reached only because of the refusal. This error keeps its own class and
+    // exit, and the refusal rides as `cause` for the renderer to fold into the remediation — see
+    // withLifecycleRefusalCause in src/cli/errors.ts. An already-set `cause` is another failure's evidence
+    // and is not replaced, a non-Error throw has no `cause` to set, and a renderer whose walk does not reach
+    // the refusal appends nothing: on any of these nothing else carries the refusal, so the operator
+    // receives only this error.
+    if (error instanceof Error && error.cause === undefined) {
+      error.cause = refusal;
+    }
+    throw error;
+  }
+}
+
+/**
+ * Issue one invocation against the coordinator this namespace has, and — for a route whose successor can
+ * discharge it — once more against a successor when the reached incumbent refused it on lifecycle grounds.
+ *
+ * Re-issuing may repeat no work, so a lifecycle-refused method must not have executed; see 'keeps unrelated
+ * catalog methods closed while draining' in tests/unit/transport/ipc/draining-recovery.test.ts. And exactly one re-issue: a
+ * successor that refuses in turn has answered, so trying again would be a retry loop against a hold no spawn
+ * can clear.
+ */
+export async function issueWithSuccessorAfterLifecycleRefusal<TResult>(
+  method: string,
+  pluginRoot: string | undefined,
+  issue: (client: Pick<IpcClient, 'request'>) => Promise<TResult>,
+  timePort?: TimePort,
+): Promise<TResult> {
+  const incumbent = await ensure(method, pluginRoot, timePort);
+  try {
+    return await issue(incumbent);
+  } catch (error: unknown) {
+    // The disposition is the refused route's, not the reached route's: an `issue` that falls back to a second
+    // method must be answered for the method the coordinator actually refused.
+    if (!(error instanceof IpcLifecycleRefusal) || ipcRouteRefusalDisposition(error.method) === 'report-refusal') {
+      throw error;
+    }
+    return issue(await ensureSuccessorAfterLifecycleRefusal(error, pluginRoot, timePort));
+  }
 }

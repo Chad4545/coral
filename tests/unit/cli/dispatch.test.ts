@@ -24,13 +24,23 @@ function makeTempDir(): string {
   return root;
 }
 
-vi.mock('#src/transport/ipc/ensure.js', () => ({
-  ensure: vi.fn(async () => ({
+vi.mock('#src/transport/ipc/ensure.js', () => {
+  const client = {
     request: mockState.request,
     subscribe: mockState.subscribe,
     health: mockState.health,
-  })),
-}));
+  };
+  const ensure = vi.fn(async () => client);
+  return {
+    ensure,
+    // What the lifecycle fallback does with a refusal is pinned in tests/unit/transport/ipc/ensure.test.ts;
+    // here it stands in only as the one reach a dispatched request makes before issuing.
+    issueWithSuccessorAfterLifecycleRefusal: vi.fn(
+      async (_method: string, _pluginRoot: string | undefined, issue: (reached: unknown) => Promise<unknown>) =>
+        issue(await ensure()),
+    ),
+  };
+});
 
 vi.mock('#src/cli/read-store.js', () => ({
   getSharedReadCoralStore: vi.fn(() => mockState.readStore),

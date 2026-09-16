@@ -20,12 +20,19 @@ type OperationalDispatchKind =
   | 'catalog';
 type OperationalAuthentication = 'none' | 'principal';
 
+/** What a refused answer means for the caller. Declared per route, beside the route. */
+type RouteRefusalDisposition = 'spawn-successor' | 'report-refusal';
+
+type OperationalDispatch =
+  | Readonly<{ kind: Exclude<OperationalDispatchKind, 'catalog'> }>
+  | Readonly<{ kind: 'catalog'; onRefusal: RouteRefusalDisposition }>;
+
 type OperationalBaseSpec = {
   readonly id: string;
   readonly requires: Capability;
   readonly requestBinding?: RequestBindingRule;
   readonly requiresRunningLifecycle: boolean;
-  readonly dispatch: { readonly kind: OperationalDispatchKind };
+  readonly dispatch: OperationalDispatch;
   readonly authentication: OperationalAuthentication;
 };
 
@@ -153,7 +160,7 @@ export const operationalRouteSpecs: readonly OperationalRouteSpec[] = [
     ipc: { method: jobsAbortRpcSpec.name },
     requires: jobsAbortRpcSpec.requires,
     requiresRunningLifecycle: false,
-    dispatch: { kind: 'catalog' },
+    dispatch: { kind: 'catalog', onRefusal: 'spawn-successor' },
     authentication: 'principal',
   },
   {
@@ -162,7 +169,7 @@ export const operationalRouteSpecs: readonly OperationalRouteSpec[] = [
     ipc: { method: providerProxySetContainRpcSpec.name },
     requires: providerProxySetContainRpcSpec.requires,
     requiresRunningLifecycle: false,
-    dispatch: { kind: 'catalog' },
+    dispatch: { kind: 'catalog', onRefusal: 'spawn-successor' },
     authentication: 'principal',
   },
   {
@@ -171,7 +178,34 @@ export const operationalRouteSpecs: readonly OperationalRouteSpec[] = [
     ipc: { method: providerProxySetContainBooleanRpcSpec.name },
     requires: providerProxySetContainBooleanRpcSpec.requires,
     requiresRunningLifecycle: false,
-    dispatch: { kind: 'catalog' },
+    dispatch: { kind: 'catalog', onRefusal: 'spawn-successor' },
     authentication: 'principal',
   },
 ] as const;
+
+function isIpcOperationalSpec(spec: OperationalRouteSpec): spec is IpcOperationalSpec {
+  return spec.transport === 'ipc';
+}
+
+const IPC_OPERATIONAL_SPECS: readonly IpcOperationalSpec[] = operationalRouteSpecs.filter(isIpcOperationalSpec);
+
+export function readIpcOperationalSpec(method: string): IpcOperationalSpec | null {
+  return IPC_OPERATIONAL_SPECS.find((spec) => spec.ipc.method === method) ?? null;
+}
+
+export type RouteLifecycleAdmission = 'running' | 'running-or-draining';
+
+/** Derived, not hand-listed: on IPC, admitted-while-draining ⟺ requiresRunningLifecycle === false. */
+export function ipcRouteLifecycleAdmission(method: string): RouteLifecycleAdmission {
+  const spec = readIpcOperationalSpec(method);
+  if (spec === null) {
+    return 'running';
+  }
+  return spec.requiresRunningLifecycle ? 'running' : 'running-or-draining';
+}
+
+/** A method with no catalog dispatch has no successor that could discharge it, so its refusal is reported. */
+export function ipcRouteRefusalDisposition(method: string): RouteRefusalDisposition {
+  const dispatch = readIpcOperationalSpec(method)?.dispatch;
+  return dispatch?.kind === 'catalog' ? dispatch.onRefusal : 'report-refusal';
+}

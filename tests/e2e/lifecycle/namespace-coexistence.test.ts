@@ -249,7 +249,7 @@ async function withTopLevelHome<T>(home: TemporaryHome, action: () => Promise<T>
 async function ensureFixtureBackend(pluginRoot: string, home: TemporaryHome): Promise<void> {
   await withTopLevelHome(home, async () => {
     try {
-      await ensure(pluginRoot);
+      await ensure('sessions.create', pluginRoot);
     } catch (error: unknown) {
       const flavor = readBuildFlavor(pluginRoot);
       const paths = coordinatorPaths(flavor, { baseDir: join(home, '.coral') });

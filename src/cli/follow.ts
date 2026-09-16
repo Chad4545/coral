@@ -605,7 +605,7 @@ export async function launchAndFollow(options: FollowOptions): Promise<number> {
     connect: async ({ jobIds, cursor, timeoutSeconds, signal }) => {
       let backend;
       try {
-        backend = await ensure(options.pluginRoot);
+        backend = await ensure('jobs.wait', options.pluginRoot);
         const result = await runHandoff(
           {
             kind: 'wait-jobs',
