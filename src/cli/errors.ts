@@ -12,7 +12,8 @@ import {
   serializeCoralSetupError,
 } from '../runtime/errors.js';
 import { ChildPrincipalBindingError } from '../transport/ipc/child-principal-auth.js';
-import { IpcRpcError } from '../transport/ipc/client.js';
+import { IpcDrainRequestUnanswered, IpcLifecycleRefusal, IpcRpcError } from '../transport/ipc/client.js';
+import { shutdownObligationAbandonMethod } from '../obligation/shutdown-abandonment.js';
 
 export type StoreResetCliErrorCode =
   | 'invalid_store_reset_incident_id'
@@ -159,6 +160,7 @@ export function errorCodeToExit(code: string, httpStatus?: number): number {
   if (
     code === 'transient' ||
     code === 'backend_shutting_down' ||
+    code === 'coordinator_drain_unanswered' ||
     code === 'provider_host_inventory_unavailable' ||
     LAUNCH_AND_DOMAIN_RETRY_LATER_ERROR_CODES.has(code) ||
     httpStatus === 503
@@ -256,6 +258,25 @@ function directErrorEnvelope(error: unknown): CliErrorResult | null {
   return null;
 }
 
+/**
+ * A held shutdown does not end on its own, and a hook retrying on exit 75 alone would retry forever — so both
+ * branches must name the operator exit that ends one, `backend shutdown-recovery abandon`. Neither branch may
+ * promise a command that reports the subject that exit takes: what makes naming one safe instead is that the
+ * accepted set is closed and abandon refuses a subject the held shutdown did not offer. Both branches must
+ * also say the refused method did not run, because the refusal is all the caller receives about its effect.
+ * A refused abandon may not be told to run abandon: a coordinator that refuses it offers no abandonment exit.
+ */
+function lifecycleRefusalExit(error: IpcLifecycleRefusal): string {
+  const didNotRun = `The coordinator refused ${error.method} before dispatch, so it did not run.`;
+  const abandon =
+    error.method === shutdownObligationAbandonMethod
+      ? 'That coordinator does not admit abandoning a held obligation, so `coral-cli backend status` is the remaining exit: read its recorded process there, and retry the abandon once a coordinator that admits it is serving.'
+      : 'End the held obligation with `coral-cli backend shutdown-recovery abandon <subject>`: the closed set of subjects is listed by `coral-cli backend shutdown-recovery abandon --help`, and the command refuses a subject the held shutdown did not offer, so trying one is safe. `coral-cli backend shutdown-recovery status` shows the abandonments already recorded.';
+  return error.addressDisposition.kind === 'held-past-release-budget'
+    ? `${didNotRun} That coordinator will not be replaced by retrying, and \`coral-cli backend status\` will only confirm that it is still shutting down. ${abandon}`
+    : `${didNotRun} Run \`coral-cli backend status\` to see whether that coordinator is still shutting down before retrying this command. A drain that does not clear on its own will not clear by retrying either. ${abandon}`;
+}
+
 function transportErrorEnvelope(error: unknown): CliErrorResult | null {
   if (error instanceof BackendToolHttpError) {
     return structuredBodyError(error.body, {
@@ -263,6 +284,23 @@ function transportErrorEnvelope(error: unknown): CliErrorResult | null {
       message: error.message,
       httpStatus: error.statusCode,
     });
+  }
+  if (error instanceof IpcLifecycleRefusal) {
+    return withExitCode(
+      { error: true, code: error.code, message: error.message, remediation: lifecycleRefusalExit(error) },
+      errorCodeToExit(error.code),
+    );
+  }
+  if (error instanceof IpcDrainRequestUnanswered) {
+    return withExitCode(
+      {
+        error: true,
+        code: error.code,
+        message: error.message,
+        remediation: `Do not retry before \`coral-cli backend status\`: whether ${error.method} ran is unknown.`,
+      },
+      errorCodeToExit(error.code),
+    );
   }
   if (error instanceof IpcRpcError) {
     return structuredBodyError(error.data, { code: 'ipc_rpc_error', message: error.message });
@@ -277,7 +315,56 @@ function transportErrorEnvelope(error: unknown): CliErrorResult | null {
   return null;
 }
 
+/**
+ * How far a refusal attached as `cause` is looked for. A refusal is attached by the invocation that was
+ * reached only because of it, so it sits within a few links of the error that surfaces; an unbounded walk
+ * would follow a cause chain a foreign library owns.
+ */
+const LIFECYCLE_REFUSAL_CAUSE_DEPTH = 3;
+
+function lifecycleRefusalCause(error: unknown): IpcLifecycleRefusal | null {
+  let current: unknown = error;
+  for (let depth = 0; depth < LIFECYCLE_REFUSAL_CAUSE_DEPTH; depth += 1) {
+    if (!(current instanceof Error)) {
+      return null;
+    }
+    const cause: unknown = current.cause;
+    if (cause instanceof IpcLifecycleRefusal) {
+      return cause;
+    }
+    current = cause;
+  }
+  return null;
+}
+
+/**
+ * A refusal a failing invocation carried as `cause` reaches the operator only here: the surfacing error keeps
+ * its own code, message, and exit, and the refusal contributes the one exit from the hold that error cannot
+ * name. When the walk finds no refusal nothing is appended, so attaching a cause is not on its own a promise
+ * that the refusal was rendered.
+ */
+function withLifecycleRefusalCause(result: CliErrorResult, error: unknown): CliErrorResult {
+  // A refusal already rendered as the surfacing error may not be rendered a second time from its own cause.
+  if (error instanceof IpcLifecycleRefusal) {
+    return result;
+  }
+  const refusal = lifecycleRefusalCause(error);
+  if (refusal === null) {
+    return result;
+  }
+  const disclosed = `${refusal.message} ${lifecycleRefusalExit(refusal)}`;
+  const { remediation } = result.envelope;
+  return withExitCode(
+    { ...result.envelope, remediation: remediation === undefined ? disclosed : `${remediation} ${disclosed}` },
+    result.exitCode,
+  );
+}
+
 export function buildErrorEnvelope(error: unknown): CliErrorResult {
+  return withLifecycleRefusalCause(classifiedErrorEnvelope(error), error);
+}
+
+function classifiedErrorEnvelope(error: unknown): CliErrorResult {
   const direct = directErrorEnvelope(error);
   if (direct !== null) {
     return direct;

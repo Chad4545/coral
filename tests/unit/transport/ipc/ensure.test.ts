@@ -1,4 +1,5 @@
 import type * as BundleManifestMod from '#src/infra/bundle-manifest.js';
+import type * as IpcClientMod from '#src/transport/ipc/client.js';
 import type { ProcessIncarnation } from '#src/infra/node-process.js';
 import { testIncarnation } from '#tests/helpers/process-incarnation.js';
 
@@ -17,10 +18,16 @@ import {
   type StrictBundleManifest,
 } from '#src/infra/bundle-manifest.js';
 import { documentedCoralSetupError } from '#src/runtime/errors.js';
+import { shutdownObligationAbandonMethod } from '#src/obligation/shutdown-abandonment.js';
+import { TOOL_TIMEOUT_MS } from '#src/transport/http/sse.js';
+import type { IpcClient } from '#src/transport/ipc/client.js';
+import { ipcRouteRefusalDisposition } from '#src/transport/rpc/operational-catalog.js';
+import { jobsAbortRpcSpec, providerProxySetContainRpcSpec } from '#src/transport/rpc/catalog.js';
 
 const mockState = vi.hoisted(() => ({
   spawn: vi.fn<(command: string, args?: readonly string[], options?: unknown) => ChildProcess>(),
   health: vi.fn<(socketPath: string, options?: unknown) => Promise<unknown>>(),
+  request: vi.fn<(socketPath: string, method: string, params?: unknown, options?: unknown) => Promise<unknown>>(),
   shutdown: vi.fn<(socketPath: string, options?: unknown) => Promise<unknown>>(),
   bindSocket: vi.fn<() => Promise<{ kind: 'bound' } | { kind: 'incumbent'; reason: string }>>(),
   createdClients: [] as Array<{ socketPath: string; auth: unknown }>,
@@ -50,18 +57,25 @@ vi.mock('node:os', async () => {
   };
 });
 
-vi.mock('#src/transport/ipc/client.js', () => ({
-  createIpcClient: (socketPath: string, _time?: unknown, auth?: unknown) => {
-    mockState.createdClients.push({ socketPath, auth });
-    return {
-      socketPath,
-      request: vi.fn(),
-      ping: (options?: unknown) => mockState.health(socketPath, options),
-      health: (options?: unknown) => mockState.health(socketPath, options),
-      shutdown: (options?: unknown) => mockState.shutdown(socketPath, options),
-    };
-  },
-}));
+// `IpcLifecycleRefusal` stays real: the lifecycle fallback decides on the thrown class, so a stubbed
+// stand-in would let a test pass against a fallback that never recognized a refusal.
+vi.mock('#src/transport/ipc/client.js', async () => {
+  const actual = await vi.importActual<typeof IpcClientMod>('#src/transport/ipc/client.js');
+  return {
+    ...actual,
+    createIpcClient: (socketPath: string, _time?: unknown, auth?: unknown) => {
+      mockState.createdClients.push({ socketPath, auth });
+      return {
+        socketPath,
+        request: (method: string, params?: unknown, options?: unknown) =>
+          mockState.request(socketPath, method, params, options),
+        ping: (options?: unknown) => mockState.health(socketPath, options),
+        health: (options?: unknown) => mockState.health(socketPath, options),
+        shutdown: (options?: unknown) => mockState.shutdown(socketPath, options),
+      };
+    },
+  };
+});
 
 // Stub bindSocket so probeSocketReleased's behavior is deterministic without
 // real fs sockets. Default: socket is released (returns 'bound').
@@ -262,6 +276,7 @@ afterEach(() => {
   }
   mockState.spawn.mockReset();
   mockState.health.mockReset();
+  mockState.request.mockReset();
   mockState.shutdown.mockReset();
   mockState.bindSocket.mockReset();
   mockState.bindSocket.mockResolvedValue({ kind: 'bound' });
@@ -287,9 +302,16 @@ describe('ipc ensure', () => {
       namespace: 'foreign-namespace',
     };
 
-    expect(mayInvocationBeServedByIncumbent(health)).toBe(true);
-    expect(mayInvocationBeServedByIncumbent({ ...health, status: 'draining' })).toBe(false);
-    expect(mayInvocationBeServedByIncumbent(null)).toBe(false);
+    expect(mayInvocationBeServedByIncumbent(health, 'running')).toBe(true);
+    expect(mayInvocationBeServedByIncumbent({ ...health, status: 'draining' }, 'running')).toBe(false);
+    expect(mayInvocationBeServedByIncumbent(null, 'running')).toBe(false);
+
+    expect(mayInvocationBeServedByIncumbent(health, 'running-or-draining')).toBe(true);
+    expect(mayInvocationBeServedByIncumbent({ ...health, status: 'draining' }, 'running-or-draining')).toBe(true);
+    expect(mayInvocationBeServedByIncumbent(null, 'running-or-draining')).toBe(false);
+
+    // Replacement does not move with the route's admission: a draining incumbent stays replaceable so an
+    // admitted route that could not be served by it still has a successor to reach.
     expect(mayProcessReplaceIncumbent(health)).toBe(false);
     expect(mayProcessReplaceIncumbent({ ...health, status: 'draining' })).toBe(true);
     expect(mayProcessReplaceIncumbent(null)).toBe(true);
@@ -314,7 +336,7 @@ describe('ipc ensure', () => {
     });
 
     const { ensure } = await importEnsure();
-    const ensured = await ensure(root);
+    const ensured = await ensure('sessions.create', root);
 
     expect(ensured.instanceId).toBe('existing-coordinator');
     expect(mockState.spawn).not.toHaveBeenCalled();
@@ -349,7 +371,7 @@ describe('ipc ensure', () => {
     });
 
     const { ensure } = await importEnsure();
-    const ensured = await ensure(root);
+    const ensured = await ensure('sessions.create', root);
 
     expect(ensured.instanceId).toBe('existing-coordinator');
     expect(mockState.spawn).not.toHaveBeenCalled();
@@ -374,7 +396,7 @@ describe('ipc ensure', () => {
       });
 
       const { ensure } = await importEnsure();
-      const ensured = await ensure(root);
+      const ensured = await ensure('sessions.create', root);
 
       expect(ensured.instanceId).toBe('parent-coordinator');
       expect(ensured.bundleHash).toBe('parent-hash');
@@ -393,7 +415,7 @@ describe('ipc ensure', () => {
 
       const { ensure } = await importEnsure();
 
-      await expect(ensure(root)).rejects.toThrow(
+      await expect(ensure('sessions.create', root)).rejects.toThrow(
         'Nested Coral command stopped because its parent coordinator is unreachable',
       );
       expect(existsSync(discoveryPath(root))).toBe(false);
@@ -418,7 +440,29 @@ describe('ipc ensure', () => {
 
       const { ensure } = await importEnsure();
 
-      await expect(ensure(root)).rejects.toThrow('parent coordinator is draining');
+      await expect(ensure('sessions.create', root)).rejects.toThrow('parent coordinator is draining');
+      expect(mockState.shutdown).not.toHaveBeenCalled();
+      expect(mockState.bindSocket).not.toHaveBeenCalled();
+      expect(mockState.spawn).not.toHaveBeenCalled();
+    });
+
+    it('refuses a draining parent even for a route the catalog admits while draining', async () => {
+      makeHome();
+      const root = createPluginRoot();
+      setCompleteChildEnv();
+      writeDiscovery(root, { instanceId: 'parent-coordinator' });
+      mockState.health.mockResolvedValue({
+        status: 'draining',
+        version: '0.5.2',
+        bundleHash: 'test-hash',
+        flavor: 'prod',
+        instanceId: 'parent-coordinator',
+        namespace: pluginRootNamespace(root),
+      });
+
+      const { ensure } = await importEnsure();
+
+      await expect(ensure('jobs.abort', root)).rejects.toThrow('parent coordinator is draining');
       expect(mockState.shutdown).not.toHaveBeenCalled();
       expect(mockState.bindSocket).not.toHaveBeenCalled();
       expect(mockState.spawn).not.toHaveBeenCalled();
@@ -452,7 +496,7 @@ describe('ipc ensure', () => {
       );
 
       const { ensure } = await importEnsure();
-      const result = ensure(root);
+      const result = ensure('sessions.create', root);
       await vi.advanceTimersByTimeAsync(400);
       const ensured = await result;
 
@@ -487,7 +531,7 @@ describe('ipc ensure', () => {
         .mockResolvedValue({ status: 'ok', ...identity, pid: 4_202 });
 
       const { ensure } = await importEnsure();
-      const result = ensure(root).catch((error: unknown) => error);
+      const result = ensure('sessions.create', root).catch((error: unknown) => error);
       await vi.advanceTimersByTimeAsync(400);
       const error = await result;
 
@@ -520,7 +564,7 @@ describe('ipc ensure', () => {
 
       const { ensure } = await importEnsure();
 
-      await expect(ensure(root)).rejects.toThrow('discovery does not match the observed parent');
+      await expect(ensure('sessions.create', root)).rejects.toThrow('discovery does not match the observed parent');
       expect(mockState.shutdown).not.toHaveBeenCalled();
       expect(mockState.bindSocket).not.toHaveBeenCalled();
       expect(mockState.spawn).not.toHaveBeenCalled();
@@ -545,7 +589,7 @@ describe('ipc ensure', () => {
 
       const { ensure } = await importEnsure();
 
-      await expect(ensure(root)).rejects.toThrow('discovery does not match the observed parent');
+      await expect(ensure('sessions.create', root)).rejects.toThrow('discovery does not match the observed parent');
       expect(mockState.shutdown).not.toHaveBeenCalled();
       expect(mockState.bindSocket).not.toHaveBeenCalled();
       expect(mockState.spawn).not.toHaveBeenCalled();
@@ -576,7 +620,7 @@ describe('ipc ensure', () => {
       setTimeout(() => writeDiscovery(root, { instanceId: 'replacement-coordinator' }), 100);
 
       const { ensure } = await importEnsure();
-      const ensured = ensure(root);
+      const ensured = ensure('sessions.create', root);
       const result = ensured.catch((error: unknown) => error);
       await vi.advanceTimersByTimeAsync(400);
       const error = await result;
@@ -604,7 +648,7 @@ describe('ipc ensure', () => {
 
       const { ensure } = await importEnsure();
 
-      await expect(ensure(root)).rejects.toThrow('discovery does not match the observed parent');
+      await expect(ensure('sessions.create', root)).rejects.toThrow('discovery does not match the observed parent');
       expect(mockState.shutdown).not.toHaveBeenCalled();
       expect(mockState.spawn).not.toHaveBeenCalled();
     });
@@ -627,7 +671,7 @@ describe('ipc ensure', () => {
       });
 
       const { ensure, KERNEL_READY_DEADLINE_MS, STARTUP_POLL_MS } = await importEnsure();
-      const result = ensure(root).catch((error: unknown) => error);
+      const result = ensure('sessions.create', root).catch((error: unknown) => error);
       await vi.advanceTimersByTimeAsync(KERNEL_READY_DEADLINE_MS + STARTUP_POLL_MS);
       const error = await result;
 
@@ -658,7 +702,7 @@ describe('ipc ensure', () => {
     });
 
     const { ensure } = await importEnsure();
-    const ensured = await ensure(root);
+    const ensured = await ensure('sessions.create', root);
 
     expect(ensured.version).toBe('0.8.7');
     expect(ensured.instanceId).toBe('old-coordinator');
@@ -701,7 +745,7 @@ describe('ipc ensure', () => {
 
     const { ensure, STARTUP_POLL_MS } = await importEnsure();
     expect(STARTUP_POLL_MS).toBe(200);
-    const ensuredPromise = ensure(root);
+    const ensuredPromise = ensure('sessions.create', root);
     await vi.advanceTimersByTimeAsync(800);
     const ensured = await ensuredPromise;
 
@@ -723,7 +767,7 @@ describe('ipc ensure', () => {
     });
 
     const { ensure, KERNEL_READY_DEADLINE_MS, STARTUP_POLL_MS } = await importEnsure();
-    const result = ensure(root).catch((error: unknown) => error);
+    const result = ensure('sessions.create', root).catch((error: unknown) => error);
     await vi.advanceTimersByTimeAsync(KERNEL_READY_DEADLINE_MS + STARTUP_POLL_MS);
     const error = await result;
 
@@ -782,13 +826,426 @@ describe('ipc ensure', () => {
     });
 
     const { ensure } = await importEnsure();
-    const ensuredPromise = ensure(root);
+    const ensuredPromise = ensure('sessions.create', root);
     await vi.advanceTimersByTimeAsync(800);
     const ensured = await ensuredPromise;
 
     expect(ensured.instanceId).toBe('replacement-coordinator');
     expect(mockState.spawn).toHaveBeenCalledTimes(1);
     expect(mockState.shutdown).not.toHaveBeenCalled();
+  });
+
+  it('serves a draining incumbent for a route the catalog admits while draining', async () => {
+    makeHome();
+    const root = createPluginRoot();
+    writeDiscovery(root, {
+      port: 4232,
+      token: 'draining-token',
+      instanceId: 'draining-coordinator',
+    });
+    mockState.health.mockResolvedValue({
+      status: 'draining',
+      version: '0.5.2',
+      bundleHash: 'test-hash',
+      flavor: 'prod',
+      instanceId: 'draining-coordinator',
+      namespace: pluginRootNamespace(root),
+    });
+
+    const { ensure } = await importEnsure();
+    const ensured = await ensure('jobs.abort', root);
+
+    expect(ensured.instanceId).toBe('draining-coordinator');
+    expect(mockState.bindSocket).not.toHaveBeenCalled();
+    expect(mockState.spawn).not.toHaveBeenCalled();
+    expect(mockState.shutdown).not.toHaveBeenCalled();
+    expect(mockState.createdClients).toContainEqual({
+      socketPath: socketPath(root),
+      auth: { kind: 'boot', token: 'test-boot-token' },
+    });
+  });
+
+  it('bounds a reached draining incumbent at the drain budget and leaves a serving one uncapped', async () => {
+    makeHome();
+    const root = createPluginRoot();
+    writeDiscovery(root, { port: 4236, instanceId: 'one-coordinator' });
+    const health = {
+      version: '0.5.2',
+      bundleHash: 'test-hash',
+      flavor: 'prod' as const,
+      instanceId: 'one-coordinator',
+      namespace: pluginRootNamespace(root),
+    };
+    mockState.request.mockResolvedValue({ aborted: [] });
+
+    const { ensure, HANDOFF_DRAIN_TIMEOUT_MS } = await importEnsure();
+
+    mockState.health.mockResolvedValue({ ...health, status: 'draining' });
+    await (await ensure('jobs.abort', root)).request('jobs.abort', {}, { timeoutMs: TOOL_TIMEOUT_MS });
+
+    expect(mockState.request).toHaveBeenLastCalledWith(
+      socketPath(root),
+      'jobs.abort',
+      {},
+      expect.objectContaining({ timeoutMs: HANDOFF_DRAIN_TIMEOUT_MS }),
+    );
+
+    // A caller budget of zero means unbounded downstream, so the bound may not take it as the smaller one.
+    await (await ensure('jobs.abort', root)).request('jobs.abort', {}, { timeoutMs: 0 });
+
+    expect(mockState.request).toHaveBeenLastCalledWith(
+      socketPath(root),
+      'jobs.abort',
+      {},
+      expect.objectContaining({ timeoutMs: HANDOFF_DRAIN_TIMEOUT_MS }),
+    );
+
+    mockState.health.mockResolvedValue({ ...health, status: 'ok' });
+    await (await ensure('jobs.abort', root)).request('jobs.abort', {}, { timeoutMs: TOOL_TIMEOUT_MS });
+
+    expect(mockState.request).toHaveBeenLastCalledWith(
+      socketPath(root),
+      'jobs.abort',
+      {},
+      expect.objectContaining({ timeoutMs: TOOL_TIMEOUT_MS }),
+    );
+  });
+
+  it('answers its own expiring bound with an unknown disposition rather than an unattributed failure', async () => {
+    makeHome();
+    const root = createPluginRoot();
+    writeDiscovery(root, { port: 4237, instanceId: 'one-coordinator' });
+    mockState.health.mockResolvedValue({
+      status: 'draining',
+      version: '0.5.2',
+      bundleHash: 'test-hash',
+      flavor: 'prod',
+      instanceId: 'one-coordinator',
+      namespace: pluginRootNamespace(root),
+    });
+
+    const { ensure, HANDOFF_DRAIN_TIMEOUT_MS } = await importEnsure();
+    const { IpcDrainRequestUnanswered, IpcRequestTimeout } = await import('#src/transport/ipc/client.js');
+
+    mockState.request.mockRejectedValue(new IpcRequestTimeout('IPC request timed out after 29876ms'));
+    const client = await ensure('jobs.abort', root);
+    const raised: unknown = await client.request('jobs.abort', {}, { timeoutMs: TOOL_TIMEOUT_MS }).then(
+      (result: unknown) => result,
+      (error: unknown) => error,
+    );
+
+    expect(raised).toBeInstanceOf(IpcDrainRequestUnanswered);
+    expect(raised).toMatchObject({
+      code: 'coordinator_drain_unanswered',
+      method: 'jobs.abort',
+      socketPath: socketPath(root),
+      budgetMs: HANDOFF_DRAIN_TIMEOUT_MS,
+    });
+    expect((raised as Error).message).toContain('whether jobs.abort ran is unknown');
+    expect(mockState.spawn).not.toHaveBeenCalled();
+
+    // A caller whose own smaller budget expired was never bounded here, so it keeps its own outcome.
+    mockState.request.mockRejectedValue(new IpcRequestTimeout('IPC request timed out after 900ms'));
+    const unbounded: unknown = await client.request('jobs.abort', {}, { timeoutMs: 1_000 }).then(
+      (result: unknown) => result,
+      (error: unknown) => error,
+    );
+
+    expect(unbounded).toBeInstanceOf(IpcRequestTimeout);
+    expect(unbounded).not.toBeInstanceOf(IpcDrainRequestUnanswered);
+  });
+
+  describe('lifecycle refusal from a reached incumbent', () => {
+    const successorDischargeableMethods = [jobsAbortRpcSpec.name, providerProxySetContainRpcSpec.name] as const;
+
+    function drainingIncumbent(root: string): void {
+      writeDiscovery(root, { port: 4270, token: 'draining-token', instanceId: 'draining-coordinator' });
+      mockState.health.mockImplementation(async () => ({
+        status: mockState.spawn.mock.calls.length === 0 ? 'draining' : 'ok',
+        version: '0.5.2',
+        bundleHash: 'test-hash',
+        flavor: 'prod',
+        instanceId: mockState.spawn.mock.calls.length === 0 ? 'draining-coordinator' : 'successor-coordinator',
+        namespace: pluginRootNamespace(root),
+      }));
+      mockState.spawn.mockImplementation(() => {
+        writeDiscovery(root, { port: 4271, token: 'successor-token', instanceId: 'successor-coordinator' });
+        return spawnedChild();
+      });
+    }
+
+    function reachedInstanceId(client: Pick<IpcClient, 'request'>): string {
+      return (client as unknown as { instanceId: string }).instanceId;
+    }
+
+    it.each(successorDischargeableMethods)(
+      're-issues %s once on the successor after the refusing incumbent releases the address',
+      async (method) => {
+        makeHome();
+        vi.useFakeTimers();
+        const root = createPluginRoot();
+        drainingIncumbent(root);
+        let bindCalls = 0;
+        mockState.bindSocket.mockImplementation(async () => {
+          bindCalls += 1;
+          return bindCalls === 1 ? { kind: 'incumbent', reason: 'live-listener' } : { kind: 'bound' };
+        });
+
+        const { issueWithSuccessorAfterLifecycleRefusal } = await importEnsure();
+        const { IpcLifecycleRefusal } = await import('#src/transport/ipc/client.js');
+        const reached: string[] = [];
+        const issue = vi.fn(async (client: Pick<IpcClient, 'request'>) => {
+          const instanceId = reachedInstanceId(client);
+          reached.push(instanceId);
+          if (instanceId === 'draining-coordinator') throw new IpcLifecycleRefusal(socketPath(root), method);
+          return `answered-by-${instanceId}`;
+        });
+
+        const issued = issueWithSuccessorAfterLifecycleRefusal(method, root, issue);
+        await vi.advanceTimersByTimeAsync(2_000);
+
+        await expect(issued).resolves.toBe('answered-by-successor-coordinator');
+        expect(reached).toEqual(['draining-coordinator', 'successor-coordinator']);
+        expect(bindCalls).toBeGreaterThan(1);
+        expect(mockState.spawn).toHaveBeenCalledTimes(1);
+        expect(mockState.shutdown).not.toHaveBeenCalled();
+      },
+    );
+
+    it.each(successorDischargeableMethods)(
+      'raises the refusal of %s when the refusing incumbent keeps the address past the drain budget',
+      async (method) => {
+        makeHome();
+        vi.useFakeTimers();
+        const root = createPluginRoot();
+        drainingIncumbent(root);
+        mockState.bindSocket.mockResolvedValue({ kind: 'incumbent', reason: 'live-listener' });
+
+        const { issueWithSuccessorAfterLifecycleRefusal, HANDOFF_DRAIN_TIMEOUT_MS } = await importEnsure();
+        const { IpcLifecycleRefusal } = await import('#src/transport/ipc/client.js');
+        const { buildErrorEnvelope } = await import('#src/cli/errors.js');
+        const issue = vi.fn(async () => {
+          throw new IpcLifecycleRefusal(socketPath(root), method);
+        });
+
+        const issued: Promise<unknown> = issueWithSuccessorAfterLifecycleRefusal(method, root, issue).then(
+          (result: unknown) => result,
+          (error: unknown) => error,
+        );
+        await vi.advanceTimersByTimeAsync(HANDOFF_DRAIN_TIMEOUT_MS + 2_000);
+        const raised: unknown = await issued;
+
+        expect(raised).toBeInstanceOf(IpcLifecycleRefusal);
+        expect(raised).toMatchObject({ code: 'backend_shutting_down', method, socketPath: socketPath(root) });
+        expect((raised as Error).message).toContain(method);
+        expect((raised as Error).message).toContain('still held that address');
+        expect((raised as Error).message).not.toContain('while draining');
+        expect(issue).toHaveBeenCalledTimes(1);
+        expect(mockState.spawn).not.toHaveBeenCalled();
+
+        const { envelope, exitCode } = buildErrorEnvelope(raised);
+        expect(exitCode).toBe(75);
+        expect(envelope.code).toBe('backend_shutting_down');
+        expect(envelope.remediation).toContain('coral-cli backend status');
+        expect(envelope.remediation).toContain('coral-cli backend shutdown-recovery abandon');
+      },
+    );
+
+    it.each(successorDischargeableMethods)(
+      'stops at one re-issue of %s when the successor refuses in turn',
+      async (method) => {
+        makeHome();
+        const root = createPluginRoot();
+        drainingIncumbent(root);
+
+        const { issueWithSuccessorAfterLifecycleRefusal } = await importEnsure();
+        const { IpcLifecycleRefusal } = await import('#src/transport/ipc/client.js');
+        const successorSocketPath = `${socketPath(root)}.successor`;
+        const issue = vi.fn(async (client: Pick<IpcClient, 'request'>) => {
+          const draining = reachedInstanceId(client) === 'draining-coordinator';
+          throw new IpcLifecycleRefusal(draining ? socketPath(root) : successorSocketPath, method);
+        });
+
+        const raised: unknown = await issueWithSuccessorAfterLifecycleRefusal(method, root, issue).then(
+          (result: unknown) => result,
+          (error: unknown) => error,
+        );
+
+        expect(raised).toBeInstanceOf(IpcLifecycleRefusal);
+        expect(raised).toMatchObject({ method, socketPath: successorSocketPath });
+        expect(issue).toHaveBeenCalledTimes(2);
+        expect(mockState.spawn).toHaveBeenCalledTimes(1);
+      },
+    );
+
+    it('obtains no successor when the drain bound, not the coordinator, ended the request', async () => {
+      makeHome();
+      const root = createPluginRoot();
+      drainingIncumbent(root);
+
+      const { issueWithSuccessorAfterLifecycleRefusal } = await importEnsure();
+      const { IpcDrainRequestUnanswered, IpcRequestTimeout } = await import('#src/transport/ipc/client.js');
+      mockState.request.mockRejectedValue(new IpcRequestTimeout('IPC request timed out after 29876ms'));
+
+      const raised: unknown = await issueWithSuccessorAfterLifecycleRefusal(jobsAbortRpcSpec.name, root, (client) =>
+        client.request(jobsAbortRpcSpec.name, {}, { timeoutMs: TOOL_TIMEOUT_MS }),
+      ).then(
+        (result: unknown) => result,
+        (error: unknown) => error,
+      );
+
+      expect(raised).toBeInstanceOf(IpcDrainRequestUnanswered);
+      expect(mockState.request).toHaveBeenCalledTimes(1);
+      expect(mockState.bindSocket).not.toHaveBeenCalled();
+      expect(mockState.spawn).not.toHaveBeenCalled();
+    });
+
+    it('keeps the refusal attached when obtaining the successor fails for another reason', async () => {
+      makeHome();
+      const root = createPluginRoot();
+      drainingIncumbent(root);
+      mockState.bindSocket.mockResolvedValue({ kind: 'bound' });
+      mockState.spawn.mockImplementation(() => {
+        throw new Error('spawn was refused by the host');
+      });
+
+      const { issueWithSuccessorAfterLifecycleRefusal } = await importEnsure();
+      const { IpcLifecycleRefusal } = await import('#src/transport/ipc/client.js');
+      const refusal = new IpcLifecycleRefusal(socketPath(root), jobsAbortRpcSpec.name);
+      const issue = vi.fn(async () => {
+        throw refusal;
+      });
+
+      const raised: unknown = await issueWithSuccessorAfterLifecycleRefusal(jobsAbortRpcSpec.name, root, issue).then(
+        (result: unknown) => result,
+        (error: unknown) => error,
+      );
+
+      expect(raised).not.toBeInstanceOf(IpcLifecycleRefusal);
+      expect((raised as Error).message).toContain('spawn was refused by the host');
+      expect((raised as Error).cause).toBe(refusal);
+      expect(issue).toHaveBeenCalledTimes(1);
+    });
+
+    it('raises a refused shutdown-obligation abandon without reaching for a successor', async () => {
+      makeHome();
+      const root = createPluginRoot();
+      drainingIncumbent(root);
+
+      expect(ipcRouteRefusalDisposition(shutdownObligationAbandonMethod)).toBe('report-refusal');
+
+      const { issueWithSuccessorAfterLifecycleRefusal } = await importEnsure();
+      const { IpcLifecycleRefusal } = await import('#src/transport/ipc/client.js');
+      const issue = vi.fn(async () => {
+        throw new IpcLifecycleRefusal(socketPath(root), shutdownObligationAbandonMethod);
+      });
+
+      const raised: unknown = await issueWithSuccessorAfterLifecycleRefusal(
+        shutdownObligationAbandonMethod,
+        root,
+        issue,
+      ).then(
+        (result: unknown) => result,
+        (error: unknown) => error,
+      );
+
+      expect(raised).toBeInstanceOf(IpcLifecycleRefusal);
+      expect(raised).toMatchObject({ method: shutdownObligationAbandonMethod });
+      expect(issue).toHaveBeenCalledTimes(1);
+      expect(mockState.bindSocket).not.toHaveBeenCalled();
+      expect(mockState.spawn).not.toHaveBeenCalled();
+    });
+  });
+
+  it('waits for release then spawns when an admitted route meets a draining incumbent with no record', async () => {
+    makeHome();
+    vi.useFakeTimers();
+    const root = createPluginRoot();
+
+    let spawned = false;
+    mockState.health.mockImplementation(async () =>
+      spawned
+        ? {
+            status: 'ok',
+            version: '0.5.2',
+            bundleHash: 'test-hash',
+            flavor: 'prod',
+            instanceId: 'replacement-coordinator',
+            namespace: pluginRootNamespace(root),
+          }
+        : {
+            status: 'draining',
+            version: '0.5.2',
+            bundleHash: 'test-hash',
+            flavor: 'prod',
+            instanceId: 'draining-coordinator',
+            namespace: pluginRootNamespace(root),
+          },
+    );
+
+    let bindCalls = 0;
+    mockState.bindSocket.mockImplementation(async () => {
+      bindCalls += 1;
+      if (bindCalls === 1) return { kind: 'incumbent', reason: 'live-listener' };
+      return { kind: 'bound' };
+    });
+
+    mockState.spawn.mockImplementation(() => {
+      spawned = true;
+      writeDiscovery(root, {
+        port: 4233,
+        token: 'replacement-token',
+        instanceId: 'replacement-coordinator',
+      });
+      return spawnedChild();
+    });
+
+    const { ensure } = await importEnsure();
+    const ensuredPromise = ensure('jobs.abort', root);
+    await vi.advanceTimersByTimeAsync(800);
+    const ensured = await ensuredPromise;
+
+    expect(ensured.instanceId).toBe('replacement-coordinator');
+    expect(bindCalls).toBeGreaterThan(1);
+    expect(mockState.spawn).toHaveBeenCalledTimes(1);
+    expect(mockState.shutdown).not.toHaveBeenCalled();
+  });
+
+  it('spawns for a strict route whose authenticated re-read of the incumbent reports draining', async () => {
+    makeHome();
+    vi.useFakeTimers();
+    const root = createPluginRoot();
+    writeDiscovery(root, { port: 4234, token: 'old-token', instanceId: 'draining-coordinator' });
+
+    const drainingHealth = {
+      status: 'draining' as const,
+      version: '0.5.2',
+      bundleHash: 'test-hash',
+      flavor: 'prod' as const,
+      instanceId: 'draining-coordinator',
+      namespace: pluginRootNamespace(root),
+    };
+    let healthCalls = 0;
+    mockState.health.mockImplementation(async () => {
+      healthCalls += 1;
+      // The unauthenticated ping catches the incumbent before it published the drain; the authenticated
+      // re-read is the first reading that shows it.
+      if (healthCalls === 1) return { ...drainingHealth, status: 'ok' };
+      if (mockState.spawn.mock.calls.length === 0) return drainingHealth;
+      return { ...drainingHealth, status: 'ok', instanceId: 'replacement-coordinator' };
+    });
+    mockState.spawn.mockImplementation(() => {
+      writeDiscovery(root, { port: 4235, token: 'replacement-token', instanceId: 'replacement-coordinator' });
+      return spawnedChild();
+    });
+
+    const { ensure } = await importEnsure();
+    const ensuredPromise = ensure('sessions.create', root);
+    await vi.advanceTimersByTimeAsync(800);
+    const ensured = await ensuredPromise;
+
+    expect(ensured.instanceId).toBe('replacement-coordinator');
+    expect(mockState.spawn).toHaveBeenCalledTimes(1);
   });
 
   it('should reuse a healthy foreign-build incumbent without changing its instance', async () => {
@@ -811,7 +1268,7 @@ describe('ipc ensure', () => {
     });
 
     const { ensure } = await importEnsure();
-    const ensured = await ensure(root);
+    const ensured = await ensure('sessions.create', root);
 
     expect(ensured.instanceId).toBe('old-coordinator');
     expect(ensured.bundleHash).toBe('old-hash');
@@ -850,7 +1307,7 @@ describe('ipc ensure', () => {
     });
 
     const { ensure } = await importEnsure();
-    const ensured = await ensure(root);
+    const ensured = await ensure('sessions.create', root);
 
     expect(ensured.instanceId).toBe('existing-coordinator');
     expect(mockState.spawn).not.toHaveBeenCalled();
@@ -878,7 +1335,7 @@ describe('ipc ensure', () => {
     });
 
     const { ensure } = await importEnsure();
-    const ensured = await ensure(root);
+    const ensured = await ensure('sessions.create', root);
 
     expect(ensured.instanceId).toBe('old-coordinator');
     expect(mockState.shutdown).not.toHaveBeenCalled();
@@ -917,7 +1374,7 @@ describe('ipc ensure', () => {
     });
 
     const { ensure } = await importEnsure();
-    const ensuredPromise = ensure(root);
+    const ensuredPromise = ensure('sessions.create', root);
     await vi.advanceTimersByTimeAsync(800);
     const ensured = await ensuredPromise;
 
@@ -964,7 +1421,7 @@ describe('ipc ensure', () => {
     });
 
     const { ensure } = await importEnsure();
-    const ensuredPromise = ensure(root);
+    const ensuredPromise = ensure('sessions.create', root);
     await vi.advanceTimersByTimeAsync(800);
     const ensured = await ensuredPromise;
 
@@ -983,7 +1440,7 @@ describe('ipc ensure', () => {
     mockState.spawn.mockReturnValue(child);
 
     const { ensure } = await importEnsure();
-    const ensuredPromise = ensure(root).catch((error: unknown) => error);
+    const ensuredPromise = ensure('sessions.create', root).catch((error: unknown) => error);
     await vi.advanceTimersByTimeAsync(0);
     expect(mockState.spawn).toHaveBeenCalledOnce();
     setTimeout(() => writeStartupSentinel(root, spawnedAttemptId()), 30_400);
@@ -1011,7 +1468,7 @@ describe('ipc ensure', () => {
     const expected = documentedCoralSetupError('handoff_sigkill_grace_target_alive', context);
 
     const { ensure } = await importEnsure();
-    const ensuredPromise = ensure(root).catch((error: unknown) => error);
+    const ensuredPromise = ensure('sessions.create', root).catch((error: unknown) => error);
     await vi.advanceTimersByTimeAsync(0);
     setTimeout(
       () =>
@@ -1050,7 +1507,7 @@ describe('ipc ensure', () => {
     const expected = documentedCoralSetupError('handoff_socket_holder_unverified', context);
 
     const { ensure } = await importEnsure();
-    const ensuredPromise = ensure(root).catch((error: unknown) => error);
+    const ensuredPromise = ensure('sessions.create', root).catch((error: unknown) => error);
     await vi.advanceTimersByTimeAsync(0);
     // A delegated build runs from its own plugin root, so both halves of its build identity differ from the
     // invoking build's. Only the exact attempt id ties this record to the spawn being waited on.
@@ -1088,7 +1545,7 @@ describe('ipc ensure', () => {
     writeStartupSentinel(root, 'foreign-attempt', { pid: process.pid, namespace: 'other-plugin-root-namespace' });
 
     const { ensure, KERNEL_READY_DEADLINE_MS, STARTUP_POLL_MS } = await importEnsure();
-    const result = ensure(root).catch((error: unknown) => error);
+    const result = ensure('sessions.create', root).catch((error: unknown) => error);
     await vi.advanceTimersByTimeAsync(KERNEL_READY_DEADLINE_MS + STARTUP_POLL_MS);
     const error = await result;
 
@@ -1105,7 +1562,7 @@ describe('ipc ensure', () => {
     mockState.spawn.mockReturnValue(child);
 
     const { ensure } = await importEnsure();
-    const ensuredPromise = ensure(root).catch((error: unknown) => error);
+    const ensuredPromise = ensure('sessions.create', root).catch((error: unknown) => error);
     await vi.advanceTimersByTimeAsync(0);
     writeStartupSentinel(root, spawnedAttemptId(), {
       code: 'future_setup_refusal',
@@ -1137,7 +1594,7 @@ describe('ipc ensure', () => {
     mockState.spawn.mockReturnValue(child);
 
     const { ensure } = await importEnsure();
-    const ensuredPromise = ensure(root).catch((error: unknown) => error);
+    const ensuredPromise = ensure('sessions.create', root).catch((error: unknown) => error);
     await vi.advanceTimersByTimeAsync(0);
     writeStartupSentinel(root, spawnedAttemptId(), {
       code: 'describer_missing',
@@ -1168,7 +1625,7 @@ describe('ipc ensure', () => {
     mockState.spawn.mockReturnValue(child);
 
     const { ensure } = await importEnsure();
-    const ensuredPromise = ensure(root).catch((error: unknown) => error);
+    const ensuredPromise = ensure('sessions.create', root).catch((error: unknown) => error);
     await vi.advanceTimersByTimeAsync(0);
     writeStartupSentinel(root, spawnedAttemptId(), {
       bundleHash: 'delegated-build-hash',
@@ -1197,7 +1654,7 @@ describe('ipc ensure', () => {
     mockState.spawn.mockReturnValue(child);
 
     const { ensure } = await importEnsure();
-    const ensuredPromise = ensure(root).catch((error: unknown) => error);
+    const ensuredPromise = ensure('sessions.create', root).catch((error: unknown) => error);
     await vi.advanceTimersByTimeAsync(0);
     writeStartupSentinel(root, spawnedAttemptId(), {
       error: {
@@ -1239,7 +1696,7 @@ describe('ipc ensure', () => {
     mockState.spawn.mockReturnValue(child);
 
     const { ensure } = await importEnsure();
-    const ensuredPromise = ensure(root).catch((error: unknown) => error);
+    const ensuredPromise = ensure('sessions.create', root).catch((error: unknown) => error);
     await vi.advanceTimersByTimeAsync(0);
     writeStartupSentinel(root, spawnedAttemptId(), {
       code,
@@ -1270,7 +1727,7 @@ describe('ipc ensure', () => {
     mockState.spawn.mockReturnValue(child);
 
     const { ensure } = await importEnsure();
-    const ensuredPromise = ensure(root).catch((error: unknown) => error);
+    const ensuredPromise = ensure('sessions.create', root).catch((error: unknown) => error);
     await vi.advanceTimersByTimeAsync(0);
     expect(mockState.spawn).toHaveBeenCalledOnce();
 
@@ -1318,7 +1775,7 @@ describe('ipc ensure', () => {
     });
 
     const { ensure } = await importEnsure();
-    const ensuredPromise = ensure(root).catch((error: unknown) => error);
+    const ensuredPromise = ensure('sessions.create', root).catch((error: unknown) => error);
     await vi.advanceTimersByTimeAsync(0);
     expect(mockState.spawn).toHaveBeenCalledOnce();
 
@@ -1366,7 +1823,7 @@ describe('ipc ensure', () => {
     });
 
     const { ensure } = await importEnsure();
-    const ensuredPromise = ensure(root);
+    const ensuredPromise = ensure('sessions.create', root);
     await vi.advanceTimersByTimeAsync(800);
     const ensured = await ensuredPromise;
 
@@ -1402,7 +1859,7 @@ describe('ipc ensure', () => {
     });
 
     const { ensure } = await importEnsure();
-    const ensuredPromise = ensure(root);
+    const ensuredPromise = ensure('sessions.create', root);
     await vi.advanceTimersByTimeAsync(0);
 
     let settled = false;
@@ -1453,7 +1910,7 @@ describe('ipc ensure', () => {
     });
 
     const { ensure } = await importEnsure();
-    const ensuredPromise = ensure(root);
+    const ensuredPromise = ensure('sessions.create', root);
     await vi.advanceTimersByTimeAsync(0);
 
     // While the exact child is live, nothing ties this coordinator to it, so the wait must not end here.
@@ -1508,7 +1965,7 @@ describe('ipc ensure', () => {
     });
 
     const { ensure } = await importEnsure();
-    const ensuredPromise = ensure(root);
+    const ensuredPromise = ensure('sessions.create', root);
     let settled = false;
     void ensuredPromise.then(
       () => {
@@ -1553,7 +2010,7 @@ describe('ipc ensure', () => {
     mockState.spawn.mockReturnValue(child);
 
     const { ensure } = await importEnsure();
-    const ensuredPromise = ensure(root).catch((error: unknown) => error);
+    const ensuredPromise = ensure('sessions.create', root).catch((error: unknown) => error);
     await vi.advanceTimersByTimeAsync(0);
     child.emit('error', new Error(spawnFailure));
     await vi.advanceTimersByTimeAsync(0);
@@ -1578,7 +2035,7 @@ describe('ipc ensure', () => {
     mockState.spawn.mockReturnValue(child);
 
     const { ensure } = await importEnsure();
-    const ensuredPromise = ensure(root).catch((error: unknown) => error);
+    const ensuredPromise = ensure('sessions.create', root).catch((error: unknown) => error);
     await vi.advanceTimersByTimeAsync(0);
     child.emit('exit', code, signal);
     await vi.advanceTimersByTimeAsync(0);
@@ -1599,7 +2056,7 @@ describe('ipc ensure', () => {
     mockState.spawn.mockReturnValue(child);
 
     const { ensure } = await importEnsure();
-    const ensuredPromise = ensure(root).catch((error: unknown) => error);
+    const ensuredPromise = ensure('sessions.create', root).catch((error: unknown) => error);
     await vi.advanceTimersByTimeAsync(0);
     writeStartupSentinel(root, 'another-attempt');
     child.emit('exit', 1, null);
@@ -1651,7 +2108,7 @@ describe('ipc ensure', () => {
     }, 19_000);
 
     const { ensure } = await importEnsure();
-    const ensuredPromise = ensure(root);
+    const ensuredPromise = ensure('sessions.create', root);
     await vi.advanceTimersByTimeAsync(20_000);
     const ensured = await ensuredPromise;
 
@@ -1709,7 +2166,7 @@ describe('ipc ensure', () => {
     });
 
     const { ensure } = await importEnsure();
-    const ensuredPromise = ensure(root);
+    const ensuredPromise = ensure('sessions.create', root);
     await vi.advanceTimersByTimeAsync(2_000);
     const ensured = await ensuredPromise;
 
@@ -1747,7 +2204,9 @@ describe('ipc ensure', () => {
       }),
     );
 
-    await expect(ensure(root)).rejects.toThrow(expect.objectContaining({ code: 'coordinator_socket_dir_unverified' }));
+    await expect(ensure('sessions.create', root)).rejects.toThrow(
+      expect.objectContaining({ code: 'coordinator_socket_dir_unverified' }),
+    );
     expect(mockState.spawn).not.toHaveBeenCalled();
   });
 
@@ -1785,7 +2244,7 @@ describe('ipc ensure', () => {
       });
 
       const { ensure } = await importEnsure();
-      const ensuredPromise = ensure(root);
+      const ensuredPromise = ensure('sessions.create', root);
       await vi.advanceTimersByTimeAsync(800);
       await ensuredPromise;
     }

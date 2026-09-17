@@ -8,8 +8,9 @@ import {
   type ProviderProxySetCommandOperations,
 } from '#src/cli/commands/backend.js';
 import { encodeProviderProxySetAddress, type ProviderProxySetAddress } from '#src/provider-proxy/set-address.js';
+import { buildErrorEnvelope } from '#src/cli/errors.js';
 import { TOOL_TIMEOUT_MS } from '#src/transport/http/sse.js';
-import { IpcRpcError } from '#src/transport/ipc/client.js';
+import { IpcDrainRequestUnanswered, IpcLifecycleRefusal, IpcRpcError } from '#src/transport/ipc/client.js';
 import {
   providerProxySetContainBooleanResponseSchema,
   providerProxySetContainBooleanRpcSpec,
@@ -203,13 +204,6 @@ const containCommandCases: readonly ContainCommandCase[] = [
     exitCode: 75,
     stream: 'stderr',
     message: "does not understand the coordinator's containment result",
-  },
-  {
-    name: 'coordinator-draining',
-    result: { kind: 'coordinator-draining', setIdentity: address },
-    exitCode: 75,
-    stream: 'stderr',
-    message: 'the coordinator is shutting down',
   },
   {
     name: 'timeout',
@@ -513,23 +507,27 @@ describe('backend provider-proxy-set contain', () => {
     expect(process.exitCode).toBe(75);
   });
 
-  it('turns the shipped draining response body into a named no-verdict result', async () => {
+  it('raises a reached coordinator lifecycle refusal instead of a no-verdict result', async () => {
+    const socketPath = '/tmp/coral-contain-refusal.sock';
     const operations = createProviderProxySetCommandOperations({
       getClient: async () =>
         ({
-          request: async () => ({ code: 'backend_shutting_down', message: 'Backend shutting down' }),
+          request: () => Promise.reject(new IpcLifecycleRefusal(socketPath, providerProxySetContainRpcSpec.name)),
         }) as never,
     });
 
-    const result = await operations.contain({ setIdentity: address, mode: 'contain' });
-    expect(result).toEqual({
-      kind: 'coordinator-draining',
-      setIdentity: address,
-    });
-    await expect(runContain(result)).resolves.toEqual(
-      expect.objectContaining({ stderr: expect.stringContaining('the coordinator is shutting down') }),
+    const raised = await operations.contain({ setIdentity: address, mode: 'contain' }).then(
+      (result: unknown) => result,
+      (error: unknown) => error,
     );
-    expect(process.exitCode).toBe(75);
+
+    expect(raised).toBeInstanceOf(IpcLifecycleRefusal);
+    expect(raised).toMatchObject({
+      code: 'backend_shutting_down',
+      method: providerProxySetContainRpcSpec.name,
+      socketPath,
+    });
+    expect(buildErrorEnvelope(raised).exitCode).toBe(75);
   });
 
   it('bounds containment IPC and names a timed-out accepted request as a no-verdict', async () => {
@@ -553,6 +551,23 @@ describe('backend provider-proxy-set contain', () => {
     const output = await runContain(result);
     expect(output.stderr).toContain('a process signal or representation release may already have happened');
     expect(output.stderr).toContain('run coral-cli backend status before deciding whether to retry');
+    expect(process.exitCode).toBe(75);
+  });
+
+  it('names a request the drain bound never got an answer to as the same no-verdict', async () => {
+    const socketPath = '/tmp/coral-draining.sock';
+    const request = vi
+      .fn()
+      .mockRejectedValue(new IpcDrainRequestUnanswered(socketPath, providerProxySetContainRpcSpec.name, 30_000));
+    const operations = createProviderProxySetCommandOperations({
+      getClient: async () => ({ request }) as never,
+    });
+
+    const result = await operations.contain({ setIdentity: address, mode: 'contain' });
+
+    expect(result).toEqual({ kind: 'timeout', setIdentity: address });
+    const output = await runContain(result);
+    expect(output.stderr).toContain('a process signal or representation release may already have happened');
     expect(process.exitCode).toBe(75);
   });
 

@@ -362,7 +362,7 @@ describe('cli follow', () => {
       `${formatLaunch(options.launchResult)}\n${formatWaitTerminal(terminalEvent, terminalCursor, false)}\n`,
     );
     expect(stderr).toBe('');
-    expect(mockState.ensure).toHaveBeenCalledWith('/plugin/root');
+    expect(mockState.ensure).toHaveBeenCalledWith('jobs.wait', '/plugin/root');
     expect(mockState.subscribe).toHaveBeenCalledWith(
       'jobs.wait',
       {

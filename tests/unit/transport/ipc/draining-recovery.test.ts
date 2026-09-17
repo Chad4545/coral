@@ -5,7 +5,7 @@ import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import { fileURLToPath } from 'node:url';
 
-import { requestIpcMethod } from '#src/transport/ipc/client.js';
+import { IpcLifecycleRefusal, requestIpcMethod } from '#src/transport/ipc/client.js';
 import { closeIpcServer, createIpcServer, listenIpcServer } from '#src/transport/ipc/server.js';
 import type { HttpHandlerPorts } from '#src/transport/server-ports.js';
 import type { ProviderProxySetAddress } from '#src/provider-proxy/set-address.js';
@@ -90,6 +90,7 @@ function createDrainingPorts(containmentKind: 'contained' | 'abandoned' = 'aband
     jobs: {
       scopeCheck: vi.fn((jobs: string[]) => ({ valid: jobs, missing: [], mismatch: [] })),
       abort: vi.fn((jobs: string[]) => ({ aborted: jobs, notFound: [] })),
+      list: vi.fn(() => []),
     },
     providerProxySets: {
       contain: vi.fn(async () => containmentResult(containmentKind)),
@@ -407,16 +408,63 @@ describe('draining IPC recovery ingress', () => {
     await listenIpcServer(listener, path);
 
     try {
-      await expect(
-        requestIpcMethod(
-          path,
-          'jobs.list',
-          { projectRoot: PROJECT_ROOT },
-          {
-            auth: { kind: 'boot', token: 'boot-token' },
-          },
-        ),
-      ).resolves.toEqual({ code: 'backend_shutting_down', message: 'Backend shutting down' });
+      const refused = await requestIpcMethod(
+        path,
+        'jobs.list',
+        { projectRoot: PROJECT_ROOT },
+        { auth: { kind: 'boot', token: 'boot-token' } },
+      ).then(
+        (result: unknown) => result,
+        (error: unknown) => error,
+      );
+
+      expect(refused).toBeInstanceOf(IpcLifecycleRefusal);
+      expect(refused).toMatchObject({
+        code: 'backend_shutting_down',
+        method: 'jobs.list',
+        socketPath: path,
+      });
+      // Re-issuing a refused method against a successor may repeat no work, so the refusal must precede the
+      // port call, not follow it.
+      expect(ports.jobs.list).not.toHaveBeenCalled();
+    } finally {
+      await closeIpcServer(listener);
+    }
+  });
+
+  it('refuses a drain-admitted method on a stopped lifecycle without running it', async () => {
+    const draining = createDrainingPorts();
+    const ports = {
+      ...draining,
+      admin: {
+        ...draining.admin,
+        getLifecycleState: () => 'stopped',
+        isDrainRequested: () => false,
+        isLifecycleRunning: () => false,
+      },
+    } as unknown as HttpHandlerPorts;
+    const listener = createIpcServer(ports);
+    const path = socketPath();
+    await listenIpcServer(listener, path);
+
+    try {
+      const refused = await requestIpcMethod(
+        path,
+        'jobs.abort',
+        { jobs: ['held-job'], projectRoot: PROJECT_ROOT },
+        { auth: { kind: 'boot', token: 'boot-token' } },
+      ).then(
+        (result: unknown) => result,
+        (error: unknown) => error,
+      );
+
+      expect(refused).toBeInstanceOf(IpcLifecycleRefusal);
+      expect(refused).toMatchObject({
+        code: 'backend_shutting_down',
+        method: 'jobs.abort',
+        socketPath: path,
+      });
+      expect(ports.jobs.abort).not.toHaveBeenCalled();
     } finally {
       await closeIpcServer(listener);
     }

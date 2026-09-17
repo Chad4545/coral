@@ -283,7 +283,7 @@ export function createCliExpansionActivation(): CliExpansionActivation {
   const ipcAuthOptions = childPrincipalAuthOptions(ipcAuth);
   const lowLevel = {
     async activateExpansion(name: string) {
-      const client = await ensure(resolvePluginRoot());
+      const client = await ensure('coordinator.equipExpansion', resolvePluginRoot());
       const runtime = resolveRuntime();
       const catalog = readExpansionCatalog(runtime);
       const result = equipExpansionResultSchema.parse(
@@ -296,7 +296,7 @@ export function createCliExpansionActivation(): CliExpansionActivation {
     },
 
     async deactivateExpansion(name: string) {
-      const client = await ensure(resolvePluginRoot());
+      const client = await ensure('coordinator.unequipExpansion', resolvePluginRoot());
       const result = unequipExpansionResultSchema.parse(
         await client.request('coordinator.unequipExpansion', { name }, ipcAuthOptions),
       );
@@ -304,7 +304,7 @@ export function createCliExpansionActivation(): CliExpansionActivation {
     },
 
     async removeExpansionCatalog(name: string) {
-      const client = await ensure(resolvePluginRoot());
+      const client = await ensure('coordinator.removeExpansionCatalog', resolvePluginRoot());
       return removeExpansionCatalogResultSchema.parse(
         await client.request('coordinator.removeExpansionCatalog', { name }, ipcAuthOptions),
       );
@@ -368,7 +368,7 @@ export function createCliExpansionActivation(): CliExpansionActivation {
     },
 
     async readBinding(binding: string): Promise<ReadBindingResult> {
-      const client = await ensure(resolvePluginRoot());
+      const client = await ensure('coordinator.readBinding', resolvePluginRoot());
       return readBindingResultSchema.parse(
         await client.request('coordinator.readBinding', { binding }, ipcAuthOptions),
       );

@@ -95,6 +95,7 @@ type OperationalRouteSummary = {
     | 'shutdown-abandon'
     | 'kb-restart'
     | 'catalog';
+  readonly onRefusal?: 'spawn-successor' | 'report-refusal';
   readonly authentication: 'none' | 'principal';
 };
 
@@ -192,6 +193,7 @@ const expectedOperationalSpecs = {
     requires: 'jobs:control',
     requiresRunningLifecycle: false,
     dispatchKind: 'catalog',
+    onRefusal: 'spawn-successor',
     authentication: 'principal',
   },
   'ipc.provider-proxy-set.contain.drain-recovery': {
@@ -200,6 +202,7 @@ const expectedOperationalSpecs = {
     requires: 'system:shutdown',
     requiresRunningLifecycle: false,
     dispatchKind: 'catalog',
+    onRefusal: 'spawn-successor',
     authentication: 'principal',
   },
   'ipc.provider-proxy-set.contain-boolean.drain-recovery': {
@@ -208,6 +211,7 @@ const expectedOperationalSpecs = {
     requires: 'system:shutdown',
     requiresRunningLifecycle: false,
     dispatchKind: 'catalog',
+    onRefusal: 'spawn-successor',
     authentication: 'principal',
   },
 } as const satisfies Record<ExpectedOperationalRouteId, OperationalRouteSummary>;
@@ -217,6 +221,7 @@ function summarizeOperationalSpec(spec: (typeof operationalRouteSpecs)[number]):
     requires: spec.requires,
     requiresRunningLifecycle: spec.requiresRunningLifecycle,
     dispatchKind: spec.dispatch.kind,
+    ...(spec.dispatch.kind === 'catalog' ? { onRefusal: spec.dispatch.onRefusal } : {}),
     authentication: spec.authentication,
   };
 

@@ -7,7 +7,8 @@ import { StoreResetCliError, UsageError, buildErrorEnvelope, errorCodeToExit } f
 import { documentedCoralSetupError, serializeCoralSetupError } from '#src/runtime/errors.js';
 import { buildTransportErrorResponse } from '#src/transport/error-response.js';
 import { ChildPrincipalBindingError } from '#src/transport/ipc/child-principal-auth.js';
-import { IpcRpcError } from '#src/transport/ipc/client.js';
+import { IpcDrainRequestUnanswered, IpcLifecycleRefusal, IpcRpcError } from '#src/transport/ipc/client.js';
+import { shutdownObligationAbandonMethod } from '#src/obligation/shutdown-abandonment.js';
 import { domainResultToHttp, launchToHttp } from '#src/transport/response.js';
 
 describe('cli errors', () => {
@@ -229,6 +230,128 @@ describe('cli errors', () => {
       },
     );
 
+    it('renders a reached coordinator lifecycle refusal as a clearable hold naming an operator exit', () => {
+      const result = buildErrorEnvelope(new IpcLifecycleRefusal('/tmp/coral.sock', 'jobs.abort'));
+
+      expect(result.exitCode).toBe(75);
+      expect(result.envelope.code).toBe('backend_shutting_down');
+      expect(result.envelope.message).toContain('jobs.abort');
+      expect(result.envelope.message).toContain('/tmp/coral.sock');
+      expect(result.envelope.message).not.toContain('while draining');
+      expect(result.envelope.remediation).toContain('coral-cli backend status');
+      expect(result.envelope.remediation).toContain('coral-cli backend shutdown-recovery abandon');
+    });
+
+    it.each([
+      ['a refusal whose address may still be released', new IpcLifecycleRefusal('/tmp/coral.sock', 'jobs.abort')],
+      [
+        'a refusal whose coordinator kept the address',
+        new IpcLifecycleRefusal('/tmp/coral.sock', 'jobs.abort').stillHoldingAddress(30_000),
+      ],
+    ])('discloses that the refused method never ran for %s', (_case, refusal) => {
+      const { envelope } = buildErrorEnvelope(refusal);
+
+      expect(envelope.remediation).toContain('refused jobs.abort before dispatch, so it did not run');
+    });
+
+    it('does not tell a refused abandon to run abandon', () => {
+      const refusals = [
+        new IpcLifecycleRefusal('/tmp/coral.sock', shutdownObligationAbandonMethod),
+        new IpcLifecycleRefusal('/tmp/coral.sock', shutdownObligationAbandonMethod).stillHoldingAddress(30_000),
+      ];
+
+      for (const refusal of refusals) {
+        const { envelope, exitCode } = buildErrorEnvelope(refusal);
+        expect(exitCode).toBe(75);
+        expect(envelope.remediation).not.toContain('shutdown-recovery abandon');
+        expect(envelope.remediation).toContain('coral-cli backend status');
+        expect(envelope.remediation).toContain(`refused ${shutdownObligationAbandonMethod} before dispatch`);
+      }
+    });
+
+    it('renders a refusal that itself carries a refusal cause exactly once', () => {
+      const refusal = new IpcLifecycleRefusal('/tmp/coral.sock', 'jobs.abort');
+      refusal.cause = new IpcLifecycleRefusal('/tmp/coral.sock', 'jobs.abort').stillHoldingAddress(30_000);
+
+      const { envelope } = buildErrorEnvelope(refusal);
+
+      expect(envelope.remediation?.match(/shutdown-recovery abandon <subject>/g)).toHaveLength(1);
+    });
+
+    it('promises no command that reports the abandon subject, and says why naming one is safe', () => {
+      const remediations = [
+        buildErrorEnvelope(new IpcLifecycleRefusal('/tmp/coral.sock', 'jobs.abort')).envelope.remediation,
+        buildErrorEnvelope(new IpcLifecycleRefusal('/tmp/coral.sock', 'jobs.abort').stillHoldingAddress(30_000))
+          .envelope.remediation,
+      ];
+
+      for (const remediation of remediations) {
+        expect(remediation).toContain('coral-cli backend shutdown-recovery status');
+        expect(remediation).toContain('refuses a subject the held shutdown did not offer');
+        expect(remediation).not.toContain('the subject that status reports');
+        expect(remediation).toContain('coral-cli backend shutdown-recovery abandon --help');
+      }
+    });
+
+    it('folds a refusal carried as cause into the surfacing failure without taking over its class', () => {
+      const refusal = new IpcLifecycleRefusal('/tmp/coral.sock', 'jobs.abort');
+      const surfacing = new BackendUnreachableError('Coral coordinator socket was never bound.');
+      surfacing.cause = refusal;
+
+      const result = buildErrorEnvelope(surfacing);
+
+      expect(result.exitCode).toBe(69);
+      expect(result.envelope.code).toBe('backend_unreachable');
+      expect(result.envelope.message).toBe('Coral coordinator socket was never bound.');
+      expect(result.envelope.remediation).toContain('refused jobs.abort');
+      expect(result.envelope.remediation).toContain('coral-cli backend shutdown-recovery abandon');
+    });
+
+    it('reaches a refusal nested behind an intermediate cause, and appends nothing when there is none', () => {
+      const refusal = new IpcLifecycleRefusal('/tmp/coral.sock', 'coordinator.provider_proxy_set.contain.v2');
+      const intermediate = new Error('spawning a successor failed');
+      intermediate.cause = refusal;
+      const surfacing = new BackendUnreachableError('Coral coordinator could not be replaced.');
+      surfacing.cause = intermediate;
+
+      expect(buildErrorEnvelope(surfacing).envelope.remediation).toContain(
+        'refused coordinator.provider_proxy_set.contain.v2',
+      );
+
+      const unrelated = new BackendUnreachableError('Coral coordinator could not be replaced.');
+      unrelated.cause = new Error('socket directory is unreadable');
+      expect(buildErrorEnvelope(unrelated).envelope.remediation).toBeUndefined();
+    });
+
+    it('renders a drain-bounded request that was never answered as an unknown disposition, not a refusal', () => {
+      const result = buildErrorEnvelope(new IpcDrainRequestUnanswered('/tmp/coral.sock', 'jobs.abort', 30_000));
+
+      expect(result.exitCode).toBe(75);
+      expect(result.envelope.code).toBe('coordinator_drain_unanswered');
+      expect(result.envelope.code).not.toBe('backend_shutting_down');
+      expect(result.envelope.message).toContain('did not answer jobs.abort within 30s');
+      expect(result.envelope.message).toContain('/tmp/coral.sock');
+      expect(result.envelope.message).toContain('whether jobs.abort ran is unknown');
+      expect(result.envelope.remediation).toBe(
+        'Do not retry before `coral-cli backend status`: whether jobs.abort ran is unknown.',
+      );
+    });
+
+    it('distinguishes a refusal whose coordinator kept the address from one that may still release it', () => {
+      const refused = new IpcLifecycleRefusal('/tmp/coral.sock', 'jobs.abort');
+      const held = refused.stillHoldingAddress(30_000);
+
+      expect(held.addressDisposition).toEqual({ kind: 'held-past-release-budget', budgetMs: 30_000 });
+      expect(held.message).toContain('still held that address 30s later');
+      expect(held.message).not.toContain('while draining');
+
+      const heldEnvelope = buildErrorEnvelope(held);
+      expect(heldEnvelope.exitCode).toBe(75);
+      expect(heldEnvelope.envelope.remediation).toContain('will not be replaced by retrying');
+      expect(heldEnvelope.envelope.remediation).toContain('coral-cli backend shutdown-recovery abandon');
+      expect(buildErrorEnvelope(refused).envelope.remediation).not.toContain('will not be replaced by retrying');
+    });
+
     it.each([
       [{ code: 'backend_shutting_down', message: 'Backend shutting down' }, 503, 75],
       [{ code: 'internal_error', message: 'Internal error' }, 500, 70],
@@ -407,6 +530,17 @@ describe('cli errors', () => {
         expect(errorCodeToExit(code)).toBe(75);
         expect(expansionExitCode({ status: 'error', code, userMessage: 'unused', remediation: 'unused' })).toBe(75);
       }
+    });
+
+    it('names coordinator_drain_unanswered in the exit-75 catalog row', async () => {
+      const { readFileSync } = await import('node:fs');
+      const row = readFileSync('docs/cli-errors.md', 'utf-8')
+        .split('\n')
+        .find((line) => line.startsWith('| `75` |'));
+
+      expect(row).toBeDefined();
+      expect(row).toContain('`coordinator_drain_unanswered`');
+      expect(errorCodeToExit('coordinator_drain_unanswered')).toBe(75);
     });
 
     it('names provider_preflight_undetermined in the exit-75 catalog row', async () => {

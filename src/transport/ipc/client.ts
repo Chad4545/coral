@@ -4,6 +4,7 @@ import { CoralSetupError } from '../../runtime/errors.js';
 import { createRealTimePort } from '../../infra/time.js';
 import { encode, decode, type IpcAuthMetadata, type JsonRpcEnvelope, type JsonRpcRequestEnvelope } from './json-rpc.js';
 import { createLineFramer } from '../line-framing.js';
+import { isLifecycleRefusalResult, lifecycleRefusalResult } from '../lifecycle-refusal.js';
 import type { TimePort } from '../../infra/port-types.js';
 
 const IPC_RETRY_BACKOFF_MS = 100;
@@ -71,6 +72,95 @@ export class IpcRpcError extends Error {
       typeof error.data.code === 'string'
         ? error.data.code
         : undefined;
+  }
+}
+
+/**
+ * What the refused invocation went on to observe about the address the refusal came from. The two answers
+ * carry different operator exits — a coordinator that released the address is being replaced, while one still
+ * holding it past its own release budget is not replaced by retrying — so the disposition rides the refusal
+ * rather than being reconstructed from a message.
+ */
+export type LifecycleRefusalAddressDisposition =
+  | Readonly<{ kind: 'unobserved' }>
+  | Readonly<{ kind: 'held-past-release-budget'; budgetMs: number }>;
+
+function lifecycleRefusalMessage(
+  socketPath: string,
+  method: string,
+  addressDisposition: LifecycleRefusalAddressDisposition,
+): string {
+  const refused = `The Coral coordinator at ${socketPath} refused ${method} because it is shutting down`;
+  return addressDisposition.kind === 'unobserved'
+    ? `${refused}.`
+    : `${refused}, and still held that address ${Math.round(addressDisposition.budgetMs / 1000)}s later.`;
+}
+
+/**
+ * A lifecycle refusal arrives on a `response` envelope, so the unary path rejects with this rather than
+ * resolving a body no caller's schema accepts. Both server sites also answer a `stopped` lifecycle, so the
+ * message may not claim the coordinator is draining.
+ */
+export class IpcLifecycleRefusal extends Error {
+  readonly code = lifecycleRefusalResult.code;
+  readonly method: string;
+  readonly socketPath: string;
+  readonly addressDisposition: LifecycleRefusalAddressDisposition;
+
+  constructor(
+    socketPath: string,
+    method: string,
+    addressDisposition: LifecycleRefusalAddressDisposition = { kind: 'unobserved' },
+  ) {
+    super(lifecycleRefusalMessage(socketPath, method, addressDisposition));
+    this.name = 'IpcLifecycleRefusal';
+    this.method = method;
+    this.socketPath = socketPath;
+    this.addressDisposition = addressDisposition;
+  }
+
+  /**
+   * The same refusal, with the address now observed held past `budgetMs`. Restating the subject rather than
+   * taking a method and a socket keeps a caller from attributing the stronger observation to another
+   * invocation's refusal.
+   */
+  stillHoldingAddress(budgetMs: number): IpcLifecycleRefusal {
+    return new IpcLifecycleRefusal(this.socketPath, this.method, { kind: 'held-past-release-budget', budgetMs });
+  }
+}
+
+/**
+ * The unary request budget expired with no answer: the method may have run, so this is neither a refusal nor a
+ * completion. Typed rather than message-matched so a caller that set the budget can recognize its own bound
+ * expiring without re-deriving it from prose — see drainBoundedClient in src/transport/ipc/ensure.ts.
+ */
+export class IpcRequestTimeout extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = 'IpcRequestTimeout';
+  }
+}
+
+/**
+ * A draining coordinator did not answer within the budget the drain bound imposed — see drainBoundedClient in
+ * src/transport/ipc/ensure.ts. Whether the method ran is unknown, so this may not be read as a refusal:
+ * nothing may re-issue the method against a successor, and it may not be rendered as an internal failure.
+ */
+export class IpcDrainRequestUnanswered extends Error {
+  readonly code = 'coordinator_drain_unanswered';
+  readonly method: string;
+  readonly socketPath: string;
+  readonly budgetMs: number;
+
+  constructor(socketPath: string, method: string, budgetMs: number) {
+    super(
+      `The draining Coral coordinator at ${socketPath} did not answer ${method} within ` +
+        `${Math.round(budgetMs / 1000)}s, so whether ${method} ran is unknown.`,
+    );
+    this.name = 'IpcDrainRequestUnanswered';
+    this.method = method;
+    this.socketPath = socketPath;
+    this.budgetMs = budgetMs;
   }
 }
 
@@ -250,7 +340,12 @@ export async function requestIpcMethod<TResult>(
         }
 
         if (envelope.kind === 'response' && envelope.id === requestId) {
-          finish(() => resolve(envelope.result as TResult));
+          const result = envelope.result;
+          finish(() =>
+            isLifecycleRefusalResult(result)
+              ? reject(new IpcLifecycleRefusal(socketPath, method))
+              : resolve(result as TResult),
+          );
           socket.end();
           return;
         }
@@ -264,11 +359,11 @@ export async function requestIpcMethod<TResult>(
     const responseBudget = remainingMs(deadlineMs, timePort);
     if (typeof responseBudget === 'number' && responseBudget > 0) {
       timer = timePort.setTimeout(() => {
-        socket.destroy(new Error(`IPC request timed out after ${responseBudget}ms`));
+        socket.destroy(new IpcRequestTimeout(`IPC request timed out after ${responseBudget}ms`));
       }, responseBudget);
     } else if (typeof responseBudget === 'number' && responseBudget === 0) {
       queueMicrotask(() => {
-        socket.destroy(new Error('IPC request deadline already exceeded'));
+        socket.destroy(new IpcRequestTimeout('IPC request deadline already exceeded'));
       });
     }
 

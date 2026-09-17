@@ -4,6 +4,7 @@ import { createRealRuntime } from '../../../runtime/real.js';
 import { HEALTH_TIMEOUT_MS, parseJsonResponse } from '../sse.js';
 import { errorMessage, thrownErrnoCode } from '../../../infra/error-format.js';
 import { isRecord } from '../../../infra/json.js';
+import { isLifecycleRefusalResult } from '../../lifecycle-refusal.js';
 import { isCoralChildEnvironment } from '../../../security/child-principal-env.js';
 
 /**
@@ -72,10 +73,6 @@ type ShutdownResultReason = Exclude<ShutdownResult, { ok: true }>['reason'];
 type ReasonSetsMatch<A extends string, B extends string> = [A] extends [B] ? ([B] extends [A] ? true : false) : false;
 const _shutdownReasonsStaySynced: ReasonSetsMatch<ShutdownReason, ShutdownResultReason> = true;
 
-function isShuttingDownError(value: unknown): value is { code: 'backend_shutting_down' } {
-  return isRecord(value) && value.code === 'backend_shutting_down';
-}
-
 function isShutdownAccepted(value: unknown): boolean {
   return isRecord(value) && (value.status === 'draining' || value.status === 'shutting_down');
 }
@@ -94,7 +91,7 @@ function classifyShutdownResponse(
   if (response.status === 200 && isShutdownAccepted(body)) {
     return { ok: true };
   }
-  if (response.status === 503 && isShuttingDownError(body)) {
+  if (response.status === 503 && isLifecycleRefusalResult(body)) {
     return { ok: true, alreadyDraining: true };
   }
   if (response.status === 401) {

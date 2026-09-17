@@ -25,6 +25,7 @@ import { operationalRouteSpecs, type HttpOperationalSpec } from '../rpc/operatio
 import { formatZodError } from '../validation.js';
 import type { EventStreamHandlers, HttpHandlerPorts } from '../server-ports.js';
 import { domainResultToHttp } from '../response.js';
+import { lifecycleRefusalResult } from '../lifecycle-refusal.js';
 import { subscribeAll } from './sse-subscribe.js';
 import type { TimePort } from '../../infra/port-types.js';
 import { createRealTimePort } from '../../infra/time.js';
@@ -1353,7 +1354,7 @@ export function createHttpHandler(
       deps.admin.getLifecycleState?.() ?? (deps.admin.isLifecycleRunning() ? 'running' : 'stopped');
     if (lifecycleState === 'draining' || lifecycleState === 'stopped' || deps.admin.isDrainRequested()) {
       req.resume();
-      sendJson(res, 503, { code: 'backend_shutting_down', message: 'Backend shutting down' });
+      sendJson(res, 503, lifecycleRefusalResult);
       return;
     }
 

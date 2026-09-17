@@ -53,7 +53,8 @@ This only affects malformed or truncated backend responses. In normal operation 
 | `system_provider_scope_unconfigured`          | HTTP or daemon-internal provider execution was requested, but the daemon booted without a named system scope                                                                                                                                                                                                                                                                                                                                                   |
 | `provider_preflight_faulted`                  | A provider preflight returned no valid answer — it threw, its promise rejected, it fulfilled with a value that is not `satisfied`, `refused` or `undetermined`, or it fulfilled with one of those whose required message was missing or blank — so Coral reports an internal fault rather than an undetermined provider observation. The structured context preserves `provider` and `cause`; report this code with that cause. It maps to HTTP `500` and exit `70`. This fault says nothing about whether the provider is installed, available, or authenticated, so do not reinstall or re-authenticate based on it                                                                                                                        |
 | `transient`                                   | Retry-later failure. This covers HTTP `502`/`503`/`504`, resumable wait interruptions, and a wait event the installed CLI cannot decode after bounded retries. The decode message tells the operator to rerun the command or upgrade the installed Coral plugin; raw schema diagnostics are not emitted. CLI-side: any `TransientHttpError` maps to exit `75` via `instanceof` dispatch; `code === 'transient'` or backend `503` bodies also land on exit `75` |
-| `backend_shutting_down`                       | The backend is running but draining and refusing new work                                                                                                                                                                                                                                                                                                                                                                                                      |
+| `backend_shutting_down`                       | The coordinator answered and refused this method because it is draining or stopped. Either the method is not one that coordinator admits while draining, or it is an older build that admits none of them. See [`503` vs Unreachable](#503-vs-unreachable) before retrying                                                                                                                                                                                     |
+| `coordinator_drain_unanswered`                | A request issued to a reached draining coordinator was cut short by the drain bound (`HANDOFF_DRAIN_TIMEOUT_MS`, 30s) with no answer. This is not a refusal: whether the method ran is unknown, so no successor is tried and nothing is re-issued. Exit `75`. Do not retry before `coral-cli backend status`                                                                                                                                                   |
 | `backend_unreachable`                         | The backend could not be reached at all. Typical causes are not-started daemon, refused connection, or transport-level lookup/reset failures                                                                                                                                                                                                                                                                                                                   |
 | `kb_initializing`                             | A KB-touching command was issued while the KB daemon runtime is still starting. Transient — the daemon is healthy, only KB is not ready. Maps to HTTP `503` and exit `75` (retry-later); the response carries a `remediation` hint                                                                                                                                                                                                                             |
 | `kb_offline`                                  | The KB daemon runtime is offline or failed. The daemon is otherwise healthy. Maps to HTTP `503` and exit `75`; the `remediation` hint asks the operator to restart the daemon                                                                                                                                                                                                                                                                                  |
@@ -148,7 +149,7 @@ Provider-host `list` and `inspect` can report `reclamation-failed`. This status 
 | ---- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | `2`  | `invalid_usage`, `invalid_store_reset_incident_id`                                                                                                                                                                                                                                                                                           |
 | `1`  | User-correctable backend/domain errors such as `invalid_request`, `not_found`, `session_not_found`, `audit_requires_ended_session`, `scope_mismatch`, `unauthorized`, provider-host errors other than `provider_host_inventory_unavailable`, the generation-boundary/operator codes whose rows below say `1`, `store_reset_incident_not_found`, and default `backend_error` cases |
-| `75` | Temporary holds and no-verdict refusals: `transient`, `busy`, `backend_shutting_down`, `backend_recovering`, `kb_disabled`, `kb_unavailable`, `kb_initializing`, `kb_offline`, `provider_host_inventory_unavailable` (matched by code name because the IPC path carries no HTTP status), `provider_preflight_undetermined` (matched by code name for the same reason: a launch decision reaches IPC as a code without its status), and `coordinator_unreachable`/`coordinator_record_unreadable`/`coordinator_socket_dir_unverified`, plus `legacy_source_writer_observation_unknown` when a generation's writer lease could not be observed at all, the handoff codes `handoff_fresh_discovery_unavailable`, `handoff_fresh_discovery_changed`, `handoff_signal_cooldown_active`, `handoff_legacy_signal_attempt_indeterminate`, `handoff_socket_holder_unverified`, `handoff_process_identity_unavailable`, `handoff_process_liveness_unknown`, `handoff_published_incarnation_mismatch`, `handoff_signal_anchor_missing`, `handoff_pid_recycled`, and `handoff_sigkill_grace_target_gone_socket_still_bound`, plus generic HTTP `503` fallback. Documented-code exits come from `DOCUMENTED_CORAL_SETUP_ERRORS` through `errorCodeToExit`; `coral-cli expansion` delegates error results to that same mapper. Among the handoff codes, only `handoff_fresh_discovery_unavailable`, `handoff_legacy_signal_attempt_indeterminate`, `handoff_socket_holder_unverified`, `handoff_process_identity_unavailable`, `handoff_process_liveness_unknown`, and `handoff_signal_anchor_missing` carry observation `not_observed`. Retry only when that code's remediation says the condition can clear without intervention |
+| `75` | Temporary holds and no-verdict refusals: `transient`, `busy`, `backend_shutting_down` (a refusal rather than a decision, and not one of the retryable ones: on a route the catalog admits while draining the CLI has already reached that coordinator, so the next step is `coral-cli backend status` and then `coral-cli backend shutdown-recovery abandon <subject>`, whose `--help` lists the closed set of subjects — see [`503` vs Unreachable](#503-vs-unreachable)), `coordinator_drain_unanswered` (the drain bound expired with no answer, so whether the method ran is unknown; do not retry before `coral-cli backend status`), `backend_recovering`, `kb_disabled`, `kb_unavailable`, `kb_initializing`, `kb_offline`, `provider_host_inventory_unavailable` (matched by code name because the IPC path carries no HTTP status), `provider_preflight_undetermined` (matched by code name for the same reason: a launch decision reaches IPC as a code without its status), and `coordinator_unreachable`/`coordinator_record_unreadable`/`coordinator_socket_dir_unverified`, plus `legacy_source_writer_observation_unknown` when a generation's writer lease could not be observed at all, the handoff codes `handoff_fresh_discovery_unavailable`, `handoff_fresh_discovery_changed`, `handoff_signal_cooldown_active`, `handoff_legacy_signal_attempt_indeterminate`, `handoff_socket_holder_unverified`, `handoff_process_identity_unavailable`, `handoff_process_liveness_unknown`, `handoff_published_incarnation_mismatch`, `handoff_signal_anchor_missing`, `handoff_pid_recycled`, and `handoff_sigkill_grace_target_gone_socket_still_bound`, plus generic HTTP `503` fallback. Documented-code exits come from `DOCUMENTED_CORAL_SETUP_ERRORS` through `errorCodeToExit`; `coral-cli expansion` delegates error results to that same mapper. Among the handoff codes, only `handoff_fresh_discovery_unavailable`, `handoff_legacy_signal_attempt_indeterminate`, `handoff_socket_holder_unverified`, `handoff_process_identity_unavailable`, `handoff_process_liveness_unknown`, and `handoff_signal_anchor_missing` carry observation `not_observed`. Retry only when that code's remediation says the condition can clear without intervention |
 | `69` | `backend_unreachable`, `handoff_accepted_signal_target_alive_after_failure`, `handoff_accepted_signal_target_alive_after_bind`, and `handoff_sigkill_grace_target_alive`                                                                                                                                                                                                                            |
 | `77` | Authorization failures that no retry fixes: `missing_capability`, `child_credentials_incomplete`, `handoff_signal_capability_unavailable`, `handoff_shutdown_capability_rejected`, `handoff_shutdown_credential_unavailable`, `handoff_manual_policy`, `handoff_platform_identity_insufficient`, `handoff_published_incarnation_missing`, and `handoff_signal_rejected_live`. `handoff_term_only_policy` also exits `77`, but is retryable because Coral already delivered SIGTERM and the target can finish autonomously. The same code is used by `coral-cli expansion …`, whose single-JSON-line output carries `missing_capability` and `child_credentials_incomplete` as an `InstallError` |
 | `70` | `internal`, `internal_error`, `provider_preflight_faulted`, `store_reset_build_mismatch`, `store_reset_incident_build_mismatch`, `store_reset_reporting_failed`, and generic HTTP `500` fallback                                                                                                                                                                           |
@@ -195,11 +196,13 @@ claim-discharge result are separate discriminators, with this exhaustive treatme
 | `store-unreadable` | `75` | Nothing was signalled or released, and `abandon` cannot override this fence. Run `coral-cli backend recovery-quarantine list`. Repair the exact raw row externally, or—only when the list prints one—run its exact `discard-provider-operation` command. The row-discard phase atomically removes the raw row, due pointers, and quarantine evidence; after that effect the command can still return `adoption-refused` with exit `75` if Coral cannot adopt a surviving readable record. Follow the command's result, then rerun the list and status. |
 | `containment-unconfirmed` | `75` | The recorded-containment attempt ended without absence proof and may already have sent the signals listed by the result. Run the exact `contain` command printed by the result to retry the same set. |
 | unsupported coordinator (`-32601`) | `75` | The coordinator rejected the method before accepting the operation, so nothing was signalled or released. Upgrade or restart into this build, then rerun `coral-cli backend status` before retrying. |
-| coordinator draining | `75` | The coordinator refused the request before dispatch, so nothing was signalled or released. Wait for the successor, then rerun `coral-cli backend status` before retrying. |
 | unsupported coordinator result | `75` | The coordinator replied, but this CLI could not decode the result. Whether a signal or representation release occurred is unknown. Upgrade or converge on one build, then rerun `coral-cli backend status` before any retry. |
 | timeout | `75` | The bounded request deadline expired without a reply. Whether a signal or representation release occurred is unknown. Rerun `coral-cli backend status` before deciding whether to retry. |
 
-An older coordinator's JSON-RPC method-not-found, a structurally identified newer result, a pre-dispatch drain,
+A refusal from a draining coordinator is not one of these outcomes: it is rendered as the
+`backend_shutting_down` error described in [`503` vs Unreachable](#503-vs-unreachable).
+
+An older coordinator's JSON-RPC method-not-found, a structurally identified newer result,
 and a bounded request timeout all become named `75` no-verdicts. An unfamiliar result or timeout may arrive
 after a signal or representation release, so both require `coral-cli backend status` before any retry. None is rendered as
 an internal parse error. Forced containment may signal the recorded proxy process group plus every recorded provider root for the set that is
@@ -247,9 +250,11 @@ treatment is:
 | `quarantine-not-found` | `75` | No exact persisted quarantine subject authorized the operation. The raw row and due pointers were untouched. Start or repair the canonical coordinator, rerun `coral-cli backend recovery-quarantine list`, and use only a command it currently prints. |
 | `owned` (`retrying` or `continuation`) | `75` | Recovery already owns the subject. The raw row, due pointers, and quarantine evidence were untouched. Let that owner finish, then rerun `coral-cli backend recovery-quarantine list`. |
 | unsupported coordinator (`-32601`) | `75` | The coordinator rejected the method before accepting the discard operation, so nothing was deleted. Upgrade or restart into this build, rerun `coral-cli backend recovery-quarantine list`, and retry only a currently printed command. |
-| coordinator draining | `75` | The coordinator refused the request before dispatch, so nothing was deleted. Wait for the successor, then rerun `coral-cli backend recovery-quarantine list` before deciding whether to retry. |
 | unsupported coordinator result | `75` | No discard verdict: the coordinator replied, but the response could not be decoded, whether its coordinates are missing, malformed, mismatched, or exact. The requested coordinate is retained; deletion may already have completed. Upgrade or converge on one build, then rerun `coral-cli backend recovery-quarantine list` and `coral-cli backend status` before any retry. |
 | timeout | `75` | No discard verdict: the bounded request deadline expired without a reply, and deletion may already have completed. Rerun `coral-cli backend recovery-quarantine list` and `coral-cli backend status` before deciding whether to retry. |
+
+A refusal from a draining coordinator is not one of these outcomes either: it is rendered as the
+`backend_shutting_down` error described in [`503` vs Unreachable](#503-vs-unreachable).
 
 Persisted `active` entries with no retry or continuation owner print a complete `clear=coral-cli backend recovery-quarantine clear --boundary ... --key ... --revision ...` line. Synthetic entries derived only from an unreadable raw row, and persisted entries in `retrying` or
 `continuation`, print neither a clear nor a discard command. Every received but undecodable discard response retains the
@@ -370,11 +375,17 @@ The input is wrong in both cases. The exit code differs because `invalid_usage` 
 
 Two "service unavailable" cases also differ on purpose:
 
-- `backend_shutting_down` means the backend answered and said it is draining. Its exit code is `75`, and this specific condition can clear when the drain finishes.
+- `backend_shutting_down` means the coordinator answered and refused the method. Its exit code is `75`. On a route the operational catalog admits while draining, the CLI has already reached the draining coordinator, and for `jobs.abort` and provider-proxy containment it also tried the successor: once that incumbent released the socket, the request was re-issued against the coordinator that replaced it. A refusal that still reaches the operator is what is left after both. That is not a condition a retry loop clears: a drain held open by the component it is waiting on never finishes. Inspect it with `coral-cli backend status`, which reports that the coordinator is shutting down but not which obligation holds it, and end a held drain through `coral-cli backend shutdown-recovery abandon <subject>`. `coral-cli backend shutdown-recovery abandon --help` lists the closed set of subjects, and abandon refuses a subject the held shutdown did not offer, so naming one that is not held changes nothing; `coral-cli backend shutdown-recovery status` shows the abandonments already recorded. The `wait jobs` subscription path is the exception, and it is retryable: it renders the same condition as `[code=transient]`, because a subscription can be re-established against whichever coordinator is serving next.
 - `backend_unreachable` means the CLI could not talk to the backend at all. Exit code is `69`, which usually means the daemon needs to be started or restarted first.
 - `kb_initializing` and `kb_offline` mean the daemon answered, but the KB daemon runtime specifically is not ready. The daemon itself is healthy — only KB-touching commands surface these. Both map to exit `75`.
 
-Drain-in-progress example:
+Refused-method example, over local IPC:
+
+```text
+The Coral coordinator at <run-dir>/coordinator.sock refused jobs.abort because it is shutting down. [code=backend_shutting_down]
+```
+
+The same refusal over the HTTP gateway carries its status instead:
 
 ```text
 Backend shutting down [code=backend_shutting_down, http=503]
@@ -398,7 +409,7 @@ A `coral-cli` invoked from inside a provider job (a Coral child) reconnects to i
 
 ## Consumer Examples
 
-Retry only on retry-later failures:
+Retry only on retry-later failures. `backend_shutting_down` is not one of them: the coordinator answered, and where a successor could have discharged the method the CLI already tried one, so a loop only waits out a drain that may never end. A `wait jobs` subscription surfaces a drain as `transient` and is handled by the first arm; the explicit `backend_shutting_down` arm is what the same loop needs once it wraps a mutating command such as `abort jobs`.
 
 ```bash
 #!/usr/bin/env bash
@@ -416,8 +427,12 @@ while true; do
 
   stderr_text="$(cat "$stderr_file")"
   case "$stderr_text" in
-    *"[code=transient"*|*"[code=backend_shutting_down"*)
+    *"[code=transient"*)
       sleep 2
+      ;;
+    *"[code=backend_shutting_down"*)
+      echo "The coordinator refused this command while shutting down; run 'coral-cli backend status'." >&2
+      exit "$wait_status"
       ;;
     *"[code=backend_unreachable"*)
       echo "Coral backend is not reachable; restart it first." >&2
@@ -444,7 +459,9 @@ function parseCliError(stderr: string): CliError {
   };
 }
 
-function classify(error: CliError): 'fix-input' | 'retry' | 'restart-backend' | 'run-at-top-level' | 'escalate' {
+function classify(
+  error: CliError,
+): 'fix-input' | 'retry' | 'restart-backend' | 'inspect-backend' | 'run-at-top-level' | 'escalate' {
   switch (error.code) {
     case 'invalid_usage':
     case 'invalid_request':
@@ -453,8 +470,9 @@ function classify(error: CliError): 'fix-input' | 'retry' | 'restart-backend' | 
     case 'scope_mismatch':
       return 'fix-input';
     case 'transient':
-    case 'backend_shutting_down':
       return 'retry';
+    case 'backend_shutting_down':
+      return 'inspect-backend';
     case 'backend_unreachable':
       return 'restart-backend';
     case 'missing_capability':
@@ -465,3 +483,5 @@ function classify(error: CliError): 'fix-input' | 'retry' | 'restart-backend' | 
   }
 }
 ```
+
+`inspect-backend` is a separate verdict from `retry` and from `restart-backend` because the wrapper cannot resolve a refused method on its own: the coordinator answered, and where a successor could have discharged the method the CLI already spawned one. The next step is an operator reading `coral-cli backend status`.
