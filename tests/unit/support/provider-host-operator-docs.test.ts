@@ -64,9 +64,8 @@ describe('provider-host operator documentation', () => {
 
   it('names every exit the release can be ended through, including the one a work directory is left with', () => {
     expect(catalogEntry('provider_host_owner_torn_down')).toContain('coral-cli backend status');
-    expect(cliErrors).toContain(
-      'coral-cli backend shutdown-recovery abandon provider-control-and-ipc-authority-release',
-    );
+    expect(cliErrors).toContain('ends by itself when its budget is exhausted');
+    expect(cliErrors).not.toContain('coral-cli backend shutdown-recovery abandon');
     expect(cliErrors).toContain('coral-cli backend provider-proxy-set contain <set-token>');
     expect(cliErrors).toContain('coral-cli backend provider-proxy-set abandon <set-token>');
     expect(cliErrors).toContain(

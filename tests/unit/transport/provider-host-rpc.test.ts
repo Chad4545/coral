@@ -196,7 +196,7 @@ describe('provider-host RPC authorization', () => {
     ],
     [
       'provider_host_owner_torn_down',
-      'Run `coral-cli backend status`. If the coordinator is draining, its successor re-establishes control; retry the original command once the successor serves. If the drain is held on the control release, end it with `coral-cli backend shutdown-recovery abandon provider-control-and-ipc-authority-release`. If it is not draining, `coral-cli backend status` reports the released set under its own token; resolve it with `coral-cli backend provider-proxy-set contain <set-token>` or `coral-cli backend provider-proxy-set abandon <set-token>`, or retry the original command once succession completes.',
+      'Run `coral-cli backend status`. If the coordinator is draining, its successor re-establishes control; retry the original command once the successor serves. If the drain is held on the control release, it ends by itself when its budget is exhausted; retry once `coral-cli backend status` no longer reports that coordinator as shutting down. If it is not draining, `coral-cli backend status` reports the released set under its own token; resolve it with `coral-cli backend provider-proxy-set contain <set-token>` or `coral-cli backend provider-proxy-set abandon <set-token>`, or retry the original command once succession completes.',
     ],
   ] as const)('returns actionable remediation for %s', async (code, remediation) => {
     const inspect = vi.fn(async () => {
