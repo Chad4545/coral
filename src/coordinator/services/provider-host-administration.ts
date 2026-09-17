@@ -3,6 +3,7 @@ import type {
   ProviderHostEvictionDisposition,
   ProviderHostTerminalEvictionDisposition,
 } from '../../providers/contract.js';
+import type { ProviderHostAdministrationErrorCode } from '../../providers/host-administration-vocabulary.js';
 import { exactHostRefIdentityKey, exactHostRefsMatch } from '../../providers/host-admission.js';
 import {
   providerHostInventoryRecordSchema,
@@ -29,7 +30,7 @@ type EvictionOwnerSelection = Readonly<{
   owner: ProviderHostAdministrationOwner;
   hostRef: HostRef;
   /** Owners the selection could not ask, so a call that is never sent can say who else was released. */
-  releasedOwnerIds: readonly string[];
+  tornDownOwnerIds: readonly string[];
 }>;
 
 export type ProviderHostAdministrationOwner = Readonly<{
@@ -41,21 +42,6 @@ export type ProviderHostAdministrationOwner = Readonly<{
   ): Promise<ProviderHostTerminalEvictionDisposition | null> | ProviderHostTerminalEvictionDisposition | null;
   evictProviderHost(ref: HostRef): Promise<ProviderHostEvictionDisposition>;
 }>;
-
-/** The owner of this vocabulary. See providerHostAdministrationCopy in src/transport/dispatch.ts. */
-export const PROVIDER_HOST_ADMINISTRATION_ERROR_CODES = [
-  'provider_host_inventory_unavailable',
-  'provider_host_owner_torn_down',
-  'provider_host_not_found',
-  'provider_host_ambiguous',
-  'provider_host_eviction_requires_exact_ref',
-  'provider_host_identity_integrity',
-  'provider_host_operator_abandoned',
-  'provider_host_shutdown_held',
-  'provider_host_stale',
-] as const;
-
-export type ProviderHostAdministrationErrorCode = (typeof PROVIDER_HOST_ADMINISTRATION_ERROR_CODES)[number];
 
 /** Raised only by an owner adapter that declined to send, because this coordinator had already released that
  *  owner's administration control. An answer, a refusal, a timeout, and a lost reply all reached a control
@@ -121,7 +107,7 @@ export class ProviderHostAdministrationService {
 
   async inspect(selector: ProviderHostSelector): Promise<ProviderHostInventoryRow> {
     const inventory = await this.captureInventory();
-    const selected = resolveOneObserved(inventory, selector);
+    const selected = resolveOne(inventory, selector, inventory.tornDownOwnerIds);
     let inspected: ProviderHostInventoryRecord | null;
     try {
       inspected = providerHostInventoryRecordSchema
@@ -153,7 +139,7 @@ export class ProviderHostAdministrationService {
     try {
       disposition = await selected.owner.evictProviderHost(selected.hostRef);
     } catch (error: unknown) {
-      throw ownerCallFailure(error, selected.owner.ownerId, [selected.hostRef], selected.releasedOwnerIds);
+      throw ownerCallFailure(error, selected.owner.ownerId, [selected.hostRef], selected.tornDownOwnerIds);
     }
     if (disposition.kind === 'stale') {
       throw new ProviderHostAdministrationError('provider_host_stale', {
@@ -183,14 +169,14 @@ export class ProviderHostAdministrationService {
     // Absence from inventory must not override a terminal outcome retained by its owner.
     const discovery = await this.discoverRetainedEvictionOwner(owners, hostRef);
     if (discovery.retained !== null) {
-      return { ...discovery.retained, releasedOwnerIds: discovery.tornDownOwnerIds };
+      return { ...discovery.retained, tornDownOwnerIds: discovery.tornDownOwnerIds };
     }
     const inventory = await this.captureInventory();
-    const releasedOwnerIds = Object.freeze([
+    const tornDownOwnerIds = Object.freeze([
       ...new Set([...discovery.tornDownOwnerIds, ...inventory.tornDownOwnerIds]),
     ]);
-    const resolved = resolveOneObserved({ ...inventory, tornDownOwnerIds: releasedOwnerIds }, { hostRef });
-    return { owner: resolved.owner, hostRef: resolved.row.ref, releasedOwnerIds };
+    const resolved = resolveOne(inventory, { hostRef }, tornDownOwnerIds);
+    return { owner: resolved.owner, hostRef: resolved.row.ref, tornDownOwnerIds };
   }
 
   private async discoverRetainedEvictionOwner(
@@ -223,13 +209,12 @@ export class ProviderHostAdministrationService {
         matches: matches.map(() => hostRef),
       });
     }
-    const frozenTornDownOwnerIds = Object.freeze([...tornDownOwnerIds]);
     const owner = matches[0];
     if (owner === undefined) {
-      return Object.freeze({ retained: null, tornDownOwnerIds: frozenTornDownOwnerIds });
+      return Object.freeze({ retained: null, tornDownOwnerIds });
     }
     this.retainEvictionOwner(owner.ownerId, hostRef);
-    return Object.freeze({ retained: { owner, hostRef }, tornDownOwnerIds: frozenTornDownOwnerIds });
+    return Object.freeze({ retained: { owner, hostRef }, tornDownOwnerIds });
   }
 
   private retainedEvictionOwner(
@@ -242,7 +227,7 @@ export class ProviderHostAdministrationService {
     if (owner === undefined) {
       throw new ProviderHostAdministrationError('provider_host_inventory_unavailable', { ownerIds: [ownerId] });
     }
-    return { owner, hostRef, releasedOwnerIds: [] };
+    return { owner, hostRef, tornDownOwnerIds: [] };
   }
 
   private retainEvictionOwner(ownerId: string, hostRef: HostRef): void {
@@ -281,11 +266,7 @@ export class ProviderHostAdministrationService {
     }
 
     rows.sort(compareRows);
-    return Object.freeze({
-      owners,
-      rows: Object.freeze(rows),
-      tornDownOwnerIds: Object.freeze(rejections.tornDownOwnerIds),
-    });
+    return Object.freeze({ owners, rows: Object.freeze(rows), tornDownOwnerIds: rejections.tornDownOwnerIds });
   }
 
   private captureOwners(): readonly ProviderHostAdministrationOwner[] {
@@ -303,7 +284,7 @@ export class ProviderHostAdministrationService {
 function partitionOwnerRejections(
   owners: readonly ProviderHostAdministrationOwner[],
   responses: readonly PromiseSettledResult<unknown>[],
-): Readonly<{ tornDownOwnerIds: string[]; unavailableOwnerIds: string[] }> {
+): Readonly<{ tornDownOwnerIds: readonly string[]; unavailableOwnerIds: readonly string[] }> {
   const tornDownOwnerIds: string[] = [];
   const unavailableOwnerIds: string[] = [];
   for (const [index, response] of responses.entries()) {
@@ -312,20 +293,20 @@ function partitionOwnerRejections(
     const bucket = response.reason instanceof ProviderHostOwnerTornDown ? tornDownOwnerIds : unavailableOwnerIds;
     bucket.push(owner.ownerId);
   }
-  return { tornDownOwnerIds, unavailableOwnerIds };
+  return { tornDownOwnerIds: Object.freeze(tornDownOwnerIds), unavailableOwnerIds: Object.freeze(unavailableOwnerIds) };
 }
 
 function ownerCallFailure(
   error: unknown,
   ownerId: string,
   matches: readonly HostRef[],
-  releasedOwnerIds: readonly string[] = [],
+  tornDownOwnerIds: readonly string[],
 ): ProviderHostAdministrationError {
   // The released owners join the answer only when the call itself was never sent: a real call failure names
   // the owner it reached, and folding unasked owners into it would read as owners that also failed.
   return error instanceof ProviderHostOwnerTornDown
     ? new ProviderHostAdministrationError('provider_host_owner_torn_down', {
-        ownerIds: [...new Set([ownerId, ...releasedOwnerIds])],
+        ownerIds: [...new Set([ownerId, ...tornDownOwnerIds])],
         matches,
       })
     : new ProviderHostAdministrationError('provider_host_inventory_unavailable', { ownerIds: [ownerId] });
@@ -336,45 +317,14 @@ function ownerCallFailure(
  *  could not ask — `provider_host_ambiguous` already refuses to choose a match by position, and choosing by
  *  which owner happened to answer is that same choice. So a found `hostRef` decides on an incomplete
  *  capture; an absent ref and a matched work directory decide only on a complete one. */
-function resolveOneObserved(
+function resolveOne(
   inventory: ProviderHostInventoryCapture,
   selector: ProviderHostSelector,
+  tornDownOwnerIds: readonly string[],
 ): Readonly<{ row: ProviderHostInventoryRow; owner: ProviderHostAdministrationOwner }> {
-  const unasked = inventory.tornDownOwnerIds;
-  const tornDownAnswer = (): ProviderHostAdministrationError =>
-    new ProviderHostAdministrationError('provider_host_owner_torn_down', {
-      ownerIds: unasked,
-      ...('hostRef' in selector ? { matches: [selector.hostRef] } : { workDir: selector.workDir }),
-    });
-
-  let resolved: Readonly<{ row: ProviderHostInventoryRow; owner: ProviderHostAdministrationOwner }>;
-  try {
-    resolved = resolveOne(inventory.owners, inventory.rows, selector);
-  } catch (error: unknown) {
-    if (
-      unasked.length === 0 ||
-      !(error instanceof ProviderHostAdministrationError) ||
-      error.code !== 'provider_host_not_found'
-    ) {
-      throw error;
-    }
-    throw tornDownAnswer();
-  }
-  if (unasked.length > 0 && 'workDir' in selector) throw tornDownAnswer();
-  return resolved;
-}
-
-function resolveOne(
-  owners: readonly ProviderHostAdministrationOwner[],
-  rows: readonly ProviderHostInventoryRow[],
-  selector: ProviderHostSelector,
-): Readonly<{ row: ProviderHostInventoryRow; owner: ProviderHostAdministrationOwner }> {
-  const matches = rows.filter((row) =>
+  const matches = inventory.rows.filter((row) =>
     'hostRef' in selector ? exactHostRefsMatch(row.ref, selector.hostRef) : row.spec.cwd === selector.workDir,
   );
-  if (matches.length === 0) {
-    throw new ProviderHostAdministrationError('provider_host_not_found');
-  }
   if (matches.length > 1) {
     throw new ProviderHostAdministrationError(
       'hostRef' in selector ? 'provider_host_identity_integrity' : 'provider_host_ambiguous',
@@ -384,8 +334,17 @@ function resolveOne(
       },
     );
   }
+  if (tornDownOwnerIds.length > 0 && (matches.length === 0 || 'workDir' in selector)) {
+    throw new ProviderHostAdministrationError('provider_host_owner_torn_down', {
+      ownerIds: tornDownOwnerIds,
+      ...('hostRef' in selector ? { matches: [selector.hostRef] } : { workDir: selector.workDir }),
+    });
+  }
+  if (matches.length === 0) {
+    throw new ProviderHostAdministrationError('provider_host_not_found');
+  }
   const row = matches[0];
-  const owner = owners.find((candidate) => candidate.ownerId === row.ownerId);
+  const owner = inventory.owners.find((candidate) => candidate.ownerId === row.ownerId);
   if (owner === undefined) {
     throw new ProviderHostAdministrationError('provider_host_inventory_unavailable', { ownerIds: [row.ownerId] });
   }

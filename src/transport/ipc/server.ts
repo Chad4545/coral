@@ -296,7 +296,7 @@ function authenticateIpcRequest(auth: IpcAuthMetadata | undefined, rpcPorts: Htt
 }
 
 /** The manual shutdown and KB-restart routes answer every authorization refusal in their own documented
- *  vocabulary; no other operational route has one. */
+ *  vocabulary. */
 function routeCredentialRefusal(spec: IpcOperationalSpec): typeof IPC_UNAUTHORIZED_RESPONSE | null {
   if (spec.dispatch.kind === 'shutdown') {
     return SHUTDOWN_UNAUTHORIZED_RESPONSE;

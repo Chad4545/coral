@@ -421,7 +421,7 @@ describe('cli errors', () => {
       ['provider_host_inventory_unavailable', 'Provider-host inventory is temporarily unavailable.'],
       [
         'provider_host_owner_torn_down',
-        'This coordinator has released administration control of provider-proxy:set-a and can no longer ask them.',
+        'This coordinator has released administration control of provider-proxy:set-a and can no longer ask it.',
       ],
     ] as const)('retries %s at exit 75 over IPC even though the wire carries no numeric status', (code, message) => {
       // No numeric HTTP status crosses IPC, so a code whose HTTP mapping is 503 must be recognised by name

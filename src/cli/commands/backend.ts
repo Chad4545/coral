@@ -1334,8 +1334,7 @@ export function createProviderHostCommandOperations(
         return providerHostListV2ResponseSchema.parse(await request(providerHostListV2RpcSpec.name, params));
       } catch (error: unknown) {
         if (!(error instanceof IpcRpcError) || error.rpcCode !== -32601) throw error;
-        // A coordinator without the v2 route cannot report an owner it could not ask, and refuses the whole
-        // listing when it has one, so an answered v1 listing is complete.
+        // A v1 listing is complete or refused; it may never carry an unasked owner.
         const v1 = providerHostListResponseSchema.parse(await request(providerHostListRpcSpec.name, params));
         return providerHostListV2ResponseSchema.parse({ hosts: v1.hosts, tornDownOwnerIds: [] });
       }

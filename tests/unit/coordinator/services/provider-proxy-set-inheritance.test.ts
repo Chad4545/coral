@@ -1199,6 +1199,43 @@ describe('attemptProviderProxySetInheritance', () => {
     await outcome.set.initiateControlClose();
   });
 
+  // Every refusal `registerInheritedSet` can raise happens before a slot holds the set, so no owner is left
+  // holding the redemption's three control clients and heartbeats — the redemption itself must close them.
+  it('closes every redeemed role when registering the inherited set throws', async () => {
+    const loc = locator();
+    mockedReadCapsule.mockReturnValueOnce(capsuleFor(loc));
+    const calls: { method: string; params: unknown }[] = [];
+    const closed: string[] = [];
+    const responses = redemptionResponses(loc, matchingOperationSets([]));
+    const roleEndpoints = [
+      loc.locator.guardian.controlEndpoint,
+      loc.locator.reaper.controlEndpoint,
+      loc.locator.proxy.controlEndpoint,
+    ];
+    mockedConnect.mockImplementation(async (socketPath: string) => {
+      if (!roleEndpoints.includes(socketPath)) throw new Error(`unexpected connection to ${socketPath}`);
+      return fakeClient(responses, calls, () => closed.push(socketPath));
+    });
+
+    await expect(
+      attemptProviderProxySetInheritance(
+        loc,
+        unusedDb,
+        {
+          runtime,
+          coordinatorIdentity: COORDINATOR_IDENTITY,
+          operationRegistry: { operationsFor: () => [], providerRootsFor: () => [] },
+          registerInheritedSet: () => {
+            throw new Error('already_established');
+          },
+        },
+        neverAborts,
+      ),
+    ).rejects.toThrow('already_established');
+    expect(closed).toHaveLength(3);
+    expect(closed).toEqual(expect.arrayContaining(roleEndpoints));
+  });
+
   it('rejects and closes every opened role when one redeemed operation set is a strict subset', async () => {
     const loc = locator();
     mockedReadCapsule.mockReturnValueOnce(capsuleFor(loc));

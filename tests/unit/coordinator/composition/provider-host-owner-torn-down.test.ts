@@ -84,15 +84,7 @@ function proxySetAnsweringWith(error: Error): ProviderProxySetAuthority {
 }
 
 function proxySetHoldingNoHosts(): ProviderProxySetAuthority {
-  return {
-    proxyInstanceId,
-    providerHosts: {
-      list: async () => [],
-      inspect: async () => null,
-      terminalEviction: async () => null,
-      evict: async () => ({ kind: 'evicted' }),
-    },
-  } as unknown as ProviderProxySetAuthority;
+  return { proxyInstanceId, providerHosts: { list: async () => [] } } as unknown as ProviderProxySetAuthority;
 }
 
 function composeProviderHostPorts(): NonNullable<HttpHandlerPorts['providerHosts']> {

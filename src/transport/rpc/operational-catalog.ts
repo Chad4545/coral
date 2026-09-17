@@ -171,6 +171,8 @@ export const operationalRouteSpecs: readonly OperationalRouteSpec[] = [
     dispatch: { kind: 'catalog', onRefusal: 'spawn-successor' },
     authentication: 'principal',
   },
+  // A successor has not captured the incumbent's provider-host owners, so its answer is not the incumbent's,
+  // and it cannot discharge an eviction: all four routes report the refusal instead of spawning one.
   {
     id: 'ipc.provider-host.list.drain-observation',
     transport: 'ipc',
@@ -198,7 +200,6 @@ export const operationalRouteSpecs: readonly OperationalRouteSpec[] = [
     dispatch: { kind: 'catalog', onRefusal: 'report-refusal' },
     authentication: 'principal',
   },
-  /** A successor cannot discharge an eviction. */
   {
     id: 'ipc.provider-host.evict.drain-recovery',
     transport: 'ipc',

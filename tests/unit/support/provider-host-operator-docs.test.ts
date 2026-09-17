@@ -54,33 +54,24 @@ describe('provider-host operator documentation', () => {
     );
   });
 
-  it('documents a torn-down owner as a call never sent, not an unavailable inventory', () => {
-    const entry = catalogEntry('provider_host_owner_torn_down');
-    expect(entry).toContain('released administration control');
-    expect(entry).toContain('never sent');
-    expect(entry).toContain('Not an unavailable inventory');
-    expect(entry).toContain('not by itself a drain');
-    expect(entry).toContain('coordinator.provider_host.list.v2');
-    expect(entry).toContain('tornDownOwnerIds');
-    expect(entry).toContain('coral-cli backend status');
-    expect(entry).toContain('coral-cli backend shutdown-recovery abandon provider-control-and-ipc-authority-release');
-    expect(cliErrors).toContain('served while the coordinator drains');
-  });
-
-  it('names the non-draining exit, because containment and succession release control on a healthy coordinator', () => {
-    const entry = catalogEntry('provider_host_owner_torn_down');
-    expect(entry).toContain('If it is not draining');
-    expect(entry).toContain('reports the released set under its own token');
-    expect(entry).toContain('coral-cli backend provider-proxy-set contain <set-token>');
-    expect(entry).toContain('coral-cli backend provider-proxy-set abandon <set-token>');
-    expect(entry).toContain('retry the original command once succession completes');
-  });
-
-  it('quotes the list line an operator reads verbatim, and pins the v1 shape it cannot use', () => {
-    expect(catalogEntry('provider_host_owner_torn_down')).toContain(
+  it('names the released owners at their own address and quotes the list line an operator reads verbatim', () => {
+    expect(cliErrors).toContain('`coordinator.provider_host.list.v2` always answers `tornDownOwnerIds`');
+    expect(cliErrors).toContain('keeps its exact `{ hosts }` shape for a shipped CLI');
+    expect(cliErrors).toContain(
       'provider_host_owner_torn_down: administration control released for <ids>; their hosts are not listed.',
     );
-    expect(cliErrors).toContain('keeps its exact `{ hosts }` shape for a shipped CLI');
+  });
+
+  it('names every exit the release can be ended through, including the one a work directory is left with', () => {
+    expect(catalogEntry('provider_host_owner_torn_down')).toContain('coral-cli backend status');
+    expect(cliErrors).toContain(
+      'coral-cli backend shutdown-recovery abandon provider-control-and-ipc-authority-release',
+    );
+    expect(cliErrors).toContain('coral-cli backend provider-proxy-set contain <set-token>');
+    expect(cliErrors).toContain('coral-cli backend provider-proxy-set abandon <set-token>');
+    expect(cliErrors).toContain(
+      'for a work directory the rendered remediation therefore starts with `coral-cli backend provider-host list`',
+    );
   });
 
   it('documents both inventory-unavailable and identity-integrity causes', () => {

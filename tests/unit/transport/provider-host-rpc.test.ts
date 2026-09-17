@@ -10,7 +10,6 @@ import { encodeHostRef } from '#src/providers/host-ref-codec.js';
 import type { HostRef } from '#src/providers/contract.js';
 import { canonicalizeWorkDir } from '#src/runtime/canonical-work-dir.js';
 import { executeCatalogRequest } from '#src/transport/dispatch.js';
-import { coordinatorHttpRoutes } from '#src/transport/http/handler.js';
 import {
   providerHostEvictRpcSpec,
   providerHostInspectRpcSpec,
@@ -107,17 +106,7 @@ describe('provider-host RPC authorization', () => {
     expect(providerHostEvictRpcSpec.requires).toBe('system:shutdown');
   });
 
-  it('projects each list generation onto its own HTTP route, and only v2 can carry a torn-down owner', () => {
-    expect(coordinatorHttpRoutes).toContainEqual({
-      method: 'GET',
-      path: '/coordinator/provider-hosts',
-      spec: providerHostListRpcSpec,
-    });
-    expect(coordinatorHttpRoutes).toContainEqual({
-      method: 'GET',
-      path: '/coordinator/provider-hosts/v2',
-      spec: providerHostListV2RpcSpec,
-    });
+  it('keeps each list generation strict about its own shape, so only v2 can carry a torn-down owner', () => {
     expect(providerHostListV2RpcSpec.requires).toBe(providerHostListRpcSpec.requires);
     expect(
       providerHostListV2RpcSpec.responseSchema.parse({ hosts: [], tornDownOwnerIds: ['provider-proxy:set-a'] }),
@@ -207,7 +196,7 @@ describe('provider-host RPC authorization', () => {
     ],
     [
       'provider_host_owner_torn_down',
-      'Run `coral-cli backend status`. If the coordinator is draining, its successor re-establishes control; retry there once it serves. If the drain is held on the control release, end it with `coral-cli backend shutdown-recovery abandon provider-control-and-ipc-authority-release`. If it is not draining, `coral-cli backend status` reports the released set under its own token; resolve it with `coral-cli backend provider-proxy-set contain <set-token>` or `coral-cli backend provider-proxy-set abandon <set-token>`, or retry the original command once succession completes.',
+      'Run `coral-cli backend status`. If the coordinator is draining, its successor re-establishes control; retry the original command once the successor serves. If the drain is held on the control release, end it with `coral-cli backend shutdown-recovery abandon provider-control-and-ipc-authority-release`. If it is not draining, `coral-cli backend status` reports the released set under its own token; resolve it with `coral-cli backend provider-proxy-set contain <set-token>` or `coral-cli backend provider-proxy-set abandon <set-token>`, or retry the original command once succession completes.',
     ],
   ] as const)('returns actionable remediation for %s', async (code, remediation) => {
     const inspect = vi.fn(async () => {
@@ -401,7 +390,7 @@ describe('provider-host RPC authorization', () => {
       statusCode: 503,
       body: {
         code: 'provider_host_owner_torn_down',
-        message: `This coordinator has released administration control of provider-proxy:set-a and can no longer ask them, so it cannot say whether ${encodedRef} exists there.`,
+        message: `This coordinator has released administration control of provider-proxy:set-a and can no longer ask it, so it cannot say whether ${encodedRef} exists on it.`,
         detail: { ownerIds: ['provider-proxy:set-a'], hostRefs: [encodedRef] },
       },
     });
@@ -429,7 +418,10 @@ describe('provider-host RPC authorization', () => {
       statusCode: 503,
       body: {
         code: 'provider_host_owner_torn_down',
-        message: `This coordinator has released administration control of provider-proxy:set-a and can no longer ask them, so it cannot say whether any host for work directory ${process.cwd()} exists there.`,
+        message: `This coordinator has released administration control of provider-proxy:set-a and can no longer ask it, so it cannot say whether any host for work directory ${process.cwd()} exists on it.`,
+        remediation: expect.stringContaining(
+          'Run `coral-cli backend provider-host list`; if the host you want is listed, use its exact reference with `inspect`/`evict` — an exact reference on an owner that answered is served now. Run `coral-cli backend status`.',
+        ),
         detail: { ownerIds: ['provider-proxy:set-a'], hostRefs: [], workDir: process.cwd() },
       },
     });

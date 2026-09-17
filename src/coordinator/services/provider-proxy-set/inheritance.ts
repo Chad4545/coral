@@ -366,10 +366,6 @@ async function buildInheritedAuthority(
   }>
 > {
   const bundle = providerProxyControlRedemptionBundle(redemption);
-  // A published authority may not be closed through the redemption, so registration happens only once the
-  // try block can no longer close it — see closeRedeemedProviderProxyControl in
-  // src/coordinator/live/provider-proxy/control-redemption.ts.
-  let set: DurableProviderProxyOperationAuthority;
   try {
     if (expectedIdentity !== null && !providerProxySetIdentitiesEqual(expectedIdentity, bundle.setIdentity)) {
       throw new ProviderProxySetInheritanceCorruptionError(
@@ -405,19 +401,19 @@ async function buildInheritedAuthority(
         signal.throwIfAborted();
         throw new Error('provider_proxy_recovery_credential_install_cancelled');
     }
-    set = createProviderProxyOperationAuthority({
+    const set = createProviderProxyOperationAuthority({
       base,
       setIdentity: bundle.setIdentity,
       clients: bundle.clients,
       faults: bundle.faults,
       mutationRpcTimeoutMs: PROXY_CONTROL_RPC_TIMEOUT_MS,
     });
+    deps.registerInheritedSet?.(set, bundle.publicationReceipt, 'protected');
+    return { set, publicationReceipt: bundle.publicationReceipt, protection: 'protected' };
   } catch (error: unknown) {
     closeRedeemedProviderProxyControl(redemption);
     throw error;
   }
-  deps.registerInheritedSet?.(set, bundle.publicationReceipt, 'protected');
-  return { set, publicationReceipt: bundle.publicationReceipt, protection: 'protected' };
 }
 
 async function redeemCapsule(

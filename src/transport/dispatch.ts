@@ -43,6 +43,10 @@ import type { WorkflowPortInput } from './rpc/ports.js';
 import type { JobsListFilters } from '../jobs/read-queries.js';
 import { buildInvocationContext, buildInvocationContextFromQuery } from './invocation-context.js';
 import { callerProviderScopeSchema } from '../infra/provider-scope.js';
+import {
+  PROVIDER_HOST_ADMINISTRATION_ERROR_CODES,
+  type ProviderHostAdministrationErrorCode,
+} from '../providers/host-administration-vocabulary.js';
 import { encodeHostRef } from '../providers/host-ref-codec.js';
 
 type RetentionPolicy = NonNullable<JobLaunchRequest['retention']>;
@@ -393,17 +397,6 @@ function workDirectoryFailure(error: WorkDirectoryError): CatalogRequestExecutio
   );
 }
 
-type ProviderHostAdministrationErrorCode =
-  | 'provider_host_inventory_unavailable'
-  | 'provider_host_owner_torn_down'
-  | 'provider_host_not_found'
-  | 'provider_host_ambiguous'
-  | 'provider_host_eviction_requires_exact_ref'
-  | 'provider_host_identity_integrity'
-  | 'provider_host_operator_abandoned'
-  | 'provider_host_shutdown_held'
-  | 'provider_host_stale';
-
 type ProviderHostEvictionAbandonmentView = Readonly<{
   kind: 'operator-abandoned';
   subject: Readonly<Record<string, unknown>>;
@@ -411,23 +404,12 @@ type ProviderHostEvictionAbandonmentView = Readonly<{
   successor: Readonly<{ owner: 'operator-command'; acceptance: 'accepted' }>;
 }>;
 
-const PROVIDER_HOST_ADMINISTRATION_ERROR_CODES = new Set<ProviderHostAdministrationErrorCode>([
-  'provider_host_inventory_unavailable',
-  'provider_host_owner_torn_down',
-  'provider_host_not_found',
-  'provider_host_ambiguous',
-  'provider_host_eviction_requires_exact_ref',
-  'provider_host_identity_integrity',
-  'provider_host_operator_abandoned',
-  'provider_host_shutdown_held',
-  'provider_host_stale',
-]);
+const PROVIDER_HOST_ADMINISTRATION_ERROR_CODE_SET: ReadonlySet<string> = new Set(
+  PROVIDER_HOST_ADMINISTRATION_ERROR_CODES,
+);
 
 function isProviderHostAdministrationErrorCode(code: unknown): code is ProviderHostAdministrationErrorCode {
-  return (
-    typeof code === 'string' &&
-    PROVIDER_HOST_ADMINISTRATION_ERROR_CODES.has(code as ProviderHostAdministrationErrorCode)
-  );
+  return typeof code === 'string' && PROVIDER_HOST_ADMINISTRATION_ERROR_CODE_SET.has(code);
 }
 
 function isProviderHostEvictionAbandonmentView(value: unknown): value is ProviderHostEvictionAbandonmentView {
@@ -493,13 +475,17 @@ function providerHostAdministrationCopy(
       };
     case 'provider_host_owner_torn_down': {
       const owners = ownerIds.length === 0 ? 'one or more provider-host owners' : ownerIds.join(', ');
+      const ownerPronoun = ownerIds.length === 1 ? 'it' : 'them';
       // The release is this coordinator's own act and says nothing about why it released.
       const selected = workDir === null ? 'the selected provider host' : `any host for work directory ${workDir}`;
       const subject = hostRefs[0] ?? selected;
+      const exactReferenceExit =
+        workDir === null
+          ? ''
+          : 'Run `coral-cli backend provider-host list`; if the host you want is listed, use its exact reference with `inspect`/`evict` — an exact reference on an owner that answered is served now. ';
       return {
-        message: `This coordinator has released administration control of ${owners} and can no longer ask them, so it cannot say whether ${subject} exists there.`,
-        remediation:
-          'Run `coral-cli backend status`. If the coordinator is draining, its successor re-establishes control; retry there once it serves. If the drain is held on the control release, end it with `coral-cli backend shutdown-recovery abandon provider-control-and-ipc-authority-release`. If it is not draining, `coral-cli backend status` reports the released set under its own token; resolve it with `coral-cli backend provider-proxy-set contain <set-token>` or `coral-cli backend provider-proxy-set abandon <set-token>`, or retry the original command once succession completes.',
+        message: `This coordinator has released administration control of ${owners} and can no longer ask ${ownerPronoun}, so it cannot say whether ${subject} exists on ${ownerPronoun}.`,
+        remediation: `${exactReferenceExit}Run \`coral-cli backend status\`. If the coordinator is draining, its successor re-establishes control; retry the original command once the successor serves. If the drain is held on the control release, end it with \`coral-cli backend shutdown-recovery abandon provider-control-and-ipc-authority-release\`. If it is not draining, \`coral-cli backend status\` reports the released set under its own token; resolve it with \`coral-cli backend provider-proxy-set contain <set-token>\` or \`coral-cli backend provider-proxy-set abandon <set-token>\`, or retry the original command once succession completes.`,
       };
     }
     case 'provider_host_not_found':
@@ -605,7 +591,7 @@ function requiredCapability(spec: RpcMethodSpec<unknown, unknown>): Capability |
 }
 
 /** One home for the authorization answer, so a nested session reads one refusal regardless of which gate
- *  refused it; see authorizeIpcOperation in src/transport/ipc/server.ts. */
+ *  refused it. */
 export function authorizationFailurePayload(
   decision: Extract<Decision, { ok: false }>,
   principal: Principal,

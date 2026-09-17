@@ -435,7 +435,7 @@ describe('provider host administration', () => {
     expect(second.evictProviderHost).not.toHaveBeenCalled();
   });
 
-  it('lists a real local shutdown-held host while the coordinator drains and takes its operator exit', async () => {
+  it('lists a real shutdown-held host from the local manager and takes its reported operator exit', async () => {
     const request = vi
       .fn()
       .mockResolvedValueOnce({
@@ -585,6 +585,24 @@ describe('provider host administration', () => {
     await expect(service.evict({ hostRef: selectedRef })).rejects.toMatchObject({
       code: 'provider_host_owner_torn_down',
       ownerIds: ['provider-proxy:released'],
+      matches: [selectedRef],
+    });
+  });
+
+  it('names both the owner that refused to send and the owner it could not ask', async () => {
+    const selectedRef = hostRef('observed-then-released');
+    const selected = owner('coordinator:test', [record(selectedRef)], {
+      evictProviderHost: vi.fn(async () => Promise.reject(new ProviderHostOwnerTornDown())),
+    });
+    const unasked = owner('provider-proxy:released', [], {
+      listProviderHosts: vi.fn(async () => Promise.reject(new ProviderHostOwnerTornDown())),
+      terminalEviction: vi.fn(async () => Promise.reject(new ProviderHostOwnerTornDown())),
+    });
+    const service = new ProviderHostAdministrationService({ owners: () => [selected, unasked] });
+
+    await expect(service.evict({ hostRef: selectedRef })).rejects.toMatchObject({
+      code: 'provider_host_owner_torn_down',
+      ownerIds: ['coordinator:test', 'provider-proxy:released'],
       matches: [selectedRef],
     });
   });
