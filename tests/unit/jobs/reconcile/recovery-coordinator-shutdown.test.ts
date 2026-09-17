@@ -28,7 +28,7 @@ import { testProjectPrincipal } from '#tests/helpers/principal.js';
 import { createBoundIpcLifecycleDeps } from '#tests/helpers/bound-ipc-lifecycle.js';
 import type { WorkflowExecutionPort } from '#src/workflow/execution-contract.js';
 import type { WorkflowFinalizationIntent } from '#src/workflow/finalization.js';
-import type { LifecycleShutdownDisposition } from '#src/coordinator/lifecycle.js';
+import type { LifecycleController, LifecycleShutdownDisposition } from '#src/coordinator/lifecycle.js';
 import {
   readDurableCliContainmentStatus,
   readDurableCliProcessRuntimeEvidence,
@@ -397,13 +397,12 @@ function stubRecoverableWorkflow(
   });
 }
 
-async function stopLifecycleController(controller: {
-  shutdown: (reason: string) => Promise<LifecycleShutdownDisposition>;
-  waitForShutdown: () => Promise<LifecycleShutdownDisposition>;
-}): Promise<LifecycleShutdownDisposition | null> {
+async function stopLifecycleController(
+  controller: Pick<LifecycleController, 'shutdown' | 'waitForShutdown'>,
+): Promise<LifecycleShutdownDisposition | null> {
   let disposition: LifecycleShutdownDisposition | null = null;
   try {
-    disposition = await controller.shutdown('test-cleanup');
+    disposition = await controller.shutdown('test-teardown');
   } catch {
     /* best effort */
   }
@@ -519,7 +518,10 @@ function createCoordinatorShutdownHarness(options: HarnessOptions) {
       removeBackendInfoIfOwnerFn: () => {},
       cleanupStaleJobsFn: () => {},
       markJobsAsErrorFn: () => {},
-      terminateAllFn: () => ({ kind: 'all-observed-absent' }),
+      terminateAllFn: (stage) =>
+        stage === 'pending-launch-settlement'
+          ? { kind: 'all-pending-launches-settled' }
+          : { kind: 'all-children-observed-absent' },
       providerHostManager: createFakeProviderHostManager() as never,
       kbDaemonSupervisor,
       handoffQuiescePorts: () => [],
@@ -622,7 +624,7 @@ describe('recovery coordinator shutdown', () => {
       projectRoot,
       serviceOverrides: {
         adoptRunningJob: vi.fn(() => {
-          void controller.shutdown('test-mid-recovery');
+          void controller.shutdown('test-teardown');
           return { adopted: true, cleanup: cleanupSpy };
         }),
       },
@@ -728,7 +730,7 @@ describe('recovery coordinator shutdown', () => {
       },
       recoverPersistedDiscussImpl: async () => {
         expect(recoveryPollHandle).not.toBeNull();
-        void controller.shutdown('test-after-poller-live');
+        void controller.shutdown('test-teardown');
         return [];
       },
     });

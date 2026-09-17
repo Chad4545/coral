@@ -38,6 +38,7 @@ import {
   runShutdownSequence,
   type LifecycleWiringState,
   type ShutdownMode,
+  type ShutdownReason,
   HANDOFF_DRAIN_TIMEOUT_MS,
 } from './shutdown.js';
 import type {
@@ -49,7 +50,7 @@ import type {
   ShutdownOperatorAction,
   ShutdownSequenceDisposition,
 } from './shutdown-settlement.js';
-import type { TerminateAllDisposition } from './live/admission.js';
+import type { LaunchTerminationFn } from './live/admission.js';
 import type { HandoffQuiescePort } from './execution-service.js';
 import type { InterruptedAppServerReason } from '../jobs/reconcile/interrupted-reason.js';
 import {
@@ -793,7 +794,7 @@ export type LifecycleDeps = {
   readonly removeBackendInfoIfOwnerFn: (instanceId: string) => void;
   readonly cleanupStaleJobsFn: (currentBundleHash: string, signal: AbortSignal) => void | Promise<void>;
   readonly markJobsAsErrorFn: (message: string, signal: AbortSignal) => void | Promise<void>;
-  readonly terminateAllFn: (signal: AbortSignal) => TerminateAllDisposition | Promise<TerminateAllDisposition>;
+  readonly terminateAllFn: LaunchTerminationFn;
   readonly providerHostManager: Pick<ProviderHostManager, 'drainForHandoff' | 'shutdown'>;
   /**
    * The live guardian/reaper/proxy sets, absent whenever the composition layer had no real acquisition path
@@ -824,7 +825,7 @@ export type LifecycleDeps = {
 
 export type LifecycleController = {
   start(): Promise<CoordinatorServerInfo>;
-  shutdown(reason: string): Promise<LifecycleShutdownDisposition>;
+  shutdown(reason: ShutdownReason): Promise<LifecycleShutdownDisposition>;
   abandonShutdownObligation(request: ShutdownObligationAbandonRequest): ShutdownObligationAbandonResult;
   requestShutdownRetry(): void;
   waitForShutdown(): Promise<LifecycleShutdownDisposition>;
@@ -881,6 +882,7 @@ type LifecycleControlState = LifecycleWiringState & {
   shutdownAutomaticRetryAttempts: number;
   shutdownRetryAfter: Promise<void> | null;
   shutdownRetry: (() => Promise<ShutdownSequenceDisposition>) | null;
+  shutdownReason: ShutdownReason | null;
   lastShutdownDisposition: LifecycleShutdownDisposition | null;
   operatorAbandonedShutdownObligations: Set<ShutdownObligationSubject>;
   started: boolean;
@@ -895,7 +897,7 @@ type LifecycleStartupContext = {
   state: LifecycleControlState;
   createInvocationContext: (projectRoot: string) => InvocationContext;
   ownershipChecker: ReturnType<typeof createReplacementBackendOwnershipChecker>;
-  shutdown: (reason: string) => Promise<LifecycleShutdownDisposition>;
+  shutdown: (reason: ShutdownReason) => Promise<LifecycleShutdownDisposition>;
 };
 
 async function runLifecycleStartup({
@@ -1360,6 +1362,7 @@ export function createLifecycle(
     shutdownAutomaticRetryAttempts: 0,
     shutdownRetryAfter: null,
     shutdownRetry: null,
+    shutdownReason: null,
     lastShutdownDisposition: null,
     operatorAbandonedShutdownObligations: new Set(),
     started: false,
@@ -1387,8 +1390,9 @@ export function createLifecycle(
     return { projectRoot, pluginRoot, coralEnv: {}, principal };
   }
 
-  async function shutdown(reason: string): Promise<LifecycleShutdownDisposition> {
+  async function shutdown(reason: ShutdownReason): Promise<LifecycleShutdownDisposition> {
     if (state.shutdownPromise) return state.shutdownPromise;
+    if (state.shutdownRetry === null) state.shutdownReason = reason;
     state.lastShutdownDisposition = null;
 
     // Calling `abort()` with no reason sets `signal.reason` to the platform
@@ -1578,15 +1582,19 @@ export function createLifecycle(
   function requestShutdownRetry(): void {
     const currentAttempt = state.shutdownPromise;
     if (currentAttempt === null) {
-      void shutdown('operator-recovery').catch((error: unknown) => {
+      if (state.shutdownRetry === null || state.shutdownReason === null) return;
+      void shutdown(state.shutdownReason).catch((error: unknown) => {
         log(`operator recovery shutdown retry failed (${formatError(error)})\n`);
       });
       return;
     }
     void currentAttempt
       .then((disposition) => {
-        if (disposition.disposition === 'held' || disposition.disposition === 'transfer-pending') {
-          return shutdown('operator-recovery');
+        if (
+          (disposition.disposition === 'held' || disposition.disposition === 'transfer-pending') &&
+          state.shutdownReason !== null
+        ) {
+          return shutdown(state.shutdownReason);
         }
       })
       .catch((error: unknown) => {

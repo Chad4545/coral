@@ -16,6 +16,7 @@ import type {
   ProviderProxyAuthorityRegistry,
   ProviderProxySetAuthority,
 } from '#src/coordinator/live/provider-proxy/authority.js';
+import type { LaunchTerminationDisposition, LaunchTerminationStage } from '#src/coordinator/live/admission.js';
 import type { IpcListener } from '#src/transport/ipc/server.js';
 import type { Runtime } from '#src/runtime/ports.js';
 import { VirtualTime } from '#tools/simulation/core/virtual-time.js';
@@ -23,6 +24,12 @@ import { testIncarnation } from '#tests/helpers/process-incarnation.js';
 import { unexercisedProviderHostControls } from '#tests/helpers/provider-host-controls.js';
 
 type CallLog = string[];
+
+function settledLaunchTermination(stage: LaunchTerminationStage): LaunchTerminationDisposition {
+  return stage === 'pending-launch-settlement'
+    ? { kind: 'all-pending-launches-settled' }
+    : { kind: 'all-children-observed-absent' };
+}
 
 interface Harness {
   time: VirtualTime;
@@ -37,7 +44,7 @@ function buildHarness(opts: {
   hooksOnShutdown?: (signal: AbortSignal) => Promise<void>;
   closeIpcServerFn?: (listener: IpcListener) => Promise<void>;
   stopStoreEpochSweepFn?: () => Promise<void>;
-  reason?: string;
+  reason?: Parameters<typeof runShutdownSequence>[0]['reason'];
   providerProxyAuthority?: ProviderProxyAuthorityRegistry;
   stopProviderOperationReconciler?: NonNullable<
     Parameters<typeof runShutdownSequence>[0]['stopProviderOperationReconciler']
@@ -139,7 +146,7 @@ function buildHarness(opts: {
       set: () => {},
       clear: () => {},
     } as never,
-    terminateAllFn: () => ({ kind: 'all-observed-absent' }),
+    terminateAllFn: settledLaunchTermination,
     handoffQuiescePorts: () => [],
     disposeLifecycleReactor: () => {
       callLog.push('lifecycleReactor.dispose');
@@ -664,7 +671,7 @@ describe('runShutdownSequence drain budget', () => {
       hooksOnShutdown: async () => {},
       stopProviderOperationReconciler,
     });
-    harness.ctx.reason = 'test-cleanup';
+    harness.ctx.reason = 'test-teardown';
     let providerSignal: AbortSignal | undefined;
     harness.ctx.providerHostManager = {
       drainForHandoff: async () => ({
@@ -678,9 +685,9 @@ describe('runShutdownSequence drain budget', () => {
         return new Promise<void>(() => {});
       },
     } as never;
-    harness.ctx.terminateAllFn = () => {
-      harness.callLog.push('terminateAllFn');
-      return { kind: 'all-observed-absent' };
+    harness.ctx.terminateAllFn = (stage) => {
+      harness.callLog.push(`terminateAllFn:${stage}`);
+      return settledLaunchTermination(stage);
     };
 
     const sequence = runShutdownSequence(harness.ctx);
@@ -699,12 +706,12 @@ describe('runShutdownSequence drain budget', () => {
     );
     expect(providerSignal?.aborted).toBe(true);
     expect(stopProviderOperationReconciler).not.toHaveBeenCalled();
-    expect(harness.callLog).not.toContain('terminateAllFn');
+    expect(harness.callLog).not.toContain('terminateAllFn:pending-launch-settlement');
     expect(harness.closeIpcCalled()).toBe(false);
   });
 
   it('reaps cleanup obligations from an independent snapshot after provider-host shutdown rejects', async () => {
-    const harness = buildHarness({ reason: 'test-cleanup', hooksOnShutdown: async () => {} });
+    const harness = buildHarness({ reason: 'test-teardown', hooksOnShutdown: async () => {} });
     const stopAndReap = vi.fn(async () => ({ disappearanceReceipt: 'gone:retained-proxy' }));
     const retry = vi.fn(async () => ({ kind: 'absence-confirmed' as const, strandedArtifacts: [] }));
     const retainedSet = fakeSet('retained-proxy', harness.callLog, { stopAndReap });
@@ -768,7 +775,7 @@ describe('runShutdownSequence drain budget', () => {
     const harness = buildHarness({
       hooksOnShutdown: async () => {},
     });
-    harness.ctx.reason = 'test-cleanup';
+    harness.ctx.reason = 'test-teardown';
     let terminalizationSignal: AbortSignal | undefined;
     harness.ctx.markJobsAsErrorFn = (_message, signal) => {
       terminalizationSignal = signal;
@@ -787,17 +794,23 @@ describe('runShutdownSequence drain budget', () => {
         return { kind: 'provider-hosts-quiesced', liveProxySets: [], acquisitionCleanupHolds: [], closingHosts: [] };
       },
     } as never;
-    harness.ctx.terminateAllFn = () => {
-      harness.callLog.push('terminateAllFn');
-      return { kind: 'all-observed-absent' };
+    harness.ctx.terminateAllFn = (stage) => {
+      harness.callLog.push(`terminateAllFn:${stage}`);
+      return settledLaunchTermination(stage);
     };
 
     const held = requireHeld(await runShutdownSequence(harness.ctx));
 
     expect(terminalizationSignal).toBeInstanceOf(AbortSignal);
     expect(harness.callLog).toContain('providerHostManager.shutdown');
-    expect(harness.callLog).toContain('terminateAllFn');
-    expect(harness.callLog.indexOf('terminateAllFn')).toBeLessThan(harness.callLog.indexOf('markJobsAsErrorFn'));
+    expect(harness.callLog).toContain('terminateAllFn:pending-launch-settlement');
+    expect(harness.callLog).toContain('terminateAllFn:registered-child-termination');
+    expect(harness.callLog.indexOf('terminateAllFn:pending-launch-settlement')).toBeLessThan(
+      harness.callLog.indexOf('terminateAllFn:registered-child-termination'),
+    );
+    expect(harness.callLog.indexOf('terminateAllFn:registered-child-termination')).toBeLessThan(
+      harness.callLog.indexOf('markJobsAsErrorFn'),
+    );
     expect(harness.logLines).toContainEqual(expect.stringContaining('crashed job terminalization settlement failed'));
     expect(heldFailureDetail(held)).toContain('crashed job terminalization: injected crash terminalization failure');
     expect(held.retainedAuthority.operatorActions).toContainEqual(
@@ -806,18 +819,19 @@ describe('runShutdownSequence drain budget', () => {
   });
 
   it('does not terminalize jobs when child containment remains unresolved', async () => {
-    const harness = buildHarness({ reason: 'test-cleanup', hooksOnShutdown: async () => {} });
+    const harness = buildHarness({ reason: 'test-teardown', hooksOnShutdown: async () => {} });
     harness.ctx.markJobsAsErrorFn = vi.fn();
-    harness.ctx.terminateAllFn = async () => ({
-      kind: 'unresolved-at-deadline',
-      processes: [{ kind: 'target-alive', pid: 4_242, stage: 'after-sigkill' }],
-      pendingLaunches: 0,
-      retainedLaunches: [],
-      cleanupHandles: 1,
-      retainedProcesses: [],
-      cleanupFailures: 0,
-      owner: 'launch-coordinator',
-    });
+    harness.ctx.terminateAllFn = async (stage) =>
+      stage === 'pending-launch-settlement'
+        ? { kind: 'all-pending-launches-settled' }
+        : {
+            kind: 'children-unresolved-at-deadline',
+            processes: [{ kind: 'target-alive', pid: 4_242, stage: 'after-sigkill' }],
+            cleanupHandles: 1,
+            retainedProcesses: [],
+            cleanupFailures: 0,
+            owner: 'launch-coordinator',
+          };
 
     const held = requireHeld(await runShutdownSequence(harness.ctx));
 
@@ -828,18 +842,79 @@ describe('runShutdownSequence drain budget', () => {
     );
   });
 
+  it('keeps pending launch settlement and registered child termination as separate obligations', async () => {
+    const harness = buildHarness({ reason: 'test-teardown', hooksOnShutdown: async () => {} });
+    const stages: LaunchTerminationStage[] = [];
+    harness.ctx.markJobsAsErrorFn = vi.fn();
+    harness.ctx.terminateAllFn = async (stage) => {
+      stages.push(stage);
+      return stage === 'pending-launch-settlement'
+        ? {
+            kind: 'pending-launches-unresolved-at-deadline',
+            pendingLaunches: 1,
+            retainedLaunches: [
+              {
+                kind: 'awaiting-wrapper-identity',
+                provider: 'codex',
+                jobId: 'pending-job',
+                jobDir: '/tmp/coral/jobs/pending-job',
+              },
+            ],
+            owner: 'launch-coordinator',
+          }
+        : {
+            kind: 'children-unresolved-at-deadline',
+            processes: [{ kind: 'target-alive', pid: 4_242, stage: 'after-sigkill' }],
+            cleanupHandles: 1,
+            retainedProcesses: [
+              {
+                kind: 'recorded-wrapper-group',
+                provider: 'claude',
+                jobId: 'published-job',
+                jobDir: '/tmp/coral/jobs/published-job',
+                containment: {
+                  pid: 4_242,
+                  incarnation: testIncarnation('published-child'),
+                  processGroupId: 4_242,
+                  childRoot: null,
+                },
+              },
+            ],
+            cleanupFailures: 0,
+            owner: 'launch-coordinator',
+          };
+    };
+
+    const held = requireHeld(await runShutdownSequence(harness.ctx));
+
+    expect(stages).toEqual(['pending-launch-settlement', 'registered-child-termination']);
+    expect(heldFailureDetail(held)).toContain('pending launch settlement: unconfirmed');
+    expect(heldFailureDetail(held)).toContain('child termination: unconfirmed');
+    expect(held.retainedAuthority.cleanupObligations).toEqual(
+      expect.arrayContaining(['pending launch settlement', 'child termination']),
+    );
+    expect(held.retainedAuthority.operatorActions).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({ kind: 'retained-job-containment', jobId: 'pending-job' }),
+        expect.objectContaining({ kind: 'retained-job-containment', jobId: 'published-job' }),
+      ]),
+    );
+    expect(harness.ctx.markJobsAsErrorFn).not.toHaveBeenCalled();
+  });
+
   it('holds hard shutdown and names a durable child that remains alive at the deadline', async () => {
-    const harness = buildHarness({ reason: 'test-cleanup', hooksOnShutdown: async () => {} });
-    harness.ctx.terminateAllFn = async () => ({
-      kind: 'unresolved-at-deadline',
-      processes: [{ kind: 'target-alive', pid: 4_242, stage: 'after-sigkill' }],
-      pendingLaunches: 0,
-      retainedLaunches: [],
-      cleanupHandles: 1,
-      retainedProcesses: [],
-      cleanupFailures: 0,
-      owner: 'launch-coordinator',
-    });
+    const harness = buildHarness({ reason: 'test-teardown', hooksOnShutdown: async () => {} });
+    harness.ctx.terminateAllFn = async (stage) =>
+      stage === 'pending-launch-settlement'
+        ? { kind: 'all-pending-launches-settled' }
+        : {
+            kind: 'children-unresolved-at-deadline',
+            processes: [{ kind: 'target-alive', pid: 4_242, stage: 'after-sigkill' }],
+            cleanupHandles: 1,
+            retainedProcesses: [],
+            cleanupFailures: 0,
+            owner: 'launch-coordinator',
+          };
 
     const detail = await shutdownFailureDetail(harness.ctx);
 
@@ -848,23 +923,24 @@ describe('runShutdownSequence drain budget', () => {
   });
 
   it('holds hard shutdown and names unavailable signal authority at the deadline', async () => {
-    const harness = buildHarness({ reason: 'test-cleanup', hooksOnShutdown: async () => {} });
-    harness.ctx.terminateAllFn = async () => ({
-      kind: 'unresolved-at-deadline',
-      processes: [
-        {
-          kind: 'signal-refused',
-          pid: 4_243,
-          reason: 'recorded-incarnation-unavailable',
-        },
-      ],
-      pendingLaunches: 0,
-      retainedLaunches: [],
-      cleanupHandles: 1,
-      retainedProcesses: [],
-      cleanupFailures: 0,
-      owner: 'launch-coordinator',
-    });
+    const harness = buildHarness({ reason: 'test-teardown', hooksOnShutdown: async () => {} });
+    harness.ctx.terminateAllFn = async (stage) =>
+      stage === 'pending-launch-settlement'
+        ? { kind: 'all-pending-launches-settled' }
+        : {
+            kind: 'children-unresolved-at-deadline',
+            processes: [
+              {
+                kind: 'signal-refused',
+                pid: 4_243,
+                reason: 'recorded-incarnation-unavailable',
+              },
+            ],
+            cleanupHandles: 1,
+            retainedProcesses: [],
+            cleanupFailures: 0,
+            owner: 'launch-coordinator',
+          };
 
     const detail = await shutdownFailureDetail(harness.ctx);
 
@@ -873,17 +949,18 @@ describe('runShutdownSequence drain budget', () => {
   });
 
   it('continues remaining hard teardown when child liveness is unobservable', async () => {
-    const harness = buildHarness({ reason: 'test-cleanup', hooksOnShutdown: async () => {} });
-    harness.ctx.terminateAllFn = async () => ({
-      kind: 'unresolved-at-deadline',
-      processes: [{ kind: 'target-unobservable', pid: 4_244, stage: 'after-sigkill' }],
-      pendingLaunches: 0,
-      retainedLaunches: [],
-      cleanupHandles: 1,
-      retainedProcesses: [],
-      cleanupFailures: 0,
-      owner: 'launch-coordinator',
-    });
+    const harness = buildHarness({ reason: 'test-teardown', hooksOnShutdown: async () => {} });
+    harness.ctx.terminateAllFn = async (stage) =>
+      stage === 'pending-launch-settlement'
+        ? { kind: 'all-pending-launches-settled' }
+        : {
+            kind: 'children-unresolved-at-deadline',
+            processes: [{ kind: 'target-unobservable', pid: 4_244, stage: 'after-sigkill' }],
+            cleanupHandles: 1,
+            retainedProcesses: [],
+            cleanupFailures: 0,
+            owner: 'launch-coordinator',
+          };
     harness.ctx.hooks = {
       onShutdown: async () => {
         harness.callLog.push('hooks.onShutdown');
@@ -1114,7 +1191,7 @@ describe('runShutdownSequence drain budget', () => {
   it('retains hard-mode IPC and provider control until child cleanup retry confirms absence', async () => {
     const authorityCalls: string[] = [];
     const set = fakeSet('hard-held', authorityCalls);
-    const harness = buildHarness({ reason: 'fatal', hooksOnShutdown: async () => {} });
+    const harness = buildHarness({ reason: 'test-teardown', hooksOnShutdown: async () => {} });
     harness.ctx.providerHostManager = {
       drainForHandoff: async () => ({
         kind: 'provider-hosts-quiesced',
@@ -1133,14 +1210,13 @@ describe('runShutdownSequence drain budget', () => {
       authorityCalls.push('closeIpc');
     };
     let childCleanupAttempts = 0;
-    harness.ctx.terminateAllFn = async () => {
+    harness.ctx.terminateAllFn = async (stage) => {
+      if (stage === 'pending-launch-settlement') return { kind: 'all-pending-launches-settled' };
       childCleanupAttempts += 1;
       return childCleanupAttempts === 1
         ? {
-            kind: 'unresolved-at-deadline',
+            kind: 'children-unresolved-at-deadline',
             processes: [{ kind: 'target-alive', pid: 4_242, stage: 'after-sigkill' }],
-            pendingLaunches: 0,
-            retainedLaunches: [],
             cleanupHandles: 1,
             retainedProcesses: [
               {
@@ -1159,7 +1235,7 @@ describe('runShutdownSequence drain budget', () => {
             cleanupFailures: 0,
             owner: 'launch-coordinator',
           }
-        : { kind: 'all-observed-absent' };
+        : { kind: 'all-children-observed-absent' };
     };
 
     const held = await runShutdownSequence(harness.ctx);
@@ -1804,7 +1880,7 @@ describe('required provider-proxy shutdown steps', () => {
       },
       recoveryCapability: { retry },
     };
-    const harness = buildHarness({ reason: 'fatal' });
+    const harness = buildHarness({ reason: 'test-teardown' });
     harness.ctx.markJobsAsErrorFn = vi.fn();
     harness.ctx.providerHostManager = {
       drainForHandoff: async () => ({
@@ -1831,13 +1907,13 @@ describe('required provider-proxy shutdown steps', () => {
   it('reaps every live set on a hard shutdown before terminating owned children', async () => {
     const callLog: CallLog = [];
     const harness = buildHarness({
-      reason: 'fatal',
+      reason: 'test-teardown',
       hooksOnShutdown: async () => {},
       providerProxyAuthority: registryOf([fakeSet('p1', callLog), fakeSet('p2', callLog)]),
     });
-    harness.ctx.terminateAllFn = () => {
-      callLog.push('terminateAll');
-      return { kind: 'all-observed-absent' };
+    harness.ctx.terminateAllFn = (stage) => {
+      callLog.push(stage);
+      return settledLaunchTermination(stage);
     };
 
     await runShutdownSequence(harness.ctx);
@@ -1847,7 +1923,8 @@ describe('required provider-proxy shutdown steps', () => {
     expect(callLog).toEqual([
       'reap:p1',
       'reap:p2',
-      'terminateAll',
+      'pending-launch-settlement',
+      'registered-child-termination',
       'heartbeats:p1',
       'heartbeats:p2',
       'control:p1',
@@ -1864,7 +1941,7 @@ describe('required provider-proxy shutdown steps', () => {
     const callLog: CallLog = [];
     let live: readonly ProviderProxySetAuthority[] = [];
     const harness = buildHarness({
-      reason: 'fatal',
+      reason: 'test-teardown',
       hooksOnShutdown: async () => {},
       providerProxyAuthority: { liveSets: () => live },
     });
@@ -1887,22 +1964,28 @@ describe('required provider-proxy shutdown steps', () => {
         };
       },
     } as never;
-    harness.ctx.terminateAllFn = () => {
-      callLog.push('terminateAll');
-      return { kind: 'all-observed-absent' };
+    harness.ctx.terminateAllFn = (stage) => {
+      callLog.push(stage);
+      return settledLaunchTermination(stage);
     };
 
     await runShutdownSequence(harness.ctx);
 
     // The late-settling set must still go through the required reap step, not be silently skipped because an
     // earlier, now-stale reading of `liveSets()` reported nothing live.
-    expect(callLog).toEqual(['reap:late', 'terminateAll', 'heartbeats:late', 'control:late']);
+    expect(callLog).toEqual([
+      'reap:late',
+      'pending-launch-settlement',
+      'registered-child-termination',
+      'heartbeats:late',
+      'control:late',
+    ]);
   });
 
   it('holds the shutdown when a reap completes without confirming disappearance', async () => {
     const callLog: CallLog = [];
     const harness = buildHarness({
-      reason: 'fatal',
+      reason: 'test-teardown',
       hooksOnShutdown: async () => {},
       providerProxyAuthority: registryOf([
         fakeSet('p1', callLog, { stopAndReap: async () => ({ unconfirmed: 'a recorded root is still alive' }) }),
@@ -1922,7 +2005,7 @@ describe('required provider-proxy shutdown steps', () => {
     const callLog: CallLog = [];
     let reapAttempts = 0;
     const harness = buildHarness({
-      reason: 'fatal',
+      reason: 'test-teardown',
       hooksOnShutdown: async () => {},
       providerProxyAuthority: registryOf([
         fakeSet('p1', callLog, {

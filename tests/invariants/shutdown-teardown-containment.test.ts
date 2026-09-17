@@ -406,7 +406,7 @@ function settlementConstructorDefinitionViolations(sourceFile: ts.SourceFile, ex
   );
 }
 
-function cleanupHandleLoop(terminateAll: NamedFunction): ts.ForOfStatement | null {
+function cleanupHandleLoop(childTermination: NamedFunction): ts.ForOfStatement | null {
   let match: ts.ForOfStatement | null = null;
 
   function visit(node: ts.Node): void {
@@ -421,7 +421,7 @@ function cleanupHandleLoop(terminateAll: NamedFunction): ts.ForOfStatement | nul
     ts.forEachChild(node, visit);
   }
 
-  if (terminateAll.body) visit(terminateAll.body);
+  if (childTermination.body) visit(childTermination.body);
   return match;
 }
 
@@ -442,16 +442,16 @@ function isInsideCaughtTry(node: ts.Node, loop: ts.ForOfStatement): boolean {
   return false;
 }
 
-function childTerminationViolations(sourceFile: ts.SourceFile): string[] {
-  const terminateAll = findFunction(sourceFile, 'terminateAll');
-  const loop = cleanupHandleLoop(terminateAll);
+function childTerminationViolations(sourceFile: ts.SourceFile, functionName: string): string[] {
+  const childTermination = findFunction(sourceFile, functionName);
+  const loop = cleanupHandleLoop(childTermination);
   if (loop === null) {
-    return [formatViolation(terminateAll, terminateAll, 'missing cleanupHandles.values() termination loop')];
+    return [formatViolation(childTermination, childTermination, 'missing cleanupHandles.values() termination loop')];
   }
 
   const cleanupName = loopBindingName(loop);
   if (cleanupName === null) {
-    return [formatViolation(terminateAll, loop, 'cleanup handle loop must use an exact identifier binding')];
+    return [formatViolation(childTermination, loop, 'cleanup handle loop must use an exact identifier binding')];
   }
 
   const cleanupCalls: ts.CallExpression[] = [];
@@ -468,12 +468,14 @@ function childTerminationViolations(sourceFile: ts.SourceFile): string[] {
   visit(loop.statement);
 
   if (cleanupCalls.length === 0) {
-    return [formatViolation(terminateAll, loop, `cleanup handle ${cleanupName} is never called`)];
+    return [formatViolation(childTermination, loop, `cleanup handle ${cleanupName} is never called`)];
   }
 
   return cleanupCalls
     .filter((call) => !isInsideCaughtTry(call, loop))
-    .map((call) => formatViolation(terminateAll, call, `${cleanupName}() bypasses per-handle try/catch containment`));
+    .map((call) =>
+      formatViolation(childTermination, call, `${cleanupName}() bypasses per-handle try/catch containment`),
+    );
 }
 
 describe('shutdown teardown containment invariant', () => {
@@ -641,11 +643,11 @@ describe('shutdown teardown containment invariant', () => {
   });
 
   it('contains every cleanup call in the child-termination loop', () => {
-    expect(childTerminationViolations(readSource(ADMISSION_PATH))).toEqual([]);
+    expect(childTerminationViolations(readSource(ADMISSION_PATH), 'terminateRegisteredChildren')).toEqual([]);
   });
 
   it('rejects a bare child-cleanup mutation', () => {
-    expect(childTerminationViolations(readFixture('terminate-all-bare-cleanup'))).toEqual([
+    expect(childTerminationViolations(readFixture('terminate-all-bare-cleanup'), 'terminateAll')).toEqual([
       `${FIXTURE_ROOT}/terminate-all-bare-cleanup.ts:4 terminateAll: ` +
         'cleanup() bypasses per-handle try/catch containment',
     ]);

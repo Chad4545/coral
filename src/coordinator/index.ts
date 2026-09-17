@@ -17,6 +17,7 @@ import {
 import { createCoordinatorCore } from './composition/index.js';
 import { createCoordinatorProviderHostAdmission } from './live/provider-host-admission.js';
 import type { CoordinatorCoreOptions, CoordinatorCoreResult } from './composition/types.js';
+import type { ShutdownReason } from './shutdown.js';
 import type { CoordinatorStoreServices, StoreServicesRef } from './composition/store-services-ref.js';
 import type { CoordinatorServerInfo, LifecycleShutdownDisposition, LifecycleState } from './lifecycle.js';
 import { ExecutionService } from './execution-service.js';
@@ -76,7 +77,7 @@ export type CoordinatorServerOptions = Omit<
 export type CoordinatorServerController = {
   server: CoordinatorCoreResult['server'];
   start: () => Promise<CoordinatorServerInfo>;
-  shutdown: (reason: string) => Promise<LifecycleShutdownDisposition>;
+  shutdown: (reason: ShutdownReason) => Promise<LifecycleShutdownDisposition>;
   waitForShutdown: () => Promise<LifecycleShutdownDisposition>;
   getLifecycle: () => LifecycleState;
   getIdleTimer: () => CoordinatorCoreResult['idleTimer'];

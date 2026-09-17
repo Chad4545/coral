@@ -11,7 +11,11 @@ import type { IpcListener } from '../transport/ipc/server.js';
 import type { ShutdownObligationSubject } from '../obligation/shutdown-abandonment.js';
 import type { StoreServicesRef } from './composition/store-services-ref.js';
 import type { HandoffQuiescePort } from './execution-service.js';
-import type { TerminateAllDisposition } from './live/admission.js';
+import type {
+  ChildTerminationDisposition,
+  LaunchTerminationFn,
+  PendingLaunchSettlementDisposition,
+} from './live/admission.js';
 import type { IdleTimer } from './live/idle.js';
 import type {
   ProviderHostCleanupObligations,
@@ -40,7 +44,25 @@ export const SHUTDOWN_POLL_MS = 50;
 
 export type ShutdownMode = 'handoff' | 'hard';
 
-function shutdownModeFromReason(reason: string): ShutdownMode {
+const SHUTDOWN_REASONS = [
+  'replaced',
+  'sigterm',
+  'sigint',
+  'handoff',
+  'provider-proxy-lifecycle-fatal',
+  'idle',
+  'test-teardown',
+] as const;
+
+export type ShutdownReason = (typeof SHUTDOWN_REASONS)[number];
+
+const shutdownReasons: ReadonlySet<string> = new Set(SHUTDOWN_REASONS);
+
+export function isShutdownReason(reason: string): reason is ShutdownReason {
+  return shutdownReasons.has(reason);
+}
+
+function shutdownModeFromReason(reason: ShutdownReason): ShutdownMode {
   if (reason === 'replaced' || reason === 'sigterm') return 'handoff';
   return 'hard';
 }
@@ -55,7 +77,7 @@ interface ShutdownRuntimeState {
 }
 
 type RunShutdownSequenceContext = {
-  reason: string;
+  reason: ShutdownReason;
   state: LifecycleWiringState;
   teardownRecoveryCoordinator: () => Promise<void>;
   runtimeState: ShutdownRuntimeState;
@@ -77,7 +99,7 @@ type RunShutdownSequenceContext = {
   stopProviderOperationReconciler?: () => ProviderOperationReconcilerStopDisposition;
   kbDaemonSupervisor?: KbDaemonSupervisor;
   storeServicesRef: StoreServicesRef;
-  terminateAllFn: (signal: AbortSignal) => TerminateAllDisposition | Promise<TerminateAllDisposition>;
+  terminateAllFn: LaunchTerminationFn;
   handoffQuiescePorts: () => readonly HandoffQuiescePort[];
   disposeLifecycleReactor: () => void | Promise<void>;
   hooks: { onShutdown(mode: ShutdownMode, signal: AbortSignal): Promise<void> };
@@ -88,7 +110,10 @@ type RunShutdownSequenceContext = {
   acceptProcessExitRemainder?: (remainder: ProcessExitRemainder) => ProcessExitRemainderAcceptance;
 };
 
-type UnresolvedChildProcess = Extract<TerminateAllDisposition, { kind: 'unresolved-at-deadline' }>['processes'][number];
+type UnresolvedChildProcess = Extract<
+  ChildTerminationDisposition,
+  { kind: 'children-unresolved-at-deadline' }
+>['processes'][number];
 
 function unresolvedChildProcessDetail(process: UnresolvedChildProcess): string {
   switch (process.kind) {
@@ -106,25 +131,39 @@ function unresolvedChildProcessDetail(process: UnresolvedChildProcess): string {
   }
 }
 
-function childTerminationConfirmation(disposition: TerminateAllDisposition): SettlementConfirmation {
-  if (disposition.kind === 'all-observed-absent') return { confirmed: true };
-  const observations = disposition.processes.map(unresolvedChildProcessDetail).join('; ');
+function pendingLaunchSettlementConfirmation(disposition: PendingLaunchSettlementDisposition): SettlementConfirmation {
+  if (disposition.kind === 'all-pending-launches-settled') return { confirmed: true };
   const retainedLaunches = disposition.retainedLaunches
     .map((launch) => `${launch.provider}:${launch.jobDir} awaiting wrapper identity`)
     .join('; ');
+  const actionCommands = disposition.retainedLaunches.flatMap((launch) =>
+    launch.jobId === undefined ? [] : [`coral-cli abort jobs ${launch.jobId}`],
+  );
+  return {
+    confirmed: false,
+    detail:
+      `${disposition.pendingLaunches} pending launch(es) remain owned by ${disposition.owner}` +
+      `${retainedLaunches.length === 0 ? '' : ` (${retainedLaunches})`}. ` +
+      (actionCommands.length === 0
+        ? 'No durable job identity was returned for an operator action.'
+        : `Run ${actionCommands.join(', ')}; the durable containment row remains visible until discharge.`),
+  };
+}
+
+function childTerminationConfirmation(disposition: ChildTerminationDisposition): SettlementConfirmation {
+  if (disposition.kind === 'all-children-observed-absent') return { confirmed: true };
+  const observations = disposition.processes.map(unresolvedChildProcessDetail).join('; ');
   const retainedProcesses = disposition.retainedProcesses
     .map((process) => `${process.provider}:${process.jobDir} pgid ${process.containment.processGroupId}`)
     .join('; ');
-  const retained = [retainedLaunches, retainedProcesses].filter((detail) => detail.length > 0).join('; ');
-  const actionCommands = [...disposition.retainedLaunches, ...disposition.retainedProcesses].flatMap((process) =>
+  const actionCommands = disposition.retainedProcesses.flatMap((process) =>
     process.jobId === undefined ? [] : [`coral-cli abort jobs ${process.jobId}`],
   );
   return {
     confirmed: false,
     detail:
-      `${disposition.cleanupHandles} cleanup handle(s) and ${disposition.pendingLaunches} pending launch(es) ` +
-      `remain owned by ${disposition.owner}` +
-      `${observations.length === 0 && retained.length === 0 ? '' : ` (${[observations, retained].filter(Boolean).join('; ')})`}. ` +
+      `${disposition.cleanupHandles} cleanup handle(s) remain owned by ${disposition.owner}` +
+      `${observations.length === 0 && retainedProcesses.length === 0 ? '' : ` (${[observations, retainedProcesses].filter(Boolean).join('; ')})`}. ` +
       (actionCommands.length === 0
         ? 'No durable job identity was returned for an operator action.'
         : `Run ${actionCommands.join(', ')}; the durable containment row remains visible until discharge.`),
@@ -246,9 +285,30 @@ function abandonableCleanupContribution(
   });
 }
 
-function retainedChildActions(disposition: TerminateAllDisposition | null): readonly ShutdownOperatorAction[] {
-  if (disposition === null || disposition.kind === 'all-observed-absent') return [];
-  return [...disposition.retainedLaunches, ...disposition.retainedProcesses].flatMap((retained) =>
+function retainedPendingLaunchActions(
+  disposition: PendingLaunchSettlementDisposition | null,
+): readonly ShutdownOperatorAction[] {
+  if (disposition === null || disposition.kind === 'all-pending-launches-settled') return [];
+  return disposition.retainedLaunches.flatMap((retained) =>
+    retained.jobId === undefined
+      ? []
+      : [
+          {
+            kind: 'retained-job-containment' as const,
+            jobId: retained.jobId,
+            provider: retained.provider,
+            jobDir: retained.jobDir,
+            actionCommand: `coral-cli abort jobs ${retained.jobId}`,
+          },
+        ],
+  );
+}
+
+function retainedChildProcessActions(
+  disposition: ChildTerminationDisposition | null,
+): readonly ShutdownOperatorAction[] {
+  if (disposition === null || disposition.kind === 'all-children-observed-absent') return [];
+  return disposition.retainedProcesses.flatMap((retained) =>
     retained.jobId === undefined
       ? []
       : [
@@ -662,17 +722,45 @@ function buildHardShutdownConsequences({
     shutdownObligationAbandoned,
     stopProviderOperationReconciler,
   });
-  let childTerminationDisposition: TerminateAllDisposition | null = null;
+  let pendingLaunchDisposition: PendingLaunchSettlementDisposition | null = null;
+  const pendingLaunchSettlement: ShutdownObligation = {
+    label: 'pending launch settlement',
+    task: async (signal) => {
+      if (shutdownObligationAbandoned('child-termination')) return { confirmed: true };
+      const disposition = await terminateAllFn('pending-launch-settlement', signal);
+      if (
+        disposition.kind === 'all-children-observed-absent' ||
+        disposition.kind === 'children-unresolved-at-deadline'
+      ) {
+        throw new Error(`Pending launch settlement returned child termination disposition ${disposition.kind}.`);
+      }
+      pendingLaunchDisposition = disposition;
+      return pendingLaunchSettlementConfirmation(disposition);
+    },
+    retainedAuthority: () =>
+      abandonableCleanupContribution('pending launch settlement', 'child-termination', {
+        operatorActions: retainedPendingLaunchActions(pendingLaunchDisposition),
+      }),
+    remainder: { owner: 'none' },
+  };
+  let childTerminationDisposition: ChildTerminationDisposition | null = null;
   const childTermination: ShutdownObligation = {
     label: 'child termination',
     task: async (signal) => {
       if (shutdownObligationAbandoned('child-termination')) return { confirmed: true };
-      childTerminationDisposition = await terminateAllFn(signal);
-      return childTerminationConfirmation(childTerminationDisposition);
+      const disposition = await terminateAllFn('registered-child-termination', signal);
+      if (
+        disposition.kind === 'all-pending-launches-settled' ||
+        disposition.kind === 'pending-launches-unresolved-at-deadline'
+      ) {
+        throw new Error(`Child termination returned pending launch disposition ${disposition.kind}.`);
+      }
+      childTerminationDisposition = disposition;
+      return childTerminationConfirmation(disposition);
     },
     retainedAuthority: () =>
       abandonableCleanupContribution('child termination', 'child-termination', {
-        operatorActions: retainedChildActions(childTerminationDisposition),
+        operatorActions: retainedChildProcessActions(childTerminationDisposition),
       }),
     remainder: { owner: 'none' },
   };
@@ -686,6 +774,7 @@ function buildHardShutdownConsequences({
       if (
         !ledger.isDischarged(providerHostShutdown) ||
         !ledger.isDischarged(providerOperationMutationDrain) ||
+        !ledger.isDischarged(pendingLaunchSettlement) ||
         !ledger.isDischarged(childTermination)
       ) {
         return Promise.resolve({
@@ -704,6 +793,7 @@ function buildHardShutdownConsequences({
       storeServicesCheck,
       providerHostShutdown,
       providerOperationMutationDrain,
+      pendingLaunchSettlement,
       childTermination,
       crashedJobTerminalization,
     ],

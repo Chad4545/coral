@@ -36,6 +36,7 @@ import { readDurableCliContainmentStatus, writeDurableCliProcessRuntimeMeta } fr
 import { testIncarnation } from '#tests/helpers/process-incarnation.js';
 import { encodeHistoricalDurableCliProcessRuntimeMeta } from '#tests/helpers/historical-durable-cli-runtime-meta.js';
 import type {
+  LifecycleController,
   LifecycleShutdownDisposition,
   RecoverPersistedDiscussFn,
   RunStartupRecoveryFn,
@@ -59,7 +60,7 @@ import { createFailedWorkflowDescendantReleaser } from '#src/coordinator/service
 import type { AtomicFailedWorkflowDescendantReleaser } from '#src/workflow/recover.js';
 import type { WorkflowPlan } from '#src/workflow/plan.js';
 import { awaitRecoveryCursorBarrier } from '#src/coordinator/index.js';
-import type { TerminateAllDisposition } from '#src/coordinator/live/admission.js';
+import type { LaunchTerminationFn } from '#src/coordinator/live/admission.js';
 
 let runtime: ReturnType<typeof createRealRuntime>;
 
@@ -744,7 +745,7 @@ function createLifecycleHarness(
     writeBackendInfoFn?: () => void;
     cleanupStaleJobsFn?: (currentBundleHash: string, signal: AbortSignal) => void | Promise<void>;
     markJobsAsErrorFn?: (message: string, signal: AbortSignal) => void | Promise<void>;
-    terminateAllFn?: (signal: AbortSignal) => TerminateAllDisposition | Promise<TerminateAllDisposition>;
+    terminateAllFn?: LaunchTerminationFn;
     registerRuntimeComponentFn?: (component: RuntimeComponent) => void;
     interruptedAppServerReason?: 'restart' | 'handoff';
     runtime?: ReturnType<typeof createRealRuntime>;
@@ -836,7 +837,12 @@ function createLifecycleHarness(
       removeBackendInfoIfOwnerFn: () => {},
       cleanupStaleJobsFn: options.cleanupStaleJobsFn ?? (() => {}),
       markJobsAsErrorFn: options.markJobsAsErrorFn ?? (() => {}),
-      terminateAllFn: options.terminateAllFn ?? (() => ({ kind: 'all-observed-absent' })),
+      terminateAllFn:
+        options.terminateAllFn ??
+        ((stage) =>
+          stage === 'pending-launch-settlement'
+            ? { kind: 'all-pending-launches-settled' }
+            : { kind: 'all-children-observed-absent' }),
       kbDaemonSupervisor,
       handoffQuiescePorts: () => [],
       createKbHealthComponentFn: () => createKbDaemonHealthComponent(kbDaemonSupervisor),
@@ -940,13 +946,12 @@ function createActualRecoveryService(
   );
 }
 
-async function stopLifecycleController(controller: {
-  shutdown: (reason: string) => Promise<LifecycleShutdownDisposition>;
-  waitForShutdown: () => Promise<LifecycleShutdownDisposition>;
-}): Promise<LifecycleShutdownDisposition | null> {
+async function stopLifecycleController(
+  controller: Pick<LifecycleController, 'shutdown' | 'waitForShutdown'>,
+): Promise<LifecycleShutdownDisposition | null> {
   let disposition: LifecycleShutdownDisposition | null = null;
   try {
-    disposition = await controller.shutdown('test');
+    disposition = await controller.shutdown('test-teardown');
   } catch {
     /* best effort */
   }
@@ -1842,24 +1847,24 @@ describe('lifecycle recovery', () => {
       eventBus,
       runStartupRecoveryFn: async () => [],
       markJobsAsErrorFn,
-      terminateAllFn: () =>
-        containmentAbsent
-          ? { kind: 'all-observed-absent' }
-          : {
-              kind: 'unresolved-at-deadline',
-              processes: [{ kind: 'target-alive', pid: 4_242, stage: 'after-sigkill' }],
-              pendingLaunches: 0,
-              retainedLaunches: [],
-              cleanupHandles: 1,
-              retainedProcesses: [],
-              cleanupFailures: 0,
-              owner: 'launch-coordinator',
-            },
+      terminateAllFn: (stage) =>
+        stage === 'pending-launch-settlement'
+          ? { kind: 'all-pending-launches-settled' }
+          : containmentAbsent
+            ? { kind: 'all-children-observed-absent' }
+            : {
+                kind: 'children-unresolved-at-deadline',
+                processes: [{ kind: 'target-alive', pid: 4_242, stage: 'after-sigkill' }],
+                cleanupHandles: 1,
+                retainedProcesses: [],
+                cleanupFailures: 0,
+                owner: 'launch-coordinator',
+              },
     });
 
     try {
       await controller.start();
-      await expect(controller.shutdown('test')).resolves.toMatchObject({
+      await expect(controller.shutdown('test-teardown')).resolves.toMatchObject({
         disposition: 'held',
         recovery: {
           retainedOwnership: {
@@ -1960,7 +1965,7 @@ describe('lifecycle recovery', () => {
     try {
       await controller.start();
       expect(runtimeState.getLifecycle()).toBe('running');
-      await controller.shutdown('test');
+      await controller.shutdown('test-teardown');
       expect(progressStore.readStatus(faultJobId)?.phase).toBe('launching');
       expect(progressStore.readStatus(foreignFaultJobId)?.phase).toBe('launching');
       expect(progressStore.readStatus(siblingJobId)).toMatchObject({

@@ -1,4 +1,4 @@
-import type { TerminateAllDisposition } from '../live/admission.js';
+import type { LaunchTerminationFn } from '../live/admission.js';
 import type { IncomingMessage, Server, ServerResponse } from 'node:http';
 import type { BackendInfo } from '../../infra/backend-discovery.js';
 import type { ProviderRegistry } from '../../providers/registry.js';
@@ -34,6 +34,7 @@ import type { KbDaemonSupervisor } from '../live/kb-daemon-supervisor.js';
 import type { ProviderScope } from '../../infra/provider-scope.js';
 import type { StoreFormatDescription } from '../../store/format-fingerprint.js';
 import type { ProcessExitRemainder, ProcessExitRemainderAcceptance } from '../shutdown-settlement.js';
+import type { ShutdownReason } from '../shutdown.js';
 
 type CoordinatorBootSnapshot = {
   version?: string;
@@ -77,7 +78,7 @@ export type CoordinatorCoreOptions = {
   cleanupStaleJobsFn?: (currentBundleHash: string) => void | Promise<void>;
   markJobsAsErrorFn?: (message: string) => void | Promise<void>;
   createStoreServicesFromDbFn?: (storeDb: Database) => CoordinatorStoreServices;
-  terminateAllFn?: (signal: AbortSignal) => TerminateAllDisposition | Promise<TerminateAllDisposition>;
+  terminateAllFn?: LaunchTerminationFn;
   registerBuiltInProvidersFn?: RegisterBuiltInProvidersFn;
   recoverPersistedDiscussFn?: RecoverPersistedDiscussFn;
   providerHostManager?: ProviderHostManager;
@@ -145,7 +146,7 @@ export type CoordinatorCoreResult = {
   getDiscussContext: (ctx: InvocationContext) => DiscussContext;
   resolveProjectSource: (projectRoot: string) => string;
   isDrainRequested: () => boolean;
-  requestDrain: (reason: string) => void;
+  requestDrain: (reason: ShutdownReason) => void;
   getKbJobRecorder: () => KbJobRecorder;
   hooks: LifecycleHooks;
 };

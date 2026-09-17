@@ -29,6 +29,7 @@ import { parseProviderRoleArgv, type ProviderRole } from '../provider-proxy/role
 import { runProviderRoleMain } from '../provider-proxy/role-main.js';
 import { currentCoralStoreFormat } from '../store-format.js';
 import { generationMutationCoordinationSeam } from '../store/generation-mutation-coordination.js';
+import { SIGTERM_GRACE_MS } from '../infra/process-constants.js';
 import {
   processIncarnationProbeRegistrySize,
   snapshotProcessIncarnationProbeSubjects,
@@ -68,40 +69,39 @@ function createBootstrapProbeExitGate(): Readonly<{
     if (cleanupInFlight || exited) return;
     cleanupInFlight = true;
     const cleanupSubjects = snapshotProcessIncarnationProbeSubjects();
-    void terminateProcessIncarnationProbes().then(
-      (disposition) => {
-        if (disposition.disposition === 'hold') {
-          const holds = disposition.unsettled
-            .map((hold) =>
-              'key' in hold
-                ? `key=${hold.key} reason=${hold.reason} exit=${hold.exit}`
-                : `pid=${hold.pid ?? 'unavailable'} reason=${hold.reason} exit=${hold.exit}`,
-            )
+    const cleanupAbort = new AbortController();
+    const cleanupDeadline = setTimeout(() => cleanupAbort.abort(), SIGTERM_GRACE_MS);
+    void terminateProcessIncarnationProbes(cleanupAbort.signal)
+      .then(
+        (disposition) => {
+          cleanupInFlight = false;
+          if (disposition.disposition === 'hold') {
+            const holds = disposition.unsettled
+              .map((hold) =>
+                'key' in hold
+                  ? `key=${hold.key} reason=${hold.reason} exit=${hold.exit}`
+                  : `pid=${hold.pid ?? 'unavailable'} reason=${hold.reason} exit=${hold.exit}`,
+              )
+              .join('; ');
+            backendLog.error(`Coordinator exit proceeding with unsettled process-incarnation probes: ${holds}`);
+          }
+          if (requestedExitCode !== null) {
+            exited = true;
+            process.exit(requestedExitCode);
+          }
+        },
+        (error: unknown) => {
+          cleanupInFlight = false;
+          const subjects = cleanupSubjects
+            .map((subject) => ('key' in subject ? `key=${subject.key}` : `pid=${subject.pid}`))
             .join('; ');
-          backendLog.error(`Coordinator exit remains held by unsettled process-incarnation probes: ${holds}`);
-          void disposition.untilSettled.then(() => {
-            cleanupInFlight = false;
-            requestCleanup();
-          });
-          return;
-        }
-        cleanupInFlight = false;
-        if (requestedExitCode !== null) {
-          exited = true;
-          process.exit(requestedExitCode);
-        }
-      },
-      (error: unknown) => {
-        cleanupInFlight = false;
-        const subjects = cleanupSubjects
-          .map((subject) => ('key' in subject ? `key=${subject.key}` : `pid=${subject.pid}`))
-          .join('; ');
-        backendLog.error(
-          `Coordinator process-incarnation probe cleanup failed; exit remains held; registered subjects: ${subjects || 'none'}`,
-          error,
-        );
-      },
-    );
+          backendLog.error(
+            `Coordinator process-incarnation probe cleanup failed; exit remains held; registered subjects: ${subjects || 'none'}`,
+            error,
+          );
+        },
+      )
+      .finally(() => clearTimeout(cleanupDeadline));
   };
 
   const recordExitCode = (code: number): void => {
