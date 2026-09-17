@@ -167,7 +167,7 @@ type RemainderAcceptanceState<Acceptance, Failure> =
   | Readonly<{ kind: 'accepted'; acceptance: Acceptance }>
   | Readonly<{ kind: 'failed'; failure: Failure }>;
 
-const BOUNDARY_TRANSFER_ATTEMPT_LIMIT = 3;
+export const BOUNDARY_TRANSFER_ATTEMPT_LIMIT = 3;
 
 type GateResolution<Acceptance> =
   | Readonly<{ kind: 'held'; boundaryFailure: Extract<Settlement, { kind: 'declined' }> }>

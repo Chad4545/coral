@@ -4582,7 +4582,7 @@ export class ProviderProxySetLifecycle {
     ) {
       return;
     }
-    // Both retirements already reached the fatal sink, whose handoff drain is ledger-bounded.
+    // A both-retired window may not schedule a retry: the fatal that retired the second source is its exit.
     if (window.retiredSources.has('redemption') && window.retiredSources.has('absence')) return;
     slot.attemptToken += 1;
     window.attemptToken = slot.attemptToken;

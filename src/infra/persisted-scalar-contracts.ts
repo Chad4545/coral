@@ -5,7 +5,7 @@ import { MAX_PROCESS_INCARNATION_LENGTH, type ProcessIncarnation } from './node-
 export const persistedNonEmptyStringSchema = z.string().min(1);
 
 /** A durable root may not derive from `processIncarnationSchema` in src/infra/node-process.ts (see
- *  tests/invariants/durable-schema-independence.test.ts). */
+ *  DURABLE_SCHEMA_ROOTS in tests/invariants/durable-schema-independence.test.ts). */
 export const persistedProcessIncarnationSchema = z
   .string()
   .min(1)

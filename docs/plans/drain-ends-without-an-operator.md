@@ -214,7 +214,10 @@ publication throws remains a named `process-exit` loss.
   named redemption/absence pair.
 
 - **AC16** — `SettlementLedger.gate` remains the sole disposition constructor and `runShutdownSequence`'s
-  sole return — `tests/invariants/shutdown-teardown-containment.test.ts` passes unchanged.
+  sole return — `tests/invariants/shutdown-teardown-containment.test.ts` keeps its substance (**corrected in
+  review:** it did not pass byte-unchanged; it took mechanical renames for AC4/AC5 — `deferredFailures` →
+  `undischarged`, the dropped disposition `owner`, and the `terminateRegisteredChildren` seam — with the
+  per-handle try/catch invariant carried forward intact).
 - **AC17** — A test-only backend entrypoint, built from production coordinator/bootstrap modules but never
   copied into the plugin, exposes the exact composition fatal callback to a parent-owned trigger pipe,
   injects a never-settling lifecycle-reactor disposal, and supplies a programmatic shutdown budget.
@@ -758,7 +761,7 @@ npm run test:e2e:build && npm run test:e2e:lifecycle
 
 **Invariants:**
 
-- `tests/invariants/shutdown-teardown-containment.test.ts` — passes unchanged (AC16).
+- `tests/invariants/shutdown-teardown-containment.test.ts` — substance unchanged; renamed identifiers only (AC16, see the correction there).
 - `tests/invariants/lifecycle-phase-monotonic.test.ts` — passes unchanged; already permits
   `draining → stopped`.
 - `tests/invariants/provider-proxy-recovery-policy.test.ts` — **deliberate revision** for conditional

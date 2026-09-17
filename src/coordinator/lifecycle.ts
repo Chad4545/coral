@@ -3,6 +3,7 @@ import { backendLog } from '../infra/backend-log.js';
 import { readBackendInfo, type BackendInfo, type BackendInfoRemovalResult } from '../infra/backend-discovery.js';
 import { formatError } from '../infra/error-format.js';
 import { type LaunchCoordinator } from './live/admission.js';
+import { BOUNDARY_TRANSFER_ATTEMPT_LIMIT } from '../obligation/settlement.js';
 import type { RecoveryRegistry } from '../jobs/reconcile/registry.js';
 import type { IdleTimer } from './live/idle.js';
 import type { InvocationContext } from '../runtime/invocation-context.js';
@@ -837,7 +838,8 @@ export type LifecycleController = {
   getRecoveryRegistry(): RecoveryRegistry | null;
 };
 
-const SHUTDOWN_ATTEMPT_LIMIT = 3;
+// The continuation's last attempt must be the ledger's terminal attempt, or the loop ends on a hold.
+const SHUTDOWN_ATTEMPT_LIMIT = BOUNDARY_TRANSFER_ATTEMPT_LIMIT;
 
 /** Lifecycle finalization is forbidden while coordinator authority remains retained. */
 type LifecycleShutdownHoldReason = ShutdownHoldReason;
