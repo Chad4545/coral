@@ -1,6 +1,6 @@
 import type { LaunchTerminationFn } from '../live/admission.js';
 import type { IncomingMessage, Server, ServerResponse } from 'node:http';
-import type { BackendInfo } from '../../infra/backend-discovery.js';
+import type { BackendInfo, BackendInfoRemovalResult } from '../../infra/backend-discovery.js';
 import type { ProviderRegistry } from '../../providers/registry.js';
 import type { HostAdmissionCollection } from '../../providers/host-admission.js';
 import type { InvocationContext } from '../../runtime/invocation-context.js';
@@ -73,7 +73,7 @@ export type CoordinatorCoreOptions = {
   createIdleTimer?: () => IdleTimer;
   createExecutionService?: (ctx: InvocationContext, deps: ExecutionServiceDeps) => ProjectRequestPort;
   writeBackendInfoFn?: (info: BackendInfo) => boolean | void;
-  removeBackendInfoIfOwnerFn?: (instanceId: string) => void;
+  removeBackendInfoIfOwnerFn?: (instanceId: string) => void | BackendInfoRemovalResult;
   closeServerFn?: (server: Server) => Promise<void>;
   cleanupStaleJobsFn?: (currentBundleHash: string) => void | Promise<void>;
   markJobsAsErrorFn?: (message: string) => void | Promise<void>;

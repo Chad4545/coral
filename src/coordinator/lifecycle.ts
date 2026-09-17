@@ -1,6 +1,6 @@
 import type { Server, ServerResponse } from 'node:http';
 import { backendLog } from '../infra/backend-log.js';
-import { readBackendInfo, type BackendInfo } from '../infra/backend-discovery.js';
+import { readBackendInfo, type BackendInfo, type BackendInfoRemovalResult } from '../infra/backend-discovery.js';
 import { formatError } from '../infra/error-format.js';
 import { type LaunchCoordinator } from './live/admission.js';
 import type { RecoveryRegistry } from '../jobs/reconcile/registry.js';
@@ -792,9 +792,7 @@ export type LifecycleDeps = {
   readonly knownDiscussSources: () => Set<string>;
   readonly getDiscussContext: (ctx: InvocationContext) => DiscussContext;
   readonly writeBackendInfoFn: (info: BackendInfo) => boolean | void;
-  readonly removeBackendInfoIfOwnerFn: (
-    instanceId: string,
-  ) => void | Readonly<{ kind: 'removed' | 'unchanged' }> | Readonly<{ kind: 'refused'; detail: string }>;
+  readonly removeBackendInfoIfOwnerFn: (instanceId: string) => void | BackendInfoRemovalResult;
   readonly cleanupStaleJobsFn: (currentBundleHash: string, signal: AbortSignal) => void | Promise<void>;
   readonly markJobsAsErrorFn: (message: string, signal: AbortSignal) => void | Promise<void>;
   readonly terminateAllFn: LaunchTerminationFn;
@@ -877,6 +875,8 @@ export type LifecycleShutdownTerminalDisposition = Extract<
   LifecycleShutdownDisposition,
   { disposition: 'finalized' | 'finalized-with-losses' }
 >;
+
+type ShutdownRemainderWriteResult = Readonly<{ kind: 'written' }> | Readonly<{ kind: 'refused'; detail: string }>;
 
 export function isLifecycleShutdownTerminal(
   disposition: LifecycleShutdownDisposition,
@@ -1321,7 +1321,7 @@ async function runLifecycleStartup({
         // best effort
       }
     }
-    removeBackendInfoIfOwnerFn(instanceId);
+    void removeBackendInfoIfOwnerFn(instanceId);
 
     if (error instanceof HandoffEscalationError) {
       backendLog.error('Handoff escalation failed', error);
@@ -1425,17 +1425,29 @@ export function createLifecycle(
         time: runtime.time,
         runDir: runtime.paths.coral.coordinator.runDir,
       };
-      const recordRemainder = (): boolean =>
-        recordShutdownRemainder(remainderRuntime, {
-          instanceId,
-          reason,
-          mode: shutdownModeFromReason(reason),
-          exitCode,
-          undischarged: finalized.disposition === 'finalized' ? [] : finalized.undischarged,
-        });
+      const recordRemainder = (): ShutdownRemainderWriteResult => {
+        try {
+          return recordShutdownRemainder(remainderRuntime, {
+            instanceId,
+            reason,
+            mode: shutdownModeFromReason(reason),
+            exitCode,
+            undischarged: finalized.disposition === 'finalized' ? [] : finalized.undischarged,
+          })
+            ? { kind: 'written' }
+            : { kind: 'refused', detail: 'record publication returned false' };
+        } catch (error: unknown) {
+          return { kind: 'refused', detail: formatError(error) };
+        }
+      };
 
       try {
-        void recordRemainder();
+        const remainderWrite = recordRemainder();
+        const remainderPublished = remainderWrite.kind === 'written';
+        if (remainderWrite.kind === 'refused') {
+          bestEffortLifecycleLog(log, `shutdown remainder write refused (${remainderWrite.detail})\n`);
+          exitCode = Math.max(exitCode, 1);
+        }
         let withdrawalRefusal: string | null = null;
         try {
           const withdrawal = removeBackendInfoIfOwnerFn(instanceId);
@@ -1457,10 +1469,11 @@ export function createLifecycle(
               },
             ],
           };
-          try {
-            void recordRemainder();
-          } catch (error: unknown) {
-            bestEffortLifecycleLog(log, `shutdown remainder rewrite failed (${formatError(error)})\n`);
+          if (remainderPublished) {
+            const remainderRewrite = recordRemainder();
+            if (remainderRewrite.kind === 'refused') {
+              bestEffortLifecycleLog(log, `shutdown remainder rewrite refused (${remainderRewrite.detail})\n`);
+            }
           }
         }
         return finalized;

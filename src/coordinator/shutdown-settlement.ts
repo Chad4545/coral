@@ -42,8 +42,7 @@ export type ShutdownHoldExit =
   | 'admitted-provider-operation-mutation-settlement'
   | 'provider-operation-mutation-admission-availability'
   | 'provider-proxy-set-release-retry'
-  | 'durable-operator-abandonment'
-  | 'required-cleanup-capability-confirmation-or-durable-operator-abandonment'
+  | 'shutdown-budget-exhaustion'
   | 'authority-release-settlement';
 
 export type ShutdownOperatorAction =
@@ -102,7 +101,6 @@ export type ShutdownRetainedAuthorityContribution = Readonly<{
   ipcSocket?: boolean;
   providerControlProxyInstanceIds?: readonly string[];
   cleanupObligations?: readonly string[];
-  operatorActions?: readonly ShutdownOperatorAction[];
 }>;
 
 export type ShutdownHold = SettlementHold<ShutdownHoldReason, ShutdownHoldExit>;
@@ -142,38 +140,23 @@ function unique<T>(values: readonly T[]): readonly T[] {
   return [...new Set(values)];
 }
 
-function operatorActionKey(action: ShutdownOperatorAction): string {
-  switch (action.kind) {
-    case 'retained-job-containment':
-      return `${action.kind}:${action.jobId}:${action.jobDir}`;
-    case 'provider-proxy-set-containment':
-      return `${action.kind}:${action.proxyInstanceId}`;
-    case 'shutdown-obligation-abandonment':
-      return `${action.kind}:${action.subject}`;
-  }
-}
-
 function foldRetainedAuthority(
   contributions: readonly ShutdownRetainedAuthorityContribution[],
 ): ShutdownRetainedAuthority {
-  const actions = new Map<string, ShutdownOperatorAction>();
-  for (const contribution of contributions) {
-    for (const action of contribution.operatorActions ?? []) actions.set(operatorActionKey(action), action);
-  }
   return {
     ipcSocket: contributions.some(({ ipcSocket }) => ipcSocket === true),
     providerControlProxyInstanceIds: unique(
       contributions.flatMap(({ providerControlProxyInstanceIds }) => providerControlProxyInstanceIds ?? []),
     ),
     cleanupObligations: unique(contributions.flatMap(({ cleanupObligations }) => cleanupObligations ?? [])),
-    operatorActions: [...actions.values()],
+    operatorActions: [],
   };
 }
 
 function defaultHold(): ShutdownHold {
   return {
     reason: 'required-shutdown-step-unsettled',
-    exit: 'durable-operator-abandonment',
+    exit: 'shutdown-budget-exhaustion',
   };
 }
 

@@ -127,7 +127,7 @@ describe('resolveCoordinatorDefaults eager defaults', () => {
       flavor: harness.info.flavor,
     });
 
-    harness.defaults.removeBackendInfoIfOwnerFn(harness.info.instanceId);
+    expect(harness.defaults.removeBackendInfoIfOwnerFn(harness.info.instanceId)).toEqual({ kind: 'removed' });
     expect(readBackendInfo(discoveryRuntime)).toBeNull();
   });
 
@@ -140,7 +140,7 @@ describe('resolveCoordinatorDefaults eager defaults', () => {
     };
 
     harness.defaults.writeBackendInfoFn(harness.info);
-    harness.defaults.removeBackendInfoIfOwnerFn('some-other-instance');
+    expect(harness.defaults.removeBackendInfoIfOwnerFn('some-other-instance')).toEqual({ kind: 'unchanged' });
     expect(readBackendInfo(discoveryRuntime)).not.toBeNull();
   });
 

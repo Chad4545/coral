@@ -196,6 +196,94 @@ async function flush(rounds = 16): Promise<void> {
   for (let i = 0; i < rounds; i += 1) await Promise.resolve();
 }
 
+function buildRemainderWriteRefusalHarness(
+  write: () => boolean,
+  withdrawal: Readonly<{ kind: 'removed' }> | Readonly<{ kind: 'refused'; detail: string }> = { kind: 'removed' },
+) {
+  const harness = buildHarness({ hooksOnShutdown: async () => {} });
+  const order: string[] = [];
+  const logLines: string[] = [];
+  const runtime = {
+    ...harness.runtime,
+    storage: {
+      ...harness.runtime.storage,
+      existsSync: () => false,
+      writeAtomicDurableSync: () => {
+        order.push('record');
+        return write();
+      },
+    },
+  } as Runtime;
+  let lifecycle: 'running' | 'draining' | 'stopped' = 'running';
+  const runtimeState = {
+    ...harness.ctx.runtimeState,
+    getLifecycle: () => lifecycle,
+    setLifecycle: (next: typeof lifecycle) => {
+      lifecycle = next;
+      if (next === 'stopped') order.push('stopped');
+    },
+  };
+  const onStopped = vi.fn((exitCode: number) => {
+    order.push(`exit:${exitCode}`);
+  });
+  const removeBackendInfoIfOwnerFn = vi.fn(() => {
+    order.push('withdraw');
+    return withdrawal;
+  });
+  const controller = createLifecycle(
+    {
+      identity: {
+        pluginRoot: '/plugin',
+        instanceId: 'remainder-write-refusal',
+        log: (message: string) => logLines.push(message),
+      },
+      runtime,
+      storeFormat: {},
+      backendPid: 4_242,
+      runtimeState,
+      idleTimer: { ...harness.ctx.idleTimer, inflightRequests: 0 },
+      storeServicesRef: harness.ctx.storeServicesRef,
+      createStoreServicesFromDbFn: () => ({}),
+      streamResponses: harness.ctx.streamResponses,
+      discussStores: harness.ctx.discussStores,
+      eventBus: {},
+      launchCoordinator: {},
+      providerRegistry: {},
+      server: harness.ctx.server,
+      getExecutionService: () => ({}),
+      getRecoveryService: () => ({}),
+      listExecutionServices: () => [],
+      getDiscussStoreForSource: () => {
+        throw new Error('unexpected discuss store lookup');
+      },
+      knownDiscussSources: () => new Set(),
+      getDiscussContext: () => {
+        throw new Error('unexpected discuss context lookup');
+      },
+      writeBackendInfoFn: () => {},
+      removeBackendInfoIfOwnerFn,
+      cleanupStaleJobsFn: () => {},
+      markJobsAsErrorFn: harness.ctx.markJobsAsErrorFn,
+      terminateAllFn: harness.ctx.terminateAllFn,
+      providerHostManager: harness.ctx.providerHostManager,
+      handoffQuiescePorts: () => [],
+      createKbHealthComponentFn: () => ({}),
+      registerBuiltInProvidersFn: () => {},
+      recoverPersistedDiscussFn: async () => [],
+      hooks: harness.ctx.hooks,
+      closeServerFn: harness.ctx.closeServerFn,
+      listenFn: async () => ({ host: '127.0.0.1', port: 43123 }),
+      ipcServer: harness.ctx.ipcServer,
+      closeIpcServerFn: harness.ctx.closeIpcServerFn,
+      disposeLifecycleReactor: harness.ctx.disposeLifecycleReactor,
+      onStopped,
+    } as never,
+    async () => [],
+  );
+
+  return { controller, logLines, onStopped, order, removeBackendInfoIfOwnerFn };
+}
+
 type ShutdownSequenceHold = Extract<Awaited<ReturnType<typeof runShutdownSequence>>, { disposition: 'held' }>;
 type ShutdownSequenceUnaccepted = Extract<
   Awaited<ReturnType<typeof runShutdownSequence>>,
@@ -512,9 +600,7 @@ describe('runShutdownSequence drain budget', () => {
     expect(hookSignal).not.toBeNull();
     expect((hookSignal as unknown as AbortSignal).aborted).toBe(true);
     expect(heldFailureDetail(held)).toContain('hooks.onShutdown: timed-out');
-    expect(held.retainedAuthority.operatorActions).toContainEqual(
-      expect.objectContaining({ kind: 'shutdown-obligation-abandonment' }),
-    );
+    expect(held.retainedAuthority.operatorActions).toEqual([]);
 
     expect(harness.closeIpcCalled()).toBe(false);
   });
@@ -703,9 +789,7 @@ describe('runShutdownSequence drain budget', () => {
     expect(sawExceeded).toBe(true);
     expect(heldFailureDetail(held)).toContain('provider host shutdown: timed-out');
     expect(heldFailureDetail(held)).toContain('child termination: budget-exhausted');
-    expect(held.retainedAuthority.operatorActions).toContainEqual(
-      expect.objectContaining({ kind: 'shutdown-obligation-abandonment' }),
-    );
+    expect(held.retainedAuthority.operatorActions).toEqual([]);
     expect(providerSignal?.aborted).toBe(true);
     expect(stopProviderOperationReconciler).not.toHaveBeenCalled();
     expect(harness.callLog).not.toContain('terminateAllFn:pending-launch-settlement');
@@ -898,10 +982,12 @@ describe('runShutdownSequence drain budget', () => {
     };
 
     const terminal = requireUnaccepted(await runShutdownSequence(harness.ctx));
+    const detail = failureDetail(terminal);
 
     expect(stages).toEqual(['pending-launch-settlement', 'registered-child-termination']);
-    expect(failureDetail(terminal)).toContain('pending launch settlement: unconfirmed');
-    expect(failureDetail(terminal)).toContain('child termination: unconfirmed');
+    expect(detail).toContain('pending launch settlement: unconfirmed');
+    expect(detail).toContain('child termination: unconfirmed');
+    expect(detail).not.toContain('coral-cli abort jobs');
     expect(terminal.undischarged).toEqual(
       expect.arrayContaining([
         expect.objectContaining({ label: 'pending launch settlement' }),
@@ -1014,9 +1100,7 @@ describe('runShutdownSequence drain budget', () => {
     expect(sawExceeded).toBe(true);
     expect(sawSkipped).toBe(true);
     expect(heldFailureDetail(held)).toContain('provider host drain for handoff: timed-out');
-    expect(held.retainedAuthority.operatorActions).toContainEqual(
-      expect.objectContaining({ kind: 'shutdown-obligation-abandonment' }),
-    );
+    expect(held.retainedAuthority.operatorActions).toEqual([]);
     expect(harness.closeIpcCalled()).toBe(false);
   });
 
@@ -1063,9 +1147,7 @@ describe('runShutdownSequence drain budget', () => {
     expect(order).toContain('hooks:start');
     expect(order).not.toContain('closeIpc');
     expect(heldFailureDetail(held)).toContain('hooks.onShutdown: timed-out');
-    expect(held.retainedAuthority.operatorActions).toContainEqual(
-      expect.objectContaining({ kind: 'shutdown-obligation-abandonment' }),
-    );
+    expect(held.retainedAuthority.operatorActions).toEqual([]);
   });
 
   it('returns a hold after a synchronous finalizer exhausts the budget', async () => {
@@ -1084,9 +1166,7 @@ describe('runShutdownSequence drain budget', () => {
     const held = requireHeld(await sequence);
 
     expect(heldFailureDetail(held)).toContain('lifecycle reactor dispose: budget-exhausted');
-    expect(held.retainedAuthority.operatorActions).toContainEqual(
-      expect.objectContaining({ kind: 'shutdown-obligation-abandonment' }),
-    );
+    expect(held.retainedAuthority.operatorActions).toEqual([]);
     expect(harness.closeIpcCalled()).toBe(false);
   });
 
@@ -2232,9 +2312,7 @@ describe('required provider-proxy shutdown steps', () => {
 
     const held = requireHeld(await runShutdownSequence(harness.ctx));
     expect(heldFailureDetail(held)).toMatch(/control p1: .*control gone/u);
-    expect(held.retainedAuthority.operatorActions).toContainEqual(
-      expect.objectContaining({ kind: 'provider-proxy-set-containment', proxyInstanceId: 'p1' }),
-    );
+    expect(held.retainedAuthority.operatorActions).toEqual([]);
     expect(callLog).not.toContain('closeIpcServerFn:start');
     await expect(held.retry()).resolves.toEqual({ disposition: 'settled' });
     expect(controlAttempts).toBe(2);
@@ -2272,6 +2350,72 @@ describe('required provider-proxy shutdown steps', () => {
     harness.time.tick(1);
     await flush();
     expect(woke).toBe(true);
+  });
+
+  it.each([
+    {
+      label: 'returns false',
+      write: () => false,
+      expectedDetail: 'record publication returned false',
+    },
+    {
+      label: 'throws',
+      write: () => {
+        throw new Error('remainder storage unavailable');
+      },
+      expectedDetail: 'remainder storage unavailable',
+    },
+  ])(
+    'withdraws discovery and requests nonzero exit when the remainder write $label',
+    async ({ write, expectedDetail }) => {
+      const harness = buildRemainderWriteRefusalHarness(write);
+
+      await expect(harness.controller.shutdown('replaced')).resolves.toEqual({ disposition: 'finalized' });
+
+      expect(harness.removeBackendInfoIfOwnerFn).toHaveBeenCalledOnce();
+      expect(harness.onStopped).toHaveBeenCalledWith(1);
+      expect(harness.order).toEqual(['stopped', 'record', 'withdraw', 'exit:1']);
+      expect(harness.logLines.some((line) => line.includes('shutdown remainder write refused'))).toBe(true);
+      expect(harness.logLines.some((line) => line.includes(expectedDetail))).toBe(true);
+    },
+  );
+
+  it('does not rewrite a withdrawal loss when the original remainder publication was refused', async () => {
+    const harness = buildRemainderWriteRefusalHarness(() => false, {
+      kind: 'refused',
+      detail: 'unlink denied',
+    });
+
+    await expect(harness.controller.shutdown('replaced')).resolves.toMatchObject({
+      disposition: 'finalized-with-losses',
+      undischarged: [expect.objectContaining({ label: 'backend discovery withdrawal' })],
+    });
+
+    expect(harness.order).toEqual(['stopped', 'record', 'withdraw', 'exit:1']);
+    expect(harness.logLines).toEqual(
+      expect.arrayContaining([
+        expect.stringContaining('shutdown remainder write refused'),
+        expect.stringContaining('backend discovery withdrawal refused (unlink denied)'),
+      ]),
+    );
+  });
+
+  it('consumes a refused withdrawal-loss rewrite without delaying exit', async () => {
+    let writes = 0;
+    const harness = buildRemainderWriteRefusalHarness(
+      () => {
+        writes += 1;
+        return writes === 1;
+      },
+      { kind: 'refused', detail: 'unlink denied' },
+    );
+
+    await expect(harness.controller.shutdown('replaced')).resolves.toMatchObject({
+      disposition: 'finalized-with-losses',
+    });
+
+    expect(harness.order).toEqual(['stopped', 'record', 'withdraw', 'record', 'exit:1']);
+    expect(harness.logLines).toContain('shutdown remainder rewrite refused (record publication returned false)\n');
   });
 
   it('exhausts a never-settling control close through the production lifecycle continuation', async () => {
@@ -2467,9 +2611,7 @@ describe('required provider-proxy shutdown steps', () => {
 
     const held = requireHeld(await runShutdownSequence(harness.ctx));
     expect(heldFailureDetail(held)).toMatch(/heartbeats p-throws: .*heartbeat scheduler already disposed/u);
-    expect(held.retainedAuthority.operatorActions).toContainEqual(
-      expect.objectContaining({ kind: 'provider-proxy-set-containment', proxyInstanceId: 'p-throws' }),
-    );
+    expect(held.retainedAuthority.operatorActions).toEqual([]);
     expect(callLog).toContain('heartbeats:p2');
     expect(callLog).toContain('control:p-throws');
     expect(callLog).toContain('control:p2');
@@ -2513,9 +2655,7 @@ describe('required provider-proxy shutdown steps', () => {
     expect(heldFailureDetail(held)).toMatch(
       /provider control and IPC authority release: .*IPC socket: .*socket stuck/u,
     );
-    expect(held.retainedAuthority.operatorActions).toContainEqual(
-      expect.objectContaining({ kind: 'shutdown-obligation-abandonment' }),
-    );
+    expect(held.retainedAuthority.operatorActions).toEqual([]);
     expect(callLog).toContain('control:p1');
     await expect(held.retry()).resolves.toEqual({ disposition: 'settled' });
     expect(ipcAttempts).toBe(2);

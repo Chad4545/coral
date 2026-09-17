@@ -32,7 +32,6 @@ import {
   type ProcessExitRemainderAcceptance,
   type ShutdownAuthorityReleaseBoundary,
   type ShutdownObligation,
-  type ShutdownOperatorAction,
   type ShutdownRetainedAuthorityContribution,
   type ShutdownSequenceDisposition,
   type ShutdownSettlementLedger,
@@ -136,17 +135,11 @@ function pendingLaunchSettlementConfirmation(disposition: PendingLaunchSettlemen
   const retainedLaunches = disposition.retainedLaunches
     .map((launch) => `${launch.provider}:${launch.jobDir} awaiting wrapper identity`)
     .join('; ');
-  const actionCommands = disposition.retainedLaunches.flatMap((launch) =>
-    launch.jobId === undefined ? [] : [`coral-cli abort jobs ${launch.jobId}`],
-  );
   return {
     confirmed: false,
     detail:
       `${disposition.pendingLaunches} pending launch(es) remain owned by ${disposition.owner}` +
-      `${retainedLaunches.length === 0 ? '' : ` (${retainedLaunches})`}. ` +
-      (actionCommands.length === 0
-        ? 'No durable job identity was returned for an operator action.'
-        : `Run ${actionCommands.join(', ')}; the durable containment row remains visible until discharge.`),
+      `${retainedLaunches.length === 0 ? '' : ` (${retainedLaunches})`}.`,
   };
 }
 
@@ -156,17 +149,11 @@ function childTerminationConfirmation(disposition: ChildTerminationDisposition):
   const retainedProcesses = disposition.retainedProcesses
     .map((process) => `${process.provider}:${process.jobDir} pgid ${process.containment.processGroupId}`)
     .join('; ');
-  const actionCommands = disposition.retainedProcesses.flatMap((process) =>
-    process.jobId === undefined ? [] : [`coral-cli abort jobs ${process.jobId}`],
-  );
   return {
     confirmed: false,
     detail:
       `${disposition.cleanupHandles} cleanup handle(s) remain owned by ${disposition.owner}` +
-      `${observations.length === 0 && retainedProcesses.length === 0 ? '' : ` (${[observations, retainedProcesses].filter(Boolean).join('; ')})`}. ` +
-      (actionCommands.length === 0
-        ? 'No durable job identity was returned for an operator action.'
-        : `Run ${actionCommands.join(', ')}; the durable containment row remains visible until discharge.`),
+      `${observations.length === 0 && retainedProcesses.length === 0 ? '' : ` (${[observations, retainedProcesses].filter(Boolean).join('; ')})`}.`,
   };
 }
 
@@ -263,64 +250,6 @@ function cleanupContribution(
   extra: ShutdownRetainedAuthorityContribution = {},
 ): ShutdownRetainedAuthorityContribution {
   return { ...extra, cleanupObligations: [label, ...(extra.cleanupObligations ?? [])] };
-}
-
-function shutdownAbandonmentAction(subject: ShutdownObligationSubject): ShutdownOperatorAction {
-  return {
-    kind: 'shutdown-obligation-abandonment',
-    subject,
-    inspectCommand: 'coral-cli backend shutdown-recovery status',
-    actionCommand: `coral-cli backend shutdown-recovery abandon ${subject}`,
-  };
-}
-
-function abandonableCleanupContribution(
-  label: string,
-  subject: ShutdownObligationSubject,
-  extra: ShutdownRetainedAuthorityContribution = {},
-): ShutdownRetainedAuthorityContribution {
-  return cleanupContribution(label, {
-    ...extra,
-    operatorActions: [shutdownAbandonmentAction(subject), ...(extra.operatorActions ?? [])],
-  });
-}
-
-function retainedPendingLaunchActions(
-  disposition: PendingLaunchSettlementDisposition | null,
-): readonly ShutdownOperatorAction[] {
-  if (disposition === null || disposition.kind === 'all-pending-launches-settled') return [];
-  return disposition.retainedLaunches.flatMap((retained) =>
-    retained.jobId === undefined
-      ? []
-      : [
-          {
-            kind: 'retained-job-containment' as const,
-            jobId: retained.jobId,
-            provider: retained.provider,
-            jobDir: retained.jobDir,
-            actionCommand: `coral-cli abort jobs ${retained.jobId}`,
-          },
-        ],
-  );
-}
-
-function retainedChildProcessActions(
-  disposition: ChildTerminationDisposition | null,
-): readonly ShutdownOperatorAction[] {
-  if (disposition === null || disposition.kind === 'all-children-observed-absent') return [];
-  return disposition.retainedProcesses.flatMap((retained) =>
-    retained.jobId === undefined
-      ? []
-      : [
-          {
-            kind: 'retained-job-containment' as const,
-            jobId: retained.jobId,
-            provider: retained.provider,
-            jobDir: retained.jobDir,
-            actionCommand: `coral-cli abort jobs ${retained.jobId}`,
-          },
-        ],
-  );
 }
 
 function closingHostDetail(closing: ProviderHostCleanupObligations['closingHosts'][number]): string {
@@ -431,8 +360,7 @@ function buildOpeningShutdownObligations({
           shutdownObligationAbandoned('recovery-coordinator-teardown')
             ? Promise.resolve({ confirmed: true })
             : confirmedTask(teardownRecoveryCoordinator),
-        retainedAuthority: () =>
-          abandonableCleanupContribution('recovery coordinator teardown', 'recovery-coordinator-teardown'),
+        retainedAuthority: () => cleanupContribution('recovery coordinator teardown'),
         remainder: { owner: 'process-exit' },
       },
       {
@@ -462,7 +390,7 @@ function buildOpeningShutdownObligations({
             ? { confirmed: true }
             : { confirmed: false, detail: kbDaemonHold.reason };
         },
-        retainedAuthority: () => abandonableCleanupContribution('kb child shutdown', 'kb-child-shutdown'),
+        retainedAuthority: () => cleanupContribution('kb child shutdown'),
         remainder: { owner: 'process-exit' },
         hold: () =>
           kbDaemonHold?.kind === 'holding'
@@ -473,7 +401,7 @@ function buildOpeningShutdownObligations({
               }
             : {
                 reason: 'required-shutdown-step-unsettled',
-                exit: 'durable-operator-abandonment',
+                exit: 'shutdown-budget-exhaustion',
               },
       });
     }
@@ -516,28 +444,6 @@ function createProviderCleanupController({
   const retainedAuthority = (label: string): ShutdownRetainedAuthorityContribution => {
     refresh();
     const providerControlProxyInstanceIds = providerCleanup.liveProxySets.map(({ proxyInstanceId }) => proxyInstanceId);
-    const representationReleaseRetryProxyInstanceIds = new Set(
-      providerCleanup.representationReleaseHolds.flatMap((hold) =>
-        hold.disposition.kind === 'fatal-successor-pending' ? [] : [hold.proxyInstanceId],
-      ),
-    );
-    const fatalRepresentationReleaseProxyInstanceIds = providerCleanup.representationReleaseHolds.flatMap((hold) =>
-      hold.disposition.kind === 'fatal-successor-pending' ? [hold.proxyInstanceId] : [],
-    );
-    const operatorActionProxyInstanceIds = [
-      ...new Set([
-        ...providerControlProxyInstanceIds.filter(
-          (proxyInstanceId) => !representationReleaseRetryProxyInstanceIds.has(proxyInstanceId),
-        ),
-        ...fatalRepresentationReleaseProxyInstanceIds,
-      ]),
-    ];
-    const operatorActions: ShutdownOperatorAction[] = operatorActionProxyInstanceIds.map((proxyInstanceId) => ({
-      kind: 'provider-proxy-set-containment',
-      proxyInstanceId,
-      inspectCommand: 'coral-cli backend status',
-      actionCommand: 'coral-cli backend provider-proxy-set abandon <set-token>',
-    }));
     const acquisitionLabels = providerCleanup.acquisitionCleanupHolds.map((hold) =>
       acquisitionCleanupHoldLabel(hold, 'provider '),
     );
@@ -552,7 +458,6 @@ function createProviderCleanupController({
         ...representationReleaseLabels,
         ...providerCleanup.closingHosts.map(closingHostDetail),
       ],
-      operatorActions,
     });
   };
   const hold = () => {
@@ -568,7 +473,7 @@ function createProviderCleanupController({
       reason: 'required-shutdown-step-unsettled' as const,
       exit: representationReleaseRetryPending
         ? ('provider-proxy-set-release-retry' as const)
-        : ('required-cleanup-capability-confirmation-or-durable-operator-abandonment' as const),
+        : ('shutdown-budget-exhaustion' as const),
       ...(cleanupSettlements.length === 0
         ? {}
         : { retryAfter: Promise.allSettled(cleanupSettlements).then(() => undefined) }),
@@ -630,7 +535,7 @@ function buildProviderOperationMutationDrainObligation({
           };
     },
     retainedAuthority: () =>
-      abandonableCleanupContribution('provider operation mutation drain', 'provider-operation-mutation-drain', {
+      cleanupContribution('provider operation mutation drain', {
         ipcSocket: true,
         providerControlProxyInstanceIds:
           providerProxyAuthority?.liveSets().map(({ proxyInstanceId }) => proxyInstanceId) ?? [],
@@ -641,7 +546,7 @@ function buildProviderOperationMutationDrainObligation({
       hold === null
         ? {
             reason: 'required-shutdown-step-unsettled',
-            exit: 'durable-operator-abandonment',
+            exit: 'shutdown-budget-exhaustion',
           }
         : {
             reason: 'provider-operation-mutations-unsettled',
@@ -707,7 +612,7 @@ function buildHardShutdownConsequences({
     },
     retainedAuthority: () => {
       const retained = providerCleanup.retainedAuthority('provider host shutdown');
-      return abandonableCleanupContribution('provider host shutdown', 'provider-host-shutdown', {
+      return cleanupContribution('provider host shutdown', {
         ...retained,
         cleanupObligations: retained.cleanupObligations?.filter((label) => label !== 'provider host shutdown'),
       });
@@ -722,7 +627,6 @@ function buildHardShutdownConsequences({
     shutdownObligationAbandoned,
     stopProviderOperationReconciler,
   });
-  let pendingLaunchDisposition: PendingLaunchSettlementDisposition | null = null;
   const pendingLaunchSettlement: ShutdownObligation = {
     label: 'pending launch settlement',
     task: async (signal) => {
@@ -734,16 +638,11 @@ function buildHardShutdownConsequences({
       ) {
         throw new Error(`Pending launch settlement returned child termination disposition ${disposition.kind}.`);
       }
-      pendingLaunchDisposition = disposition;
       return pendingLaunchSettlementConfirmation(disposition);
     },
-    retainedAuthority: () =>
-      abandonableCleanupContribution('pending launch settlement', 'child-termination', {
-        operatorActions: retainedPendingLaunchActions(pendingLaunchDisposition),
-      }),
+    retainedAuthority: () => cleanupContribution('pending launch settlement'),
     remainder: { owner: 'process-exit' },
   };
-  let childTerminationDisposition: ChildTerminationDisposition | null = null;
   const childTermination: ShutdownObligation = {
     label: 'child termination',
     task: async (signal) => {
@@ -755,13 +654,9 @@ function buildHardShutdownConsequences({
       ) {
         throw new Error(`Child termination returned pending launch disposition ${disposition.kind}.`);
       }
-      childTerminationDisposition = disposition;
       return childTerminationConfirmation(disposition);
     },
-    retainedAuthority: () =>
-      abandonableCleanupContribution('child termination', 'child-termination', {
-        operatorActions: retainedChildProcessActions(childTerminationDisposition),
-      }),
+    retainedAuthority: () => cleanupContribution('child termination'),
     remainder: { owner: 'process-exit' },
   };
   const crashedJobTerminalization: ShutdownObligation = {
@@ -833,7 +728,7 @@ function buildHandoffShutdownConsequences({
       );
       return failures.length === 0 ? { confirmed: true } : { confirmed: false, detail: failures.join('; ') };
     },
-    retainedAuthority: () => abandonableCleanupContribution('app-server handoff quiesce', 'app-server-handoff-quiesce'),
+    retainedAuthority: () => cleanupContribution('app-server handoff quiesce'),
     remainder: { owner: 'process-exit' },
   };
   const providerHostDrain: ShutdownObligation = {
@@ -854,7 +749,7 @@ function buildHandoffShutdownConsequences({
     },
     retainedAuthority: () => {
       const retained = providerCleanup.retainedAuthority('provider host drain for handoff');
-      return abandonableCleanupContribution('provider host drain for handoff', 'provider-host-drain-for-handoff', {
+      return cleanupContribution('provider host drain for handoff', {
         ...retained,
         cleanupObligations: retained.cleanupObligations?.filter((label) => label !== 'provider host drain for handoff'),
       });
@@ -954,14 +849,13 @@ function buildClosingShutdownObligations({
         log(`process incarnation probe shutdown held (${detail})\n`);
         return { confirmed: false, detail };
       },
-      retainedAuthority: () =>
-        abandonableCleanupContribution('process incarnation probe shutdown', 'process-incarnation-probe-shutdown'),
+      retainedAuthority: () => cleanupContribution('process incarnation probe shutdown'),
       remainder: { owner: 'process-exit' },
       hold: () =>
         probeRetryAfter === null
           ? {
               reason: 'required-shutdown-step-unsettled',
-              exit: 'durable-operator-abandonment',
+              exit: 'shutdown-budget-exhaustion',
             }
           : {
               reason: 'process-incarnation-probes-unsettled',
@@ -977,14 +871,14 @@ function buildClosingShutdownObligations({
         shutdownObligationAbandoned('lifecycle-reactor-dispose')
           ? Promise.resolve({ confirmed: true })
           : confirmedTask(reactorDisposal.run),
-      retainedAuthority: () => abandonableCleanupContribution('lifecycle reactor dispose', 'lifecycle-reactor-dispose'),
+      retainedAuthority: () => cleanupContribution('lifecycle reactor dispose'),
       remainder: { owner: 'process-exit' },
       hold: () => {
         const settlement = reactorDisposal.settlement();
         return settlement === null
           ? {
               reason: 'required-shutdown-step-unsettled',
-              exit: 'durable-operator-abandonment',
+              exit: 'shutdown-budget-exhaustion',
             }
           : {
               reason: 'lifecycle-reactor-disposal-unsettled',
@@ -1119,15 +1013,6 @@ function buildAuthorityReleaseBoundary({
     retainedAuthority: () => {
       providerCleanup.refresh();
       synchronizeProviderReleaseCapabilities();
-      const cleanup = providerCleanup.current();
-      const representationReleaseRetryProxyInstanceIds = new Set(
-        cleanup.representationReleaseHolds.flatMap((hold) =>
-          hold.disposition.kind === 'fatal-successor-pending' ? [] : [hold.proxyInstanceId],
-        ),
-      );
-      const fatalRepresentationReleaseProxyInstanceIds = cleanup.representationReleaseHolds.flatMap((hold) =>
-        hold.disposition.kind === 'fatal-successor-pending' ? [hold.proxyInstanceId] : [],
-      );
       const retainedProviderIds = [
         ...new Set(
           [...providerReleaseCapabilities.entries()].flatMap(([set, release]) =>
@@ -1137,28 +1022,10 @@ function buildAuthorityReleaseBoundary({
           ),
         ),
       ];
-      const operatorActionProxyInstanceIds = [
-        ...new Set([
-          ...retainedProviderIds.filter(
-            (proxyInstanceId) => !representationReleaseRetryProxyInstanceIds.has(proxyInstanceId),
-          ),
-          ...fatalRepresentationReleaseProxyInstanceIds,
-        ]),
-      ];
-      return abandonableCleanupContribution(
-        'provider control and IPC authority release',
-        'provider-control-and-ipc-authority-release',
-        {
-          ipcSocket: ipcReleaseCapability !== null && ipcReleaseCapability.state.kind !== 'settled',
-          providerControlProxyInstanceIds: retainedProviderIds,
-          operatorActions: operatorActionProxyInstanceIds.map((proxyInstanceId) => ({
-            kind: 'provider-proxy-set-containment',
-            proxyInstanceId,
-            inspectCommand: 'coral-cli backend status',
-            actionCommand: 'coral-cli backend provider-proxy-set abandon <set-token>',
-          })),
-        },
-      );
+      return cleanupContribution('provider control and IPC authority release', {
+        ipcSocket: ipcReleaseCapability !== null && ipcReleaseCapability.state.kind !== 'settled',
+        providerControlProxyInstanceIds: retainedProviderIds,
+      });
     },
     hold: (settlement) => {
       const inFlight = authorityReleaseSettlements();
@@ -1170,7 +1037,7 @@ function buildAuthorityReleaseBoundary({
           }
         : {
             reason: 'required-shutdown-step-unsettled',
-            exit: 'durable-operator-abandonment',
+            exit: 'shutdown-budget-exhaustion',
           };
     },
   };
