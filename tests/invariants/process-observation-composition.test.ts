@@ -558,21 +558,65 @@ function isUnusableType(type: ts.Type): boolean {
   return (type.flags & (ts.TypeFlags.Any | ts.TypeFlags.Unknown | ts.TypeFlags.Never)) !== 0;
 }
 
+function matchesEntry(context: AnalysisContext, entry: RegistryEntry, type: ts.Type): boolean {
+  if (type === entry.type) return true;
+  const alias = canonicalSymbol(context.checker, type.aliasSymbol);
+  const registeredAlias = canonicalSymbol(context.checker, entry.type.aliasSymbol);
+  if (alias !== undefined && alias === registeredAlias) return true;
+  if (STRUCTURAL_SUBTYPE_REGISTRY.has(entry.key) && context.checker.isTypeAssignableTo(type, entry.type)) {
+    return true;
+  }
+  if ((type.flags & ts.TypeFlags.Object) !== 0 && entry.union.includes(type)) return true;
+  const union = semanticUnion(type);
+  if (union.length >= 2 && context.checker.isTypeAssignableTo(type, entry.type)) return true;
+  return union.some((member) => (member.flags & ts.TypeFlags.Object) !== 0 && entry.union.includes(member));
+}
+
 function registeredEntry(context: AnalysisContext, type: ts.Type): RegistryEntry | undefined {
   if (isUnusableType(type)) return undefined;
-  return context.registry.find((entry) => {
-    if (type === entry.type) return true;
-    const alias = canonicalSymbol(context.checker, type.aliasSymbol);
-    const registeredAlias = canonicalSymbol(context.checker, entry.type.aliasSymbol);
-    if (alias !== undefined && alias === registeredAlias) return true;
-    if (STRUCTURAL_SUBTYPE_REGISTRY.has(entry.key) && context.checker.isTypeAssignableTo(type, entry.type)) {
-      return true;
+  return context.registry.find((entry) => matchesEntry(context, entry, type));
+}
+
+const carriedEntriesByContext = new WeakMap<AnalysisContext, WeakMap<ts.Type, ReadonlySet<RegistryEntry>>>();
+
+/**
+ * Every registry entry a type carries through its type arguments and call-signature returns, answered
+ * for the whole registry in one traversal and memoized per type. The reachable set is what decides, so
+ * asking one entry at a time re-walks the same type graph per entry and re-runs the assignability checks
+ * `matchesEntry` needs, which measured 1.8s of this invariant's cost over `src/` (10-core Apple
+ * M-series, 2026-09-17). A memo may not outlive the checker that produced the types it keys on, and is
+ * therefore reachable only through the context that owns that checker.
+ */
+function carriedEntries(context: AnalysisContext, type: ts.Type): ReadonlySet<RegistryEntry> {
+  let memo = carriedEntriesByContext.get(context);
+  if (memo === undefined) {
+    memo = new WeakMap();
+    carriedEntriesByContext.set(context, memo);
+  }
+  const cached = memo.get(type);
+  if (cached !== undefined) return cached;
+
+  const carried = new Set<RegistryEntry>();
+  const seen = new Set<ts.Type>([type]);
+  const pending = [type];
+  while (pending.length > 0) {
+    const current = pending.pop()!;
+    if (isUnusableType(current)) continue;
+    for (const entry of context.registry) {
+      if (matchesEntry(context, entry, current)) carried.add(entry);
     }
-    if ((type.flags & ts.TypeFlags.Object) !== 0 && entry.union.includes(type)) return true;
-    const union = semanticUnion(type);
-    if (union.length >= 2 && context.checker.isTypeAssignableTo(type, entry.type)) return true;
-    return union.some((member) => (member.flags & ts.TypeFlags.Object) !== 0 && entry.union.includes(member));
-  });
+    const reached = [
+      ...typeArguments(context, current),
+      ...current.getCallSignatures().map((signature) => signature.getReturnType()),
+    ];
+    for (const next of reached) {
+      if (seen.has(next)) continue;
+      seen.add(next);
+      pending.push(next);
+    }
+  }
+  memo.set(type, carried);
+  return carried;
 }
 
 type UnionDiscriminator = Readonly<{
@@ -651,12 +695,8 @@ function typeCarriesVocabulary(context: AnalysisContext, type: ts.Type, seen = n
   });
 }
 
-function typeCarriesRegistry(context: AnalysisContext, type: ts.Type, seen = new Set<ts.Type>()): boolean {
-  if (seen.has(type) || isUnusableType(type)) return false;
-  seen.add(type);
-  if (registeredEntry(context, type) !== undefined) return true;
-  if (typeArguments(context, type).some((argument) => typeCarriesRegistry(context, argument, seen))) return true;
-  return type.getCallSignatures().some((signature) => typeCarriesRegistry(context, signature.getReturnType(), seen));
+function typeCarriesRegistry(context: AnalysisContext, type: ts.Type): boolean {
+  return carriedEntries(context, type).size > 0;
 }
 
 function declarationName(node: BodyFunction): string | undefined {
@@ -859,10 +899,9 @@ function sourceVocabularyViolations(
 function functionRegistryCarriers(context: AnalysisContext, node: BodyFunction): string[] {
   const carriers = new Set<string>();
   for (const parameter of node.parameters) {
-    const type = context.checker.getTypeAtLocation(parameter);
+    const carried = carriedEntries(context, context.checker.getTypeAtLocation(parameter));
     for (const entry of context.registry) {
-      const scoped = { ...context, registry: [entry] };
-      if (typeCarriesRegistry(scoped, type)) carriers.add(`${entry.key} parameter ${parameter.name.getText()}`);
+      if (carried.has(entry)) carriers.add(`${entry.key} parameter ${parameter.name.getText()}`);
     }
   }
   const visit = (child: ts.Node): void => {
@@ -870,9 +909,10 @@ function functionRegistryCarriers(context: AnalysisContext, node: BodyFunction):
     if (ts.isCallExpression(child)) {
       const type = context.checker.getTypeAtLocation(child);
       const promised = promisedType(context, type);
+      const carried = carriedEntries(context, type);
+      const promisedCarried = promised === undefined ? undefined : carriedEntries(context, promised);
       for (const entry of context.registry) {
-        const scoped = { ...context, registry: [entry] };
-        if (typeCarriesRegistry(scoped, type) || (promised !== undefined && typeCarriesRegistry(scoped, promised))) {
+        if (carried.has(entry) || promisedCarried?.has(entry) === true) {
           carriers.add(`${entry.key} call ${child.expression.getText()}`);
         }
       }
@@ -1153,13 +1193,15 @@ function fixtureContext(
 const PRODUCTION_CONTEXT = createContext(productionProgram(), REPO_ROOT, REGISTRY);
 
 describe('process observation vocabulary composes without collapsing its third answer', () => {
-  // Resolves types across every `src/` file: measured 9.9s alone and 18.9s beside the other
-  // TypeScript-program invariants at four workers with `tsc` contending (10-core Apple M-series,
-  // 2026-09-17).
+  // Asks the checker for the type of every parameter and every call expression under `src/`, which no
+  // memo removes: measured 8.6s alone and 20.4s under the full unit suite (10-core Apple M-series,
+  // 2026-09-17). CI run 35189468102 (ubuntu-latest 4 vCPU, Node 26) measured this case at 37.2s against
+  // 18.9s under the same suite locally on the code it ran, a 2.0x ratio, and two runners on one tree
+  // measured a third apart; the budget is at least twice the CI cost that ratio predicts for 20.4s.
   it('keeps process-owned vocabulary and its composition explicit', () => {
     expect(enforceAllowlist(sourceVocabularyViolations(PRODUCTION_CONTEXT), SOURCE_VOCABULARY_EXEMPTIONS)).toEqual([]);
     expect(enforceDebts(compositionViolations(PRODUCTION_CONTEXT), COMPOSITION_DEBTS)).toEqual([]);
-  }, 60_000);
+  }, 90_000);
 
   it('rejects primitive and null-bearing members added to ProcessPort', () => {
     const source = readFileSync(resolve(FIXTURE_ROOT, 'subject.ts.txt'), 'utf8');

@@ -194,14 +194,30 @@ const OWNED_SYMBOLS: readonly OwnedSymbol[] = [
  * inventoried below.
  */
 
+const OWNED_INDEX_BY_SYMBOL = new Map<ts.Symbol, number>();
+const OWNED_INDEX_BY_DECLARATION = new Map<ts.Declaration, number>();
+for (const [index, candidate] of OWNED_SYMBOLS.entries()) {
+  if (!OWNED_INDEX_BY_SYMBOL.has(candidate.symbol)) OWNED_INDEX_BY_SYMBOL.set(candidate.symbol, index);
+  for (const declaration of candidate.declarations) {
+    if (!OWNED_INDEX_BY_DECLARATION.has(declaration)) OWNED_INDEX_BY_DECLARATION.set(declaration, index);
+  }
+}
+
+/**
+ * The owned symbol a resolved symbol is, by identity or by a shared declaration. The earliest entry
+ * reached either way wins: the expected inventories carry one owned key per reference, so a later entry
+ * sharing a declaration with an earlier one may not replace it. The answer may not be a scan of the
+ * owned set.
+ */
 function matchOwnedSymbol(symbol: ts.Symbol | undefined): OwnedSymbol | undefined {
   const canonical = canonicalSymbol(symbol);
   if (canonical === undefined) return undefined;
-  return OWNED_SYMBOLS.find(
-    (candidate) =>
-      candidate.symbol === canonical ||
-      (canonical.declarations?.some((declaration) => candidate.declarations.has(declaration)) ?? false),
-  );
+  let earliest = OWNED_INDEX_BY_SYMBOL.get(canonical);
+  for (const declaration of canonical.declarations ?? []) {
+    const index = OWNED_INDEX_BY_DECLARATION.get(declaration);
+    if (index !== undefined && (earliest === undefined || index < earliest)) earliest = index;
+  }
+  return earliest === undefined ? undefined : OWNED_SYMBOLS[earliest];
 }
 
 function relativePath(file: ts.SourceFile): string {
@@ -352,20 +368,42 @@ function isExactCallCallee(node: ts.Node): boolean {
 
 type ReferenceRecorder = (file: ts.SourceFile, node: ts.Node, symbol: ts.Symbol | undefined, nodeKind: string) => void;
 
+/**
+ * A contextual property reference is a property of the literal's contextual type under the written
+ * member name, so only an owned symbol declared under that same name can match it — which holds while
+ * `src/` has no key-remapped mapped type (`[K in keyof T as …]`) and no namespace contextual type over an
+ * alias-renamed export, the two constructs that would let a property keep a declaration under another
+ * name. Asking for the
+ * contextual type of a literal that writes no owned member name therefore cannot find one, and asking
+ * for it on every literal measured a sixth of the project-wide reference pass (10-core Apple M-series,
+ * 2026-09-17).
+ */
+const OWNED_MEMBER_NAMES = new Set(
+  OWNED_SYMBOLS.flatMap((candidate) => [
+    candidate.symbol.name,
+    ...[...candidate.declarations].flatMap((declaration) => {
+      const name = ts.getNameOfDeclaration(declaration);
+      return name !== undefined && (ts.isIdentifier(name) || ts.isStringLiteralLike(name)) ? [name.text] : [];
+    }),
+  ]),
+);
+
 function recordContextualProperties(file: ts.SourceFile, node: ts.ObjectLiteralExpression, record: ReferenceRecorder) {
-  const contextual = CHECKER.getContextualType(node);
-  if (contextual === undefined) return;
-  for (const property of node.properties) {
+  const members = node.properties.flatMap((property) => {
     if (
       !ts.isPropertyAssignment(property) &&
       !ts.isMethodDeclaration(property) &&
       !ts.isShorthandPropertyAssignment(property)
     ) {
-      continue;
+      return [];
     }
     const name = property.name;
-    if (name === undefined) continue;
-    const memberName = name.getText(file).replaceAll(/["']/gu, '');
+    return name === undefined ? [] : [{ property, memberName: name.getText(file).replaceAll(/["']/gu, '') }];
+  });
+  if (!members.some(({ memberName }) => OWNED_MEMBER_NAMES.has(memberName))) return;
+  const contextual = CHECKER.getContextualType(node);
+  if (contextual === undefined) return;
+  for (const { property, memberName } of members) {
     record(file, property, contextual.getProperty(memberName), `Contextual${ts.SyntaxKind[property.kind]}`);
   }
 }
@@ -1312,10 +1350,13 @@ describe('provider proxy recovery policy construction', () => {
       forbiddenAllSettled: [],
       forbiddenMethods: [],
     });
-    // A budget argument binds the case it closes, and this one resolves types across every `src/` file:
-    // measured 7.6s alone and 13.5s beside the other TypeScript-program invariants at four workers with
-    // `tsc` contending (10-core Apple M-series, 2026-09-17).
-  }, 45_000);
+    // A budget argument binds the case it closes, and this one resolves the symbol behind every call,
+    // access and identifier under `src/`: measured 6.7s alone and 16.0s under the full unit suite
+    // (10-core Apple M-series, 2026-09-17). CI run 35189468102 (ubuntu-latest 4 vCPU, Node 26) measured
+    // this case at 27.1s against 13.5s under the same suite locally on the code it ran, a 2.0x ratio, and
+    // two runners on one tree measured a third apart; the budget is at least twice the CI cost that ratio
+    // predicts for 16.0s.
+  }, 70_000);
 
   it('rejects destructured dispatcher and arbiter consumers', () => {
     // Rooting only what analyzeAdversarialProgram names measured 0.52s against 1.29s for this case with

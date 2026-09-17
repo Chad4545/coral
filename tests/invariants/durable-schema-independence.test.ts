@@ -15,6 +15,7 @@ type SourceUnit = Readonly<{
 
 const localSchemaNamesBySource = new WeakMap<ts.SourceFile, ReadonlySet<string>>();
 const localConstDeclarationsBySource = new WeakMap<ts.SourceFile, ReadonlyMap<string, ts.VariableDeclaration>>();
+const localFunctionsBySource = new WeakMap<ts.SourceFile, ReadonlyMap<string, ts.FunctionDeclaration>>();
 
 const DURABLE_SCHEMA_ROOTS = new Set<SchemaKey>([
   'src/causality/cause-ref.ts#causeRefSchema',
@@ -254,7 +255,14 @@ function localConstDeclarations(unit: SourceUnit): ReadonlyMap<string, ts.Variab
   return declarations;
 }
 
+/**
+ * Several questions here ask a unit for its functions, and the answer is a walk of the whole unit: over
+ * `src/` the repeated walks measured 0.5s of this invariant's 2.6s (10-core Apple M-series,
+ * 2026-09-17). A parsed unit never changes, so the walk happens once per source file.
+ */
 function localFunctions(unit: SourceUnit): ReadonlyMap<string, ts.FunctionDeclaration> {
+  const cached = localFunctionsBySource.get(unit.source);
+  if (cached !== undefined) return cached;
   const functions = new Map<string, ts.FunctionDeclaration>();
   function visit(node: ts.Node): void {
     if (ts.isFunctionDeclaration(node)) {
@@ -264,6 +272,7 @@ function localFunctions(unit: SourceUnit): ReadonlyMap<string, ts.FunctionDeclar
     ts.forEachChild(node, visit);
   }
   visit(unit.source);
+  localFunctionsBySource.set(unit.source, functions);
   return functions;
 }
 
@@ -643,6 +652,12 @@ function componentRegistrationViolations(components: ReadonlySet<SchemaKey>): st
 }
 
 describe('durable schema independence invariant', () => {
+  // One parse of every production source is the floor here: measured 2.0s alone and 5.4s under the full
+  // unit suite (10-core Apple M-series, 2026-09-17). CI run 35189468102 (ubuntu-latest 4 vCPU, Node 26)
+  // measured this case at 9.1s against 7.1s under the same suite locally on the code it ran; the sibling
+  // whole-tree invariants measured 2.0x on that run, and two runners on one tree measured a third apart,
+  // so the budget is at least twice the CI cost a 2.0x ratio predicts for 5.4s rather than the suite
+  // default.
   it('keeps durable shapes independent from in-memory schema objects', () => {
     const units = readSourceTree('src');
     const declarations = schemaDeclarations(units);
@@ -653,7 +668,7 @@ describe('durable schema independence invariant', () => {
     expect(unregisteredBoundaryViolations(units, durableSchemas)).toEqual([]);
     expect(borrowedSchemaViolations(units, declarations, durableSchemas)).toEqual([]);
     expect(borrowedFactoryViolations(units, durableSchemas)).toEqual([]);
-  });
+  }, 20_000);
 
   it('rejects an unclassified schema at an ordinary database persistence boundary', () => {
     const fixture = readFixture('unregistered-database-row');
