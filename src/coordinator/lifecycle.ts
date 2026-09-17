@@ -805,6 +805,7 @@ export type LifecycleDeps = {
   readonly providerProxyAuthority?: ProviderProxyAuthorityRegistry;
   readonly kbDaemonSupervisor?: KbDaemonSupervisor;
   readonly handoffQuiescePorts: () => readonly HandoffQuiescePort[];
+  readonly handoffDrainBudgetMs?: number;
   readonly disposeLifecycleReactor?: () => void | Promise<void>;
   readonly createKbHealthComponentFn: CreateKbHealthComponentFn;
   readonly registerBuiltInProvidersFn: RegisterBuiltInProvidersFn;
@@ -1571,6 +1572,7 @@ export function createLifecycle(
           storeServicesRef,
           terminateAllFn,
           handoffQuiescePorts: deps.handoffQuiescePorts,
+          handoffDrainBudgetMs: deps.handoffDrainBudgetMs,
           disposeLifecycleReactor,
           hooks,
           discussStores,

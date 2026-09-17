@@ -57,7 +57,7 @@ const PROVIDER_ROLE_STARTUP_FAILURE_EXIT_CODES: Readonly<Record<ProviderRole, nu
  */
 const UNOBSERVED_STARTUP_DELEGATION_EXIT_CODE: ReturnType<typeof handoffRoutingStatusExitContribution> = 75;
 
-function createBootstrapProbeExitGate(): Readonly<{
+export function createBootstrapProbeExitGate(): Readonly<{
   recordExitCode(code: number): void;
   requestExit(code: number): void;
 }> {

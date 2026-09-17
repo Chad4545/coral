@@ -113,6 +113,9 @@ export type CoordinatorCoreOptions = {
    */
   getConsumerStuck: () => NonNullable<NonNullable<HealthSnapshot['diagnostics']>['consumerStuck']>;
   getTextProjectionState?: () => HealthSnapshot['textProjectionState'];
+  /** Programmatic composition seams must not become environment, argv, or transport controls. */
+  captureProviderProxyLifecycleFatal?: (handler: (error: unknown) => void) => void;
+  handoffDrainBudgetMs?: number;
   disposeLifecycleReactor?: () => void | Promise<void>;
   onStopped?: (exitCode: number) => void;
   acceptProcessExitRemainder?: (remainder: ProcessExitRemainder) => ProcessExitRemainderAcceptance;

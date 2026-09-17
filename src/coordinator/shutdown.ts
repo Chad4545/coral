@@ -100,6 +100,7 @@ type RunShutdownSequenceContext = {
   storeServicesRef: StoreServicesRef;
   terminateAllFn: LaunchTerminationFn;
   handoffQuiescePorts: () => readonly HandoffQuiescePort[];
+  handoffDrainBudgetMs?: number;
   disposeLifecycleReactor: () => void | Promise<void>;
   hooks: { onShutdown(mode: ShutdownMode, signal: AbortSignal): Promise<void> };
   discussStores: Map<string, DiscussSessionStore>;
@@ -1065,6 +1066,7 @@ export async function runShutdownSequence({
   storeServicesRef,
   terminateAllFn,
   handoffQuiescePorts,
+  handoffDrainBudgetMs,
   disposeLifecycleReactor,
   hooks,
   discussStores,
@@ -1074,7 +1076,7 @@ export async function runShutdownSequence({
   acceptProcessExitRemainder,
 }: RunShutdownSequenceContext): Promise<ShutdownSequenceDisposition> {
   const mode = shutdownModeFromReason(reason);
-  const budgetMs = mode === 'handoff' ? HANDOFF_DRAIN_TIMEOUT_MS : SHUTDOWN_DRAIN_TIMEOUT_MS;
+  const budgetMs = mode === 'handoff' ? (handoffDrainBudgetMs ?? HANDOFF_DRAIN_TIMEOUT_MS) : SHUTDOWN_DRAIN_TIMEOUT_MS;
   const ledger = createShutdownSettlementLedger({
     budgetMs,
     time: runtime.time,

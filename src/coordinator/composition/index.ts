@@ -872,6 +872,11 @@ export function createCoordinatorCore(
   const eventStreamSubscriptions = new WeakMap<EventStreamHandlers, () => void>();
   let readIpcOpenSockets = () => 0;
   let lifecycleController: LifecycleController | null = null;
+  const onProviderProxyLifecycleFatal = (error: unknown): void => {
+    world.log(`Fatal provider proxy lifecycle error: ${formatError(error)}\n`);
+    void lifecycleController?.shutdown('provider-proxy-lifecycle-fatal').catch(() => undefined);
+  };
+  options.captureProviderProxyLifecycleFatal?.(onProviderProxyLifecycleFatal);
   const services = createExecutionServices({
     world,
     runtime,
@@ -879,10 +884,7 @@ export function createCoordinatorCore(
     backendNamespace: world.namespace,
     settlementRefusalRecorder,
     createExecutionService: defaults.createExecutionService,
-    onProviderProxyLifecycleFatal: (error) => {
-      world.log(`Fatal provider proxy lifecycle error: ${formatError(error)}\n`);
-      void lifecycleController?.shutdown('provider-proxy-lifecycle-fatal').catch(() => undefined);
-    },
+    onProviderProxyLifecycleFatal,
   });
   adoptRepairedProviderOperation = services.adoptRepairedProviderOperation;
   releaseUnreadableProviderOperationStartupOwnership = services.releaseUnreadableProviderOperationStartupOwnership;
@@ -1783,6 +1785,7 @@ export function createCoordinatorCore(
     listenFn: defaults.listenFn,
     ipcServer,
     closeIpcServerFn: closeIpcServer,
+    handoffDrainBudgetMs: options.handoffDrainBudgetMs,
     listenIpcFn:
       options.listenIpcFn ??
       ((listener, additionalCompatibilitySocketPaths = [], publishedCompatibilitySocketAddresses = []) =>

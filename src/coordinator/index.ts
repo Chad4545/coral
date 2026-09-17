@@ -435,6 +435,7 @@ export function createCoordinatorServer(options: CoordinatorServerOptions = {}):
     });
     return lifecycleReactorDisposal;
   };
+  const shutdownLifecycleReactor = coreOptions.disposeLifecycleReactor ?? disposeLifecycleReactor;
   handleKbDaemonEvent = (message: KbDaemonEventMessage): void => {
     if (message.event === 'journal') {
       if (!isAppendedEventArray(message.appended)) {
@@ -472,7 +473,7 @@ export function createCoordinatorServer(options: CoordinatorServerOptions = {}):
       runtime,
       storeFormat,
       discardSessionArtifacts: (sessionId) => lifecycleReactor.discardSessionArtifacts(sessionId),
-      disposeLifecycleReactor,
+      disposeLifecycleReactor: shutdownLifecycleReactor,
       createStoreServicesFromDbFn,
       buildProviderEventHandler,
       operationRegistry,
