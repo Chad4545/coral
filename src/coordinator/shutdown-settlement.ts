@@ -14,8 +14,7 @@ import type { ShutdownObligationSubject } from '../obligation/shutdown-abandonme
 
 export type UndischargedRemainder =
   | Readonly<{ owner: 'process-exit' }>
-  | Readonly<{ owner: 'successor-recovery'; via: string }>
-  | Readonly<{ owner: 'none' }>;
+  | Readonly<{ owner: 'successor-recovery'; via: string }>;
 
 export type ShutdownHoldReason =
   | 'kb-daemon-shutdown-unsettled'
@@ -181,8 +180,6 @@ function declinedFailure(
 
 function remainderRole(remainder: UndischargedRemainder): RemainderSettlementRole {
   switch (remainder.owner) {
-    case 'none':
-      return 'blocking';
     case 'process-exit':
       return 'delegable';
     case 'successor-recovery':
@@ -233,7 +230,7 @@ export function createShutdownSettlementLedger(options: ShutdownSettlementLedger
     log: options.log,
     pollMs: options.pollMs,
     remainderRole,
-    boundaryRemainder: { owner: 'none' },
+    boundaryRemainder: { owner: 'process-exit' },
     delegatedOwner: 'process-exit',
     ...(accept === undefined
       ? {}

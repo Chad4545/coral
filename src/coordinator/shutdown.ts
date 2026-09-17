@@ -433,7 +433,7 @@ function buildOpeningShutdownObligations({
             : confirmedTask(teardownRecoveryCoordinator),
         retainedAuthority: () =>
           abandonableCleanupContribution('recovery coordinator teardown', 'recovery-coordinator-teardown'),
-        remainder: { owner: 'none' },
+        remainder: { owner: 'process-exit' },
       },
       {
         label: 'ownership checker teardown',
@@ -463,7 +463,7 @@ function buildOpeningShutdownObligations({
             : { confirmed: false, detail: kbDaemonHold.reason };
         },
         retainedAuthority: () => abandonableCleanupContribution('kb child shutdown', 'kb-child-shutdown'),
-        remainder: { owner: 'none' },
+        remainder: { owner: 'process-exit' },
         hold: () =>
           kbDaemonHold?.kind === 'holding'
             ? {
@@ -636,7 +636,7 @@ function buildProviderOperationMutationDrainObligation({
           providerProxyAuthority?.liveSets().map(({ proxyInstanceId }) => proxyInstanceId) ?? [],
         cleanupObligations: hold?.pendingMutations ?? [],
       }),
-    remainder: { owner: 'none' },
+    remainder: { owner: 'process-exit' },
     hold: () =>
       hold === null
         ? {
@@ -712,7 +712,7 @@ function buildHardShutdownConsequences({
         cleanupObligations: retained.cleanupObligations?.filter((label) => label !== 'provider host shutdown'),
       });
     },
-    remainder: { owner: 'none' },
+    remainder: { owner: 'process-exit' },
     hold: providerCleanup.hold,
   };
   const providerOperationMutationDrain = buildProviderOperationMutationDrainObligation({
@@ -741,7 +741,7 @@ function buildHardShutdownConsequences({
       abandonableCleanupContribution('pending launch settlement', 'child-termination', {
         operatorActions: retainedPendingLaunchActions(pendingLaunchDisposition),
       }),
-    remainder: { owner: 'none' },
+    remainder: { owner: 'process-exit' },
   };
   let childTerminationDisposition: ChildTerminationDisposition | null = null;
   const childTermination: ShutdownObligation = {
@@ -762,7 +762,7 @@ function buildHardShutdownConsequences({
       abandonableCleanupContribution('child termination', 'child-termination', {
         operatorActions: retainedChildProcessActions(childTerminationDisposition),
       }),
-    remainder: { owner: 'none' },
+    remainder: { owner: 'process-exit' },
   };
   const crashedJobTerminalization: ShutdownObligation = {
     label: 'crashed job terminalization',
@@ -834,7 +834,7 @@ function buildHandoffShutdownConsequences({
       return failures.length === 0 ? { confirmed: true } : { confirmed: false, detail: failures.join('; ') };
     },
     retainedAuthority: () => abandonableCleanupContribution('app-server handoff quiesce', 'app-server-handoff-quiesce'),
-    remainder: { owner: 'none' },
+    remainder: { owner: 'process-exit' },
   };
   const providerHostDrain: ShutdownObligation = {
     label: 'provider host drain for handoff',
@@ -859,7 +859,7 @@ function buildHandoffShutdownConsequences({
         cleanupObligations: retained.cleanupObligations?.filter((label) => label !== 'provider host drain for handoff'),
       });
     },
-    remainder: { owner: 'none' },
+    remainder: { owner: 'process-exit' },
     hold: providerCleanup.hold,
   };
   const providerOperationMutationDrain = buildProviderOperationMutationDrainObligation({
@@ -956,7 +956,7 @@ function buildClosingShutdownObligations({
       },
       retainedAuthority: () =>
         abandonableCleanupContribution('process incarnation probe shutdown', 'process-incarnation-probe-shutdown'),
-      remainder: { owner: 'none' },
+      remainder: { owner: 'process-exit' },
       hold: () =>
         probeRetryAfter === null
           ? {
@@ -978,7 +978,7 @@ function buildClosingShutdownObligations({
           ? Promise.resolve({ confirmed: true })
           : confirmedTask(reactorDisposal.run),
       retainedAuthority: () => abandonableCleanupContribution('lifecycle reactor dispose', 'lifecycle-reactor-dispose'),
-      remainder: { owner: 'none' },
+      remainder: { owner: 'process-exit' },
       hold: () => {
         const settlement = reactorDisposal.settlement();
         return settlement === null
@@ -1224,7 +1224,7 @@ export async function runShutdownSequence({
       label: 'store epoch sweep cancellation',
       task: () => confirmedTask(storeEpochSweepCancellation.run),
       retainedAuthority: () => cleanupContribution('store epoch sweep cancellation'),
-      remainder: { owner: 'none' },
+      remainder: { owner: 'process-exit' },
       hold: () => {
         const settlement = storeEpochSweepCancellation.settlement();
         return settlement === null

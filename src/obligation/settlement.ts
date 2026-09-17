@@ -616,10 +616,6 @@ export class SettlementLedger<
     for (const { obligation } of delegable) await this.runWithBudget(obligation, attemptBudgetMs);
     for (const { obligation } of successor) await this.runWithBudget(obligation, attemptBudgetMs);
 
-    const authorityBlocked = this.declinedEntries().some(
-      ({ obligation }) => this.options.remainderRole(obligation.remainder) !== 'delegable',
-    );
-    if (authorityBlocked) return this.gate(boundary, { kind: 'held', boundaryFailure: null });
     if (preparation.kind === 'declined') {
       return this.gate(boundary, { kind: 'held', boundaryFailure: preparation.settlement });
     }
@@ -740,11 +736,6 @@ export class SettlementLedger<
   private async settleInitially(
     boundary: SettlementAuthorityReleaseBoundary<RetainedAuthorityContribution, Reason, Exit>,
   ): Promise<SettlementDisposition<Owner, Reason, Exit, Failure, RetainedAuthority, Acceptance>> {
-    const authorityBlocked = this.declinedEntries().some(
-      ({ obligation }) => this.options.remainderRole(obligation.remainder) !== 'delegable',
-    );
-    if (authorityBlocked) return this.gate(boundary, { kind: 'held', boundaryFailure: null });
-
     const preparation = await this.prepareBoundary(boundary, null);
     if (preparation.kind === 'declined') {
       return this.gate(boundary, { kind: 'held', boundaryFailure: preparation.settlement });
