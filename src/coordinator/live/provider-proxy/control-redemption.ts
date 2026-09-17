@@ -272,6 +272,10 @@ export function providerProxyControlRedemptionBundle(
   return redemption[redeemedProviderProxyControlBrand];
 }
 
+/**
+ * Callable only on a redemption whose authority is not published: closing a published one strands
+ * clients and heartbeats an owner still holds.
+ */
 export function closeRedeemedProviderProxyControl(redemption: RedeemedProviderProxyControl): void {
   const bundle = providerProxyControlRedemptionBundle(redemption);
   bundle.heartbeats.guardian.stop();

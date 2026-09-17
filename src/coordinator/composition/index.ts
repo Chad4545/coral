@@ -40,7 +40,7 @@ import type { RpcPorts } from '../../transport/rpc/ports.js';
 import {
   providerHostEvictResponseSchema,
   providerHostInspectResponseSchema,
-  providerHostListResponseSchema,
+  providerHostListV2ResponseSchema,
   providerProxySetContainBooleanResponseSchema,
   providerProxySetContainResponseSchema,
   unreadableProviderOperationDiscardResultSchema,
@@ -1186,30 +1186,10 @@ export function createCoordinatorCore(
         ...proxySets.map(
           (set): ProviderHostAdministrationOwner => ({
             ownerId: `provider-proxy:${set.proxyInstanceId}`,
-            listProviderHosts: async () => {
-              if (set.providerHosts === undefined) {
-                throw new Error('provider_host_inventory_unavailable: proxy set has no administration control');
-              }
-              return set.providerHosts.list();
-            },
-            inspectProviderHost: async (hostRef) => {
-              if (set.providerHosts === undefined) {
-                throw new Error('provider_host_inventory_unavailable: proxy set has no administration control');
-              }
-              return set.providerHosts.inspect(hostRef);
-            },
-            terminalEviction: async (hostRef) => {
-              if (set.providerHosts === undefined) {
-                throw new Error('provider_host_inventory_unavailable: proxy set has no administration control');
-              }
-              return set.providerHosts.terminalEviction(hostRef);
-            },
-            evictProviderHost: async (hostRef) => {
-              if (set.providerHosts === undefined) {
-                throw new Error('provider_host_inventory_unavailable: proxy set has no administration control');
-              }
-              return set.providerHosts.evict(hostRef);
-            },
+            listProviderHosts: () => set.providerHosts.list(),
+            inspectProviderHost: (hostRef) => set.providerHosts.inspect(hostRef),
+            terminalEviction: (hostRef) => set.providerHosts.terminalEviction(hostRef),
+            evictProviderHost: (hostRef) => set.providerHosts.evict(hostRef),
           }),
         ),
       ];
@@ -1360,7 +1340,10 @@ export function createCoordinatorCore(
     },
     recoveryQuarantine,
     providerHosts: {
-      list: async () => providerHostListResponseSchema.parse({ hosts: await providerHostAdministration.list() }),
+      list: async () => {
+        const { rows, tornDownOwnerIds } = await providerHostAdministration.list();
+        return providerHostListV2ResponseSchema.parse({ hosts: rows, tornDownOwnerIds });
+      },
       inspect: async (selector) =>
         providerHostInspectResponseSchema.parse({
           host: await providerHostAdministration.inspect(selector),

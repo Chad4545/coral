@@ -215,14 +215,22 @@ export const providerHostSelectorRequestSchema = z.union([
   z.object({ hostRef: hostRefSchema }).strict(),
   z.object({ workDir: z.string().min(1), projectRoot: z.string().min(1) }).strict(),
 ]);
+/** v0.10.9's CLI parses this response `.strict()`, so this generation's shape may never grow a key. */
 export const providerHostListResponseSchema = z.object({ hosts: z.array(providerHostInventoryRowSchema) }).strict();
+/** This CLI parses this response `.strict()` too, so a further field is a v3, never a key added here. */
+export const providerHostListV2ResponseSchema = z
+  .object({
+    hosts: z.array(providerHostInventoryRowSchema),
+    tornDownOwnerIds: z.array(z.string().min(1)),
+  })
+  .strict();
 export const providerHostInspectResponseSchema = z.object({ host: providerHostInventoryRowSchema }).strict();
 export const providerHostEvictResponseSchema = z
   .object({ ownerId: z.string().min(1), hostRef: hostRefSchema })
   .strict();
 
 export type ProviderHostSelectorRequest = z.input<typeof providerHostSelectorRequestSchema>;
-export type ProviderHostListResponse = z.output<typeof providerHostListResponseSchema>;
+export type ProviderHostListV2Response = z.output<typeof providerHostListV2ResponseSchema>;
 export type ProviderHostInspectResponse = z.output<typeof providerHostInspectResponseSchema>;
 export type ProviderHostEvictResponse = z.output<typeof providerHostEvictResponseSchema>;
 
@@ -522,6 +530,18 @@ export const providerHostListRpcSpec = {
   http: { method: 'GET', path: '/coordinator/provider-hosts' },
 } as const satisfies RpcMethodSpec<unknown, unknown>;
 
+export const providerHostListV2RpcSpec = {
+  name: 'coordinator.provider_host.list.v2',
+  kind: 'unary',
+  requires: 'system:debug',
+  requestBinding: { kind: 'projectRoot', projectRoot: 'optional-all-projects' },
+  requestSchema: providerHostListRequestSchema,
+  responseSchema: providerHostListV2ResponseSchema,
+  responseKind: 'json',
+  portKey: 'providerHosts',
+  http: { method: 'GET', path: '/coordinator/provider-hosts/v2' },
+} as const satisfies RpcMethodSpec<unknown, unknown>;
+
 export const providerHostInspectRpcSpec = {
   name: 'coordinator.provider_host.inspect',
   kind: 'unary',
@@ -607,6 +627,7 @@ export const rpcCatalog = [
   recoveryQuarantineClearRpcSpec,
   unreadableProviderOperationDiscardRpcSpec,
   providerHostListRpcSpec,
+  providerHostListV2RpcSpec,
   providerHostInspectRpcSpec,
   providerHostEvictRpcSpec,
   providerProxySetContainBooleanRpcSpec,

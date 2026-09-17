@@ -8,12 +8,15 @@ import { canonicalWorkDirWireSchema } from '#src/runtime/canonical-work-dir.js';
 import type { ProviderHostEntry } from '#src/coordinator/live/provider-hosts/index.js';
 import {
   ProviderHostAdministrationService,
+  ProviderHostOwnerTornDown,
   type ProviderHostAdministrationOwner,
   type ProviderHostInventoryRecord,
+  type ProviderHostInventoryRow,
 } from '#src/coordinator/services/provider-host-administration.js';
 import {
   StubbedContainmentProviderHostManager,
   noCarrierBlocksRetirement,
+  createExclusiveSpec,
   createFakeProviderServerHandle,
   createSharedSpec,
   createSpawnProviderServerMock,
@@ -70,6 +73,10 @@ function reclamationFailedRecord(ref: HostRef): Extract<ProviderHostInventoryRec
   };
 }
 
+async function listRows(service: ProviderHostAdministrationService): Promise<readonly ProviderHostInventoryRow[]> {
+  return (await service.list()).rows;
+}
+
 function owner(
   ownerId: string,
   records: readonly ProviderHostInventoryRecord[],
@@ -122,7 +129,7 @@ describe('provider host administration', () => {
       evictProviderHost: (ref) => manager.evictHost(ref),
     };
     const service = new ProviderHostAdministrationService({ owners: () => [local] });
-    await expect(service.list()).resolves.toMatchObject([{ status: 'live', ref: lease.hostRef }]);
+    await expect(listRows(service)).resolves.toMatchObject([{ status: 'live', ref: lease.hostRef }]);
 
     server.resolveClosed();
     await server.handle.closePromise;
@@ -151,7 +158,7 @@ describe('provider host administration', () => {
         reclamationFailure: reapFailure.message,
       },
     };
-    await expect(service.list()).resolves.toMatchObject([failedRow]);
+    await expect(listRows(service)).resolves.toMatchObject([failedRow]);
     await expect(service.inspect({ hostRef: lease.hostRef })).resolves.toMatchObject(failedRow);
 
     reapContainment.mockResolvedValue(undefined);
@@ -159,7 +166,7 @@ describe('provider host administration', () => {
       ownerId: 'coordinator:test',
       hostRef: lease.hostRef,
     });
-    await expect(service.list()).resolves.toEqual([]);
+    await expect(listRows(service)).resolves.toEqual([]);
     expect(entry.containment).toBeNull();
     expect(reapContainment).toHaveBeenCalledTimes(4);
     await expect(service.evict({ hostRef: lease.hostRef })).resolves.toEqual({
@@ -207,7 +214,7 @@ describe('provider host administration', () => {
     server.resolveClosed();
     await server.handle.closePromise;
     for (let round = 0; round < 8; round += 1) await Promise.resolve();
-    await expect(service.list()).resolves.toMatchObject([
+    await expect(listRows(service)).resolves.toMatchObject([
       { status: 'reclamation-failed', host: { reclamationAttempts: 1 } },
     ]);
     const eviction = service.evict({ hostRef: lease.hostRef });
@@ -228,7 +235,7 @@ describe('provider host administration', () => {
 
     retryReap.resolve();
     await expect(eviction).resolves.toEqual({ ownerId: 'coordinator:test', hostRef: lease.hostRef });
-    await expect(service.list()).resolves.toEqual([]);
+    await expect(listRows(service)).resolves.toEqual([]);
     expect(reapContainment).toHaveBeenCalledTimes(2);
     lease.close();
   });
@@ -238,7 +245,7 @@ describe('provider host administration', () => {
     const proxy = owner('proxy-a', [record(hostRef('retired'), 'retired-blocked')]);
     const service = new ProviderHostAdministrationService({ owners: () => [local, proxy] });
 
-    await expect(service.list()).resolves.toMatchObject([
+    await expect(listRows(service)).resolves.toMatchObject([
       { ownerId: 'coordinator', status: 'live', ref: { instanceId: 'live' } },
       { ownerId: 'proxy-a', status: 'retired-blocked', ref: { instanceId: 'retired' } },
     ]);
@@ -428,6 +435,178 @@ describe('provider host administration', () => {
     expect(second.evictProviderHost).not.toHaveBeenCalled();
   });
 
+  it('lists a real shutdown-held host from the local manager and takes its reported operator exit', async () => {
+    const request = vi
+      .fn()
+      .mockResolvedValueOnce({
+        ok: false,
+        disposition: 'held-alive',
+        observation: 'alive',
+        subjects: [{ kind: 'claude-child', controller: 'tui', generation: 1 }],
+        successor: { kind: 'accepted', owner: 'broker-session-pool' },
+        operatorExit: { kind: 'retry-broker-shutdown' },
+      })
+      .mockResolvedValue({
+        ok: false,
+        disposition: 'held-unobservable',
+        observation: 'unobservable',
+        subjects: [{ kind: 'claude-child', controller: 'tui', generation: 1 }],
+        successor: { kind: 'accepted', owner: 'broker-session-pool' },
+        operatorExit: { kind: 'retry-broker-shutdown' },
+      });
+    const server = createFakeProviderServerHandle({ generation: 601, request });
+    const manager = new StubbedContainmentProviderHostManager({
+      carrierBlocksRetirement: noCarrierBlocksRetirement,
+      runtime,
+      spawnProviderServer: createSpawnProviderServerMock(server.handle),
+      reapContainment: vi.fn(async () => undefined),
+      allocateProviderServerGeneration: () => 601,
+    });
+    const lease = await manager.openSession(
+      createExclusiveSpec({
+        shutdownCapability: {
+          method: 'broker/shutdown',
+          timeoutMs: 1_000,
+          resultDisposition: {
+            kind: 'provider-server-shutdown-v1',
+            successorOwner: 'broker-session-pool',
+            operatorExit: 'retry-broker-shutdown',
+          },
+        },
+      }),
+      { jobId: 'held-broker-job' },
+    );
+    const local: ProviderHostAdministrationOwner = {
+      ownerId: 'coordinator:test',
+      listProviderHosts: () => manager.listProviderHosts(),
+      inspectProviderHost: (ref) => manager.inspectProviderHost(ref),
+      terminalEviction: (ref) => manager.terminalEviction(ref),
+      evictProviderHost: (ref) => manager.evictHost(ref),
+    };
+    const service = new ProviderHostAdministrationService({ owners: () => [local] });
+
+    lease.close();
+    await vi.waitFor(async () =>
+      expect(await listRows(service)).toMatchObject([
+        {
+          ownerId: 'coordinator:test',
+          ref: lease.hostRef,
+          status: 'shutdown-held',
+          host: { observation: 'alive', operatorExit: 'retry-broker-shutdown' },
+        },
+      ]),
+    );
+
+    await expect(service.evict({ hostRef: lease.hostRef })).rejects.toMatchObject({
+      code: 'provider_host_shutdown_held',
+      ownerIds: ['coordinator:test'],
+      matches: [lease.hostRef],
+      hold: { kind: 'held', observation: 'unobservable' },
+    });
+  });
+
+  it('answers a torn-down owner rather than an unavailable inventory once its control is released', async () => {
+    const localRef = hostRef('local-while-draining');
+    const local = owner('coordinator:test', [record(localRef)]);
+    const tornDown = owner('provider-proxy:released', [], {
+      listProviderHosts: vi.fn(async () => Promise.reject(new ProviderHostOwnerTornDown())),
+      inspectProviderHost: vi.fn(async () => Promise.reject(new ProviderHostOwnerTornDown())),
+      terminalEviction: vi.fn(async () => Promise.reject(new ProviderHostOwnerTornDown())),
+      evictProviderHost: vi.fn(async () => Promise.reject(new ProviderHostOwnerTornDown())),
+    });
+    const service = new ProviderHostAdministrationService({ owners: () => [local, tornDown] });
+
+    await expect(service.list()).resolves.toMatchObject({
+      rows: [{ ownerId: 'coordinator:test', ref: { instanceId: 'local-while-draining' } }],
+      tornDownOwnerIds: ['provider-proxy:released'],
+    });
+    await expect(service.evict({ hostRef: localRef })).resolves.toEqual({
+      ownerId: 'coordinator:test',
+      hostRef: localRef,
+    });
+
+    const unknownRef = hostRef('only-on-the-torn-down-owner');
+    for (const result of [service.evict({ hostRef: unknownRef }), service.inspect({ hostRef: unknownRef })]) {
+      await expect(result).rejects.toMatchObject({
+        code: 'provider_host_owner_torn_down',
+        ownerIds: ['provider-proxy:released'],
+        matches: [unknownRef],
+      });
+    }
+  });
+
+  it('refuses a single work-directory match while any owner is unasked, because uniqueness is unproven', async () => {
+    const observed = owner('coordinator:test', [record(hostRef('only-observed-match'))]);
+    const tornDown = owner('provider-proxy:released', [], {
+      listProviderHosts: vi.fn(async () => Promise.reject(new ProviderHostOwnerTornDown())),
+    });
+    const service = new ProviderHostAdministrationService({ owners: () => [observed, tornDown] });
+
+    await expect(service.inspect({ workDir })).rejects.toMatchObject({
+      code: 'provider_host_owner_torn_down',
+      ownerIds: ['provider-proxy:released'],
+      matches: [],
+      workDir,
+    });
+    expect(observed.inspectProviderHost).not.toHaveBeenCalled();
+  });
+
+  it('keeps resolving an exact reference that one observed owner holds while another is unasked', async () => {
+    const exactRef = hostRef('exact-on-an-observed-owner');
+    const observed = owner('coordinator:test', [record(exactRef)], {
+      inspectProviderHost: vi.fn(async () => record(exactRef)),
+    });
+    const tornDown = owner('provider-proxy:released', [], {
+      listProviderHosts: vi.fn(async () => Promise.reject(new ProviderHostOwnerTornDown())),
+      terminalEviction: vi.fn(async () => Promise.reject(new ProviderHostOwnerTornDown())),
+    });
+    const service = new ProviderHostAdministrationService({ owners: () => [observed, tornDown] });
+
+    await expect(service.inspect({ hostRef: exactRef })).resolves.toMatchObject({ ownerId: 'coordinator:test' });
+    await expect(service.evict({ hostRef: exactRef })).resolves.toEqual({
+      ownerId: 'coordinator:test',
+      hostRef: exactRef,
+    });
+  });
+
+  it('reports the selected owner torn down when its control is released after inventory capture', async () => {
+    const selectedRef = hostRef('selected-then-released');
+    const selected = owner('provider-proxy:released', [record(selectedRef)], {
+      inspectProviderHost: vi.fn(async () => Promise.reject(new ProviderHostOwnerTornDown())),
+      evictProviderHost: vi.fn(async () => Promise.reject(new ProviderHostOwnerTornDown())),
+    });
+    const service = new ProviderHostAdministrationService({ owners: () => [selected] });
+
+    await expect(service.inspect({ hostRef: selectedRef })).rejects.toMatchObject({
+      code: 'provider_host_owner_torn_down',
+      ownerIds: ['provider-proxy:released'],
+      matches: [selectedRef],
+    });
+    await expect(service.evict({ hostRef: selectedRef })).rejects.toMatchObject({
+      code: 'provider_host_owner_torn_down',
+      ownerIds: ['provider-proxy:released'],
+      matches: [selectedRef],
+    });
+  });
+
+  it('names both the owner that refused to send and the owner it could not ask', async () => {
+    const selectedRef = hostRef('observed-then-released');
+    const selected = owner('coordinator:test', [record(selectedRef)], {
+      evictProviderHost: vi.fn(async () => Promise.reject(new ProviderHostOwnerTornDown())),
+    });
+    const unasked = owner('provider-proxy:released', [], {
+      listProviderHosts: vi.fn(async () => Promise.reject(new ProviderHostOwnerTornDown())),
+      terminalEviction: vi.fn(async () => Promise.reject(new ProviderHostOwnerTornDown())),
+    });
+    const service = new ProviderHostAdministrationService({ owners: () => [selected, unasked] });
+
+    await expect(service.evict({ hostRef: selectedRef })).rejects.toMatchObject({
+      code: 'provider_host_owner_torn_down',
+      ownerIds: ['coordinator:test', 'provider-proxy:released'],
+      matches: [selectedRef],
+    });
+  });
+
   it.each(['list', 'inspect', 'evict'] as const)(
     'fails %s closed when any captured owner inventory is unavailable',
     async (operation) => {
@@ -470,7 +649,7 @@ describe('provider host administration', () => {
     const failed = reclamationFailedRecord(hostRef('pre-containment-failure'));
     const service = new ProviderHostAdministrationService({ owners: () => [owner('coordinator', [failed])] });
 
-    await expect(service.list()).resolves.toEqual([{ ownerId: 'coordinator', ...failed }]);
+    await expect(listRows(service)).resolves.toEqual([{ ownerId: 'coordinator', ...failed }]);
   });
 
   it('rejects process-group metadata without a matching pid', async () => {
@@ -597,9 +776,9 @@ describe('provider host administration', () => {
     const ownerSource = vi.fn(() => owners);
     const service = new ProviderHostAdministrationService({ owners: ownerSource });
 
-    await expect(service.list()).resolves.toHaveLength(1);
+    await expect(listRows(service)).resolves.toHaveLength(1);
     expect(ownerSource).toHaveBeenCalledOnce();
     expect(added.listProviderHosts).not.toHaveBeenCalled();
-    await expect(service.list()).resolves.toHaveLength(2);
+    await expect(listRows(service)).resolves.toHaveLength(2);
   });
 });

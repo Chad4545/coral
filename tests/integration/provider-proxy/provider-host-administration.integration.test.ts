@@ -37,7 +37,8 @@ import {
 } from '#src/providers/app-server-transport.js';
 import type { HostRef, ProviderServerSpec } from '#src/providers/contract.js';
 import type { ProviderResponseDiagnosticFact } from '#src/providers/host-diagnostics.js';
-import type { ControlClient } from '#src/provider-proxy/control-client.js';
+import { ControlClientError, type ControlClient } from '#src/provider-proxy/control-client.js';
+import { ProviderHostOwnerTornDown } from '#src/coordinator/services/provider-host-administration.js';
 import { connectControlClient } from '#src/provider-proxy/control-client.js';
 import type { ControlEndpointTimer } from '#src/provider-proxy/control-endpoint.js';
 import type { ProxyBootstrapCapsule } from '#src/provider-proxy/bootstrap-capsule.js';
@@ -485,7 +486,6 @@ describe('provider-host proxy controls', () => {
 
   it('passes actual live and retained-tombstone records through the real strict list and inspect handlers', async () => {
     const controls = authority.providerHosts;
-    if (controls === undefined) throw new Error('provider-host controls were not composed');
 
     const liveRecords = providerHosts.listProviderHosts();
     expect(liveRecords).toHaveLength(1);
@@ -524,7 +524,6 @@ describe('provider-host proxy controls', () => {
 
   it('drives the real evict sender through the real strict receiver and handler', async () => {
     const controls = authority.providerHosts;
-    if (controls === undefined) throw new Error('provider-host controls were not composed');
 
     await expect(controls.terminalEviction(hostRef)).resolves.toBeNull();
     await expect(controls.evict(hostRef)).resolves.toEqual({ kind: 'evicted' });
@@ -534,9 +533,39 @@ describe('provider-host proxy controls', () => {
     expect(providerHosts.listProviderHosts()).toEqual([]);
   });
 
+  it.each(['list', 'inspect', 'terminalEviction', 'evict'] as const)(
+    'refuses %s without sending once this coordinator has released administration control',
+    async (call) => {
+      const controls = authority.providerHosts;
+      const proxyHandlers = [
+        vi.spyOn(providerHosts, 'listProviderHosts'),
+        vi.spyOn(providerHosts, 'inspectProviderHost'),
+        vi.spyOn(providerHosts, 'terminalEviction'),
+        vi.spyOn(providerHosts, 'evictHost'),
+      ];
+
+      await authority.initiateControlClose();
+
+      await expect(administrationCall(controls, call)).rejects.toBeInstanceOf(ProviderHostOwnerTornDown);
+      for (const handler of proxyHandlers) expect(handler).not.toHaveBeenCalled();
+    },
+  );
+
+  it.each(['list', 'inspect', 'terminalEviction', 'evict'] as const)(
+    'answers %s over a channel that closed without this coordinator releasing it as a closed control channel',
+    async (call) => {
+      const controls = authority.providerHosts;
+
+      control.close();
+
+      const answered = administrationCall(controls, call);
+      await expect(answered).rejects.toBeInstanceOf(ControlClientError);
+      await expect(answered).rejects.toMatchObject({ code: 'control_client_closed', origin: 'closed' });
+    },
+  );
+
   it('recovers a lost terminal reply through a second administration service and the surviving proxy', async () => {
     const controls = authority.providerHosts;
-    if (controls === undefined) throw new Error('provider-host controls were not composed');
     const subject = { kind: 'process' as const, pid: process.pid };
     const abandonment = {
       kind: 'operator-abandoned' as const,
@@ -612,7 +641,6 @@ describe('provider-host proxy controls', () => {
 
   it('rejects a non-canonical inventory cwd at the real proxy response sender', async () => {
     const controls = authority.providerHosts;
-    if (controls === undefined) throw new Error('provider-host controls were not composed');
     const live = providerHosts.listProviderHosts()[0];
     if (live === undefined) throw new Error('provider-host fixture did not open a live host');
     const malformed = {
@@ -718,6 +746,22 @@ function rejectedConfigRead(generation: number): ProviderResponseDiagnosticFact 
     },
     hostLog: { startSeq: 1, endSeq: 2 },
   };
+}
+
+function administrationCall(
+  controls: NonNullable<ReturnType<typeof createProviderProxySetAuthority>['providerHosts']>,
+  call: 'list' | 'inspect' | 'terminalEviction' | 'evict',
+): Promise<unknown> {
+  switch (call) {
+    case 'list':
+      return controls.list();
+    case 'inspect':
+      return controls.inspect(hostRef);
+    case 'terminalEviction':
+      return controls.terminalEviction(hostRef);
+    case 'evict':
+      return controls.evict(hostRef);
+  }
 }
 
 function unreachableClient(): ControlClient {

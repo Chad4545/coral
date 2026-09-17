@@ -45,9 +45,32 @@ describe('provider-host operator documentation', () => {
     expect(entry.indexOf('provider-host inspect <ref>')).toBeLessThan(entry.indexOf('provider-host evict <ref>'));
   });
 
-  it('documents inventory unavailability as IPC retry-later exit 75', () => {
+  it('documents inventory unavailability and a torn-down owner as IPC retry-later exit 75', () => {
     expect(cliErrors).toContain(
-      '`provider_host_inventory_unavailable` (matched by code name because the IPC path carries no HTTP status)',
+      '`provider_host_inventory_unavailable` and `provider_host_owner_torn_down` (both matched by code name because the IPC path carries no HTTP status)',
+    );
+    expect(cliErrors).toContain(
+      'provider-host errors other than `provider_host_inventory_unavailable` and `provider_host_owner_torn_down`',
+    );
+  });
+
+  it('names the released owners at their own address and quotes the list line an operator reads verbatim', () => {
+    expect(cliErrors).toContain('`coordinator.provider_host.list.v2` always answers `tornDownOwnerIds`');
+    expect(cliErrors).toContain('keeps its exact `{ hosts }` shape for a shipped CLI');
+    expect(cliErrors).toContain(
+      'provider_host_owner_torn_down: administration control released for <ids>; their hosts are not listed.',
+    );
+  });
+
+  it('names every exit the release can be ended through, including the one a work directory is left with', () => {
+    expect(catalogEntry('provider_host_owner_torn_down')).toContain('coral-cli backend status');
+    expect(cliErrors).toContain(
+      'coral-cli backend shutdown-recovery abandon provider-control-and-ipc-authority-release',
+    );
+    expect(cliErrors).toContain('coral-cli backend provider-proxy-set contain <set-token>');
+    expect(cliErrors).toContain('coral-cli backend provider-proxy-set abandon <set-token>');
+    expect(cliErrors).toContain(
+      'for a work directory the rendered remediation therefore starts with `coral-cli backend provider-host list`',
     );
   });
 

@@ -73,6 +73,7 @@ const TRANSPORT_ALLOWED = new Set([
   'src/jobs/scope.ts',
   'src/jobs/wait.ts',
   'src/jobs/wait-stream-event.ts',
+  'src/providers/host-administration-vocabulary.ts',
   'src/providers/host-ref-codec.ts',
   'src/providers/host-ref-schema.ts',
   'src/providers/host-inventory-schema.ts',

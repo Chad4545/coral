@@ -110,7 +110,7 @@ export interface ProviderProxySetAuthority extends ProviderProxyContainmentAutho
    * are confirmed absent. Observing the proxy leader's exit is not that confirmation.
    */
   stopAndReap(signal: AbortSignal): Promise<Readonly<{ disappearanceReceipt: string } | { unconfirmed: string }>>;
-  readonly providerHosts?: Readonly<{
+  readonly providerHosts: Readonly<{
     list(): Promise<readonly ProviderHostInventoryRecordWire[]>;
     inspect(hostRef: HostRef): Promise<ProviderHostInventoryRecordWire | null>;
     terminalEviction(hostRef: HostRef): Promise<ProviderHostTerminalEvictionDisposition | null>;

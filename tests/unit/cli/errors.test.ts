@@ -419,6 +419,10 @@ describe('cli errors', () => {
       ['kb_initializing', 'Knowledge base is starting up — retry in ~5 seconds'],
       ['kb_offline', 'Knowledge base is offline'],
       ['provider_host_inventory_unavailable', 'Provider-host inventory is temporarily unavailable.'],
+      [
+        'provider_host_owner_torn_down',
+        'This coordinator has released administration control of provider-proxy:set-a and can no longer ask it.',
+      ],
     ] as const)('retries %s at exit 75 over IPC even though the wire carries no numeric status', (code, message) => {
       // No numeric HTTP status crosses IPC, so a code whose HTTP mapping is 503 must be recognised by name
       // or it reaches the operator as a settled failure.
@@ -462,6 +466,7 @@ describe('cli errors', () => {
       ['kb_unavailable', undefined, 75],
       ['kb_unavailable', 503, 75],
       ['provider_host_inventory_unavailable', undefined, 75],
+      ['provider_host_owner_torn_down', undefined, 75],
       ['backend_error', 503, 75],
       ['backend_unreachable', undefined, 69],
       ['missing_capability', undefined, 77],

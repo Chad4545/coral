@@ -11,7 +11,12 @@ import {
 } from '../runtime/canonical-work-dir.js';
 import { isCapability, type Capability } from '../security/capability.js';
 import type { Principal, ResourceBinding } from '../security/principal.js';
-import { authorizeCapability, authorizeResourceBinding, type Decision } from '../security/policy/authorize.js';
+import {
+  authorizeCapability,
+  authorizeResourceBinding,
+  type AuthorizationFailureDetail,
+  type Decision,
+} from '../security/policy/authorize.js';
 import { writeAuthorizationDecisionAudit } from '../infra/audit-log.js';
 import { isRecord } from '../infra/json.js';
 import type { RecoveryQuarantineClearRequest } from '../recovery/source-registry.js';
@@ -24,6 +29,7 @@ import {
   providerHostEvictResponseSchema,
   providerHostInspectResponseSchema,
   providerHostListResponseSchema,
+  providerHostListV2ResponseSchema,
   providerProxySetContainBooleanRpcSpec,
   providerProxySetContainBooleanResponseSchema,
   providerProxySetContainRpcSpec,
@@ -37,6 +43,10 @@ import type { WorkflowPortInput } from './rpc/ports.js';
 import type { JobsListFilters } from '../jobs/read-queries.js';
 import { buildInvocationContext, buildInvocationContextFromQuery } from './invocation-context.js';
 import { callerProviderScopeSchema } from '../infra/provider-scope.js';
+import {
+  PROVIDER_HOST_ADMINISTRATION_ERROR_CODES,
+  type ProviderHostAdministrationErrorCode,
+} from '../providers/host-administration-vocabulary.js';
 import { encodeHostRef } from '../providers/host-ref-codec.js';
 
 type RetentionPolicy = NonNullable<JobLaunchRequest['retention']>;
@@ -387,16 +397,6 @@ function workDirectoryFailure(error: WorkDirectoryError): CatalogRequestExecutio
   );
 }
 
-type ProviderHostAdministrationErrorCode =
-  | 'provider_host_inventory_unavailable'
-  | 'provider_host_not_found'
-  | 'provider_host_ambiguous'
-  | 'provider_host_eviction_requires_exact_ref'
-  | 'provider_host_identity_integrity'
-  | 'provider_host_operator_abandoned'
-  | 'provider_host_shutdown_held'
-  | 'provider_host_stale';
-
 type ProviderHostEvictionAbandonmentView = Readonly<{
   kind: 'operator-abandoned';
   subject: Readonly<Record<string, unknown>>;
@@ -404,22 +404,12 @@ type ProviderHostEvictionAbandonmentView = Readonly<{
   successor: Readonly<{ owner: 'operator-command'; acceptance: 'accepted' }>;
 }>;
 
-const PROVIDER_HOST_ADMINISTRATION_ERROR_CODES = new Set<ProviderHostAdministrationErrorCode>([
-  'provider_host_inventory_unavailable',
-  'provider_host_not_found',
-  'provider_host_ambiguous',
-  'provider_host_eviction_requires_exact_ref',
-  'provider_host_identity_integrity',
-  'provider_host_operator_abandoned',
-  'provider_host_shutdown_held',
-  'provider_host_stale',
-]);
+const PROVIDER_HOST_ADMINISTRATION_ERROR_CODE_SET: ReadonlySet<string> = new Set(
+  PROVIDER_HOST_ADMINISTRATION_ERROR_CODES,
+);
 
 function isProviderHostAdministrationErrorCode(code: unknown): code is ProviderHostAdministrationErrorCode {
-  return (
-    typeof code === 'string' &&
-    PROVIDER_HOST_ADMINISTRATION_ERROR_CODES.has(code as ProviderHostAdministrationErrorCode)
-  );
+  return typeof code === 'string' && PROVIDER_HOST_ADMINISTRATION_ERROR_CODE_SET.has(code);
 }
 
 function isProviderHostEvictionAbandonmentView(value: unknown): value is ProviderHostEvictionAbandonmentView {
@@ -437,6 +427,7 @@ function isProviderHostEvictionAbandonmentView(value: unknown): value is Provide
 function providerHostAdministrationDetail(error: Record<string, unknown>): {
   ownerIds: string[];
   hostRefs: string[];
+  workDir: string | null;
   observation: 'alive' | 'unobservable' | null;
   successorOwner: string | null;
   operatorExit: string | null;
@@ -459,13 +450,15 @@ function providerHostAdministrationDetail(error: Record<string, unknown>): {
   const successorOwner = typeof hold?.successorOwner === 'string' ? hold.successorOwner : null;
   const operatorExit = typeof hold?.operatorExit === 'string' ? hold.operatorExit : null;
   const abandonment = isProviderHostEvictionAbandonmentView(error.abandonment) ? error.abandonment : null;
-  return { ownerIds, hostRefs, observation, successorOwner, operatorExit, abandonment };
+  const workDir = typeof error.workDir === 'string' && error.workDir.length > 0 ? error.workDir : null;
+  return { ownerIds, hostRefs, workDir, observation, successorOwner, operatorExit, abandonment };
 }
 
 function providerHostAdministrationCopy(
   code: ProviderHostAdministrationErrorCode,
   ownerIds: readonly string[],
   hostRefs: readonly string[],
+  workDir: string | null,
   hold: Readonly<{
     observation: 'alive' | 'unobservable' | null;
     successorOwner: string | null;
@@ -480,6 +473,21 @@ function providerHostAdministrationCopy(
         remediation:
           'Retry the original command; if it persists, run `coral-cli backend shutdown`, then retry the original command to start a fresh coordinator.',
       };
+    case 'provider_host_owner_torn_down': {
+      const owners = ownerIds.length === 0 ? 'one or more provider-host owners' : ownerIds.join(', ');
+      const ownerPronoun = ownerIds.length === 1 ? 'it' : 'them';
+      // The release is this coordinator's own act and says nothing about why it released.
+      const selected = workDir === null ? 'the selected provider host' : `any host for work directory ${workDir}`;
+      const subject = hostRefs[0] ?? selected;
+      const exactReferenceExit =
+        workDir === null
+          ? ''
+          : 'Run `coral-cli backend provider-host list`; if the host you want is listed, use its exact reference with `inspect`/`evict` — an exact reference on an owner that answered is served now. ';
+      return {
+        message: `This coordinator has released administration control of ${owners} and can no longer ask ${ownerPronoun}, so it cannot say whether ${subject} exists on ${ownerPronoun}.`,
+        remediation: `${exactReferenceExit}Run \`coral-cli backend status\`. If the coordinator is draining, its successor re-establishes control; retry the original command once the successor serves. If the drain is held on the control release, end it with \`coral-cli backend shutdown-recovery abandon provider-control-and-ipc-authority-release\`. If it is not draining, \`coral-cli backend status\` reports the released set under its own token; resolve it with \`coral-cli backend provider-proxy-set contain <set-token>\` or \`coral-cli backend provider-proxy-set abandon <set-token>\`, or retry the original command once succession completes.`,
+      };
+    }
     case 'provider_host_not_found':
       return {
         message: 'No live, retained-blocked, shutdown-held, or reclamation-failed provider host matches the selector.',
@@ -533,16 +541,20 @@ function providerHostAdministrationCopy(
 function providerHostAdministrationFailure(error: unknown): CatalogRequestExecution | null {
   if (!isRecord(error) || !isProviderHostAdministrationErrorCode(error.code)) return null;
 
-  const { ownerIds, hostRefs, observation, successorOwner, operatorExit, abandonment } =
+  const { ownerIds, hostRefs, workDir, observation, successorOwner, operatorExit, abandonment } =
     providerHostAdministrationDetail(error);
-  const { message, remediation } = providerHostAdministrationCopy(error.code, ownerIds, hostRefs, {
+  const { message, remediation } = providerHostAdministrationCopy(error.code, ownerIds, hostRefs, workDir, {
     observation,
     successorOwner,
     operatorExit,
     abandonment,
   });
   const statusCode =
-    error.code === 'provider_host_not_found' ? 404 : error.code === 'provider_host_inventory_unavailable' ? 503 : 409;
+    error.code === 'provider_host_not_found'
+      ? 404
+      : error.code === 'provider_host_inventory_unavailable' || error.code === 'provider_host_owner_torn_down'
+        ? 503
+        : 409;
   return unary(
     {
       code: error.code,
@@ -551,6 +563,7 @@ function providerHostAdministrationFailure(error: unknown): CatalogRequestExecut
       detail: {
         ownerIds,
         hostRefs,
+        ...(workDir === null ? {} : { workDir }),
         ...(error.code === 'provider_host_shutdown_held' ? { observation, successorOwner, operatorExit } : {}),
         ...(error.code === 'provider_host_operator_abandoned' ? { abandonment } : {}),
       },
@@ -577,10 +590,12 @@ function requiredCapability(spec: RpcMethodSpec<unknown, unknown>): Capability |
   return isCapability(requires) ? requires : null;
 }
 
-function authorizationFailure(
+/** One home for the authorization answer, so a nested session reads one refusal regardless of which gate
+ *  refused it. */
+export function authorizationFailurePayload(
   decision: Extract<Decision, { ok: false }>,
   principal: Principal,
-): CatalogRequestExecution {
+): Readonly<{ code: string; message: string; detail: AuthorizationFailureDetail; statusCode: number }> {
   const statusCode = decision.reason === 'resource_unbound' ? 403 : 401;
   const code = decision.reason === 'resource_unbound' ? 'scope_mismatch' : decision.reason;
   const message =
@@ -592,7 +607,15 @@ function authorizationFailure(
           : 'Missing required capability'
         : 'Principal is not bound to the requested resource';
 
-  return unary({ code, message, detail: decision.detail }, statusCode);
+  return { code, message, detail: decision.detail, statusCode };
+}
+
+function authorizationFailure(
+  decision: Extract<Decision, { ok: false }>,
+  principal: Principal,
+): CatalogRequestExecution {
+  const { code, message, detail, statusCode } = authorizationFailurePayload(decision, principal);
+  return unary({ code, message, detail }, statusCode);
 }
 
 export async function executeCatalogRequest(
@@ -724,9 +747,10 @@ async function executeUnreadableProviderOperationDiscardCatalogRequest({
   );
 }
 
-async function executeProviderHostListCatalogRequest({
-  rpcPorts,
-}: AuthorizedCatalogRequest): Promise<CatalogRequestExecution> {
+async function executeProviderHostListCatalogRequest(
+  { rpcPorts }: AuthorizedCatalogRequest,
+  generation: 'v1' | 'v2',
+): Promise<CatalogRequestExecution> {
   const providerHosts = rpcPorts.providerHosts;
   if (providerHosts === undefined) {
     return providerHostAdministrationFailure({
@@ -735,7 +759,16 @@ async function executeProviderHostListCatalogRequest({
     }) as CatalogRequestExecution;
   }
   try {
-    return unary(providerHostListResponseSchema.parse(await providerHosts.list()));
+    const listing = await providerHosts.list();
+    if (generation === 'v2') return unary(providerHostListV2ResponseSchema.parse(listing));
+    // The v1 response shape has no place for an owner this coordinator could not ask.
+    if (listing.tornDownOwnerIds.length > 0) {
+      return providerHostAdministrationFailure({
+        code: 'provider_host_inventory_unavailable',
+        ownerIds: listing.tornDownOwnerIds,
+      }) as CatalogRequestExecution;
+    }
+    return unary(providerHostListResponseSchema.parse({ hosts: listing.hosts }));
   } catch (error: unknown) {
     const failure = providerHostAdministrationFailure(error);
     if (failure !== null) return failure;
@@ -798,7 +831,9 @@ async function executeProviderHostEvictCatalogRequest({
 function executeProviderHostCatalogRequest(context: AuthorizedCatalogRequest): Promise<CatalogRequestExecution> {
   switch (context.spec.name) {
     case 'coordinator.provider_host.list':
-      return executeProviderHostListCatalogRequest(context);
+      return executeProviderHostListCatalogRequest(context, 'v1');
+    case 'coordinator.provider_host.list.v2':
+      return executeProviderHostListCatalogRequest(context, 'v2');
     case 'coordinator.provider_host.inspect':
       return executeProviderHostInspectCatalogRequest(context);
     case 'coordinator.provider_host.evict':

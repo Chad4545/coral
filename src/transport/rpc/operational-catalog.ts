@@ -1,6 +1,10 @@
 import type { Capability } from '../../security/capability.js';
 import {
   jobsAbortRpcSpec,
+  providerHostEvictRpcSpec,
+  providerHostInspectRpcSpec,
+  providerHostListRpcSpec,
+  providerHostListV2RpcSpec,
   providerProxySetContainBooleanRpcSpec,
   providerProxySetContainRpcSpec,
   transportOperationalCarveouts,
@@ -56,7 +60,11 @@ export type IpcOperationalSpec = OperationalBaseSpec & {
       | 'transport.kb.restart'
       | typeof jobsAbortRpcSpec.name
       | typeof providerProxySetContainBooleanRpcSpec.name
-      | typeof providerProxySetContainRpcSpec.name;
+      | typeof providerProxySetContainRpcSpec.name
+      | typeof providerHostListRpcSpec.name
+      | typeof providerHostListV2RpcSpec.name
+      | typeof providerHostInspectRpcSpec.name
+      | typeof providerHostEvictRpcSpec.name;
   };
 };
 
@@ -161,6 +169,44 @@ export const operationalRouteSpecs: readonly OperationalRouteSpec[] = [
     requires: jobsAbortRpcSpec.requires,
     requiresRunningLifecycle: false,
     dispatch: { kind: 'catalog', onRefusal: 'spawn-successor' },
+    authentication: 'principal',
+  },
+  // A successor has not captured the incumbent's provider-host owners, so its answer is not the incumbent's,
+  // and it cannot discharge an eviction: all four routes report the refusal instead of spawning one.
+  {
+    id: 'ipc.provider-host.list.drain-observation',
+    transport: 'ipc',
+    ipc: { method: providerHostListRpcSpec.name },
+    requires: providerHostListRpcSpec.requires,
+    requiresRunningLifecycle: false,
+    dispatch: { kind: 'catalog', onRefusal: 'report-refusal' },
+    authentication: 'principal',
+  },
+  {
+    id: 'ipc.provider-host.list-v2.drain-observation',
+    transport: 'ipc',
+    ipc: { method: providerHostListV2RpcSpec.name },
+    requires: providerHostListV2RpcSpec.requires,
+    requiresRunningLifecycle: false,
+    dispatch: { kind: 'catalog', onRefusal: 'report-refusal' },
+    authentication: 'principal',
+  },
+  {
+    id: 'ipc.provider-host.inspect.drain-observation',
+    transport: 'ipc',
+    ipc: { method: providerHostInspectRpcSpec.name },
+    requires: providerHostInspectRpcSpec.requires,
+    requiresRunningLifecycle: false,
+    dispatch: { kind: 'catalog', onRefusal: 'report-refusal' },
+    authentication: 'principal',
+  },
+  {
+    id: 'ipc.provider-host.evict.drain-recovery',
+    transport: 'ipc',
+    ipc: { method: providerHostEvictRpcSpec.name },
+    requires: providerHostEvictRpcSpec.requires,
+    requiresRunningLifecycle: false,
+    dispatch: { kind: 'catalog', onRefusal: 'report-refusal' },
     authentication: 'principal',
   },
   {

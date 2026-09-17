@@ -35,6 +35,8 @@ import {
   parseProviderHostSelector,
 } from '#src/cli/commands/backend.js';
 import type { HostRef } from '#src/providers/contract.js';
+import { providerHostListRpcSpec, providerProxySetContainRpcSpec } from '#src/transport/rpc/catalog.js';
+import { shutdownObligationAbandonMethod } from '#src/obligation/shutdown-abandonment.js';
 import { createCoordinatorCore } from '#src/coordinator/composition/index.js';
 import type {
   ProviderHostAdministrationAuthority,
@@ -542,7 +544,8 @@ describe('ipc server', () => {
     const malformed = withMalformedInventoryCwd(providerHostInventoryRecord());
     const sender = createProviderHostCommandOperations({
       getClient: async () => ({
-        request: async <TResult>() => ({ hosts: [{ ownerId: 'coordinator:test-instance', ...malformed }] }) as TResult,
+        request: async <TResult>() =>
+          ({ hosts: [{ ownerId: 'coordinator:test-instance', ...malformed }], tornDownOwnerIds: [] }) as TResult,
       }),
     });
 
@@ -619,8 +622,52 @@ describe('ipc server', () => {
         data: {
           code: 'missing_capability',
           message: 'This nested Coral session cannot perform this command. Ask the top-level Coral session to run it.',
+          detail: { requires: expect.any(String) },
         },
       });
+
+      // An operational route gates before catalog dispatch, so the authenticated child must read the same
+      // authorization answer there or the nested-session instruction and its exit code are lost. Every
+      // operational route whose refusal this change moved off `unauthorized` is listed, not just the new ones.
+      for (const method of [
+        'jobs.abort',
+        providerProxySetContainRpcSpec.name,
+        'transport.health',
+        shutdownObligationAbandonMethod,
+        providerHostListRpcSpec.name,
+      ]) {
+        const deniedOperationalRoute = await requestIpcMethod(
+          socketPath,
+          method,
+          {},
+          {
+            auth: {
+              kind: 'child',
+              handle: 'handle-a',
+              token: 'nonce-4',
+              jobId: 'job-a',
+              sessionId: 'session-a',
+            },
+          },
+        ).catch((error: unknown) => error);
+
+        expect(deniedOperationalRoute, method).toBeInstanceOf(IpcRpcError);
+        expect(deniedOperationalRoute, method).toMatchObject({
+          code: 'missing_capability',
+          message: 'This nested Coral session cannot perform this command. Ask the top-level Coral session to run it.',
+          data: { code: 'missing_capability' },
+        });
+      }
+
+      // No principal at all stays `unauthorized`: the caller presented no credential to attenuate.
+      const unauthenticatedOperationalRoute = await requestIpcMethod(
+        socketPath,
+        providerHostListRpcSpec.name,
+        {},
+      ).catch((error: unknown) => error);
+
+      expect(unauthenticatedOperationalRoute).toBeInstanceOf(IpcRpcError);
+      expect(unauthenticatedOperationalRoute).toMatchObject({ code: 'unauthorized' });
 
       await expect(
         requestIpcMethod(
