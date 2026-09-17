@@ -63,7 +63,7 @@ export function isShutdownReason(reason: string): reason is ShutdownReason {
 }
 
 function shutdownModeFromReason(reason: ShutdownReason): ShutdownMode {
-  if (reason === 'replaced' || reason === 'sigterm') return 'handoff';
+  if (reason === 'replaced' || reason === 'sigterm' || reason === 'provider-proxy-lifecycle-fatal') return 'handoff';
   return 'hard';
 }
 

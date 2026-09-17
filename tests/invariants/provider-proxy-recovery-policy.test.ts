@@ -267,6 +267,35 @@ function ownerName(owner: ts.FunctionLikeDeclaration | undefined): string {
   return '<anonymous>';
 }
 
+function nearestIfCondition(node: ts.Node): string | null {
+  for (let current = node.parent; current !== undefined; current = current.parent) {
+    if (ts.isIfStatement(current)) return current.expression.getText();
+    if (ts.isFunctionLike(current)) return null;
+  }
+  return null;
+}
+
+function namedFunctionText(file: ts.SourceFile, name: string): string {
+  let found: ts.FunctionLikeDeclaration | undefined;
+  const visit = (node: ts.Node): void => {
+    if (found !== undefined) return;
+    if (
+      (ts.isFunctionDeclaration(node) ||
+        ts.isMethodDeclaration(node) ||
+        ts.isFunctionExpression(node) ||
+        ts.isArrowFunction(node)) &&
+      ownerName(node) === name
+    ) {
+      found = node;
+      return;
+    }
+    ts.forEachChild(node, visit);
+  };
+  visit(file);
+  if (found === undefined) throw new Error(`Missing function '${name}' in '${relativePath(file)}'.`);
+  return found.getText();
+}
+
 type Reference = Readonly<{
   file: string;
   owner: string;
@@ -728,7 +757,7 @@ const EXPECTED_REJECTION_NODE_INVENTORY = [
   'src/coordinator/services/provider-proxy-set/index.ts :: #containmentAbsent :: Promise.catch :: authority .initiateControlClose() .catch',
   'src/coordinator/services/provider-proxy-set/index.ts :: #promoteControlReattachment :: Promise.catch :: oldAuthority.initiateControlClose().catch',
   'src/coordinator/services/provider-proxy-set/index.ts :: #promoteControlReattachment :: Promise.catch :: promoted.initiateControlClose().catch',
-  'src/coordinator/services/provider-proxy-set/index.ts :: #promoteControlReattachment :: catch#1 :: calls=[this.#isCurrentControlReattachment, this.#deps.onError, singleLineErrorSummary, this.#scheduleControlReattachmentRetry] assignments=[window.attemptAbort]',
+  'src/coordinator/services/provider-proxy-set/index.ts :: #promoteControlReattachment :: catch#1 :: calls=[this.#isCurrentControlReattachment, this.#deps.onError, singleLineErrorSummary, this.#scheduleControlReattachmentRetry] assignments=[window.cancelAttempt, window.attemptAbort]',
   'src/coordinator/services/provider-proxy-set/index.ts :: #recordOperatorExitRefusal :: catch#1 :: calls=[singleLineErrorSummary, this.#operatorDispositions.set] assignments=[]',
   'src/coordinator/services/provider-proxy-set/index.ts :: #recoverExactCapsule :: Promise.then(rejected) :: this.#trackDestructiveAttempt( slot, this.#reapRecordedContainment(slot.identity, proof, reapAbort.signal, () => undefined), ).then',
   'src/coordinator/services/provider-proxy-set/index.ts :: #releasePartialRedemption :: Promise.catch :: refusal.guardianAuthority.initiateControlClose().catch',
@@ -1179,6 +1208,23 @@ describe('provider proxy recovery policy construction', () => {
         )}`;
       })
       .sort();
+    const conditionalReattachmentStartInventory = callsFor('ProviderProxyRecoveryArbiter.start', references)
+      .filter(
+        (reference) =>
+          reference.file === 'src/coordinator/services/provider-proxy-set/index.ts' &&
+          (reference.owner === '#runControlReattachmentAttempt' || reference.owner === '#runReattachmentHoldAttempt'),
+      )
+      .map((reference) => {
+        const call = reference.node as ts.CallExpression;
+        return `${reference.owner} :: ${stringObjectProperty(call.arguments[0], 'sourceId')} :: ${nearestIfCondition(call) ?? '<unconditional>'}`;
+      })
+      .sort();
+    const expectedConditionalReattachmentStarts = [
+      "#runControlReattachmentAttempt :: absence :: !window.retiredSources.has('absence')",
+      "#runControlReattachmentAttempt :: redemption :: !window.retiredSources.has('redemption')",
+      "#runReattachmentHoldAttempt :: absence :: !window.retiredSources.has('absence')",
+      "#runReattachmentHoldAttempt :: redemption :: !window.retiredSources.has('redemption')",
+    ];
     const startAuthorizations: readonly JustifiedOccurrence[] = [
       {
         occurrence:
@@ -1312,6 +1358,15 @@ describe('provider proxy recovery policy construction', () => {
       visit(file);
       return matches;
     });
+    const retireFatalText = namedFunctionText(policy, 'retireFatal');
+    const submitText = namedFunctionText(policy, 'submit');
+    const sourceLocalFatalRule = {
+      recordsRetiredSource: retireFatalText.includes('retiredSources.add(sourceId)'),
+      abortsOnlyFatalSource: retireFatalText.includes('aborters.get(sourceId)?.(error)'),
+      disposesOnlyFatalSource: retireFatalText.includes('disposeCachedEvidence(undefined, sourceId)'),
+      reducesAfterRetirement: retireFatalText.includes('reduceControlReattachment()'),
+      guardsLateRetiredEvidence: submitText.includes('retiredSources.has(sourceId)'),
+    };
 
     expect(
       {
@@ -1329,6 +1384,8 @@ describe('provider proxy recovery policy construction', () => {
         valueEscapeViolations: valueEscapeViolations(references),
         beginInventory,
         startInventory,
+        conditionalReattachmentStartInventory,
+        sourceLocalFatalRule,
         producerCallInventory,
         directPolicyEffectViolations,
         rejectionNodeInventory: rejectionNodeInventory(references),
@@ -1343,6 +1400,14 @@ describe('provider proxy recovery policy construction', () => {
       valueEscapeViolations: [],
       beginInventory: expectedBegins,
       startInventory: expectedStarts,
+      conditionalReattachmentStartInventory: expectedConditionalReattachmentStarts,
+      sourceLocalFatalRule: {
+        recordsRetiredSource: true,
+        abortsOnlyFatalSource: true,
+        disposesOnlyFatalSource: true,
+        reducesAfterRetirement: true,
+        guardsLateRetiredEvidence: true,
+      },
       producerCallInventory: expectedProducerCalls,
       directPolicyEffectViolations: [],
       rejectionNodeInventory: EXPECTED_REJECTION_NODE_INVENTORY,

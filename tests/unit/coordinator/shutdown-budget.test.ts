@@ -855,6 +855,7 @@ describe('runShutdownSequence drain budget', () => {
             retainedLaunches: [
               {
                 kind: 'awaiting-wrapper-identity',
+                owner: 'process-exit',
                 provider: 'codex',
                 jobId: 'pending-job',
                 jobDir: '/tmp/coral/jobs/pending-job',
@@ -872,6 +873,16 @@ describe('runShutdownSequence drain budget', () => {
                 provider: 'claude',
                 jobId: 'published-job',
                 jobDir: '/tmp/coral/jobs/published-job',
+                publication: {
+                  kind: 'durably-published',
+                  owner: 'successor-recovery',
+                  evidence: {
+                    kind: 'durable-cli-runtime',
+                    jobId: 'published-job',
+                    pid: 4_242,
+                    leaderIncarnation: testIncarnation('published-child'),
+                  },
+                },
                 containment: {
                   pid: 4_242,
                   incarnation: testIncarnation('published-child'),
@@ -1224,6 +1235,16 @@ describe('runShutdownSequence drain budget', () => {
                 provider: 'claude',
                 jobId: 'hard-held-job',
                 jobDir: '/tmp/coral/jobs/hard-held-job',
+                publication: {
+                  kind: 'durably-published',
+                  owner: 'successor-recovery',
+                  evidence: {
+                    kind: 'durable-cli-runtime',
+                    jobId: 'hard-held-job',
+                    pid: 4_242,
+                    leaderIncarnation: testIncarnation('hard-held-child'),
+                  },
+                },
                 containment: {
                   pid: 4_242,
                   incarnation: testIncarnation('hard-held-child'),
@@ -1847,6 +1868,41 @@ async function shutdownFailureDetail(ctx: Parameters<typeof runShutdownSequence>
 }
 
 describe('required provider-proxy shutdown steps', () => {
+  it('runs a provider-proxy lifecycle fatal in handoff mode', async () => {
+    const stopAndReap = vi.fn(async () => ({ disappearanceReceipt: 'gone:healthy' }));
+    const harness = buildHarness({
+      reason: 'provider-proxy-lifecycle-fatal',
+      providerProxyAuthority: registryOf([fakeSet('healthy', [], { stopAndReap })]),
+      hooksOnShutdown: async () => new Promise<void>(() => {}),
+    });
+    harness.ctx.terminateAllFn = vi.fn(settledLaunchTermination);
+    harness.ctx.markJobsAsErrorFn = vi.fn();
+
+    let completed = false;
+    const sequence = runShutdownSequence(harness.ctx).then((disposition) => {
+      completed = true;
+      return disposition;
+    });
+    await flush(64);
+
+    for (let elapsed = 0; elapsed <= SHUTDOWN_DRAIN_TIMEOUT_MS + 100; elapsed += 100) {
+      harness.time.tick(100);
+      await flush();
+    }
+
+    expect(completed).toBe(false);
+
+    for (let elapsed = SHUTDOWN_DRAIN_TIMEOUT_MS + 200; elapsed <= HANDOFF_DRAIN_TIMEOUT_MS + 100; elapsed += 100) {
+      harness.time.tick(100);
+      await flush();
+    }
+
+    await expect(sequence).resolves.toMatchObject({ disposition: 'held' });
+    expect(stopAndReap).not.toHaveBeenCalled();
+    expect(harness.ctx.terminateAllFn).not.toHaveBeenCalled();
+    expect(harness.ctx.markJobsAsErrorFn).not.toHaveBeenCalled();
+  });
+
   it('retries every acquisition cleanup hold once and reports a surviving hold as unconfirmed', async () => {
     const retry = vi.fn(async (signal: AbortSignal) => {
       expect(signal.aborted).toBe(false);

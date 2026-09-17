@@ -1581,7 +1581,9 @@ describe('launch admission', () => {
     await expect(termination).resolves.toEqual({
       kind: 'pending-launches-unresolved-at-deadline',
       pendingLaunches: 1,
-      retainedLaunches: [{ kind: 'awaiting-wrapper-identity', provider: 'codex', jobDir: '/tmp/pending-wrapper' }],
+      retainedLaunches: [
+        { kind: 'awaiting-wrapper-identity', owner: 'process-exit', provider: 'codex', jobDir: '/tmp/pending-wrapper' },
+      ],
       owner: 'launch-coordinator',
     });
   });
@@ -1626,7 +1628,12 @@ describe('launch admission', () => {
       kind: 'pending-launches-unresolved-at-deadline',
       pendingLaunches: 1,
       retainedLaunches: [
-        { kind: 'awaiting-wrapper-identity', provider: 'codex', jobDir: '/tmp/registered-before-shutdown' },
+        {
+          kind: 'awaiting-wrapper-identity',
+          owner: 'process-exit',
+          provider: 'codex',
+          jobDir: '/tmp/registered-before-shutdown',
+        },
       ],
       owner: 'launch-coordinator',
     });
@@ -2112,6 +2119,11 @@ describe('launch admission', () => {
           kind: 'recorded-wrapper-group',
           provider: 'codex',
           jobDir: '/tmp/unpublished-launch',
+          publication: {
+            kind: 'observed-unpublished',
+            owner: 'process-exit',
+            publicationLoss: 'runtime publication is unproven because the job id is unavailable',
+          },
           containment: {
             pid: TEST_PROVIDER_PID,
             incarnation,

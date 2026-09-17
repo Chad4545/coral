@@ -76,11 +76,31 @@ function pendingWrapperTerminationOutcomeDetail(
   }
 }
 
+export type DurableCliRuntimePublicationEvidence = Readonly<{
+  kind: 'durable-cli-runtime';
+  jobId: string;
+  pid: number;
+  leaderIncarnation: ProcessIncarnation;
+}>;
+
+export type DurableProcessPublication =
+  | Readonly<{
+      kind: 'observed-unpublished';
+      owner: 'process-exit';
+      publicationLoss: string;
+    }>
+  | Readonly<{
+      kind: 'durably-published';
+      owner: 'successor-recovery';
+      evidence: DurableCliRuntimePublicationEvidence;
+    }>;
+
 export type DurableProcessRetention = Readonly<{
   kind: 'recorded-wrapper-group';
   provider: string;
   jobDir: string;
   jobId?: string;
+  publication: DurableProcessPublication;
   containment: Readonly<{
     pid: number;
     incarnation: ProcessIncarnation;
@@ -91,6 +111,7 @@ export type DurableProcessRetention = Readonly<{
 
 export type PendingDurableLaunchIdentity = Readonly<{
   kind: 'awaiting-wrapper-identity';
+  owner: 'process-exit';
   provider: string;
   jobDir: string;
   jobId?: string;
@@ -351,6 +372,7 @@ export async function spawnDurableJobTransport(params: SpawnDurableJobTransportP
     },
     retainedIdentity: () => ({
       kind: 'awaiting-wrapper-identity',
+      owner: 'process-exit',
       provider: options.provider,
       jobDir: options.jobDir,
       ...(options.jobId === undefined ? {} : { jobId: options.jobId }),
@@ -808,6 +830,11 @@ export async function spawnDurableJobTransport(params: SpawnDurableJobTransportP
       provider: options.provider,
       jobDir: options.jobDir,
       ...(options.jobId === undefined ? {} : { jobId: options.jobId }),
+      publication: {
+        kind: 'observed-unpublished',
+        owner: 'process-exit',
+        publicationLoss: 'runtime publication is unproven',
+      },
       containment: {
         pid: launch.pid,
         incarnation: launch.leaderIncarnation,
@@ -818,16 +845,72 @@ export async function spawnDurableJobTransport(params: SpawnDurableJobTransportP
     cleanupKey = Symbol();
     cleanupHandles.set(cleanupKey, cleanup);
     cleanupRetentions.set(cleanup, retainedProcess);
-    options.onRuntimeRecord?.(launch.runtimeRecord, provisionalSubject);
-    publishProcessIdentity(provisionalSubject);
-    if (abortedBySignal) {
-      enterContainmentHold('termination requested; process absence is not yet proven');
-      void cleanup().catch((error: unknown) => {
-        backendLog.warn(`[durable-process:${launch.pid}] Termination failed: ${errorMessage(error)}`);
-        enterContainmentHold(errorMessage(error));
-      });
+    let runtimePublicationFailure: Readonly<{ error: unknown }> | null = null;
+    try {
+      if (options.onRuntimeRecord === undefined) {
+        retainedProcess = {
+          ...retainedProcess,
+          publication: {
+            kind: 'observed-unpublished',
+            owner: 'process-exit',
+            publicationLoss: 'runtime publication callback is unavailable',
+          },
+        };
+        cleanupRetentions.set(cleanup, retainedProcess);
+      } else {
+        try {
+          options.onRuntimeRecord(launch.runtimeRecord, provisionalSubject);
+          retainedProcess =
+            options.jobId === undefined
+              ? {
+                  ...retainedProcess,
+                  publication: {
+                    kind: 'observed-unpublished',
+                    owner: 'process-exit',
+                    publicationLoss: 'runtime publication is unproven because the job id is unavailable',
+                  },
+                }
+              : {
+                  ...retainedProcess,
+                  publication: {
+                    kind: 'durably-published',
+                    owner: 'successor-recovery',
+                    // JobStore.appendRuntimeStarted (src/jobs/store.ts) commits no containment-status row here.
+                    evidence: {
+                      kind: 'durable-cli-runtime',
+                      jobId: options.jobId,
+                      pid: launch.runtimeRecord.pid,
+                      leaderIncarnation: launch.leaderIncarnation,
+                    },
+                  },
+                };
+          cleanupRetentions.set(cleanup, retainedProcess);
+        } catch (error: unknown) {
+          retainedProcess = {
+            ...retainedProcess,
+            publication: {
+              kind: 'observed-unpublished',
+              owner: 'process-exit',
+              publicationLoss: `runtime publication failed: ${errorMessage(error)}`,
+            },
+          };
+          cleanupRetentions.set(cleanup, retainedProcess);
+          runtimePublicationFailure = { error };
+        }
+      }
+
+      publishProcessIdentity(provisionalSubject);
+      if (runtimePublicationFailure !== null) throw runtimePublicationFailure.error;
+      if (abortedBySignal) {
+        enterContainmentHold('termination requested; process absence is not yet proven');
+        void cleanup().catch((error: unknown) => {
+          backendLog.warn(`[durable-process:${launch.pid}] Termination failed: ${errorMessage(error)}`);
+          enterContainmentHold(errorMessage(error));
+        });
+      }
+    } finally {
+      releasePendingLaunch();
     }
-    releasePendingLaunch();
   };
 
   const publishSpawned = (launch: {
@@ -847,6 +930,10 @@ export async function spawnDurableJobTransport(params: SpawnDurableJobTransportP
     });
     if (launch.leaderIncarnation !== null && launch.childRoot !== null) {
       const cleanupNeedsRetargeting = cleanupInFlight !== null;
+      const currentRetention = retainedProcess;
+      if (currentRetention === null) {
+        throw new Error('Durable launch reached readiness without retained wrapper ownership.');
+      }
       publishedSubject = {
         pid: launch.runtimeRecord.pid,
         incarnation: launch.leaderIncarnation,
@@ -854,10 +941,7 @@ export async function spawnDurableJobTransport(params: SpawnDurableJobTransportP
         childRoot: launch.childRoot,
       };
       retainedProcess = {
-        kind: 'recorded-wrapper-group',
-        provider: options.provider,
-        jobDir: options.jobDir,
-        ...(options.jobId === undefined ? {} : { jobId: options.jobId }),
+        ...currentRetention,
         containment: { ...publishedSubject, childRoot: publishedSubject.childRoot },
       };
       cleanupRetentions.set(cleanup, retainedProcess);
