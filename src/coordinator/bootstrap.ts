@@ -335,13 +335,13 @@ export async function main(): Promise<number> {
   try {
     const coordinator = createCoordinatorServer({
       pluginRoot: __PLUGIN_ROOT__,
-      onStopped: () => {
-        bootstrapProbeExitGate.requestExit(0);
+      onStopped: (exitCode = 0) => {
+        bootstrapProbeExitGate.requestExit(exitCode);
       },
       acceptProcessExitRemainder: (remainder) => ({
         kind: 'accepted',
         remainder,
-        requestExit: () => bootstrapProbeExitGate.requestExit(0),
+        requestExit: (exitCode) => bootstrapProbeExitGate.requestExit(exitCode),
       }),
       onFatalShutdownError: (error) => {
         backendLog.error('Fatal shutdown error', error);

@@ -7,6 +7,7 @@ import {
 } from '#src/coordinator/bootstrap.js';
 import { StartupStoreHandoffError } from '#src/coordinator/lifecycle.js';
 import { HandoffRunError } from '#src/coordinator/handoff-routing/runner.js';
+import type { ProcessExitRemainder, ProcessExitRemainderAcceptance } from '#src/coordinator/shutdown-settlement.js';
 import { backendLog } from '#src/infra/backend-log.js';
 import type { ValidatedHandoffTarget } from '#src/infra/handoff-target.js';
 import type * as HandoffRunnerMod from '#src/coordinator/handoff-routing/runner.js';
@@ -227,15 +228,22 @@ describe('backend bootstrap store handoff', () => {
 });
 
 describe('backend bootstrap probe cleanup', () => {
-  it('logs child and childless-lease holds and exits when the probe grace expires', async () => {
-    let onStopped!: () => void;
-    mockState.createCoordinatorServer.mockImplementation((options: { onStopped(): void }) => {
-      onStopped = options.onStopped;
-      return {
-        start: async () => ({ host: '127.0.0.1', port: 43123 }),
-        shutdown: async () => undefined,
-      };
-    });
+  it('logs probe holds and preserves the maximum shutdown exit contribution', async () => {
+    let onStopped!: (exitCode: number) => void;
+    let acceptProcessExitRemainder!: (remainder: ProcessExitRemainder) => ProcessExitRemainderAcceptance;
+    mockState.createCoordinatorServer.mockImplementation(
+      (options: {
+        onStopped(exitCode: number): void;
+        acceptProcessExitRemainder(remainder: ProcessExitRemainder): ProcessExitRemainderAcceptance;
+      }) => {
+        onStopped = options.onStopped;
+        acceptProcessExitRemainder = options.acceptProcessExitRemainder;
+        return {
+          start: async () => ({ host: '127.0.0.1', port: 43123 }),
+          shutdown: async () => undefined,
+        };
+      },
+    );
     mockState.processIncarnationProbeRegistrySize.mockReturnValue(2);
     mockState.snapshotProcessIncarnationProbeSubjects.mockReturnValue([
       { pid: 5_151 },
@@ -279,7 +287,11 @@ describe('backend bootstrap probe cleanup', () => {
     await expect(main()).resolves.toBe(0);
     vi.useFakeTimers();
     try {
-      onStopped();
+      const remainder = { undischarged: [] };
+      const acceptance = acceptProcessExitRemainder(remainder);
+      if (acceptance.kind !== 'accepted') throw new Error('bootstrap refused its process-exit remainder');
+      acceptance.requestExit(1);
+      onStopped(0);
       expect(mockState.terminateProcessIncarnationProbes).toHaveBeenCalledWith(expect.any(AbortSignal));
       expect(mockState.terminateProcessIncarnationProbes.mock.calls[0]?.[0].aborted).toBe(false);
       expect(exitProcess).not.toHaveBeenCalled();
@@ -291,7 +303,7 @@ describe('backend bootstrap probe cleanup', () => {
           'pid=5151 reason=close-unobserved exit=child-close; ' +
           'key=coordinator-probe:job-23 reason=probe-unsettled exit=probe-settlement',
       );
-      expect(exitProcess).toHaveBeenCalledWith(0);
+      expect(exitProcess).toHaveBeenCalledWith(1);
       expect(mockState.terminateProcessIncarnationProbes).toHaveBeenCalledOnce();
 
       settleLease();

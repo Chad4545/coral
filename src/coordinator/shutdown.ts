@@ -1006,6 +1006,7 @@ type AuthorityReleaseBoundaryContext = {
   readonly providerCleanup: ProviderCleanupController;
   readonly providerProxyAuthority: RunShutdownSequenceContext['providerProxyAuthority'];
   readonly shutdownObligationAbandoned: ShutdownAbandonmentCheck;
+  readonly time: Runtime['time'];
 };
 
 function buildAuthorityReleaseBoundary({
@@ -1014,6 +1015,7 @@ function buildAuthorityReleaseBoundary({
   providerCleanup,
   providerProxyAuthority,
   shutdownObligationAbandoned,
+  time,
 }: AuthorityReleaseBoundaryContext): ShutdownAuthorityReleaseBoundary {
   const providerReleaseCapabilities = new Map<
     ProviderProxySetAuthority,
@@ -1164,7 +1166,7 @@ function buildAuthorityReleaseBoundary({
         ? {
             reason: 'required-shutdown-step-unsettled',
             exit: 'authority-release-settlement',
-            retryAfter: Promise.all(inFlight).then(() => undefined),
+            retryAfter: Promise.race([Promise.all(inFlight), time.sleep(SHUTDOWN_POLL_MS)]).then(() => undefined),
           }
         : {
             reason: 'required-shutdown-step-unsettled',
@@ -1313,6 +1315,7 @@ export async function runShutdownSequence({
     providerCleanup,
     providerProxyAuthority,
     shutdownObligationAbandoned,
+    time: runtime.time,
   });
 
   return ledger.gate(authorityRelease);

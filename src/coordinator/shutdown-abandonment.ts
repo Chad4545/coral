@@ -9,8 +9,10 @@ import {
   createShutdownObligationAbandonmentReceiptParser,
   shutdownObligationSubjects,
 } from '../obligation/shutdown-abandonment.js';
+import type { ShutdownUndischarged } from './shutdown-settlement.js';
 
 const SHUTDOWN_ABANDONMENT_STATUS_VERSION = 1;
+const SHUTDOWN_REMAINDER_VERSION = 1;
 const durableShutdownObligationSubjectSchema = z.enum(shutdownObligationSubjects);
 const durableShutdownObligationAbandonmentReceiptSchema = createShutdownObligationAbandonmentReceiptParser(
   durableShutdownObligationSubjectSchema,
@@ -96,4 +98,36 @@ export function recordShutdownObligationAbandonment(
   } catch (error: unknown) {
     return { kind: 'refused', detail: error instanceof Error ? error.message : String(error) };
   }
+}
+
+type ShutdownRemainderRuntime = Readonly<{
+  storage: Pick<StoragePort, 'writeAtomicDurableSync'>;
+  runDir: string;
+}>;
+
+export type ShutdownRemainderStatus = Readonly<{
+  version: typeof SHUTDOWN_REMAINDER_VERSION;
+  entries: readonly Pick<ShutdownUndischarged, 'label' | 'remainder'>[];
+}>;
+
+export function shutdownRemainderPath(runDir: string): string {
+  return join(runDir, `shutdown-remainder.v${SHUTDOWN_REMAINDER_VERSION}.json`);
+}
+
+export function recordShutdownRemainder(
+  runtime: ShutdownRemainderRuntime,
+  undischarged: readonly ShutdownUndischarged[],
+): boolean {
+  const status: ShutdownRemainderStatus = {
+    version: SHUTDOWN_REMAINDER_VERSION,
+    entries: undischarged.map(({ label, remainder }) => ({ label, remainder })),
+  };
+  return runtime.storage.writeAtomicDurableSync(
+    shutdownRemainderPath(runtime.runDir),
+    `${JSON.stringify(status, null, 2)}\n`,
+    {
+      encoding: 'utf-8',
+      mode: 0o600,
+    },
+  );
 }

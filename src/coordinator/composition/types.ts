@@ -114,7 +114,7 @@ export type CoordinatorCoreOptions = {
   getConsumerStuck: () => NonNullable<NonNullable<HealthSnapshot['diagnostics']>['consumerStuck']>;
   getTextProjectionState?: () => HealthSnapshot['textProjectionState'];
   disposeLifecycleReactor?: () => void | Promise<void>;
-  onStopped?: () => void;
+  onStopped?: (exitCode: number) => void;
   acceptProcessExitRemainder?: (remainder: ProcessExitRemainder) => ProcessExitRemainderAcceptance;
   onFatalShutdownError?: (error: unknown) => void;
   discussRegistry?: DiscussContextRegistry;

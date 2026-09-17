@@ -19,7 +19,12 @@ import { createCoordinatorProviderHostAdmission } from './live/provider-host-adm
 import type { CoordinatorCoreOptions, CoordinatorCoreResult } from './composition/types.js';
 import type { ShutdownReason } from './shutdown.js';
 import type { CoordinatorStoreServices, StoreServicesRef } from './composition/store-services-ref.js';
-import type { CoordinatorServerInfo, LifecycleShutdownDisposition, LifecycleState } from './lifecycle.js';
+import {
+  isLifecycleShutdownTerminal,
+  type CoordinatorServerInfo,
+  type LifecycleShutdownDisposition,
+  type LifecycleState,
+} from './lifecycle.js';
 import { ExecutionService } from './execution-service.js';
 import { commit as commitJournalEvents, type AppendedEvent, type CommitEventsFn } from '../store/append.js';
 import { prepareCached, type Database } from '../store/db.js';
@@ -624,12 +629,12 @@ export function createCoordinatorServer(options: CoordinatorServerOptions = {}):
     start: () => coordinatorCore.lifecycleController.start(),
     shutdown: async (reason) => {
       const disposition = await coordinatorCore.lifecycleController.shutdown(reason);
-      if (disposition.disposition === 'finalized') await disposeLifecycleReactor();
+      if (isLifecycleShutdownTerminal(disposition)) await disposeLifecycleReactor();
       return disposition;
     },
     waitForShutdown: async () => {
       const disposition = await coordinatorCore.lifecycleController.waitForShutdown();
-      if (disposition.disposition === 'finalized') {
+      if (isLifecycleShutdownTerminal(disposition)) {
         await disposeLifecycleReactor();
         await finalizeStoreServices(coordinatorCore.storeServicesRef);
       }

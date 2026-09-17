@@ -3,6 +3,7 @@ import { describe, expect, it, vi } from 'vitest';
 import {
   readShutdownAbandonmentStatus,
   recordShutdownObligationAbandonment,
+  recordShutdownRemainder,
 } from '#src/coordinator/shutdown-abandonment.js';
 import type { StoragePort } from '#src/infra/port-types.js';
 import { shutdownObligationSubjects } from '#src/obligation/shutdown-abandonment.js';
@@ -150,5 +151,49 @@ describe('shutdown abandonment status', () => {
         ],
       },
     });
+  });
+});
+
+describe('shutdown remainder status', () => {
+  it('publishes every undischarged obligation by its ledger label', () => {
+    const storage = storageWith(null);
+
+    expect(
+      recordShutdownRemainder({ storage, runDir: '/run' }, [
+        {
+          label: 'pending durable launch settlement',
+          remainder: { owner: 'process-exit' },
+          error: new Error('launch settlement did not finish'),
+        },
+        {
+          label: 'durably published child termination',
+          remainder: { owner: 'successor-recovery', via: 'startup recovery' },
+          error: new Error('child termination was not observed'),
+        },
+      ]),
+    ).toBe(true);
+
+    expect(storage.writeAtomicDurableSync).toHaveBeenCalledOnce();
+    expect(storage.writeAtomicDurableSync).toHaveBeenCalledWith(
+      '/run/shutdown-remainder.v1.json',
+      `${JSON.stringify(
+        {
+          version: 1,
+          entries: [
+            {
+              label: 'pending durable launch settlement',
+              remainder: { owner: 'process-exit' },
+            },
+            {
+              label: 'durably published child termination',
+              remainder: { owner: 'successor-recovery', via: 'startup recovery' },
+            },
+          ],
+        },
+        null,
+        2,
+      )}\n`,
+      { encoding: 'utf-8', mode: 0o600 },
+    );
   });
 });

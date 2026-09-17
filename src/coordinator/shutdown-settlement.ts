@@ -74,7 +74,7 @@ export type ProcessExitRemainder = Readonly<{
 }>;
 
 export type ProcessExitRemainderAcceptance =
-  | Readonly<{ kind: 'accepted'; remainder: ProcessExitRemainder; requestExit: () => void }>
+  | Readonly<{ kind: 'accepted'; remainder: ProcessExitRemainder; requestExit: (exitCode: number) => void }>
   | Readonly<{ kind: 'refused'; detail: string }>;
 
 type AcceptedProcessExitRemainder = Extract<ProcessExitRemainderAcceptance, { kind: 'accepted' }>;
@@ -238,6 +238,7 @@ export function createShutdownSettlementLedger(options: ShutdownSettlementLedger
           acceptDelegatedRemainder: (declined) => acceptProcessExitRemainder(declined, accept, options.log),
         }),
     acceptedUndischarged: (acceptance) => acceptance.remainder.undischarged,
+    acceptanceFailureLabel: 'process-exit-remainder-acceptance',
     failure: declinedFailure,
     foldRetainedAuthority,
     defaultHold,

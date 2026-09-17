@@ -4,6 +4,7 @@ import { fileURLToPath } from 'node:url';
 import { describe, expect, it, vi } from 'vitest';
 
 import { createCoordinatorShutdownSignalHandler } from '#src/coordinator/bootstrap.js';
+import { createLifecycle, isLifecycleShutdownTerminal } from '#src/coordinator/lifecycle.js';
 import { HANDOFF_DRAIN_TIMEOUT_MS, SHUTDOWN_DRAIN_TIMEOUT_MS, runShutdownSequence } from '#src/coordinator/shutdown.js';
 import {
   createShutdownSettlementLedger,
@@ -1111,7 +1112,10 @@ describe('runShutdownSequence drain budget', () => {
     const lifecyclePath = fileURLToPath(new URL('../../../src/coordinator/lifecycle.ts', import.meta.url));
     const source = readFileSync(lifecyclePath, 'utf-8');
     const sequenceResolution = source.indexOf('state.shutdownRetry = null;');
-    const finalization = source.indexOf('return finalizeStoppedLifecycle();', sequenceResolution);
+    const finalization = source.indexOf(
+      "return finalizeStoppedLifecycle({ disposition: 'finalized' });",
+      sequenceResolution,
+    );
 
     expect(sequenceResolution).toBeGreaterThan(-1);
     expect(finalization).toBeGreaterThan(sequenceResolution);
@@ -1941,6 +1945,121 @@ describe('settlement ledger exit gate', () => {
     expect(delegated).not.toHaveProperty('owner');
     expect(delegated.acceptance.remainder).not.toHaveProperty('owner');
   });
+
+  it('turns the third declined authority-release commit into a named terminal loss', async () => {
+    const time = new VirtualTime();
+    const prepare = vi.fn<ShutdownAuthorityReleaseBoundary['prepare']>(async () => ({
+      confirmed: true,
+      token: {},
+    }));
+    const commit = vi.fn<ShutdownAuthorityReleaseBoundary['commit']>(async () => ({
+      confirmed: false,
+      detail: 'authority release permanently declined',
+    }));
+    const boundary: ShutdownAuthorityReleaseBoundary = {
+      label: 'authority release',
+      prepare,
+      commit,
+      retainedAuthority: () => ({ ipcSocket: true }),
+    };
+    const accept = vi.fn(
+      (remainder: ProcessExitRemainder): ProcessExitRemainderAcceptance => ({
+        kind: 'accepted',
+        remainder,
+        requestExit: () => undefined,
+      }),
+    );
+    const ledger = createShutdownSettlementLedger({
+      budgetMs: 900,
+      time,
+      log: () => {},
+      pollMs: 50,
+      acceptProcessExitRemainder: accept,
+    });
+
+    const first = requireHeld(await ledger.gate(boundary));
+    const second = requireHeld(await first.retry());
+    const exhausted = await second.retry();
+
+    expect(exhausted).toMatchObject({
+      disposition: 'delegated',
+      undischarged: [{ label: 'authority release', remainder: { owner: 'process-exit' } }],
+    });
+    expect(prepare).toHaveBeenCalledTimes(3);
+    expect(commit).toHaveBeenCalledTimes(3);
+    expect(accept).toHaveBeenCalledOnce();
+  });
+
+  it('turns the third declined authority preparation into a named terminal loss', async () => {
+    const time = new VirtualTime();
+    const prepare = vi.fn<ShutdownAuthorityReleaseBoundary['prepare']>(async () => ({
+      confirmed: false,
+      detail: 'authority snapshot unavailable',
+    }));
+    const commit = vi.fn<ShutdownAuthorityReleaseBoundary['commit']>();
+    const boundary: ShutdownAuthorityReleaseBoundary = {
+      label: 'authority release',
+      prepare,
+      commit,
+      retainedAuthority: () => ({ ipcSocket: true }),
+    };
+    const ledger = createShutdownSettlementLedger({ budgetMs: 900, time, log: () => {}, pollMs: 50 });
+
+    const first = requireHeld(await ledger.gate(boundary));
+    const second = requireHeld(await first.retry());
+    const exhausted = await second.retry();
+
+    expect(exhausted).toMatchObject({
+      disposition: 'unaccepted',
+      undischarged: [{ label: 'authority release', remainder: { owner: 'process-exit' } }],
+    });
+    expect(prepare).toHaveBeenCalledTimes(3);
+    expect(commit).not.toHaveBeenCalled();
+  });
+
+  it('names a refused remainder acceptance without rerunning obligations', async () => {
+    const time = new VirtualTime();
+    const task = vi.fn(async () => {
+      throw new Error('cleanup unavailable');
+    });
+    const obligation: ShutdownObligation = {
+      label: 'process-exit finalizer',
+      task,
+      retainedAuthority: () => ({ cleanupObligations: ['process-exit finalizer'] }),
+      remainder: { owner: 'process-exit' },
+    };
+    const boundary: ShutdownAuthorityReleaseBoundary = {
+      label: 'authority release',
+      prepare: async () => ({ confirmed: true, token: {} }),
+      commit: async () => ({ confirmed: true }),
+      retainedAuthority: () => ({ ipcSocket: true }),
+    };
+    const accept = vi.fn<(remainder: ProcessExitRemainder) => ProcessExitRemainderAcceptance>(() => ({
+      kind: 'refused',
+      detail: 'exit owner unavailable',
+    }));
+    const ledger = createShutdownSettlementLedger({
+      budgetMs: 900,
+      time,
+      log: () => {},
+      pollMs: 50,
+      acceptProcessExitRemainder: accept,
+    });
+
+    await ledger.run(obligation);
+    const terminal = await ledger.gate(boundary);
+    await ledger.run(obligation);
+
+    expect(terminal).toMatchObject({
+      disposition: 'unaccepted',
+      undischarged: [
+        { label: 'process-exit finalizer', remainder: { owner: 'process-exit' } },
+        { label: 'process-exit-remainder-acceptance', remainder: { owner: 'process-exit' } },
+      ],
+    });
+    expect(task).toHaveBeenCalledOnce();
+    expect(accept).toHaveBeenCalledOnce();
+  });
 });
 
 /** One live set whose every step the test drives. Defaults are the healthy path. */
@@ -2223,6 +2342,140 @@ describe('required provider-proxy shutdown steps', () => {
     await expect(held.retry()).resolves.toEqual({ disposition: 'settled' });
     expect(controlAttempts).toBe(2);
     expect(callLog).toContain('closeIpcServerFn:start');
+  });
+
+  it('bounds the retry wake when provider control close never settles', async () => {
+    const harness = buildHarness({
+      hooksOnShutdown: async () => {},
+      providerProxyAuthority: registryOf([
+        fakeSet('hung-control', [], {
+          initiateControlClose: () => new Promise<never>(() => {}),
+        }),
+      ]),
+      acceptProcessExitRemainder: (remainder) => ({
+        kind: 'accepted',
+        remainder,
+        requestExit: () => undefined,
+      }),
+    });
+
+    const sequence = runShutdownSequence(harness.ctx);
+    await flush(64);
+    harness.time.tick(HANDOFF_DRAIN_TIMEOUT_MS);
+    await flush(64);
+    const held = requireHeld(await sequence);
+    let woke = false;
+    void held.retryAfter.then(() => {
+      woke = true;
+    });
+
+    harness.time.tick(49);
+    await flush();
+    expect(woke).toBe(false);
+    harness.time.tick(1);
+    await flush();
+    expect(woke).toBe(true);
+  });
+
+  it('exhausts a never-settling control close through the production lifecycle continuation', async () => {
+    const initiateControlClose = vi.fn(() => new Promise<never>(() => {}));
+    const authority = registryOf([fakeSet('hung-control', [], { initiateControlClose })]);
+    const harness = buildHarness({ hooksOnShutdown: async () => {}, providerProxyAuthority: authority });
+    let lifecycle: 'running' | 'draining' | 'stopped' = 'running';
+    const runtimeState = {
+      ...harness.ctx.runtimeState,
+      getLifecycle: () => lifecycle,
+      setLifecycle: (next: typeof lifecycle) => {
+        lifecycle = next;
+      },
+    };
+    const onStopped = vi.fn();
+    const controller = createLifecycle(
+      {
+        identity: {
+          pluginRoot: '/plugin',
+          instanceId: 'boundary-exhaustion',
+          log: () => {},
+        },
+        runtime: harness.runtime,
+        storeFormat: {},
+        backendPid: 4_242,
+        runtimeState,
+        idleTimer: harness.ctx.idleTimer,
+        storeServicesRef: harness.ctx.storeServicesRef,
+        createStoreServicesFromDbFn: () => ({}),
+        streamResponses: harness.ctx.streamResponses,
+        discussStores: harness.ctx.discussStores,
+        eventBus: {},
+        launchCoordinator: {},
+        providerRegistry: {},
+        server: harness.ctx.server,
+        getExecutionService: () => ({}),
+        getRecoveryService: () => ({}),
+        listExecutionServices: () => [],
+        getDiscussStoreForSource: () => {
+          throw new Error('unexpected discuss store lookup');
+        },
+        knownDiscussSources: () => new Set(),
+        getDiscussContext: () => {
+          throw new Error('unexpected discuss context lookup');
+        },
+        writeBackendInfoFn: () => {},
+        removeBackendInfoIfOwnerFn: () => {},
+        cleanupStaleJobsFn: () => {},
+        markJobsAsErrorFn: harness.ctx.markJobsAsErrorFn,
+        terminateAllFn: harness.ctx.terminateAllFn,
+        providerHostManager: harness.ctx.providerHostManager,
+        providerProxyAuthority: authority,
+        handoffQuiescePorts: () => [],
+        createKbHealthComponentFn: () => ({}),
+        registerBuiltInProvidersFn: () => {},
+        recoverPersistedDiscussFn: async () => [],
+        hooks: harness.ctx.hooks,
+        closeServerFn: harness.ctx.closeServerFn,
+        listenFn: async () => ({ host: '127.0.0.1', port: 43123 }),
+        ipcServer: harness.ctx.ipcServer,
+        closeIpcServerFn: harness.ctx.closeIpcServerFn,
+        disposeLifecycleReactor: harness.ctx.disposeLifecycleReactor,
+        onStopped,
+        acceptProcessExitRemainder: (remainder: ProcessExitRemainder) => ({
+          kind: 'accepted',
+          remainder,
+          requestExit: onStopped,
+        }),
+      } as never,
+      async () => [],
+    );
+
+    const initial = controller.shutdown('replaced');
+    await flush(64);
+    harness.time.tick(HANDOFF_DRAIN_TIMEOUT_MS);
+    await flush(64);
+    const held = await initial;
+    expect(isLifecycleShutdownTerminal(held)).toBe(false);
+
+    harness.time.tick(50);
+    await flush(64);
+    harness.time.tick(HANDOFF_DRAIN_TIMEOUT_MS / 2);
+    await flush(64);
+    harness.time.tick(50);
+    await flush(64);
+    harness.time.tick(HANDOFF_DRAIN_TIMEOUT_MS / 2);
+    await flush(64);
+    const exhausted = await controller.waitForShutdown();
+
+    expect(exhausted).toMatchObject({
+      disposition: 'finalized-with-losses',
+      undischarged: expect.arrayContaining([
+        expect.objectContaining({
+          label: 'provider control and IPC authority release',
+          remainder: { owner: 'process-exit' },
+        }),
+      ]),
+    });
+    expect(initiateControlClose).toHaveBeenCalledOnce();
+    expect(onStopped).toHaveBeenCalledWith(1);
+    expect(lifecycle).toBe('stopped');
   });
 
   it('stops every heartbeat before initiating any close', async () => {

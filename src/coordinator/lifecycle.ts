@@ -818,7 +818,7 @@ export type LifecycleDeps = {
     additionalCompatibilitySocketPaths?: readonly string[],
     publishedCompatibilitySocketAddresses?: readonly PublishedIpcSocketAddress[],
   ) => Promise<ListenIpcServerResult>;
-  readonly onStopped?: () => void;
+  readonly onStopped?: (exitCode: number) => void;
   readonly acceptProcessExitRemainder?: (remainder: ProcessExitRemainder) => ProcessExitRemainderAcceptance;
   readonly onFatalShutdownError?: (error: unknown) => void;
 };
@@ -860,6 +860,7 @@ type LifecycleShutdownRecovery = Readonly<{
 
 export type LifecycleShutdownDisposition =
   | Readonly<{ disposition: 'finalized' }>
+  | Readonly<{ disposition: 'finalized-with-losses'; undischarged: readonly ShutdownUndischarged[] }>
   | Readonly<{
       disposition: 'held';
       reason: LifecycleShutdownHoldReason;
@@ -873,6 +874,17 @@ export type LifecycleShutdownDisposition =
       boundaryFailure: ShutdownUndischarged;
       recovery: LifecycleShutdownRecovery;
     }>;
+
+export type LifecycleShutdownTerminalDisposition = Extract<
+  LifecycleShutdownDisposition,
+  { disposition: 'finalized' | 'finalized-with-losses' }
+>;
+
+export function isLifecycleShutdownTerminal(
+  disposition: LifecycleShutdownDisposition,
+): disposition is LifecycleShutdownTerminalDisposition {
+  return disposition.disposition === 'finalized' || disposition.disposition === 'finalized-with-losses';
+}
 
 type LifecycleControlState = LifecycleWiringState & {
   shutdownPromise: Promise<LifecycleShutdownDisposition> | null;
@@ -1403,12 +1415,13 @@ export function createLifecycle(
     state.startupAbort?.abort();
 
     const finalizeStoppedLifecycle = (
-      onFinalized: (() => void) | undefined = onStopped,
+      terminal: LifecycleShutdownTerminalDisposition,
+      onFinalized: ((exitCode: number) => void) | undefined = onStopped,
     ): LifecycleShutdownDisposition => {
       runtimeState.setLifecycle('stopped');
       removeBackendInfoIfOwnerFn(instanceId);
-      onFinalized?.();
-      return { disposition: 'finalized' };
+      onFinalized?.(terminal.disposition === 'finalized' ? 0 : 1);
+      return terminal;
     };
     const acceptShutdownDisposition = (disposition: ShutdownSequenceDisposition): LifecycleShutdownDisposition => {
       if (disposition.disposition === 'held' || disposition.disposition === 'transfer-pending') {
@@ -1462,9 +1475,17 @@ export function createLifecycle(
       state.shutdownContinuationAbort = null;
       switch (disposition.disposition) {
         case 'settled':
-          return finalizeStoppedLifecycle();
+          return finalizeStoppedLifecycle({ disposition: 'finalized' });
         case 'delegated':
-          return finalizeStoppedLifecycle(disposition.acceptance.requestExit);
+          return finalizeStoppedLifecycle(
+            { disposition: 'finalized-with-losses', undischarged: disposition.undischarged },
+            disposition.acceptance.requestExit,
+          );
+        case 'unaccepted':
+          return finalizeStoppedLifecycle({
+            disposition: 'finalized-with-losses',
+            undischarged: disposition.undischarged,
+          });
       }
     };
     const attempt = (async (): Promise<LifecycleShutdownDisposition> => {
@@ -1517,7 +1538,7 @@ export function createLifecycle(
     const trackedAttempt = attempt.then(
       (disposition) => {
         state.lastShutdownDisposition = disposition;
-        if (disposition.disposition === 'held' || disposition.disposition === 'transfer-pending') {
+        if (!isLifecycleShutdownTerminal(disposition)) {
           state.shutdownPromise = null;
           if (
             state.shutdownContinuations.size === 0 &&
@@ -1534,7 +1555,7 @@ export function createLifecycle(
                 if (continuationAbort.signal.aborted) return;
                 state.shutdownAutomaticRetryAttempts += 1;
                 const retried = await shutdown(reason);
-                if (retried.disposition === 'finalized') return;
+                if (isLifecycleShutdownTerminal(retried)) return;
               }
             })()
               .catch((error: unknown) => {
@@ -1588,10 +1609,7 @@ export function createLifecycle(
     }
     void currentAttempt
       .then((disposition) => {
-        if (
-          (disposition.disposition === 'held' || disposition.disposition === 'transfer-pending') &&
-          state.shutdownReason !== null
-        ) {
+        if (!isLifecycleShutdownTerminal(disposition) && state.shutdownReason !== null) {
           return shutdown(state.shutdownReason);
         }
       })
@@ -1608,7 +1626,7 @@ export function createLifecycle(
 
   function abandonShutdownObligation(request: ShutdownObligationAbandonRequest): ShutdownObligationAbandonResult {
     const disposition = state.lastShutdownDisposition;
-    if (disposition === null || disposition.disposition === 'finalized') {
+    if (disposition === null || isLifecycleShutdownTerminal(disposition)) {
       return { kind: 'not-held', subject: request.subject };
     }
     const offered = disposition.recovery.retainedOwnership.operatorActions.some(
