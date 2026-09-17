@@ -200,7 +200,7 @@ describe('coordinator fatal drain integration', () => {
           `discovery=${JSON.stringify(discovery)} socket=${JSON.stringify(socket)} ` +
           `exitCode=${String(fatalCoordinator.child.exitCode)} ` +
           `signalCode=${String(fatalCoordinator.child.signalCode)} ` +
-          `liveness=${observeProcessLiveness(fatalCoordinator.child.pid ?? -1)}`,
+          `liveness=${JSON.stringify(observeProcessLiveness(fatalCoordinator.child.pid ?? -1))}`,
         { cause: error },
       );
     }
