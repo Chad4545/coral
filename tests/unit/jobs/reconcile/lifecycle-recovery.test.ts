@@ -60,7 +60,7 @@ import { createFailedWorkflowDescendantReleaser } from '#src/coordinator/service
 import type { AtomicFailedWorkflowDescendantReleaser } from '#src/workflow/recover.js';
 import type { WorkflowPlan } from '#src/workflow/plan.js';
 import { awaitRecoveryCursorBarrier } from '#src/coordinator/index.js';
-import type { LaunchTerminationFn } from '#src/coordinator/live/admission.js';
+import type { SettlePendingLaunchesFn, TerminateRegisteredChildrenFn } from '#src/coordinator/shutdown.js';
 
 let runtime: ReturnType<typeof createRealRuntime>;
 
@@ -745,7 +745,8 @@ function createLifecycleHarness(
     writeBackendInfoFn?: () => void;
     cleanupStaleJobsFn?: (currentBundleHash: string, signal: AbortSignal) => void | Promise<void>;
     markJobsAsErrorFn?: (message: string, signal: AbortSignal) => void | Promise<void>;
-    terminateAllFn?: LaunchTerminationFn;
+    settlePendingLaunchesFn?: SettlePendingLaunchesFn;
+    terminateRegisteredChildrenFn?: TerminateRegisteredChildrenFn;
     registerRuntimeComponentFn?: (component: RuntimeComponent) => void;
     interruptedAppServerReason?: 'restart' | 'handoff';
     runtime?: ReturnType<typeof createRealRuntime>;
@@ -837,12 +838,9 @@ function createLifecycleHarness(
       removeBackendInfoIfOwnerFn: () => {},
       cleanupStaleJobsFn: options.cleanupStaleJobsFn ?? (() => {}),
       markJobsAsErrorFn: options.markJobsAsErrorFn ?? (() => {}),
-      terminateAllFn:
-        options.terminateAllFn ??
-        ((stage) =>
-          stage === 'pending-launch-settlement'
-            ? { kind: 'all-pending-launches-settled' }
-            : { kind: 'all-children-observed-absent' }),
+      settlePendingLaunchesFn: options.settlePendingLaunchesFn ?? (() => ({ kind: 'all-pending-launches-settled' })),
+      terminateRegisteredChildrenFn:
+        options.terminateRegisteredChildrenFn ?? (() => ({ kind: 'all-children-observed-absent' })),
       kbDaemonSupervisor,
       handoffQuiescePorts: () => [],
       createKbHealthComponentFn: () => createKbDaemonHealthComponent(kbDaemonSupervisor),
@@ -1847,19 +1845,17 @@ describe('lifecycle recovery', () => {
       eventBus,
       runStartupRecoveryFn: async () => [],
       markJobsAsErrorFn,
-      terminateAllFn: (stage) =>
-        stage === 'pending-launch-settlement'
-          ? { kind: 'all-pending-launches-settled' }
-          : containmentAbsent
-            ? { kind: 'all-children-observed-absent' }
-            : {
-                kind: 'children-unresolved-at-deadline',
-                processes: [{ kind: 'target-alive', pid: 4_242, stage: 'after-sigkill' }],
-                cleanupHandles: 1,
-                retainedProcesses: [],
-                cleanupFailures: 0,
-                owner: 'launch-coordinator',
-              },
+      terminateRegisteredChildrenFn: () =>
+        containmentAbsent
+          ? { kind: 'all-children-observed-absent' }
+          : {
+              kind: 'children-unresolved-at-deadline',
+              processes: [{ kind: 'target-alive', pid: 4_242, stage: 'after-sigkill' }],
+              cleanupHandles: 1,
+              retainedProcesses: [],
+              cleanupFailures: 0,
+              owner: 'launch-coordinator',
+            },
     });
 
     try {

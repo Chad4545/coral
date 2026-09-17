@@ -8,7 +8,7 @@ import { fileURLToPath } from 'node:url';
 import { build } from 'esbuild';
 import { afterEach, describe, expect, it } from 'vitest';
 
-import { readShutdownRemainderStatus } from '#src/coordinator/shutdown-abandonment.js';
+import { readShutdownRemainderStatus } from '#src/coordinator/shutdown-remainder.js';
 import { CURRENT_STRICT_BUNDLE_MANIFEST_FILE } from '#src/infra/bundle-manifest-address.js';
 import type { StrictBundleManifest } from '#src/infra/bundle-manifest.js';
 import { observeProcessLiveness } from '#src/infra/node-process.js';
@@ -208,7 +208,7 @@ describe('coordinator fatal drain integration', () => {
     expect(exit.code).not.toBeNull();
     expect(exit.code).not.toBe(0);
     expect(readDiscoveryRecordForHome(home, 'prod')).toBeNull();
-    await waitForCoordinatorSocketRelease(files.socketPath, 5_000);
+    expect(await waitForCoordinatorSocketRelease(files.socketPath, 5_000)).toBe('unlinked');
 
     const runtime = createRealRuntime('prod', { baseDir: join(home, '.coral') });
     const remainder = readShutdownRemainderStatus({ storage: runtime.storage, runDir: files.runDir });

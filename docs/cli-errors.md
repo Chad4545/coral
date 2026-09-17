@@ -412,7 +412,7 @@ A `coral-cli` invoked from inside a provider job (a Coral child) reconnects to i
 
 ## Consumer Examples
 
-Retry only on retry-later failures. `backend_shutting_down` is not one of them: the coordinator answered, and where a successor could have discharged the method the CLI already tried one, so a loop only waits out a drain that may never end. A `wait jobs` subscription surfaces a drain as `transient` and is handled by the first arm; the explicit `backend_shutting_down` arm is what the same loop needs once it wraps a mutating command such as `abort jobs`.
+Retry only on retry-later failures. `backend_shutting_down` is not one of them: the coordinator answered, and where a successor could have discharged the method the CLI already tried one, so re-issuing the refused command in a tight loop only spends the drain's own budget. The drain ends by itself within a bounded number of attempts, about twice the drain budget at most: the first attempt runs under the full budget and each retry under half of it (`retryBoundaryTransfer`, `src/obligation/settlement.ts`; `SHUTDOWN_ATTEMPT_LIMIT`, `src/coordinator/lifecycle.ts`). A shutdown never waits for what it cannot end, so the next step is `coral-cli backend status`, and the refused command is retried once status no longer reports that coordinator as shutting down. A `wait jobs` subscription surfaces a drain as `transient` and is handled by the first arm; the explicit `backend_shutting_down` arm is what the same loop needs once it wraps a mutating command such as `abort jobs`.
 
 ```bash
 #!/usr/bin/env bash
@@ -434,7 +434,7 @@ while true; do
       sleep 2
       ;;
     *"[code=backend_shutting_down"*)
-      echo "The coordinator refused this command while shutting down; run 'coral-cli backend status'." >&2
+      echo "The coordinator refused this command while shutting down; the drain ends by itself. Retry once 'coral-cli backend status' no longer reports it as shutting down." >&2
       exit "$wait_status"
       ;;
     *"[code=backend_unreachable"*)
@@ -487,4 +487,4 @@ function classify(
 }
 ```
 
-`inspect-backend` is a separate verdict from `retry` and from `restart-backend` because the wrapper cannot resolve a refused method on its own: the coordinator answered, and where a successor could have discharged the method the CLI already spawned one. The next step is an operator reading `coral-cli backend status`.
+`inspect-backend` is a separate verdict from `retry` and from `restart-backend` because a refused method is not re-issued blindly: the coordinator answered, and where a successor could have discharged the method the CLI already spawned one. The drain is bounded and ends on its own, so the wrapper reads `coral-cli backend status` and retries the refused command once it no longer reports that coordinator as shutting down.

@@ -270,7 +270,15 @@ export function spawnCoordinator(options: {
   };
 }
 
-export async function probeCoordinatorSocket(socketPath: string): Promise<'accepting' | 'released'> {
+/**
+ * ECONNREFUSED and ENOENT are different exits, and a probe must not collapse them: Node unlinks a unix
+ * socket's path when `server.close()` completes (measured on Node v26.8.2, darwin; see closeIpcServer in
+ * src/transport/ipc/server.ts), while a process that died with its listener still open leaves a path that
+ * refuses connections and that only the next binder clears.
+ */
+export type CoordinatorSocketProbe = 'accepting' | 'released' | 'unlinked';
+
+export async function probeCoordinatorSocket(socketPath: string): Promise<CoordinatorSocketProbe> {
   return await new Promise((resolve, reject) => {
     const socket = createConnection(socketPath);
     socket.once('connect', () => {
@@ -279,8 +287,12 @@ export async function probeCoordinatorSocket(socketPath: string): Promise<'accep
     });
     socket.once('error', (error: NodeJS.ErrnoException) => {
       socket.destroy();
-      if (error.code === 'ECONNREFUSED' || error.code === 'ENOENT') {
+      if (error.code === 'ECONNREFUSED') {
         resolve('released');
+        return;
+      }
+      if (error.code === 'ENOENT') {
+        resolve('unlinked');
         return;
       }
       reject(error);
@@ -288,14 +300,20 @@ export async function probeCoordinatorSocket(socketPath: string): Promise<'accep
   });
 }
 
-export async function waitForCoordinatorSocketRelease(socketPath: string, timeoutMs = 10_000): Promise<void> {
+export async function waitForCoordinatorSocketRelease(
+  socketPath: string,
+  timeoutMs = 10_000,
+): Promise<Exclude<CoordinatorSocketProbe, 'accepting'>> {
   const deadline = Date.now() + timeoutMs;
-  while (Date.now() < deadline) {
-    if ((await probeCoordinatorSocket(socketPath)) === 'released') return;
+  let observed = await probeCoordinatorSocket(socketPath);
+  while (observed === 'accepting' && Date.now() < deadline) {
     await new Promise((resolve) => setTimeout(resolve, 50));
+    observed = await probeCoordinatorSocket(socketPath);
   }
-  if ((await probeCoordinatorSocket(socketPath)) === 'released') return;
-  throw new Error(`Timed out waiting for coordinator socket release: ${socketPath}`);
+  if (observed === 'accepting') {
+    throw new Error(`Timed out waiting for coordinator socket release: ${socketPath}`);
+  }
+  return observed;
 }
 
 export async function waitForProcessExit(

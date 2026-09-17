@@ -462,6 +462,62 @@ describe('provider proxy recovery producer classification', () => {
     }
   });
 
+  it.each<['control-reattachment-hold' | 'control-reattachment', 'redemption' | 'absence', 'redemption' | 'absence']>([
+    ['control-reattachment-hold', 'redemption', 'absence'],
+    ['control-reattachment-hold', 'absence', 'redemption'],
+    ['control-reattachment', 'redemption', 'absence'],
+    ['control-reattachment', 'absence', 'redemption'],
+  ])('ends the %s turn without a retry once both sources are retired, %s first', async (seam, ...order) => {
+    const identity = providerProxySetIdentityFromRecord(providerOperationRecord('executing'));
+    const redemption = controlledProducer();
+    const absence = controlledProducer();
+    const fatal = vi.fn();
+    const retry = vi.fn();
+    const retiredSources = new Set<string>();
+    const redemptionAbort = new AbortController();
+    const absenceAbort = new AbortController();
+    const dispatcher = createTestProviderProxyRecoveryDispatcher({
+      'role-control': redemption.produce,
+      'containment-proof': absence.produce as ProviderProxyRecoveryProducerPorts['containment-proof'],
+    });
+    const turn = dispatcher.begin(seam, { setIdentity: identity, retiredSources }, { evidence: vi.fn(), retry, fatal });
+    turn.start({
+      sourceId: 'redemption',
+      producerId: 'role-control',
+      input: { signal: redemptionAbort.signal, run: redemption.produce },
+      abort: (reason) => redemptionAbort.abort(reason),
+    });
+    turn.start({
+      sourceId: 'absence',
+      producerId: 'containment-proof',
+      input: { identity, signal: absenceAbort.signal },
+      abort: (reason) => absenceAbort.abort(reason),
+    });
+
+    const settlements: Record<(typeof order)[number], ControlledSettlement> = {
+      redemption: { kind: 'value', value: null },
+      absence: { kind: 'value', value: { kind: 'not-a-containment-proof' } },
+    };
+    for (const source of order) {
+      (source === 'redemption' ? redemption : absence).settle(settlements[source]);
+      await flushRecoveryTurn();
+    }
+
+    expect({
+      fatalCalls: fatal.mock.calls.length,
+      retryCalls: retry.mock.calls.length,
+      retiredSources: [...retiredSources].sort(),
+      redemptionAborted: redemptionAbort.signal.aborted,
+      absenceAborted: absenceAbort.signal.aborted,
+    }).toEqual({
+      fatalCalls: 2,
+      retryCalls: 0,
+      retiredSources: ['absence', 'redemption'],
+      redemptionAborted: true,
+      absenceAborted: true,
+    });
+  });
+
   it('disposes evidence that arrives after its source retires without retiring the surviving source', async () => {
     const firstRedemption = controlledProducer();
     const lateRedemption = controlledProducer();

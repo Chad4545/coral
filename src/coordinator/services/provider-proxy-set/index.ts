@@ -4262,13 +4262,6 @@ export class ProviderProxySetLifecycle {
           }
           if (sourceId === 'absence') {
             const proof = value as ProviderProxySetFencedContainmentProof;
-            const evidence = providerProxySetContainmentEvidenceFor(proof, slot.identity);
-            if (evidence.kind !== 'reap-required') {
-              window.cancelAttempt = null;
-              window.attemptAbort = null;
-              releaseProviderProxySetContainmentProofFence(proof);
-              return;
-            }
             const reapAbort = new AbortController();
             window.attemptAbort = reapAbort;
             void this.#trackDestructiveAttempt(
@@ -4589,6 +4582,8 @@ export class ProviderProxySetLifecycle {
     ) {
       return;
     }
+    // Both retirements already reached the fatal sink, whose handoff drain is ledger-bounded.
+    if (window.retiredSources.has('redemption') && window.retiredSources.has('absence')) return;
     slot.attemptToken += 1;
     window.attemptToken = slot.attemptToken;
     window.attempts += 1;
@@ -4606,14 +4601,6 @@ export class ProviderProxySetLifecycle {
           }
           if (sourceId === 'absence') {
             const proof = value as ProviderProxySetFencedContainmentProof;
-            const evidence = providerProxySetContainmentEvidenceFor(proof, slot.identity);
-            if (evidence.kind !== 'reap-required') {
-              window.cancelAttempt = null;
-              window.attemptAbort = null;
-              releaseProviderProxySetContainmentProofFence(proof);
-              this.#scheduleReattachmentHoldRetry(slot, window);
-              return;
-            }
             const reapAbort = new AbortController();
             window.attemptAbort = reapAbort;
             void this.#trackDestructiveAttempt(

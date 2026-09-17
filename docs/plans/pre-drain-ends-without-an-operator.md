@@ -40,10 +40,11 @@ Design decisions settled by pioneer (`fable`), traced against the tree at `7ae70
       `process-exit` and `successor-recovery`. Relaxing the predicate without this introduces a §11
       defect — a hold returned through a success type.
 - [ ] Child termination is two obligations along the seam `terminateAll` already has: pending launch
-      settlement (`process-exit`, loss named) and recorded child termination (`successor-recovery` via
-      `runStartupRecovery` → `pollAdoptedRuntime` → `adoptRunningJob` → `pollAdoptedContainment` →
-      `finalizeDeadAdoptedJob`, keyed by `DurableCliRuntimeRecord.pid` and the durable-cli containment
-      status rows).
+      settlement (`process-exit`, loss named) and recorded child termination, whose remainder is derived at
+      settlement from the retained children — `successor-recovery` with `startup-adoption` evidence listing
+      every retained child when all are durably published (adopted by `runStartupRecovery` →
+      `pollAdoptedRuntime` → `adoptRunningJob` → `pollAdoptedContainment` → `finalizeDeadAdoptedJob`, keyed
+      by `DurableCliRuntimeRecord.pid`), otherwise `process-exit`.
 - [ ] Exhaustion writes `shutdown-remainder.v1.json` in the run directory — one entry per undischarged
       obligation, keyed by the ledger's own `label` — **before** the discovery record is withdrawn.
 - [ ] Exit code is `0` iff the ledger returned `settled`, otherwise `1` through `recordExitCode`.
@@ -60,8 +61,8 @@ Design decisions settled by pioneer (`fable`), traced against the tree at `7ae70
 - [ ] `SettlementLedger.gate` remains the sole disposition constructor and `runShutdownSequence`'s sole
       return.
 - [ ] Proven against a real coordinator process and a real Unix socket: a non-zero exit code rather than
-      a signal, the owned discovery record removed, `probeSocketReleased` true, and the next mutating
-      command spawning a fresh coordinator.
+      a signal, the owned discovery record removed, the socket observed `unlinked` by the test's own probe,
+      and the next mutating command spawning a fresh coordinator.
 
 ## Scope
 
@@ -139,10 +140,12 @@ Design decisions settled by pioneer (`fable`), traced against the tree at `7ae70
   `time.sleep(pollMs)` (`SHUTDOWN_POLL_MS`, 50 ms).
 - **Disproven:** "the guardian is unreachable by definition in `reattaching` / `reattachment-hold`."
   `#beginControlReattachment` accepts incidents from any role and does not close the old controls.
-- **Corrected:** `process.exit` does not unlink a Unix socket file. `bindSocketAtAddress` answers
-  `EADDRINUSE` with `clearStaleSocket` (connect → `ECONNREFUSED` → `unlinkSync`), and
-  `probeSocketReleased` — which `waitForSocketRelease` polls — clears the path itself. The next binder is
-  the sole path-cleanup authority, so the proof's predicate is `probeSocketReleased`, not `ENOENT`.
+- **Corrected, then corrected again in review:** `process.exit` does not unlink a Unix socket file, and
+  `bindSocketAtAddress` answers `EADDRINUSE` with `clearStaleSocket` (connect → `ECONNREFUSED` →
+  `unlinkSync`) — so a process that dies with its listener open leaves a refusing path the next binder
+  clears. But an orderly drain reaches `closeIpcServer`, and Node unlinks the path when `server.close()`
+  completes (measured, Node v26.8.2), so the drain this branch proves ends in `ENOENT`. The proof's probe
+  is therefore three-valued and asserts `unlinked`; `ECONNREFUSED` is the forced-exit signature.
 - **The truth about "continuation":** with no incarnation probes registered, `requestExit` calls
   `process.exit` synchronously inside `finalizeStoppedLifecycle`, before `shutdown()`'s promise resolves
   to `src/coordinator/index.ts` — whose `disposeLifecycleReactor` after `finalized` therefore never runs

@@ -142,15 +142,6 @@ export type ChildTerminationDisposition =
       owner: 'launch-coordinator';
     }>;
 
-export type LaunchTerminationStage = 'pending-launch-settlement' | 'registered-child-termination';
-
-export type LaunchTerminationDisposition = PendingLaunchSettlementDisposition | ChildTerminationDisposition;
-
-export type LaunchTerminationFn = (
-  stage: LaunchTerminationStage,
-  signal: AbortSignal,
-) => LaunchTerminationDisposition | Promise<LaunchTerminationDisposition>;
-
 type CleanupAttemptState =
   | Readonly<{ kind: 'running'; task: Promise<DurableProcessCleanupOutcome> }>
   | Readonly<{

@@ -38,8 +38,10 @@ import {
   runShutdownSequence,
   shutdownModeFromReason,
   type LifecycleWiringState,
+  type SettlePendingLaunchesFn,
   type ShutdownMode,
   type ShutdownReason,
+  type TerminateRegisteredChildrenFn,
   HANDOFF_DRAIN_TIMEOUT_MS,
 } from './shutdown.js';
 import type {
@@ -51,7 +53,6 @@ import type {
   ShutdownSequenceDisposition,
   ShutdownUndischarged,
 } from './shutdown-settlement.js';
-import type { LaunchTerminationFn } from './live/admission.js';
 import type { HandoffQuiescePort } from './execution-service.js';
 import type { InterruptedAppServerReason } from '../jobs/reconcile/interrupted-reason.js';
 import {
@@ -112,7 +113,8 @@ import {
 } from '../jobs/crashed-job-terminalization-recovery-source.js';
 import { staleJobCleanupSource, type RawStaleJobCleanupRow } from '../jobs/stale-job-cleanup-recovery-source.js';
 import { runShutdownCrashTerminalization } from './shutdown-recovery.js';
-import { recordShutdownObligationAbandonment, recordShutdownRemainder } from './shutdown-abandonment.js';
+import { recordShutdownObligationAbandonment } from './shutdown-abandonment.js';
+import { recordShutdownRemainder } from './shutdown-remainder.js';
 import type {
   ShutdownObligationAbandonRequest,
   ShutdownObligationAbandonResult,
@@ -795,7 +797,8 @@ export type LifecycleDeps = {
   readonly removeBackendInfoIfOwnerFn: (instanceId: string) => void | BackendInfoRemovalResult;
   readonly cleanupStaleJobsFn: (currentBundleHash: string, signal: AbortSignal) => void | Promise<void>;
   readonly markJobsAsErrorFn: (message: string, signal: AbortSignal) => void | Promise<void>;
-  readonly terminateAllFn: LaunchTerminationFn;
+  readonly settlePendingLaunchesFn: SettlePendingLaunchesFn;
+  readonly terminateRegisteredChildrenFn: TerminateRegisteredChildrenFn;
   readonly providerHostManager: Pick<ProviderHostManager, 'drainForHandoff' | 'shutdown'>;
   /**
    * The live guardian/reaper/proxy sets, absent whenever the composition layer had no real acquisition path
@@ -877,8 +880,6 @@ export type LifecycleShutdownTerminalDisposition = Extract<
   { disposition: 'finalized' | 'finalized-with-losses' }
 >;
 
-type ShutdownRemainderWriteResult = Readonly<{ kind: 'written' }> | Readonly<{ kind: 'refused'; detail: string }>;
-
 export function isLifecycleShutdownTerminal(
   disposition: LifecycleShutdownDisposition,
 ): disposition is LifecycleShutdownTerminalDisposition {
@@ -891,8 +892,7 @@ type LifecycleControlState = LifecycleWiringState & {
   shutdownContinuationAbort: AbortController | null;
   shutdownAttemptsStarted: number;
   shutdownRetryAfter: Promise<void> | null;
-  shutdownRetry: (() => Promise<ShutdownSequenceDisposition>) | null;
-  shutdownReason: ShutdownReason | null;
+  shutdownRetry: Readonly<{ reason: ShutdownReason; retry: () => Promise<ShutdownSequenceDisposition> }> | null;
   lastShutdownDisposition: LifecycleShutdownDisposition | null;
   operatorAbandonedShutdownObligations: Set<ShutdownObligationSubject>;
   started: boolean;
@@ -1348,7 +1348,8 @@ export function createLifecycle(
     server,
     removeBackendInfoIfOwnerFn,
     markJobsAsErrorFn,
-    terminateAllFn,
+    settlePendingLaunchesFn,
+    terminateRegisteredChildrenFn,
     providerHostManager,
     providerProxyAuthority,
     stopProviderOperationReconciler,
@@ -1372,7 +1373,6 @@ export function createLifecycle(
     shutdownAttemptsStarted: 0,
     shutdownRetryAfter: null,
     shutdownRetry: null,
-    shutdownReason: null,
     lastShutdownDisposition: null,
     operatorAbandonedShutdownObligations: new Set(),
     started: false,
@@ -1402,8 +1402,8 @@ export function createLifecycle(
 
   async function shutdown(reason: ShutdownReason): Promise<LifecycleShutdownDisposition> {
     if (state.shutdownPromise) return state.shutdownPromise;
+    const ledgerReason = state.shutdownRetry?.reason ?? reason;
     state.shutdownAttemptsStarted += 1;
-    if (state.shutdownRetry === null) state.shutdownReason = reason;
     state.lastShutdownDisposition = null;
 
     // Calling `abort()` with no reason sets `signal.reason` to the platform
@@ -1417,75 +1417,61 @@ export function createLifecycle(
     const finalizeStoppedLifecycle = (
       terminal: LifecycleShutdownTerminalDisposition,
       onFinalized: ((exitCode: number) => void) | undefined = onStopped,
-    ): LifecycleShutdownDisposition => {
+    ): LifecycleShutdownTerminalDisposition => {
       runtimeState.setLifecycle('stopped');
-      let finalized = terminal;
-      let exitCode = terminal.disposition === 'finalized' ? 0 : 1;
-      const remainderRuntime = {
-        storage: runtime.storage,
-        time: runtime.time,
-        runDir: runtime.paths.coral.coordinator.runDir,
-      };
-      const recordRemainder = (): ShutdownRemainderWriteResult => {
+      const losses: ShutdownUndischarged[] = [...(terminal.disposition === 'finalized' ? [] : terminal.undischarged)];
+      const publish = (): void => {
+        let refusal: string | null;
         try {
-          return recordShutdownRemainder(remainderRuntime, {
-            instanceId,
-            reason,
-            mode: shutdownModeFromReason(reason),
-            exitCode,
-            undischarged: finalized.disposition === 'finalized' ? [] : finalized.undischarged,
-          })
-            ? { kind: 'written' }
-            : { kind: 'refused', detail: 'record publication returned false' };
+          refusal = recordShutdownRemainder(
+            { storage: runtime.storage, time: runtime.time, runDir: runtime.paths.coral.coordinator.runDir },
+            {
+              instanceId,
+              reason: ledgerReason,
+              mode: shutdownModeFromReason(ledgerReason),
+              exitCode: 1,
+              undischarged: losses,
+            },
+          )
+            ? null
+            : 'record publication returned false';
         } catch (error: unknown) {
-          return { kind: 'refused', detail: formatError(error) };
+          refusal = formatError(error);
+        }
+        if (refusal !== null) bestEffortLifecycleLog(log, `shutdown remainder write refused (${refusal})\n`);
+      };
+      const withdraw = (): string | null => {
+        try {
+          const withdrawal = removeBackendInfoIfOwnerFn(instanceId);
+          return withdrawal !== undefined && withdrawal.kind === 'refused' ? withdrawal.detail : null;
+        } catch (error: unknown) {
+          return formatError(error);
         }
       };
 
       try {
-        const remainderWrite = recordRemainder();
-        const remainderPublished = remainderWrite.kind === 'written';
-        if (remainderWrite.kind === 'refused') {
-          bestEffortLifecycleLog(log, `shutdown remainder write refused (${remainderWrite.detail})\n`);
-          exitCode = Math.max(exitCode, 1);
+        if (losses.length > 0) publish();
+        const refusal = withdraw();
+        if (refusal !== null) {
+          bestEffortLifecycleLog(log, `backend discovery withdrawal refused (${refusal})\n`);
+          losses.push({
+            label: 'backend discovery withdrawal',
+            remainder: { owner: 'process-exit' },
+            settlement: { cause: 'rejected', detail: refusal },
+          });
+          publish();
         }
-        let withdrawalRefusal: string | null = null;
-        try {
-          const withdrawal = removeBackendInfoIfOwnerFn(instanceId);
-          if (withdrawal !== undefined && withdrawal.kind === 'refused') withdrawalRefusal = withdrawal.detail;
-        } catch (error: unknown) {
-          withdrawalRefusal = formatError(error);
-        }
-        if (withdrawalRefusal !== null) {
-          bestEffortLifecycleLog(log, `backend discovery withdrawal refused (${withdrawalRefusal})\n`);
-          exitCode = Math.max(exitCode, 1);
-          finalized = {
-            disposition: 'finalized-with-losses',
-            undischarged: [
-              ...(finalized.disposition === 'finalized' ? [] : finalized.undischarged),
-              {
-                label: 'backend discovery withdrawal',
-                remainder: { owner: 'process-exit' },
-                settlement: { cause: 'rejected', detail: withdrawalRefusal },
-              },
-            ],
-          };
-          if (remainderPublished) {
-            const remainderRewrite = recordRemainder();
-            if (remainderRewrite.kind === 'refused') {
-              bestEffortLifecycleLog(log, `shutdown remainder rewrite refused (${remainderRewrite.detail})\n`);
-            }
-          }
-        }
-        return finalized;
+        return losses.length === 0
+          ? { disposition: 'finalized' }
+          : { disposition: 'finalized-with-losses', undischarged: losses };
       } finally {
-        onFinalized?.(exitCode);
+        onFinalized?.(losses.length === 0 ? 0 : 1);
       }
     };
     const acceptShutdownDisposition = (disposition: ShutdownSequenceDisposition): LifecycleShutdownDisposition => {
       if (disposition.disposition === 'held' || disposition.disposition === 'transfer-pending') {
         state.shutdownRetryAfter = disposition.retryAfter;
-        state.shutdownRetry = disposition.retry;
+        state.shutdownRetry = { reason: ledgerReason, retry: disposition.retry };
         const recovery: LifecycleShutdownRecovery = {
           kind: 'retry-shutdown',
           exit: disposition.exit,
@@ -1506,7 +1492,7 @@ export function createLifecycle(
             cleanupObligations: disposition.retainedAuthority.cleanupObligations,
             operatorActions: disposition.retainedAuthority.operatorActions,
           },
-          retry: () => shutdown(reason),
+          retry: () => shutdown(ledgerReason),
         };
         return disposition.disposition === 'held'
           ? { disposition: 'held', reason: disposition.reason, recovery }
@@ -1539,8 +1525,10 @@ export function createLifecycle(
       }
     };
     const attempt = (async (): Promise<LifecycleShutdownDisposition> => {
-      if (runtimeState.getLifecycle() === 'stopped') return { disposition: 'finalized' };
-      if (state.shutdownRetry !== null) return state.shutdownRetry().then(acceptShutdownDisposition);
+      if (runtimeState.getLifecycle() === 'stopped') {
+        return { disposition: 'finalized' };
+      }
+      if (state.shutdownRetry !== null) return state.shutdownRetry.retry().then(acceptShutdownDisposition);
       const stopProviderOperationMutations = (): ProviderOperationReconcilerStopDisposition => {
         const lifecycleDisposition = state.providerOperationMutationAdmission?.close() ?? {
           kind: 'drained' as const,
@@ -1550,7 +1538,7 @@ export function createLifecycle(
       };
       return acceptShutdownDisposition(
         await runShutdownSequence({
-          reason,
+          reason: ledgerReason,
           state,
           teardownRecoveryCoordinator: async () => {
             await state.recoveryCoordinator?.teardown();
@@ -1570,7 +1558,8 @@ export function createLifecycle(
           stopProviderOperationReconciler: stopProviderOperationMutations,
           kbDaemonSupervisor,
           storeServicesRef,
-          terminateAllFn,
+          settlePendingLaunchesFn,
+          terminateRegisteredChildrenFn,
           handoffQuiescePorts: deps.handoffQuiescePorts,
           handoffDrainBudgetMs: deps.handoffDrainBudgetMs,
           disposeLifecycleReactor,
@@ -1601,7 +1590,7 @@ export function createLifecycle(
               while (state.shutdownAttemptsStarted < SHUTDOWN_ATTEMPT_LIMIT) {
                 await Promise.race([state.shutdownRetryAfter ?? Promise.resolve(), cancelled]);
                 if (continuationAbort.signal.aborted) return;
-                const retried = await shutdown(reason);
+                const retried = await shutdown(ledgerReason);
                 if (isLifecycleShutdownTerminal(retried)) return;
               }
             })()
@@ -1648,16 +1637,16 @@ export function createLifecycle(
   function requestShutdownRetry(): void {
     const currentAttempt = state.shutdownPromise;
     if (currentAttempt === null) {
-      if (state.shutdownRetry === null || state.shutdownReason === null) return;
-      void shutdown(state.shutdownReason).catch((error: unknown) => {
+      if (state.shutdownRetry === null) return;
+      void shutdown(state.shutdownRetry.reason).catch((error: unknown) => {
         log(`operator recovery shutdown retry failed (${formatError(error)})\n`);
       });
       return;
     }
     void currentAttempt
       .then((disposition) => {
-        if (!isLifecycleShutdownTerminal(disposition) && state.shutdownReason !== null) {
-          return shutdown(state.shutdownReason);
+        if (!isLifecycleShutdownTerminal(disposition) && state.shutdownRetry !== null) {
+          return shutdown(state.shutdownRetry.reason);
         }
       })
       .catch((error: unknown) => {

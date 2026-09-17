@@ -101,11 +101,8 @@ function lifecycleHarness(writeBackendInfoFn: (info: BackendInfo) => boolean | v
       removeBackendInfoIfOwnerFn: vi.fn(),
       cleanupStaleJobsFn: vi.fn(),
       markJobsAsErrorFn: vi.fn(),
-      terminateAllFn: vi.fn(async (stage) =>
-        stage === 'pending-launch-settlement'
-          ? ({ kind: 'all-pending-launches-settled' } as const)
-          : ({ kind: 'all-children-observed-absent' } as const),
-      ),
+      settlePendingLaunchesFn: vi.fn(async () => ({ kind: 'all-pending-launches-settled' }) as const),
+      terminateRegisteredChildrenFn: vi.fn(async () => ({ kind: 'all-children-observed-absent' }) as const),
       providerHostManager: { drainForHandoff: vi.fn(), shutdown: vi.fn(async () => {}) } as never,
       handoffQuiescePorts: () => [],
       kbDaemonSupervisor,

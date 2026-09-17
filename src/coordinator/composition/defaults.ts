@@ -48,7 +48,8 @@ type BackendWorldBoundDefaults = {
   readonly listenFn: NonNullable<CoordinatorCoreOptions['listenFn']>;
   readonly cleanupStaleJobsFn: (currentBundleHash: string, signal: AbortSignal) => void | Promise<void>;
   readonly markJobsAsErrorFn: (message: string, signal: AbortSignal) => void | Promise<void>;
-  readonly terminateAllFn: NonNullable<CoordinatorCoreOptions['terminateAllFn']>;
+  readonly settlePendingLaunchesFn: NonNullable<CoordinatorCoreOptions['settlePendingLaunchesFn']>;
+  readonly terminateRegisteredChildrenFn: NonNullable<CoordinatorCoreOptions['terminateRegisteredChildrenFn']>;
 };
 
 type ResolvedBackendDefaults = BackendEagerDefaults & BackendWorldBoundDefaults;
@@ -158,19 +159,19 @@ export function resolveCoordinatorDefaults(
           if (progressStore === null) return;
           return markJobsAsError(progressStore, message, runtime.time.now(), signal, (cb) => progressStore.commit(cb));
         });
-      const terminateAllFn: BackendWorldBoundDefaults['terminateAllFn'] =
-        options.terminateAllFn ??
-        ((stage, signal) =>
-          stage === 'pending-launch-settlement'
-            ? bindings.launchCoordinator.settlePendingLaunches(signal)
-            : bindings.launchCoordinator.terminateRegisteredChildren(signal));
+      const settlePendingLaunchesFn: BackendWorldBoundDefaults['settlePendingLaunchesFn'] =
+        options.settlePendingLaunchesFn ?? ((signal) => bindings.launchCoordinator.settlePendingLaunches(signal));
+      const terminateRegisteredChildrenFn: BackendWorldBoundDefaults['terminateRegisteredChildrenFn'] =
+        options.terminateRegisteredChildrenFn ??
+        ((signal) => bindings.launchCoordinator.terminateRegisteredChildren(signal));
 
       return {
         ...eager,
         listenFn,
         cleanupStaleJobsFn,
         markJobsAsErrorFn,
-        terminateAllFn,
+        settlePendingLaunchesFn,
+        terminateRegisteredChildrenFn,
       };
     },
   };

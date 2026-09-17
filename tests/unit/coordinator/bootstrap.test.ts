@@ -1,6 +1,7 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 
 import {
+  createBootstrapProbeExitGate,
   createCoordinatorShutdownSignalHandler,
   handoffStartupToSelectedBuild,
   main,
@@ -312,5 +313,30 @@ describe('backend bootstrap probe cleanup', () => {
     } finally {
       vi.useRealTimers();
     }
+  });
+
+  it('exits with the requested code when probe cleanup rejects instead of holding the process', async () => {
+    const gate = createBootstrapProbeExitGate();
+    mockState.processIncarnationProbeRegistrySize.mockReturnValue(1);
+    mockState.snapshotProcessIncarnationProbeSubjects.mockReturnValue([{ pid: 5_151 }]);
+    const cleanupFailure = new Error('probe registry unavailable');
+    mockState.terminateProcessIncarnationProbes.mockRejectedValue(cleanupFailure);
+    const errorLog = vi
+      .spyOn(backendLog, 'error')
+      .mockImplementation(() => undefined)
+      .mockClear();
+    const exitProcess = vi
+      .spyOn(process, 'exit')
+      .mockImplementation((() => undefined) as never)
+      .mockClear();
+
+    gate.requestExit(1);
+    await vi.waitFor(() => expect(exitProcess).toHaveBeenCalledWith(1));
+
+    expect(errorLog).toHaveBeenCalledWith(
+      'Coordinator exit proceeding after process-incarnation probe cleanup failed; registered subjects: pid=5151',
+      cleanupFailure,
+    );
+    expect(mockState.terminateProcessIncarnationProbes).toHaveBeenCalledOnce();
   });
 });

@@ -518,10 +518,8 @@ function createCoordinatorShutdownHarness(options: HarnessOptions) {
       removeBackendInfoIfOwnerFn: () => {},
       cleanupStaleJobsFn: () => {},
       markJobsAsErrorFn: () => {},
-      terminateAllFn: (stage) =>
-        stage === 'pending-launch-settlement'
-          ? { kind: 'all-pending-launches-settled' }
-          : { kind: 'all-children-observed-absent' },
+      settlePendingLaunchesFn: () => ({ kind: 'all-pending-launches-settled' }),
+      terminateRegisteredChildrenFn: () => ({ kind: 'all-children-observed-absent' }),
       providerHostManager: createFakeProviderHostManager() as never,
       kbDaemonSupervisor,
       handoffQuiescePorts: () => [],
@@ -686,7 +684,7 @@ describe('recovery coordinator shutdown', () => {
     const startup = harness.controller.start().catch((error: unknown) => error);
     await vi.waitFor(() => expect(harness.fakeService.captureProviderRecoveryAuthority).toHaveBeenCalledTimes(1));
 
-    await harness.controller.shutdown('handoff');
+    await harness.controller.shutdown('test-teardown');
     releaseCapture({ ok: false, failure: { reason: 'subject-mismatch', provider: 'codex' } });
 
     expect(((await startup) as Error).name).toBe('AbortError');
@@ -1107,7 +1105,7 @@ describe('recovery coordinator shutdown', () => {
     virtualRuntime.time.tick(501);
     await vi.waitFor(() => expect(harness.fakeService.finalizeInterruptedDurableJob).toHaveBeenCalledTimes(1));
 
-    await harness.controller.shutdown('handoff');
+    await harness.controller.shutdown('test-teardown');
     expect(providerSignal).not.toBeNull();
     expect((providerSignal as unknown as AbortSignal).aborted).toBe(true);
   });
@@ -1164,7 +1162,7 @@ describe('recovery coordinator shutdown', () => {
     await vi.waitFor(() => expect(harness.fakeService.finalizeInterruptedDurableJob).toHaveBeenCalledTimes(1));
 
     let shutdownSettled = false;
-    const shutdown = harness.controller.shutdown('handoff').finally(() => {
+    const shutdown = harness.controller.shutdown('test-teardown').finally(() => {
       shutdownSettled = true;
     });
     await Promise.resolve();
@@ -1210,7 +1208,7 @@ describe('recovery coordinator shutdown', () => {
     await vi.waitFor(() => expect(harness.fakeService.finalizeInterruptedAppServerJob).toHaveBeenCalledTimes(1));
 
     let shutdownSettled = false;
-    const shutdown = harness.controller.shutdown('handoff').finally(() => {
+    const shutdown = harness.controller.shutdown('test-teardown').finally(() => {
       shutdownSettled = true;
     });
     await Promise.resolve();

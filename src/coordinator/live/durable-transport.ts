@@ -825,76 +825,65 @@ export async function spawnDurableJobTransport(params: SpawnDurableJobTransportP
       jobDir: options.jobDir,
     };
     signalAuthority = launch.signalAuthority;
-    retainedProcess = {
+    const wrapperGroup = {
       kind: 'recorded-wrapper-group',
       provider: options.provider,
       jobDir: options.jobDir,
       ...(options.jobId === undefined ? {} : { jobId: options.jobId }),
-      publication: {
-        kind: 'observed-unpublished',
-        owner: 'process-exit',
-        publicationLoss: 'runtime publication is unproven',
-      },
       containment: {
         pid: launch.pid,
         incarnation: launch.leaderIncarnation,
         processGroupId: launch.pid,
         childRoot: null,
       },
+    } as const;
+    const setPublication = (publication: DurableProcessPublication): DurableProcessRetention => {
+      retainedProcess = { ...wrapperGroup, publication };
+      cleanupRetentions.set(cleanup, retainedProcess);
+      return retainedProcess;
     };
+    setPublication({
+      kind: 'observed-unpublished',
+      owner: 'process-exit',
+      publicationLoss: 'runtime publication is unproven',
+    });
     cleanupKey = Symbol();
     cleanupHandles.set(cleanupKey, cleanup);
-    cleanupRetentions.set(cleanup, retainedProcess);
     let runtimePublicationFailure: Readonly<{ error: unknown }> | null = null;
     try {
       if (options.onRuntimeRecord === undefined) {
-        retainedProcess = {
-          ...retainedProcess,
-          publication: {
-            kind: 'observed-unpublished',
-            owner: 'process-exit',
-            publicationLoss: 'runtime publication callback is unavailable',
-          },
-        };
-        cleanupRetentions.set(cleanup, retainedProcess);
+        setPublication({
+          kind: 'observed-unpublished',
+          owner: 'process-exit',
+          publicationLoss: 'runtime publication callback is unavailable',
+        });
       } else {
         try {
           options.onRuntimeRecord(launch.runtimeRecord, provisionalSubject);
-          retainedProcess =
+          setPublication(
             options.jobId === undefined
               ? {
-                  ...retainedProcess,
-                  publication: {
-                    kind: 'observed-unpublished',
-                    owner: 'process-exit',
-                    publicationLoss: 'runtime publication is unproven because the job id is unavailable',
-                  },
+                  kind: 'observed-unpublished',
+                  owner: 'process-exit',
+                  publicationLoss: 'runtime publication is unproven because the job id is unavailable',
                 }
               : {
-                  ...retainedProcess,
-                  publication: {
-                    kind: 'durably-published',
-                    owner: 'successor-recovery',
-                    // JobStore.appendRuntimeStarted (src/jobs/store.ts) commits no containment-status row here.
-                    evidence: {
-                      kind: 'durable-cli-runtime',
-                      jobId: options.jobId,
-                      pid: launch.runtimeRecord.pid,
-                      leaderIncarnation: launch.leaderIncarnation,
-                    },
+                  kind: 'durably-published',
+                  owner: 'successor-recovery',
+                  evidence: {
+                    kind: 'durable-cli-runtime',
+                    jobId: options.jobId,
+                    pid: launch.runtimeRecord.pid,
+                    leaderIncarnation: launch.leaderIncarnation,
                   },
-                };
-          cleanupRetentions.set(cleanup, retainedProcess);
+                },
+          );
         } catch (error: unknown) {
-          retainedProcess = {
-            ...retainedProcess,
-            publication: {
-              kind: 'observed-unpublished',
-              owner: 'process-exit',
-              publicationLoss: `runtime publication failed: ${errorMessage(error)}`,
-            },
-          };
-          cleanupRetentions.set(cleanup, retainedProcess);
+          setPublication({
+            kind: 'observed-unpublished',
+            owner: 'process-exit',
+            publicationLoss: `runtime publication failed: ${errorMessage(error)}`,
+          });
           runtimePublicationFailure = { error };
         }
       }

@@ -584,10 +584,13 @@ export function createProviderProxyRecoveryDispatcher(
       const abortAll = (reason: unknown): void => {
         for (const abort of aborters.values()) abort(reason);
       };
-      const disposeCachedEvidence = (
-        transferred?: Readonly<{ sourceId: string; value: unknown }>,
-        sourceScope?: string,
-      ): void => {
+      const disposeCachedEvidence = ({
+        transferred,
+        sourceScope,
+      }: Readonly<{
+        transferred?: Readonly<{ sourceId: string; value: unknown }>;
+        sourceScope?: string;
+      }> = {}): void => {
         for (const sources of [exactSources, reattachmentSources]) {
           for (const [sourceId, observation] of sources) {
             if (sourceScope !== undefined && sourceId !== sourceScope) continue;
@@ -614,7 +617,7 @@ export function createProviderProxyRecoveryDispatcher(
           retiredSources.add(sourceId);
           retiredSourceFatals.set(sourceId, error);
           aborters.get(sourceId)?.(error);
-          disposeCachedEvidence(undefined, sourceId);
+          disposeCachedEvidence({ sourceScope: sourceId });
           try {
             effects.fatal(sinks, error);
           } finally {
@@ -649,12 +652,12 @@ export function createProviderProxyRecoveryDispatcher(
         }
         retired = true;
         if (redemption.kind === 'evidence') {
-          disposeCachedEvidence({ sourceId: 'redemption', value: redemption.value });
+          disposeCachedEvidence({ transferred: { sourceId: 'redemption', value: redemption.value } });
           sinks.evidence(redemption.value, 'redemption');
           return;
         }
         if (absence.kind === 'evidence' && containmentProofRequiresReap(absence.value)) {
-          disposeCachedEvidence({ sourceId: 'absence', value: absence.value });
+          disposeCachedEvidence({ transferred: { sourceId: 'absence', value: absence.value } });
           sinks.evidence(absence.value, 'absence');
           return;
         }
@@ -671,7 +674,7 @@ export function createProviderProxyRecoveryDispatcher(
         retired = true;
         const reason = new Error(`provider_proxy_control_reattachment_decided:${sourceId}`);
         abortAll(reason);
-        disposeCachedEvidence({ sourceId, value });
+        disposeCachedEvidence({ transferred: { sourceId, value } });
         sinks.evidence(value, sourceId);
       };
 
@@ -715,6 +718,10 @@ export function createProviderProxyRecoveryDispatcher(
         const redemptionSettled = redemption !== undefined || retiredSources.has('redemption');
         const absenceSettled = absence !== undefined || retiredSources.has('absence');
         if (!redemptionSettled || !absenceSettled) return;
+        if (retiredSources.has('redemption') && retiredSources.has('absence')) {
+          retired = true;
+          return;
+        }
         const unavailableObservation =
           redemption?.kind === 'unavailable' ? redemption : absence?.kind === 'unavailable' ? absence : undefined;
         const sourceFatal = retiredSourceFatals.get('redemption') ?? retiredSourceFatals.get('absence');

@@ -182,10 +182,8 @@ export function createHandoffCoresHarness(options: CreateHarnessOptions = {}): H
         removeBackendInfoIfOwnerFn: () => {},
         cleanupStaleJobsFn: () => {},
         markJobsAsErrorFn: () => {},
-        terminateAllFn: async (stage) =>
-          stage === 'pending-launch-settlement'
-            ? { kind: 'all-pending-launches-settled' }
-            : { kind: 'all-children-observed-absent' },
+        settlePendingLaunchesFn: async () => ({ kind: 'all-pending-launches-settled' }),
+        terminateRegisteredChildrenFn: async () => ({ kind: 'all-children-observed-absent' }),
         registerBuiltInProvidersFn: () => {},
         ...(opts.createExecutionService === undefined ? {} : { createExecutionService: opts.createExecutionService }),
         ...(opts.providerHostManager === undefined ? {} : { providerHostManager: opts.providerHostManager }),

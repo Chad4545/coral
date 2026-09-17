@@ -1,4 +1,4 @@
-import type { LaunchTerminationFn } from '../live/admission.js';
+import type { SettlePendingLaunchesFn, TerminateRegisteredChildrenFn } from '../shutdown.js';
 import type { IncomingMessage, Server, ServerResponse } from 'node:http';
 import type { BackendInfo, BackendInfoRemovalResult } from '../../infra/backend-discovery.js';
 import type { ProviderRegistry } from '../../providers/registry.js';
@@ -78,7 +78,8 @@ export type CoordinatorCoreOptions = {
   cleanupStaleJobsFn?: (currentBundleHash: string) => void | Promise<void>;
   markJobsAsErrorFn?: (message: string) => void | Promise<void>;
   createStoreServicesFromDbFn?: (storeDb: Database) => CoordinatorStoreServices;
-  terminateAllFn?: LaunchTerminationFn;
+  settlePendingLaunchesFn?: SettlePendingLaunchesFn;
+  terminateRegisteredChildrenFn?: TerminateRegisteredChildrenFn;
   registerBuiltInProvidersFn?: RegisterBuiltInProvidersFn;
   recoverPersistedDiscussFn?: RecoverPersistedDiscussFn;
   providerHostManager?: ProviderHostManager;

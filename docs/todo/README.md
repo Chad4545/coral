@@ -193,6 +193,26 @@ would have to satisfy both, and their requirements are opposites.
 
 ---
 
+## What a shutdown leaves behind
+
+Added 2026-09-17 from PR #363, which made a drain end by itself: the coordinator releases what it holds and
+exits, and everything it leaves is owned by a durable successor or named as lost in one record. The three
+entries are what that change could see from where it stood and deliberately did not do. They share the
+premise — nobody is watching, so the process's own exit is the only exit — and not a fix: one is a stall on
+the exit path, one is a loop across successors, one is a reader that does not exist.
+
+|                                                                                                                              |                                                                                                                                                                                                                                                                                                                                                                                                                                                             |
+| ---------------------------------------------------------------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| [`discovery-withdrawal-is-unbounded-on-the-exit-path.md`](./discovery-withdrawal-is-unbounded-on-the-exit-path.md)           | **A stated exception with no home until now.** The synchronous finalizer's last act is a `readFileSync` and an `unlinkSync` on the discovery record, uninterruptible from inside the process. A helper process was designed and rejected because the unguarded withdrawal one line later shares the journal. The decision underneath is whether the record is withdrawn by its writer or expired by its next reader, as the socket already is.               |
+| [`reproducible-fatal-successor-loop.md`](./reproducible-fatal-successor-loop.md)                                             | **Inherited and bounded, cheaper than it was.** A guardian answering out of contract produces the same fatal in every successor that redeems its capsule, until the enforcers observe the holder absent and reap the set. Under hard mode each iteration also reaped every healthy set; under handoff it costs the bad set and one CLI invocation. Ending it earlier means retiring on evidence the fatal says cannot be interpreted.                       |
+| [`shutdown-remainder-has-no-reader.md`](./shutdown-remainder-has-no-reader.md)                                               | **Track B of #357.** `readShutdownRemainderStatus` has no production caller, so the record that makes a loss visible is visible to nobody. Also carries whether `held` and `transfer-pending` survive the health projection. The surface must report and not solicit.                                                                                                                                                                                       |
+
+The first shares its cause with `wedged-coordinator-self-drain` and ships after that entry picks a half. The
+second is adjacent to both capsule-retirement entries — the same question of what may retire a capsule when no
+observation decides — and is observed through the third, so the reader lands first.
+
+---
+
 ## A probe's answer is read for more than it established
 
 Added 2026-08-19 from a PR-gate review. Both are about the distance between what a command established and

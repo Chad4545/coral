@@ -1,25 +1,18 @@
 import { formatError } from '../infra/error-format.js';
-import type { ProcessIncarnation } from '../infra/node-process.js';
 import type { TimePort } from '../infra/port-types.js';
 import {
   SettlementLedger,
   type DeclinedSettlementObligation,
-  type RemainderSettlementRole,
   type Settlement,
   type SettlementAuthorityReleaseBoundary,
   type SettlementDisposition,
-  type SettlementHold,
   type SettlementObligation,
 } from '../obligation/settlement.js';
 import type { ShutdownObligationSubject } from '../obligation/shutdown-abandonment.js';
+import type { DurableCliRuntimePublicationEvidence } from './live/durable-transport.js';
 
 export type SuccessorRecoveryEvidence =
-  | Readonly<{
-      kind: 'durable-cli-runtime';
-      jobId: string;
-      pid: number;
-      leaderIncarnation: ProcessIncarnation;
-    }>
+  | Readonly<{ kind: 'startup-adoption'; processes: readonly DurableCliRuntimePublicationEvidence[] }>
   | Readonly<{ kind: 'startup-store-recovery' }>
   | Readonly<{ kind: 'startup-liveness-recovery' }>;
 
@@ -27,23 +20,9 @@ export type UndischargedRemainder =
   | Readonly<{ owner: 'process-exit' }>
   | Readonly<{ owner: 'successor-recovery'; evidence: SuccessorRecoveryEvidence }>;
 
-export type ShutdownHoldReason =
-  | 'kb-daemon-shutdown-unsettled'
-  | 'process-incarnation-probes-unsettled'
-  | 'lifecycle-reactor-disposal-unsettled'
-  | 'provider-operation-mutations-unsettled'
-  | 'required-shutdown-step-unsettled';
+export type ShutdownHoldReason = 'required-shutdown-step-unsettled';
 
-export type ShutdownHoldExit =
-  | 'kb-daemon-process-close'
-  | 'process-incarnation-probe-settlement'
-  | 'lifecycle-reactor-disposal-settlement'
-  | 'store-epoch-sweep-settlement'
-  | 'admitted-provider-operation-mutation-settlement'
-  | 'provider-operation-mutation-admission-availability'
-  | 'provider-proxy-set-release-retry'
-  | 'shutdown-budget-exhaustion'
-  | 'authority-release-settlement';
+export type ShutdownHoldExit = 'shutdown-budget-exhaustion' | 'authority-release-settlement';
 
 export type ShutdownOperatorAction =
   | Readonly<{
@@ -103,14 +82,7 @@ export type ShutdownRetainedAuthorityContribution = Readonly<{
   cleanupObligations?: readonly string[];
 }>;
 
-export type ShutdownHold = SettlementHold<ShutdownHoldReason, ShutdownHoldExit>;
-
-export type ShutdownObligation = SettlementObligation<
-  UndischargedRemainder,
-  ShutdownRetainedAuthorityContribution,
-  ShutdownHoldReason,
-  ShutdownHoldExit
->;
+export type ShutdownObligation = SettlementObligation<UndischargedRemainder, ShutdownRetainedAuthorityContribution>;
 
 export type ShutdownAuthorityReleaseBoundary = SettlementAuthorityReleaseBoundary<
   ShutdownRetainedAuthorityContribution,
@@ -153,13 +125,6 @@ function foldRetainedAuthority(
   };
 }
 
-function defaultHold(): ShutdownHold {
-  return {
-    reason: 'required-shutdown-step-unsettled',
-    exit: 'shutdown-budget-exhaustion',
-  };
-}
-
 function declinedFailure(
   label: string,
   remainder: UndischargedRemainder,
@@ -172,27 +137,13 @@ function declinedFailure(
   };
 }
 
-function remainderRole(remainder: UndischargedRemainder): RemainderSettlementRole {
-  switch (remainder.owner) {
-    case 'process-exit':
-      return 'delegable';
-    case 'successor-recovery':
-      return 'successor';
-  }
-}
-
 function acceptProcessExitRemainder(
-  declined: readonly DeclinedSettlementObligation<
-    UndischargedRemainder,
-    ShutdownRetainedAuthorityContribution,
-    ShutdownHoldReason,
-    ShutdownHoldExit
-  >[],
+  declined: readonly DeclinedSettlementObligation<UndischargedRemainder, ShutdownRetainedAuthorityContribution>[],
   accept: (remainder: ProcessExitRemainder) => ProcessExitRemainderAcceptance,
   log: (message: string) => void,
 ): AcceptedProcessExitRemainder | null {
   const undischarged = declined.map(({ obligation, settlement }) =>
-    declinedFailure(obligation.label, obligation.remainder, settlement),
+    declinedFailure(obligation.label, obligation.remainder(), settlement),
   );
   const remainder: ProcessExitRemainder = { undischarged };
   try {
@@ -224,7 +175,6 @@ export function createShutdownSettlementLedger(options: ShutdownSettlementLedger
     time: options.time,
     log: options.log,
     pollMs: options.pollMs,
-    remainderRole,
     boundaryRemainder: { owner: 'process-exit' },
     ...(accept === undefined
       ? {}
@@ -235,6 +185,5 @@ export function createShutdownSettlementLedger(options: ShutdownSettlementLedger
     acceptanceFailureLabel: 'process-exit-remainder-acceptance',
     failure: declinedFailure,
     foldRetainedAuthority,
-    defaultHold,
   });
 }

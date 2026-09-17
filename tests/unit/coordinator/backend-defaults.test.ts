@@ -173,8 +173,8 @@ describe('resolveCoordinatorDefaults eager defaults', () => {
     });
     const controller = new AbortController();
 
-    const pendingSettlement = defaults.terminateAllFn('pending-launch-settlement', controller.signal);
-    const childTermination = defaults.terminateAllFn('registered-child-termination', controller.signal);
+    const pendingSettlement = defaults.settlePendingLaunchesFn(controller.signal);
+    const childTermination = defaults.terminateRegisteredChildrenFn(controller.signal);
     expect(receivedSignals).toEqual([controller.signal, controller.signal]);
 
     controller.abort();

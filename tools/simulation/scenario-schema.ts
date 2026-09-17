@@ -1,6 +1,6 @@
 import { z } from 'zod';
 import { providerTerminalOutcomeSchema } from '../../src/providers/contract.js';
-import { isShutdownReason, type ShutdownReason } from '../../src/coordinator/shutdown.js';
+import { SHUTDOWN_REASONS, type ShutdownReason } from '../../src/coordinator/shutdown.js';
 
 const scenarioErrorSchema = z.union([
   z.string(),
@@ -197,8 +197,10 @@ export const cycleStepSchema = z.object({
 });
 
 const simulationShutdownReasonSchema = z
-  .string()
-  .transform((reason): ShutdownReason => (isShutdownReason(reason) ? reason : 'test-teardown'));
+  .enum([...SHUTDOWN_REASONS, 'cycle', 'simulation-shutdown'])
+  .transform(
+    (reason): ShutdownReason => (reason === 'cycle' || reason === 'simulation-shutdown' ? 'test-teardown' : reason),
+  );
 
 const shutdownStepSchema = z.object({
   type: z.literal('shutdown'),

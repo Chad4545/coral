@@ -6011,21 +6011,20 @@ describe('execution backend server', () => {
   describe('shutdown policy', () => {
     it('handoff shutdown preserves children and does not mark jobs as error', async () => {
       const markJobsAsErrorFn = vi.fn();
-      const terminateAllFn = vi.fn((stage) =>
-        stage === 'pending-launch-settlement'
-          ? ({ kind: 'all-pending-launches-settled' } as const)
-          : ({ kind: 'all-children-observed-absent' } as const),
-      );
+      const settlePendingLaunchesFn = vi.fn(() => ({ kind: 'all-pending-launches-settled' }) as const);
+      const terminateRegisteredChildrenFn = vi.fn(() => ({ kind: 'all-children-observed-absent' }) as const);
 
       const backend = await startBackendServer({
         markJobsAsErrorFn,
-        terminateAllFn,
+        settlePendingLaunchesFn,
+        terminateRegisteredChildrenFn,
       });
 
       await backend.controller.shutdown('replaced');
       await backend.controller.waitForShutdown();
 
-      expect(terminateAllFn).not.toHaveBeenCalled();
+      expect(settlePendingLaunchesFn).not.toHaveBeenCalled();
+      expect(terminateRegisteredChildrenFn).not.toHaveBeenCalled();
       expect(markJobsAsErrorFn).not.toHaveBeenCalled();
     });
 
@@ -6127,11 +6126,8 @@ describe('execution backend server', () => {
           removeBackendInfoIfOwnerFn: () => {},
           cleanupStaleJobsFn: () => {},
           markJobsAsErrorFn: vi.fn(),
-          terminateAllFn: vi.fn((stage) =>
-            stage === 'pending-launch-settlement'
-              ? ({ kind: 'all-pending-launches-settled' } as const)
-              : ({ kind: 'all-children-observed-absent' } as const),
-          ),
+          settlePendingLaunchesFn: vi.fn(() => ({ kind: 'all-pending-launches-settled' }) as const),
+          terminateRegisteredChildrenFn: vi.fn(() => ({ kind: 'all-children-observed-absent' }) as const),
           providerHostManager: providerHostManager as never,
           kbDaemonSupervisor,
           handoffQuiescePorts: () => [fakeService as never],
@@ -6167,31 +6163,29 @@ describe('execution backend server', () => {
 
     it('hard shutdown completes after child absence is confirmed and marks jobs as error', async () => {
       const markJobsAsErrorFn = vi.fn();
-      const terminateAllFn = vi.fn(async (stage) =>
-        stage === 'pending-launch-settlement'
-          ? ({ kind: 'all-pending-launches-settled' } as const)
-          : ({ kind: 'all-children-observed-absent' } as const),
-      );
+      const settlePendingLaunchesFn = vi.fn(async () => ({ kind: 'all-pending-launches-settled' }) as const);
+      const terminateRegisteredChildrenFn = vi.fn(async () => ({ kind: 'all-children-observed-absent' }) as const);
       const providerHostManager = createFakeProviderHostManager();
 
       const backend = await startBackendServer({
         markJobsAsErrorFn,
-        terminateAllFn,
+        settlePendingLaunchesFn,
+        terminateRegisteredChildrenFn,
         providerHostManager: providerHostManager as never,
       });
 
       await backend.controller.shutdown('sigint');
       await backend.controller.waitForShutdown();
 
-      expect(terminateAllFn).toHaveBeenCalledTimes(2);
-      expect(terminateAllFn.mock.calls.map(([stage]) => stage)).toEqual([
-        'pending-launch-settlement',
-        'registered-child-termination',
-      ]);
+      expect(settlePendingLaunchesFn).toHaveBeenCalledOnce();
+      expect(terminateRegisteredChildrenFn).toHaveBeenCalledOnce();
+      expect(settlePendingLaunchesFn.mock.invocationCallOrder.at(0) ?? Number.POSITIVE_INFINITY).toBeLessThan(
+        terminateRegisteredChildrenFn.mock.invocationCallOrder.at(0) ?? Number.POSITIVE_INFINITY,
+      );
       expect(markJobsAsErrorFn).toHaveBeenCalledTimes(1);
       expect(providerHostManager.shutdown).toHaveBeenCalledTimes(1);
       const hostShutdownOrder = providerHostManager.shutdown.mock.invocationCallOrder.at(0);
-      const childKillOrder = terminateAllFn.mock.invocationCallOrder.at(1);
+      const childKillOrder = terminateRegisteredChildrenFn.mock.invocationCallOrder.at(0);
       const terminalizationOrder = markJobsAsErrorFn.mock.invocationCallOrder.at(0);
       expect(hostShutdownOrder ?? Number.POSITIVE_INFINITY).toBeLessThan(childKillOrder ?? Number.POSITIVE_INFINITY);
       expect(childKillOrder ?? Number.POSITIVE_INFINITY).toBeLessThan(terminalizationOrder ?? Number.POSITIVE_INFINITY);

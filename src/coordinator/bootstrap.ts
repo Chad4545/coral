@@ -74,34 +74,34 @@ export function createBootstrapProbeExitGate(): Readonly<{
     void terminateProcessIncarnationProbes(cleanupAbort.signal)
       .then(
         (disposition) => {
-          cleanupInFlight = false;
-          if (disposition.disposition === 'hold') {
-            const holds = disposition.unsettled
-              .map((hold) =>
-                'key' in hold
-                  ? `key=${hold.key} reason=${hold.reason} exit=${hold.exit}`
-                  : `pid=${hold.pid ?? 'unavailable'} reason=${hold.reason} exit=${hold.exit}`,
-              )
-              .join('; ');
-            backendLog.error(`Coordinator exit proceeding with unsettled process-incarnation probes: ${holds}`);
-          }
-          if (requestedExitCode !== null) {
-            exited = true;
-            process.exit(requestedExitCode);
-          }
+          if (disposition.disposition !== 'hold') return;
+          const holds = disposition.unsettled
+            .map((hold) =>
+              'key' in hold
+                ? `key=${hold.key} reason=${hold.reason} exit=${hold.exit}`
+                : `pid=${hold.pid ?? 'unavailable'} reason=${hold.reason} exit=${hold.exit}`,
+            )
+            .join('; ');
+          backendLog.error(`Coordinator exit proceeding with unsettled process-incarnation probes: ${holds}`);
         },
         (error: unknown) => {
-          cleanupInFlight = false;
           const subjects = cleanupSubjects
             .map((subject) => ('key' in subject ? `key=${subject.key}` : `pid=${subject.pid}`))
             .join('; ');
           backendLog.error(
-            `Coordinator process-incarnation probe cleanup failed; exit remains held; registered subjects: ${subjects || 'none'}`,
+            `Coordinator exit proceeding after process-incarnation probe cleanup failed; registered subjects: ${subjects || 'none'}`,
             error,
           );
         },
       )
-      .finally(() => clearTimeout(cleanupDeadline));
+      .then(() => {
+        clearTimeout(cleanupDeadline);
+        cleanupInFlight = false;
+        if (requestedExitCode !== null) {
+          exited = true;
+          process.exit(requestedExitCode);
+        }
+      });
   };
 
   const recordExitCode = (code: number): void => {

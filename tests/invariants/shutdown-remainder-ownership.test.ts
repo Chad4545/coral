@@ -15,13 +15,15 @@ const PROCESS_EXIT_OBLIGATION_INVENTORY = [
   'provider operation mutation drain',
   'provider host shutdown',
   'pending launch settlement',
-  'child termination',
   'app-server handoff quiesce',
   'provider host drain for handoff',
   'process incarnation probe shutdown',
   'lifecycle reactor dispose',
   'store epoch sweep cancellation',
 ] as const;
+const DERIVED_REMAINDER_OBLIGATIONS: Readonly<Record<string, string>> = {
+  'child termination': 'childTerminationRemainder',
+};
 
 function sourceFile(canonicalPath: string): ts.SourceFile {
   return ts.createSourceFile(
@@ -66,6 +68,12 @@ function unwrapExpression(expression: ts.Expression): ts.Expression {
   return current;
 }
 
+function remainderThunkBody(initializer: ts.Expression): ts.Expression | null {
+  const thunk = unwrapExpression(initializer);
+  if (!ts.isArrowFunction(thunk) || thunk.parameters.length !== 0 || ts.isBlock(thunk.body)) return null;
+  return unwrapExpression(thunk.body);
+}
+
 function ownerLiteral(property: ts.PropertyAssignment | ts.PropertySignature): string | null {
   if (ts.isPropertyAssignment(property)) {
     const initializer = unwrapExpression(property.initializer);
@@ -100,17 +108,41 @@ function processExitInventoryViolations(): string[] {
     }
   }
 
+  function inspectDerivedRemainder(name: string, initializer: ts.Expression, node: ts.Node): void {
+    const body = remainderThunkBody(initializer);
+    const derivation = DERIVED_REMAINDER_OBLIGATIONS[name];
+    if (
+      body === null ||
+      !ts.isCallExpression(body) ||
+      !ts.isIdentifier(body.expression) ||
+      body.expression.text !== derivation
+    ) {
+      violations.push(
+        `${location(node)} shutdown obligation '${name}' must derive its remainder through ${derivation}`,
+      );
+    }
+  }
+
   function visitShutdown(node: ts.Node): void {
     if (ts.isObjectLiteralExpression(node)) {
       const label = propertyAssignment(node, 'label');
-      if (label !== undefined && ts.isStringLiteral(label.initializer) && expected.has(label.initializer.text)) {
-        const name = label.initializer.text;
+      const name = label !== undefined && ts.isStringLiteral(label.initializer) ? label.initializer.text : null;
+      if (name !== null && (expected.has(name) || name in DERIVED_REMAINDER_OBLIGATIONS)) {
         found.set(name, (found.get(name) ?? 0) + 1);
         const remainder = propertyAssignment(node, 'remainder');
         if (remainder === undefined) {
           violations.push(`${location(node)} shutdown obligation '${name}' must declare a remainder owner`);
+        } else if (name in DERIVED_REMAINDER_OBLIGATIONS) {
+          inspectDerivedRemainder(name, remainder.initializer, remainder);
         } else {
-          inspectProcessExitOwner(`shutdown obligation '${name}'`, remainder.initializer, remainder);
+          const body = remainderThunkBody(remainder.initializer);
+          if (body === null) {
+            violations.push(
+              `${location(remainder)} shutdown obligation '${name}' must declare its remainder as a thunk`,
+            );
+          } else {
+            inspectProcessExitOwner(`shutdown obligation '${name}'`, body, remainder);
+          }
         }
       }
     }
@@ -118,7 +150,7 @@ function processExitInventoryViolations(): string[] {
   }
   visitShutdown(shutdown);
 
-  for (const name of expected) {
+  for (const name of [...expected, ...Object.keys(DERIVED_REMAINDER_OBLIGATIONS)]) {
     const count = found.get(name) ?? 0;
     if (count !== 1) {
       violations.push(
@@ -150,14 +182,6 @@ function ownershipShapeViolations(): string[] {
 
   for (const file of sourceFiles(OWNERSHIP_SCAN_ROOT)) {
     function visit(node: ts.Node): void {
-      if (
-        (ts.isPropertyAssignment(node) || ts.isPropertySignature(node)) &&
-        propertyName(node) === 'owner' &&
-        ownerLiteral(node) === 'none'
-      ) {
-        violations.push(`${location(node)} owner 'none' remains in the ${OWNERSHIP_SCAN_ROOT} ownership scan`);
-      }
-
       if (
         ts.isPropertyAssignment(node) &&
         propertyName(node) === 'owner' &&

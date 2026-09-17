@@ -31,7 +31,7 @@ A provider-proxy lifecycle fatal starts a shutdown that cannot finish, and the c
    A dispatcher fatal means *this coordinator received corrupt, refused or unknown evidence* — so hard
    mode asks that void judgement to destroy every healthy set and every durable child, and to reap the
    bad set through the very guardian whose answer it could not interpret.
-2. **Remainders hold authority.** `remainderRole` (`src/coordinator/shutdown-settlement.ts`) maps
+2. **Remainders hold authority.** `remainderRole` (then in `src/coordinator/shutdown-settlement.ts`, since deleted) maps
    `none → blocking`, and `authorityBlocked` in `SettlementLedger.settleInitially` / `retryDeclined`
    (`src/obligation/settlement.ts`) is *any declined role other than `delegable`* — so
    `successor-recovery` blocks too. `buildAuthorityReleaseBoundary.commit` is never reached; IPC stays
@@ -76,9 +76,12 @@ publication throws remains a named `process-exit` loss.
   `'cycle'` and default `'simulation-shutdown'` inputs normalize to that hard test-teardown member;
   production `'idle'` is its own hard-arm member and the idle callback is typed accordingly.
 - **AC2** — A `provider-proxy-lifecycle-fatal` shutdown runs in **handoff** mode: `reapProviderProxySets`
-  receives `[]` for established sets, `terminateAllFn` does not run, `markJobsAsErrorFn` does not run.
-- **AC3** — `UndischargedRemainder` has no `none` member and `remainderRole` has no `blocking` role;
-  `authorityBlocked` no longer exists. Every pass prepares and commits the authority-release boundary.
+  receives `[]` for established sets, neither `settlePendingLaunchesFn` nor `terminateRegisteredChildrenFn` runs,
+  `markJobsAsErrorFn` does not run.
+- **AC3** — `UndischargedRemainder` has no `none` member; `remainderRole` and its `blocking` role no longer
+  exist; `authorityBlocked` no longer exists. `SettlementObligation.hold` no longer exists; the
+  authority-release boundary is the only hold producer. Every pass prepares and commits the
+  authority-release boundary.
 - **AC4** — `SettlementLedger.gate` returns `settled` only when nothing declined. A pass with declined
   `successor-recovery` entries returns `delegated` carrying them, never `settled`. Two mechanics make that
   reachable, and both are asserted: `acceptDelegatedRemainder` is invoked for **every** declined entry
@@ -102,9 +105,15 @@ publication throws remains a named `process-exit` loss.
   `dispositionAtDeadline()` twice; `childTerminationConfirmation` and `retainedChildActions` split with
   them. `terminateAll` itself is **deleted**, not wrapped: its only production reference is
   `composition/defaults.ts`'s `terminateAllFn` injection, and every remaining caller is a test.
+  `terminateAllFn` is replaced by two injections named after the methods they wrap,
+  `settlePendingLaunchesFn` and `terminateRegisteredChildrenFn`. The first obligation carries `process-exit`;
+  the second derives its remainder at settlement from the retained children: `successor-recovery` with
+  `startup-adoption` evidence listing every retained child when all are durably published, otherwise
+  `process-exit` with each child's publication state named in the settlement detail.
 - **AC6** — Child state has three semantic states: a pending wrapper identity is `process-exit`; an observed
   child whose runtime publication failed or is unproven is `process-exit` with the publication loss named;
-  only a child promoted after `onRuntimeRecord` returns successfully is `successor-recovery`. The evidence
+  only a child promoted after `onRuntimeRecord` returns successfully is `successor-recovery` — per child; the
+  obligation's remainder is `successor-recovery` only when every retained child is. The evidence
   is typed and claims **only what the promotion point establishes**: `appendRuntimeStarted` commits the
   `job.runtime.started` event and `writeDurableCliProvisionalProcessRuntimeMeta` in one transaction, so the
   evidence is the job id, `DurableCliRuntimeRecord.pid`, and the leader incarnation. It does **not** claim a
@@ -129,39 +138,45 @@ publication throws remains a named `process-exit` loss.
   abandonment family still parses every record this build writes to it.
 - **AC9** — The remainder record's entries are the ledger's structured dispositions:
   `{ label, remainder, settlement: { cause, detail } }`. `remainder` is either `{ owner: 'process-exit' }`
-  or `{ owner: 'successor-recovery', evidence: SuccessorRecoveryEvidence }`; no free-form `via` string
-  remains. The record also carries `instanceId`, `recordedAt`, `reason`, `mode`, and the final
-  max-aggregated `exitCode`. Tolerance is **per entry, not only per field**: `.passthrough()` on the entry
+  or `{ owner: 'successor-recovery', evidence: SuccessorRecoveryEvidence }` (`startup-adoption`, carrying
+  the list of durably published child processes, `startup-store-recovery`, or `startup-liveness-recovery`);
+  no free-form `via` string remains. The record also carries `instanceId`, `recordedAt`, `reason`, `mode`,
+  and `exitCode`, the lifecycle's exit contribution (1 for any record that exists). Tolerance is **per entry, not only per field**: `.passthrough()` on the entry
   object does not save a reader whose `entries: z.array(closedUnion)` rejects the whole file for one
   unknown `SuccessorRecoveryEvidence` kind. Entries decode individually; an undecodable entry is skipped,
   counted, and the count is reported by the programmatic reader, per §10's own "skipped and reported by
-  key" precedent. Publication retains at most the latest 32 instance records (one record keeps all of its
+  key" precedent. Records decode individually too: an undecodable record is counted by the reader and carried
+  forward verbatim by the writer, which refuses only when the envelope itself is unreadable. Publication retains at most the latest 32 instance records (one record keeps all of its
   entries); writing an instance replaces its previous record before oldest-instance eviction, so recurring
   fatal exits have bounded parse, serialization, and durable-write cost.
 - **AC10** — The shutdown ledger contributes `0` only for `settled` and `1` for every other disposition
   through `recordExitCode`; the process exit code remains the maximum of all contributors. A prior repeated
   signal or startup contribution is therefore never lowered by a later settled ledger.
 - **AC11** — Finalization order is boundary prepare/commit attempts → `gate` (which owns the bounded
-  boundary exhaustion, see AC18) → `setLifecycle('stopped')` → write the remainder record → attempt the
+  boundary exhaustion, see AC18) → `setLifecycle('stopped')` → write the remainder record when it carries
+  losses → attempt the
   typed `removeBackendInfoIfOwnerFn` withdrawal → request exit in a `finally`-equivalent path. A returned
   read/unlink refusal is logged, contributes exit code `1`, and produces the carrying-losses lifecycle
-  terminal; it cannot skip the exit request. After a returned refusal, the same instance record receives one
-  best-effort rewrite containing the withdrawal loss and updated max exit code before exit is requested.
+  terminal; it cannot skip the exit request. After a returned refusal, the same instance record is written
+  again with the withdrawal loss before exit is requested.
   Nothing after the boundary retries. `finalizeStoppedLifecycle` and
   `acceptShutdownDisposition` remain **synchronous** — they are consumed as
   `state.shutdownRetry().then(acceptShutdownDisposition)` and as a plain return from `attempt`, so
   anything requiring an `await` cannot be placed here.
 - **AC12** — A `false` return or a throw from the remainder write is consumed explicitly per
   `.claude/rules/decision-union-results.md` as a typed `refused`, logged, and does not delay discovery
-  withdrawal or exit; the exit code is still non-zero. `removeBackendInfoIfOwner` likewise returns a typed
+  withdrawal or exit; the exit code is already non-zero: the record is written only for a shutdown carrying
+  losses, and a refused write changes neither the disposition nor the exit code. `removeBackendInfoIfOwner`
+  likewise returns a typed
   `removed | unchanged | refused` result: non-`ENOENT` discovery reads and unlinks become `refused`, and
-  finalization logs them, records a nonzero contribution, conditionally rewrites the already-published
-  record with that named loss, and still requests exit. The record is best-effort diagnostic visibility: it
+  finalization logs them, records a nonzero contribution, writes the record with that named loss, and still
+  requests exit. The record is best-effort diagnostic visibility: it
   may be lost, and losing it changes nothing about who owns the obligations it names.
 - **AC13** — `createBootstrapProbeExitGate` passes an abort signal with a `SIGTERM_GRACE_MS` deadline to the
   initial `terminateProcessIncarnationProbes` call and never re-requests cleanup on `leaseSettlement`.
   Both a probe child that never closes and a childless lease whose filesystem probe never settles therefore
-  produce a logged hold and cannot prevent `process.exit` after the grace.
+  produce a logged hold and cannot prevent `process.exit` after the grace; a rejected cleanup likewise cannot
+  prevent `process.exit`.
 - **AC14** — `waiting-for-operator` and `owner.kind: 'lifecycle-shutdown-hold'` do not exist in
   `LifecycleShutdownRecovery`; `automaticRetry.status` admits `scheduled` only. On its own that is
   cosmetic — `automaticRetry.status` is read by two test files and nothing in production. The load-bearing
@@ -208,8 +223,8 @@ publication throws remains a named `process-exit` loss.
   rather than a signal, the owned discovery record is removed, the socket stops accepting connections, and
   the next mutating command spawns a fresh coordinator. `probeSocketReleased` is a module-private function
   in `src/transport/ipc/ensure.ts` and is not assertable from a test as written — the test builds its own
-  connect probe (`ECONNREFUSED` means released) or the function is exported deliberately, but the AC does
-  not name it as if it were already available. `tests/integration/coordinator/helpers.ts` supplies
+  three-valued connect probe (`released` on `ECONNREFUSED`, `unlinked` on `ENOENT`; see Commit 5 for why an
+  orderly drain yields `unlinked`) rather than exporting the function. `tests/integration/coordinator/helpers.ts` supplies
   `spawnCoordinator`, `waitForDiscoveryRecord`, `readDiscoveryRecordForHome`, `coordinatorFilesForHome`
   and `waitForProcessExit`; it supplies **no** socket assertion, so that one is new.
 - **AC18** — A `LifecycleShutdownDisposition` distinguishes a fully discharged finalization from one
@@ -227,7 +242,7 @@ publication throws remains a named `process-exit` loss.
   Boundary exhaustion has **one** home inside `gate`. `SettlementLedger` owns
   `boundaryTransferAttemptsStarted`, keyed by the boundary. A named `attemptBoundaryTransfer` caller
   increments it immediately before each prepare/commit cycle; the initial gate cycle counts as attempt 1,
-  `retryCleanTransfer` / `retryAcceptedTransfer` drive attempts 2 and 3, and the third declined prepare or
+  one `retryBoundaryTransfer` drives attempts 2 and 3, and the third declined prepare or
   commit becomes a structured boundary `process-exit` loss and `finalized-with-losses` rather than another
   hold. `buildAuthorityReleaseBoundary.hold.retryAfter` is bounded by racing its in-flight settlement wake
   against `time.sleep(SHUTDOWN_POLL_MS)`; it never exposes raw `Promise.all(inFlight)` as the prerequisite
@@ -250,8 +265,9 @@ publication throws remains a named `process-exit` loss.
   abandon command; the function's constraint comment (*"A held shutdown does not end on its own…"*) is
   rewritten or deleted rather than edited to stay true, and `docs/cli-errors.md`'s exit-`75` row loses the
   same remediation. `ShutdownHoldExit`'s `durable-operator-abandonment` and
-  `required-cleanup-capability-confirmation-or-durable-operator-abandonment` members and `defaultHold()`'s
-  use of the first are retired; no current-build shutdown producer or serialized remainder detail offers an
+  `required-cleanup-capability-confirmation-or-durable-operator-abandonment` members are retired (and
+  `defaultHold` itself was deleted outright under AC3's later correction, since the boundary is the only
+  hold producer); no current-build shutdown producer or serialized remainder detail offers an
   imperative destructive command. This includes both shutdown paragraphs in `docs/cli-errors.md` and
   `childTerminationConfirmation`'s `Run coral-cli abort jobs …` detail, but does not remove commands or
   guidance for separate still-live provider-set/abort states.
@@ -315,9 +331,9 @@ declined successor remainders under a success type.
 | AC4 | `src/obligation/settlement.ts` |
 | AC5 | `src/coordinator/live/admission.ts`, `src/coordinator/shutdown.ts`, `src/coordinator/composition/defaults.ts`, `src/coordinator/composition/types.ts` |
 | AC6 | `src/coordinator/live/durable-transport.ts` |
-| AC7 | `src/coordinator/shutdown-abandonment.ts` |
+| AC7 | `src/coordinator/shutdown-remainder.ts` |
 | AC8 | `src/obligation/shutdown-abandonment.ts` |
-| AC9 | `src/coordinator/shutdown-abandonment.ts` |
+| AC9 | `src/coordinator/shutdown-remainder.ts` |
 | AC10 | `src/coordinator/bootstrap.ts` |
 | AC11 | `src/coordinator/lifecycle.ts` |
 | AC12 | `src/coordinator/lifecycle.ts` |
@@ -333,7 +349,7 @@ declined successor remainders under a success type.
 and AC18 — AC3 and AC4 are in different batches already, and AC18 follows AC4. `src/coordinator/lifecycle.ts`
 carries AC1, AC11, AC12, AC14 and AC18, which land in batches 1, 5, 6 and 7 — no two share a batch.
 `src/coordinator/bootstrap.ts` carries AC10 and AC13; **AC13 is in batch 1 and AC10 in batch 5**, so they
-do not collide. `src/coordinator/shutdown-abandonment.ts` carries AC7 and AC9, which are in batches 5 and
+do not collide. `src/coordinator/shutdown-remainder.ts` carries AC7 and AC9, which are in batches 5 and
 6.
 
 ### Merge order
@@ -379,8 +395,8 @@ by the fix.
 - Add `'provider-proxy-lifecycle-fatal'` to the handoff arm. *(AC2)*
 - `UndischargedRemainder` in `src/coordinator/shutdown-settlement.ts` loses `none` and free-form `via`;
   `successor-recovery` instead carries a `SuccessorRecoveryEvidence` discriminated union. Start with
-  `durable-cli-runtime`, `startup-store-recovery`, and `startup-liveness-recovery`. `remainderRole` loses
-  `blocking`; `boundaryRemainder` is `process-exit` because process death is the final release when the
+  `startup-adoption` (carrying the durably published child processes), `startup-store-recovery`, and
+  `startup-liveness-recovery`. `remainderRole` is deleted together with its `blocking` role; `boundaryRemainder` is `process-exit` because process death is the final release when the
   explicit boundary cannot confirm. *(AC3, AC9)*
 - `SettlementLedger.settleInitially` loses `authorityBlocked`; obligation execution is a one-shot phase.
   Remove `retryDeclined` from the shutdown transition: later invocations retry only acceptance and boundary
@@ -398,8 +414,7 @@ by the fix.
   which commits with `acceptance: null` by construction. *(AC4, AC9, AC16)*
 - `acceptShutdownDisposition` and `LifecycleShutdownRecovery` in `src/coordinator/lifecycle.ts`:
   `waiting-for-operator` and `owner.kind: 'lifecycle-shutdown-hold'` are deleted; `automaticRetry` keeps
-  `scheduled`. The only remaining `held` is a boundary failure (`retryCleanTransfer` /
-  `retryAcceptedTransfer`), whose `hold` names `authority-release-settlement` with a bounded `retryAfter`.
+  `scheduled`. The only remaining `held` is a boundary failure (`retryBoundaryTransfer`), whose `hold` names `authority-release-settlement` with a bounded `retryAfter`.
   `SettlementLedger.boundaryTransferAttemptsStarted` counts the initial transfer as 1 and the two retry
   closures as 2 and 3 through `attemptBoundaryTransfer`; attempt 3 converts a failed boundary into a named
   loss instead of another hold. The bounded exhaustion lives inside `gate` and has a named caller.
@@ -420,7 +435,7 @@ unfinished cleanup.
 | KB child shutdown | `process-exit` | No durable KB-child adoption record exists — but `startKbDaemonParentWatchdog` (`src/kb-daemon/daemon-main.ts`) makes the daemon self-exit on observed parent absence, so the named loss is the coordinator's confirmation, not the child |
 | Provider-operation mutation drain | `process-exit` | The aggregate includes admission state not proved by a saga row |
 | Provider-host hard shutdown | `process-exit` | The aggregate is not wholly represented by successor-readable set evidence |
-| Hard-mode aggregate child termination | `process-exit` | Conservative compile-safe owner until Commit 2 replaces this row with two obligations |
+| Hard-mode child termination | derived at settlement | `successor-recovery` with `startup-adoption` evidence when every retained child is durably published, otherwise `process-exit` |
 | App-server handoff quiesce | `process-exit` | Unconfirmed in-flight app-server writes are named as lost |
 | Provider-host handoff drain | `process-exit` | Closing hosts and representation-release holds are not all durable successor evidence |
 | Process-incarnation probe shutdown | `process-exit` | Observation-only lease; exit is allowed after the bounded probe grace |
@@ -449,7 +464,8 @@ ownership-inventory invariant enumerates this table and fails on either `none` o
 - **Two ledger tasks.** Split `LaunchCoordinator.terminateAll` into an ordered staged API: pending plus
   observed-unpublished settlement first, durably-published child termination second.
   `buildHardShutdownConsequences` registers each stage as its own obligation. The first carries
-  `process-exit`; the second carries typed `durable-cli-runtime` successor evidence. Stage 1 alone owns and
+  `process-exit`; the second derives its remainder at settlement — typed `startup-adoption` successor evidence
+  listing every retained child when all are durably published, otherwise `process-exit`. Stage 1 alone owns and
   sets `shutdownRequested`, drains the queued launches, and snapshots pending launches. Because every
   admitted durable launch registers pending synchronously after admission and before its first `await`, the
   latch closes admission before the snapshot and stage 2 cannot create a new pending launch. Pin that proof
@@ -548,9 +564,12 @@ registered aborter and disposes all cached evidence; the hold's `fatal` sink in
   fence the surviving absence source's decision depends on, and erases the evidence the new rule must read.
 - Extend the local fatal sink to receive that provenance. `submit`'s `if (retired) { … return; }` guard
   becomes per-source; late evidence from a retired source is still disposed.
-- For `control-reattachment-hold` **only**, retire the offending source without setting the turn's
-  `retired` flag. Other recovery seams keep fail-stop. Precedent: `foreign-capsule-retirement` already
-  refuses fatality per seam. Retirement records the source and immediately calls
+- For both reattachment seams — `control-reattachment` and `control-reattachment-hold`, which share
+  `reduceControlReattachment` — retire the offending source without setting the turn's `retired` flag.
+  Other recovery seams keep fail-stop. (**Corrected in review:** the plan first said hold-only; the rule
+  is a property of the two-source reducer, not of the hold's name, and restricting it would leave the
+  first attempt's redemption fatal parking the same slot with the same two sources.) Precedent:
+  `foreign-capsule-retirement` already refuses fatality per seam. Retirement records the source and immediately calls
   `reduceControlReattachment`; it is an input transition, not state that waits for another producer event.
 - In `#runReattachmentHoldAttempt`, create separate redemption and absence `AbortController`s — both
   `turn.start` calls currently pass one shared `abort.signal`. Store an aggregate attempt-cancel function
@@ -604,8 +623,8 @@ Unreachable” shutdown paragraph in `docs/cli-errors.md` lose the same remediat
 record; this is scoped to shutdown serialization and does not remove commands for separate live states.
 
 Retire `ShutdownHoldExit`'s `durable-operator-abandonment` and
-`required-cleanup-capability-confirmation-or-durable-operator-abandonment` members, `defaultHold()`'s use of
-the first, and all current-build shutdown action producers. Retain the CLI command, schemas, and IPC route
+`required-cleanup-capability-confirmation-or-durable-operator-abandonment` members and all current-build
+shutdown action producers (`defaultHold` itself is deleted under AC3's correction, not narrowed). Retain the CLI command, schemas, and IPC route
 for mixed-version operation against an older daemon; a current coordinator has no producer and answers
 `not-held`/`not-offered`. *(AC19)*
 
@@ -634,13 +653,18 @@ enough for the test; the production default remains 30 seconds.
 6. Assert the socket no longer accepts connections and the owned discovery record was removed.
 7. Issue a subsequent mutating command and prove the production backend bundle spawns a fresh coordinator.
 
-**Not `ENOENT` on the socket path.** `process.exit` does not unlink a Unix socket file.
-`bindSocketAtAddress` (`src/transport/ipc/server.ts`) answers `EADDRINUSE` with `clearStaleSocket`
-(connect → `ECONNREFUSED` → `unlinkSync`), and the release probe `waitForSocketRelease` polls clears the
-path itself. The next binder is the sole path-cleanup authority, which is what lets a process die without
-tidying. A mocked `closeIpcServerFn` proves only a call. The predicate is therefore "connect gives
-`ECONNREFUSED`" — note `probeSocketReleased` is **not exported** from `src/transport/ipc/ensure.ts`, so the
-test builds that probe or the export is added deliberately.
+**The socket has two non-serving exits, and the proof names which one it observed.** `process.exit` does
+not unlink a Unix socket file: a process that dies with its listener open leaves a path that answers
+`ECONNREFUSED`, and `bindSocketAtAddress` (`src/transport/ipc/server.ts`) clears that path through
+`clearStaleSocket` — the next binder is the sole cleanup authority for it. **Corrected during review:** an
+*orderly* drain does not die that way. It reaches `closeIpcServer` (`src/transport/ipc/server.ts`), and Node
+unlinks a listening unix socket's path when `server.close()` completes (measured on Node v26.8.2, darwin),
+so the drain AC17 exercises ends with `ENOENT`, not `ECONNREFUSED` — the earlier "not `ENOENT`" predicate
+would have failed the branch's own proof on every clean drain, and the predicate before it passed by
+collapsing the two exits. Per §11 the probe is three-valued (`accepting | released | unlinked` in
+`tests/integration/coordinator/helpers.ts`); the fatal-drain test asserts `unlinked`, which a drain that
+skipped `closeIpcServer` would fail. A mocked `closeIpcServerFn` proves only a call. `probeSocketReleased`
+in `src/transport/ipc/ensure.ts` stays private; the test owns its own probe.
 
 ## Risks & Mitigations
 
@@ -686,7 +710,7 @@ npm run test:e2e:build && npm run test:e2e:lifecycle
   `tests/simulation` and `tools/simulation/adversarial.ts`, carrying `'test'`, `'test-cleanup'`,
   `'test cleanup'`, `'test-complete'`, `'test-mid-recovery'`, `'test-after-poller-live'`, `'teardown'`,
   `'done'`, `'abort-verified'`, `'signal_abort'`, `'queue_shutdown'` beside the production
-  `'replaced'` / `'sigterm'` / `'sigint'` / `'handoff'`, plus production `'idle'` and simulation `'cycle'` /
+  `'replaced'` / `'sigterm'` / `'sigint'`, plus production `'idle'` and simulation `'cycle'` /
   `'simulation-shutdown'`. Each must land on or normalize to a union member that preserves the mode it takes
   today. Type `CoordinatorServerController.shutdown`, `SimulationController.shutdown`, the IPC callback,
   and the idle callback; `tools/simulation/runner.ts`'s `step.reason` ingress narrows rather than casts.
@@ -701,7 +725,7 @@ npm run test:e2e:build && npm run test:e2e:lifecycle
 - `tests/unit/coordinator/services/provider-proxy-set/*` — prove only one retry timer is ever armed per
   hold slot with both sources live, and that a pending `slot.retryTimer` is cleared before re-arming.
 - `tests/unit/coordinator/shutdown-abandonment.test.ts` — v1 assertions stay as compatibility tests;
-  add separate tests for the new address rather than rewriting them.
+  the new address is tested separately in `tests/unit/coordinator/shutdown-remainder.test.ts`.
 - `tests/unit/coordinator/bootstrap.test.ts` and `tests/unit/infra/*process-incarnation*.test.ts` — add a
   childless lease whose filesystem probe never settles and prove the initial cleanup deadline reaches exit.
 - `tests/unit/coordinator/live/durable-transport.test.ts` (or the nearest existing durable-launch suite) —

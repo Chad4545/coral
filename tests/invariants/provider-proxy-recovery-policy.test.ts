@@ -267,33 +267,35 @@ function ownerName(owner: ts.FunctionLikeDeclaration | undefined): string {
   return '<anonymous>';
 }
 
-function nearestIfCondition(node: ts.Node): string | null {
-  for (let current = node.parent; current !== undefined; current = current.parent) {
-    if (ts.isIfStatement(current)) return current.expression.getText();
+/**
+ * The source id a `turn.start` is fenced behind: the nearest enclosing `if` must test
+ * `!<...>.retiredSources.has('<id>')`, whatever the receiver, or there is no fence.
+ */
+function retiredSourceGuard(call: ts.CallExpression): string | null {
+  for (let current = call.parent; current !== undefined; current = current.parent) {
     if (ts.isFunctionLike(current)) return null;
+    if (!ts.isIfStatement(current)) continue;
+    const condition = current.expression;
+    if (!ts.isPrefixUnaryExpression(condition) || condition.operator !== ts.SyntaxKind.ExclamationToken) return null;
+    const membership = condition.operand;
+    if (
+      !ts.isCallExpression(membership) ||
+      !ts.isPropertyAccessExpression(membership.expression) ||
+      membership.expression.name.text !== 'has'
+    ) {
+      return null;
+    }
+    const receiver = membership.expression.expression;
+    const receiverName = ts.isPropertyAccessExpression(receiver)
+      ? receiver.name.text
+      : ts.isIdentifier(receiver)
+        ? receiver.text
+        : null;
+    if (receiverName !== 'retiredSources') return null;
+    const [guarded] = membership.arguments;
+    return guarded !== undefined && ts.isStringLiteral(guarded) ? guarded.text : null;
   }
   return null;
-}
-
-function namedFunctionText(file: ts.SourceFile, name: string): string {
-  let found: ts.FunctionLikeDeclaration | undefined;
-  const visit = (node: ts.Node): void => {
-    if (found !== undefined) return;
-    if (
-      (ts.isFunctionDeclaration(node) ||
-        ts.isMethodDeclaration(node) ||
-        ts.isFunctionExpression(node) ||
-        ts.isArrowFunction(node)) &&
-      ownerName(node) === name
-    ) {
-      found = node;
-      return;
-    }
-    ts.forEachChild(node, visit);
-  };
-  visit(file);
-  if (found === undefined) throw new Error(`Missing function '${name}' in '${relativePath(file)}'.`);
-  return found.getText();
 }
 
 type Reference = Readonly<{
@@ -1208,7 +1210,7 @@ describe('provider proxy recovery policy construction', () => {
         )}`;
       })
       .sort();
-    const conditionalReattachmentStartInventory = callsFor('ProviderProxyRecoveryArbiter.start', references)
+    const retiredSourceStartFences = callsFor('ProviderProxyRecoveryArbiter.start', references)
       .filter(
         (reference) =>
           reference.file === 'src/coordinator/services/provider-proxy-set/index.ts' &&
@@ -1216,14 +1218,16 @@ describe('provider proxy recovery policy construction', () => {
       )
       .map((reference) => {
         const call = reference.node as ts.CallExpression;
-        return `${reference.owner} :: ${stringObjectProperty(call.arguments[0], 'sourceId')} :: ${nearestIfCondition(call) ?? '<unconditional>'}`;
+        const sourceId = stringObjectProperty(call.arguments[0], 'sourceId');
+        const guard = retiredSourceGuard(call);
+        return `${reference.owner} :: ${sourceId} :: ${guard === sourceId ? 'fenced-by-own-retirement' : `unfenced(${guard ?? 'none'})`}`;
       })
       .sort();
-    const expectedConditionalReattachmentStarts = [
-      "#runControlReattachmentAttempt :: absence :: !window.retiredSources.has('absence')",
-      "#runControlReattachmentAttempt :: redemption :: !window.retiredSources.has('redemption')",
-      "#runReattachmentHoldAttempt :: absence :: !window.retiredSources.has('absence')",
-      "#runReattachmentHoldAttempt :: redemption :: !window.retiredSources.has('redemption')",
+    const expectedRetiredSourceStartFences = [
+      '#runControlReattachmentAttempt :: absence :: fenced-by-own-retirement',
+      '#runControlReattachmentAttempt :: redemption :: fenced-by-own-retirement',
+      '#runReattachmentHoldAttempt :: absence :: fenced-by-own-retirement',
+      '#runReattachmentHoldAttempt :: redemption :: fenced-by-own-retirement',
     ];
     const startAuthorizations: readonly JustifiedOccurrence[] = [
       {
@@ -1358,16 +1362,6 @@ describe('provider proxy recovery policy construction', () => {
       visit(file);
       return matches;
     });
-    const retireFatalText = namedFunctionText(policy, 'retireFatal');
-    const submitText = namedFunctionText(policy, 'submit');
-    const sourceLocalFatalRule = {
-      recordsRetiredSource: retireFatalText.includes('retiredSources.add(sourceId)'),
-      abortsOnlyFatalSource: retireFatalText.includes('aborters.get(sourceId)?.(error)'),
-      disposesOnlyFatalSource: retireFatalText.includes('disposeCachedEvidence(undefined, sourceId)'),
-      reducesAfterRetirement: retireFatalText.includes('reduceControlReattachment()'),
-      guardsLateRetiredEvidence: submitText.includes('retiredSources.has(sourceId)'),
-    };
-
     expect(
       {
         boundaryInventory: boundaryInventory(references),
@@ -1384,8 +1378,7 @@ describe('provider proxy recovery policy construction', () => {
         valueEscapeViolations: valueEscapeViolations(references),
         beginInventory,
         startInventory,
-        conditionalReattachmentStartInventory,
-        sourceLocalFatalRule,
+        retiredSourceStartFences,
         producerCallInventory,
         directPolicyEffectViolations,
         rejectionNodeInventory: rejectionNodeInventory(references),
@@ -1400,14 +1393,7 @@ describe('provider proxy recovery policy construction', () => {
       valueEscapeViolations: [],
       beginInventory: expectedBegins,
       startInventory: expectedStarts,
-      conditionalReattachmentStartInventory: expectedConditionalReattachmentStarts,
-      sourceLocalFatalRule: {
-        recordsRetiredSource: true,
-        abortsOnlyFatalSource: true,
-        disposesOnlyFatalSource: true,
-        reducesAfterRetirement: true,
-        guardsLateRetiredEvidence: true,
-      },
+      retiredSourceStartFences: expectedRetiredSourceStartFences,
       producerCallInventory: expectedProducerCalls,
       directPolicyEffectViolations: [],
       rejectionNodeInventory: EXPECTED_REJECTION_NODE_INVENTORY,
