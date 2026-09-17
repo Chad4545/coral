@@ -4,6 +4,7 @@ import { resolve } from 'node:path';
 import ts from 'typescript';
 
 import { toCanonicalSrcPath } from '#tests/helpers/ts-import-scanner.js';
+import { productionProgram } from '#tests/helpers/ts-production-program.js';
 
 const CLASSIFIER_PATH = /^src\/providers\/([^/]+)\/serviceability\.ts$/u;
 
@@ -123,31 +124,12 @@ export type CallableClosureContext = Readonly<{
   pathByFileName: ReadonlyMap<string, string>;
 }>;
 
-function compilerOptions(repoRoot: string): ts.CompilerOptions {
-  const configPath = ts.findConfigFile(repoRoot, ts.sys.fileExists, 'tsconfig.json');
-  if (configPath === undefined) throw new Error(`Missing tsconfig.json below ${repoRoot}`);
-  const config = ts.readConfigFile(configPath, ts.sys.readFile);
-  if (config.error !== undefined) {
-    throw new Error(ts.flattenDiagnosticMessageText(config.error.messageText, '\n'));
-  }
-  const parsed = ts.parseJsonConfigFileContent(config.config, ts.sys, repoRoot);
-  if (parsed.errors.length > 0) {
-    throw new Error(parsed.errors.map((error) => ts.flattenDiagnosticMessageText(error.messageText, '\n')).join('\n'));
-  }
-  return { ...parsed.options, incremental: false, noEmit: true, tsBuildInfoFile: undefined };
-}
-
 export function createCallableClosureContext(
   repoRoot: string,
   productionFilePaths: readonly string[],
   suppliedProgram?: ts.Program,
 ): CallableClosureContext {
-  const program =
-    suppliedProgram ??
-    ts.createProgram({
-      rootNames: [...productionFilePaths],
-      options: compilerOptions(repoRoot),
-    });
+  const program = suppliedProgram ?? productionProgram();
   const sourceFilesByPath = new Map<string, ts.SourceFile>();
   const pathByFileName = new Map<string, string>();
   for (const filePath of productionFilePaths) {

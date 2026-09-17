@@ -4,14 +4,15 @@ import { resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 import { afterEach, describe, expect, it } from 'vitest';
-import ts from 'typescript';
 
 import { ChildPrincipalRegistry } from '#src/coordinator/child-principal-registry.js';
 import { WorkDirectoryError } from '#src/runtime/canonical-work-dir.js';
 import { decodeProviderOperationRecord, encodeProviderOperationRecord } from '#src/store/provider-operation-record.js';
 import { providerOperationRecord } from '#tests/unit/store/provider-operation-fixtures.js';
+import { createOverlayProgram, sourceFileDiagnostics } from '#tests/helpers/ts-production-program.js';
 
 const REPO_ROOT = fileURLToPath(new URL('../../', import.meta.url));
+const RAW_ASSIGNMENT_FIXTURE_PATH = resolve(REPO_ROOT, 'tests/canonical-work-dir-raw-assignment.fixture.ts');
 const tempDirs: string[] = [];
 
 const REQUIRED_SOURCE_CARRIERS = [
@@ -169,42 +170,9 @@ afterEach(() => {
   for (const root of tempDirs.splice(0)) rmSync(root, { recursive: true, force: true });
 });
 
-function createFixtureProgram(): { program: ts.Program; fixturePath: string } {
-  const configPath = resolve(REPO_ROOT, 'tsconfig.json');
-  const config = ts.readConfigFile(configPath, ts.sys.readFile);
-  if (config.error !== undefined) {
-    throw new Error(ts.flattenDiagnosticMessageText(config.error.messageText, '\n'));
-  }
-  const parsed = ts.parseJsonConfigFileContent(config.config, ts.sys, REPO_ROOT, undefined, configPath);
-  const options: ts.CompilerOptions = {
-    ...parsed.options,
-    composite: false,
-    incremental: false,
-    noEmit: true,
-    rootDir: undefined,
-    tsBuildInfoFile: undefined,
-  };
-  const fixturePath = resolve(REPO_ROOT, 'tests/canonical-work-dir-raw-assignment.fixture.ts');
-  const host = ts.createCompilerHost(options, true);
-  const defaultFileExists = host.fileExists.bind(host);
-  const defaultReadFile = host.readFile.bind(host);
-  const defaultGetSourceFile = host.getSourceFile.bind(host);
-  host.fileExists = (fileName) => fileName === fixturePath || defaultFileExists(fileName);
-  host.readFile = (fileName) => (fileName === fixturePath ? RAW_ASSIGNMENT_FIXTURE : defaultReadFile(fileName));
-  host.getSourceFile = (fileName, languageVersion, onError, shouldCreateNewSourceFile) =>
-    fileName === fixturePath
-      ? ts.createSourceFile(fileName, RAW_ASSIGNMENT_FIXTURE, languageVersion, true, ts.ScriptKind.TS)
-      : defaultGetSourceFile(fileName, languageVersion, onError, shouldCreateNewSourceFile);
-
-  return {
-    fixturePath,
-    program: ts.createProgram({ rootNames: [fixturePath], options, host }),
-  };
-}
-
 function rejectedRawAssignments(): string[] {
-  const { program, fixturePath } = createFixtureProgram();
-  const fixture = program.getSourceFile(fixturePath);
+  const program = createOverlayProgram(new Map([[RAW_ASSIGNMENT_FIXTURE_PATH, RAW_ASSIGNMENT_FIXTURE]]));
+  const fixture = program.getSourceFile(RAW_ASSIGNMENT_FIXTURE_PATH);
   if (fixture === undefined) throw new Error('Canonical work-dir raw-assignment fixture was not compiled.');
   const carrierByLine = new Map<number, string>();
   RAW_ASSIGNMENT_FIXTURE.split('\n').forEach((line, index) => {
@@ -212,9 +180,8 @@ function rejectedRawAssignments(): string[] {
     if (marker?.[1] !== undefined) carrierByLine.set(index + 1, marker[1]);
   });
 
-  return ts
-    .getPreEmitDiagnostics(program)
-    .filter((diagnostic) => diagnostic.file?.fileName === fixturePath && diagnostic.start !== undefined)
+  return sourceFileDiagnostics(program, RAW_ASSIGNMENT_FIXTURE_PATH)
+    .filter((diagnostic) => diagnostic.start !== undefined)
     .map((diagnostic) => {
       const line = fixture.getLineAndCharacterOfPosition(diagnostic.start ?? 0).line + 1;
       return carrierByLine.get(line);
@@ -307,5 +274,5 @@ describe('canonical work-directory carrier closure', () => {
       .sort();
 
     expect(rejectedRawAssignments()).toEqual(expected);
-  }, 60_000);
+  });
 });

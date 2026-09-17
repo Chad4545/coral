@@ -1,11 +1,21 @@
-import { readFileSync, readdirSync } from 'node:fs';
-import { join, relative, resolve } from 'node:path';
+import { readFileSync } from 'node:fs';
+import { relative, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import ts from 'typescript';
 import { describe, expect, it } from 'vitest';
 
+import {
+  configDiagnostics,
+  createOverlayProgram,
+  createProductionProgram,
+  describeDiagnostic,
+  productionProgram,
+  sourceFileDiagnostics,
+} from '#tests/helpers/ts-production-program.js';
+
 const REPO_ROOT = fileURLToPath(new URL('../../', import.meta.url));
 const FIXTURE_ROOT = resolve(REPO_ROOT, 'tests/invariants/fixtures/process-observation-composition');
+const FIXTURE_SUBJECT = resolve(FIXTURE_ROOT, 'subject.ts');
 const PROCESS_PORT_PATH = 'src/runtime/ports.ts';
 const PROCESS_OWNER_PATTERN = /^src\/infra\/process-[^/]+\.ts$/u;
 
@@ -483,68 +493,6 @@ function canonicalPath(root: string, fileName: string): string {
   return relative(root, fileName).replaceAll('\\', '/');
 }
 
-function readTsConfig(root: string): ts.CompilerOptions {
-  const configPath = resolve(root, 'tsconfig.json');
-  const config = ts.readConfigFile(configPath, ts.sys.readFile);
-  if (config.error !== undefined) throw new Error(ts.flattenDiagnosticMessageText(config.error.messageText, '\n'));
-  const parsed = ts.parseJsonConfigFileContent(config.config, ts.sys, root, undefined, configPath);
-  return { ...parsed.options, composite: false, incremental: false, noEmit: true, tsBuildInfoFile: undefined };
-}
-
-function productionProgram(overlays: ReadonlyMap<string, string> = new Map()): ts.Program {
-  const srcRoot = resolve(REPO_ROOT, 'src');
-  const rootNames: string[] = [];
-  const visit = (directory: string): void => {
-    for (const entry of readdirSync(directory, { withFileTypes: true })) {
-      const path = join(directory, entry.name);
-      if (entry.isDirectory()) visit(path);
-      else if (entry.isFile() && entry.name.endsWith('.ts')) rootNames.push(path);
-    }
-  };
-  visit(srcRoot);
-  const options = readTsConfig(REPO_ROOT);
-  const overlayFiles = new Map([...overlays].map(([path, source]) => [resolve(REPO_ROOT, path), source]));
-  const defaultHost = ts.createCompilerHost(options, true);
-  const host: ts.CompilerHost = {
-    ...defaultHost,
-    fileExists: (fileName) => overlayFiles.has(fileName) || defaultHost.fileExists(fileName),
-    readFile: (fileName) => overlayFiles.get(fileName) ?? defaultHost.readFile(fileName),
-    getSourceFile: (fileName, languageVersion, onError, shouldCreateNewSourceFile) => {
-      const overlay = overlayFiles.get(fileName);
-      return overlay === undefined
-        ? defaultHost.getSourceFile(fileName, languageVersion, onError, shouldCreateNewSourceFile)
-        : ts.createSourceFile(fileName, overlay, languageVersion, true, ts.ScriptKind.TS);
-    },
-  };
-  return ts.createProgram({ rootNames: [...rootNames, ...overlayFiles.keys()], options, host });
-}
-
-function fixtureProgram(source: string): ts.Program {
-  const path = resolve(FIXTURE_ROOT, 'subject.ts');
-  const options: ts.CompilerOptions = {
-    target: ts.ScriptTarget.ES2022,
-    module: ts.ModuleKind.ESNext,
-    moduleResolution: ts.ModuleResolutionKind.Bundler,
-    strict: true,
-    skipLibCheck: true,
-    noEmit: true,
-  };
-  const defaultHost = ts.createCompilerHost(options, true);
-  const host: ts.CompilerHost = {
-    ...defaultHost,
-    fileExists: (fileName) => fileName === path || defaultHost.fileExists(fileName),
-    readFile: (fileName) => (fileName === path ? source : defaultHost.readFile(fileName)),
-    getSourceFile: (fileName, languageVersion, onError, shouldCreateNewSourceFile) =>
-      fileName === path
-        ? ts.createSourceFile(fileName, source, languageVersion, true, ts.ScriptKind.TS)
-        : defaultHost.getSourceFile(fileName, languageVersion, onError, shouldCreateNewSourceFile),
-    writeFile: () => {
-      throw new Error('Process observation fixture Programs are read-only.');
-    },
-  };
-  return ts.createProgram({ rootNames: [path], options, host });
-}
-
 function canonicalSymbol(checker: ts.TypeChecker, symbol: ts.Symbol | undefined): ts.Symbol | undefined {
   if (symbol === undefined) return undefined;
   return (symbol.flags & ts.SymbolFlags.Alias) === 0 ? symbol : checker.getAliasedSymbol(symbol);
@@ -575,12 +523,7 @@ function semanticUnion(type: ts.Type): readonly ts.Type[] {
 }
 
 function createContext(program: ts.Program, root: string, registrySpecs: readonly RegistrySpec[]): AnalysisContext {
-  const diagnostics = [
-    ...program.getConfigFileParsingDiagnostics(),
-    ...program.getOptionsDiagnostics(),
-    ...program.getSyntacticDiagnostics(),
-    ...program.getSemanticDiagnostics(),
-  ];
+  const diagnostics = configDiagnostics(program);
   if (diagnostics.length > 0) {
     throw new Error(
       ts.formatDiagnosticsWithColorAndContext(diagnostics, {
@@ -1191,30 +1134,28 @@ function enforceDebts(violations: readonly Violation[], debts: ReadonlyMap<strin
   return failures.sort();
 }
 
+/**
+ * The mutated fixture is the subject under test, so it is the one file whose own diagnostics still
+ * have to be proven here — nothing else type-checks a source that exists only as a string.
+ */
 function fixtureContext(
   source: string,
   registrySpecs: readonly RegistrySpec[] = [{ key: 'subject.ts#Observation', undecided: ['unobservable'] }],
 ): AnalysisContext {
-  const root = FIXTURE_ROOT;
-  return createContext(fixtureProgram(source), root, registrySpecs);
-}
-
-function diagnosticsFor(program: ts.Program, path: string): string[] {
-  const fileName = resolve(REPO_ROOT, path);
-  const source = program.getSourceFile(fileName);
-  if (source === undefined) throw new Error(`Missing process-observation fixture '${path}'.`);
-  return [...program.getSyntacticDiagnostics(source), ...program.getSemanticDiagnostics(source)].map(
-    (diagnostic) => `TS${diagnostic.code}: ${ts.flattenDiagnosticMessageText(diagnostic.messageText, '\n')}`,
-  );
+  const program = createOverlayProgram(new Map([[FIXTURE_SUBJECT, source]]));
+  const diagnostics = sourceFileDiagnostics(program, FIXTURE_SUBJECT).map(describeDiagnostic);
+  if (diagnostics.length > 0) {
+    throw new Error(`Process observation fixture does not compile:\n${diagnostics.join('\n')}`);
+  }
+  return createContext(program, FIXTURE_ROOT, registrySpecs);
 }
 
 const PRODUCTION_CONTEXT = createContext(productionProgram(), REPO_ROOT, REGISTRY);
 
 describe('process observation vocabulary composes without collapsing its third answer', () => {
-  // This case resolves types across every `src/` file rather than reading text, so it is CPU-bound where the
-  // suite's 15s default was calibrated for I/O-bound cases (see `vitest/default.ts`). Measured 3.8-4.1s on a
-  // 24-core host and over 15s on a GitHub 2-core runner, which this suite deliberately oversubscribes to four
-  // workers; the budget below carries that contention factor and still fails a hung walk promptly.
+  // Resolves types across every `src/` file: measured 9.9s alone and 18.9s beside the other
+  // TypeScript-program invariants at four workers with `tsc` contending (10-core Apple M-series,
+  // 2026-09-17).
   it('keeps process-owned vocabulary and its composition explicit', () => {
     expect(enforceAllowlist(sourceVocabularyViolations(PRODUCTION_CONTEXT), SOURCE_VOCABULARY_EXEMPTIONS)).toEqual([]);
     expect(enforceDebts(compositionViolations(PRODUCTION_CONTEXT), COMPOSITION_DEBTS)).toEqual([]);
@@ -1422,16 +1363,18 @@ describe('process observation vocabulary composes without collapsing its third a
         '  evidence: ProviderServerFailedSpawnAbsenceEvidence<4_133>,',
       );
 
-    const program = productionProgram(
+    const program = createProductionProgram(
       new Map([
         [path, source],
         [leaderNegativePath, leaderOnlySettlement],
         [mismatchNegativePath, mismatchedGroupSettlement],
       ]),
     );
-    expect(diagnosticsFor(program, path)).toEqual([]);
-    expect(diagnosticsFor(program, leaderNegativePath)).toEqual([expect.stringMatching(/TS2741:/u)]);
-    expect(diagnosticsFor(program, mismatchNegativePath)).toEqual([
+    expect(sourceFileDiagnostics(program, path).map(describeDiagnostic)).toEqual([]);
+    expect(sourceFileDiagnostics(program, leaderNegativePath).map(describeDiagnostic)).toEqual([
+      expect.stringMatching(/TS2741:/u),
+    ]);
+    expect(sourceFileDiagnostics(program, mismatchNegativePath).map(describeDiagnostic)).toEqual([
       expect.stringMatching(/TS2322:/u),
       expect.stringMatching(/TS2322:/u),
     ]);

@@ -5,16 +5,12 @@ import { describe, expect, it } from 'vitest';
 import ts from 'typescript';
 
 import { listProductionSourceFiles, toCanonicalSrcPath } from '#tests/helpers/ts-import-scanner.js';
+import { productionProgram } from '#tests/helpers/ts-production-program.js';
 
 const ROOT = fileURLToPath(new URL('../../', import.meta.url));
 const SRC_ROOT = join(ROOT, 'src');
 const FILES = listProductionSourceFiles(SRC_ROOT);
-const PROGRAM = ts.createProgram(FILES, {
-  module: ts.ModuleKind.NodeNext,
-  moduleResolution: ts.ModuleResolutionKind.NodeNext,
-  skipLibCheck: true,
-  target: ts.ScriptTarget.ESNext,
-});
+const PROGRAM = productionProgram();
 const CHECKER = PROGRAM.getTypeChecker();
 const ALLOWLIST = new Set(['src/store/body-codec.ts']);
 

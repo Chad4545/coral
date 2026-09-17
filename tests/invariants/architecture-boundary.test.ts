@@ -17,6 +17,7 @@ import {
   toCanonicalSrcPath,
   type ParsedImportEdge,
 } from '#tests/helpers/ts-import-scanner.js';
+import { productionProgram } from '#tests/helpers/ts-production-program.js';
 import { UNIT_TIER_ROOTS } from '../../vitest/tiers.js';
 
 const __filename = fileURLToPath(import.meta.url);
@@ -1465,26 +1466,6 @@ type RecoveryFactoryInspection = {
 const RECOVERY_CONTAINMENT_MODULE = 'src/recovery/containment.ts';
 const RECOVERY_FIXTURE_ROOT = resolve(REPO_ROOT, 'tests/invariants/fixtures/recovery-authority');
 
-function createReadonlyProductionProgram(): ts.Program {
-  const configPath = resolve(REPO_ROOT, 'tsconfig.json');
-  const config = ts.readConfigFile(configPath, ts.sys.readFile);
-  if (config.error) {
-    throw new Error(ts.flattenDiagnosticMessageText(config.error.messageText, '\n'));
-  }
-
-  const parsed = ts.parseJsonConfigFileContent(config.config, ts.sys, REPO_ROOT, undefined, configPath);
-  return ts.createProgram({
-    rootNames: PRODUCTION_FILE_PATHS,
-    options: {
-      ...parsed.options,
-      composite: false,
-      incremental: false,
-      noEmit: true,
-      tsBuildInfoFile: undefined,
-    },
-  });
-}
-
 function createRecoveryFixtureProgram(): ts.Program {
   const fixtureSources = new Map<string, string>();
   const fixtureFiles = listFilesRecursive(
@@ -1547,7 +1528,7 @@ function createRecoveryFixtureProgram(): ts.Program {
   return ts.createProgram({ rootNames: [...fixtureSources.keys()], options, host });
 }
 
-const RECOVERY_PRODUCTION_PROGRAM = createReadonlyProductionProgram();
+const RECOVERY_PRODUCTION_PROGRAM = productionProgram();
 const RECOVERY_FIXTURE_PROGRAM = createRecoveryFixtureProgram();
 
 function toAnalysisPath(context: RecoveryAnalysisContext, fileName: string): string {
@@ -3119,10 +3100,9 @@ describe('recovery authority boundary', () => {
       startupInputSeal: true,
     });
     assertNoRecoveryViolations(violations);
-    // Type-aware whole-program analysis over every production source, so this budget is hardware-bound
-    // rather than a hang signal — CI runners take roughly 6x a dev machine, and the previous 30s turned
-    // that into a failure that read like a violation. Measured locally: startup-input seal ~4.8s
-    // (type expansion), phase 1 ~2.9s, raw authority ~0.4s.
+    // Type-aware analysis over every production source: measured 17.5s alone and 31.5s beside the other
+    // TypeScript-program invariants at four workers with `tsc` contending (10-core Apple M-series,
+    // 2026-09-17).
   }, 120_000);
 
   it('accepts a fully sealed synthetic source, composite, and startup surface', () => {

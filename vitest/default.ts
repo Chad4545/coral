@@ -19,18 +19,19 @@ export default defineConfig({
     exclude: ['ref/**', 'node_modules/**'],
     setupFiles: ['vitest/setup.ts'],
     globalSetup: ['vitest/no-real-coral-leak.ts'],
-    // Deliberate budget, not vitest's 5s default. This suite is I/O-bound with workers oversubscribed (see
-    // below), and cases that reset the module registry to swap module doubles re-execute a large graph inside
-    // their own budget — measured ~0.7-1.5s idle and roughly 2x that under contention. 5s left as little as a
-    // 1.6x margin, which surfaced as intermittent "timed out in 5000ms" failures in tests/unit/cli. Still
-    // short enough to fail a genuinely hung test promptly.
+    // Deliberate budget, not vitest's 5s default: a case that resets the module registry to swap module
+    // doubles re-executes a large module graph inside its own budget, so the budget must clear that cost by
+    // a wide margin while staying short enough to fail a genuinely hung case promptly. A case that comes
+    // close to whatever budget it ends up with fails on a green run; see casesWithoutHeadroom in
+    // scripts/test-report.mjs.
     testTimeout: 15_000,
-    // Matches the integration/e2e configs. Needed because the cheapest fix for the cold-transform problem
-    // above is a beforeAll that warms the module graph once, which moves that ~1s (much more under a slow or
-    // contended filesystem) out of a case's budget and into the hook's — vitest's hook default is only 10s.
+    // A hook budget must exceed `testTimeout`: the cheapest fix for that cold-transform cost is a
+    // beforeAll that warms the module graph once, which moves the cost out of a case's budget and into the
+    // hook's. Vitest's 10s hook default does not clear it.
     hookTimeout: 30_000,
-    // On a 2-core CI runner, this I/O-bound suite benefits from oversubscription: measured ~1m11s @2 →
-    // ~38s @4. GitHub Actions sets CI=true, so CI uses that measured four-worker setting.
+    // Workers may not exceed the runner's cores under CI. GitHub gives a public repository's `ubuntu-latest`
+    // job 4 vCPU (GitHub Actions runner specification, read 2026-09-17) and sets CI=true, so CI gets exactly
+    // that core count.
     //
     // On a 24-core WSL2 host, a third of an uncapped run had processes in uninterruptible sleep on the ext4
     // journal. At eight workers, peak stall depth fell by more than half at a 1.9x wall-time cost. Concurrency

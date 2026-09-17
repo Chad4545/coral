@@ -1,5 +1,20 @@
 import { join } from 'node:path';
 
+import { beforeEach } from 'vitest';
+
+declare module 'vitest' {
+  interface TaskMeta {
+    timeout?: number;
+  }
+}
+
+// The JSON report carries durations and never budgets, so the budget rides on the task's own meta; a
+// case without it is one the headroom gate could not judge (see casesWithoutHeadroom in
+// scripts/test-report.mjs).
+beforeEach((ctx) => {
+  ctx.task.meta.timeout = ctx.task.timeout;
+});
+
 // Shared workers must raise the listener ceiling for Vitest's per-file signal handlers.
 process.setMaxListeners(100);
 

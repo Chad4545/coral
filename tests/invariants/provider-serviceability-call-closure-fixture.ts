@@ -2,7 +2,7 @@ import { readFileSync, readdirSync } from 'node:fs';
 import { join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
-import ts from 'typescript';
+import { createOverlayProgram } from '#tests/helpers/ts-production-program.js';
 
 import {
   createCallableClosureContext,
@@ -21,38 +21,20 @@ function fixtureSourceFiles(directory: string): string[] {
   });
 }
 
+/**
+ * The fixture is checked under the build's own options, like every other invariant program, so a symbol
+ * the checker resolves in a `.ts.txt` mutation resolves the same way in the production source it stands
+ * in for.
+ */
 export function serviceabilityMutationFixtureContext(): CallableClosureContext {
-  const options: ts.CompilerOptions = {
-    target: ts.ScriptTarget.ES2022,
-    module: ts.ModuleKind.NodeNext,
-    moduleResolution: ts.ModuleResolutionKind.NodeNext,
-    strict: true,
-    noEmit: true,
-  };
   const sources = new Map(
     fixtureSourceFiles(join(FIXTURE_ROOT, 'src')).map((fixturePath) => [
       resolve(fixturePath.slice(0, -'.txt'.length)),
       readFileSync(fixturePath, 'utf8'),
     ]),
   );
-  const host = ts.createCompilerHost(options);
-  const defaultFileExists = host.fileExists.bind(host);
-  const defaultReadFile = host.readFile.bind(host);
-  const defaultGetSourceFile = host.getSourceFile.bind(host);
-  host.fileExists = (fileName) => sources.has(resolve(fileName)) || defaultFileExists(fileName);
-  host.readFile = (fileName) => sources.get(resolve(fileName)) ?? defaultReadFile(fileName);
-  host.getSourceFile = (fileName, languageVersion, onError, shouldCreateNewSourceFile) => {
-    const source = sources.get(resolve(fileName));
-    return source === undefined
-      ? defaultGetSourceFile(fileName, languageVersion, onError, shouldCreateNewSourceFile)
-      : ts.createSourceFile(fileName, source, languageVersion, true, ts.ScriptKind.TS);
-  };
-  host.writeFile = () => {
-    throw new Error('Serviceability mutation fixture Programs are read-only.');
-  };
-  const rootNames = [...sources.keys()];
-  const program = ts.createProgram({ rootNames, options, host });
-  return createCallableClosureContext(FIXTURE_ROOT, rootNames, program);
+  const program = createOverlayProgram(sources);
+  return createCallableClosureContext(FIXTURE_ROOT, [...sources.keys()], program);
 }
 
 export function activeServiceabilityMutation(): string | undefined {
