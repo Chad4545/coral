@@ -17,6 +17,7 @@ import {
   toCanonicalSrcPath,
   type ParsedImportEdge,
 } from '#tests/helpers/ts-import-scanner.js';
+import { productionProgram } from '#tests/helpers/ts-production-program.js';
 import { UNIT_TIER_ROOTS } from '../../vitest/tiers.js';
 
 const __filename = fileURLToPath(import.meta.url);
@@ -1465,26 +1466,6 @@ type RecoveryFactoryInspection = {
 const RECOVERY_CONTAINMENT_MODULE = 'src/recovery/containment.ts';
 const RECOVERY_FIXTURE_ROOT = resolve(REPO_ROOT, 'tests/invariants/fixtures/recovery-authority');
 
-function createReadonlyProductionProgram(): ts.Program {
-  const configPath = resolve(REPO_ROOT, 'tsconfig.json');
-  const config = ts.readConfigFile(configPath, ts.sys.readFile);
-  if (config.error) {
-    throw new Error(ts.flattenDiagnosticMessageText(config.error.messageText, '\n'));
-  }
-
-  const parsed = ts.parseJsonConfigFileContent(config.config, ts.sys, REPO_ROOT, undefined, configPath);
-  return ts.createProgram({
-    rootNames: PRODUCTION_FILE_PATHS,
-    options: {
-      ...parsed.options,
-      composite: false,
-      incremental: false,
-      noEmit: true,
-      tsBuildInfoFile: undefined,
-    },
-  });
-}
-
 function createRecoveryFixtureProgram(): ts.Program {
   const fixtureSources = new Map<string, string>();
   const fixtureFiles = listFilesRecursive(
@@ -1547,7 +1528,7 @@ function createRecoveryFixtureProgram(): ts.Program {
   return ts.createProgram({ rootNames: [...fixtureSources.keys()], options, host });
 }
 
-const RECOVERY_PRODUCTION_PROGRAM = createReadonlyProductionProgram();
+const RECOVERY_PRODUCTION_PROGRAM = productionProgram();
 const RECOVERY_FIXTURE_PROGRAM = createRecoveryFixtureProgram();
 
 function toAnalysisPath(context: RecoveryAnalysisContext, fileName: string): string {
@@ -1576,6 +1557,55 @@ function createRecoveryAnalysisContext(
   };
   const context = { ...contextWithoutEdges, importEdges: importEdges ?? [] };
   return importEdges === undefined ? { ...context, importEdges: collectRecoveryImportEdges(context) } : context;
+}
+
+type RecoverySymbolReference = { readonly sourcePath: string; readonly node: ts.Node };
+
+const symbolReferencesByContext = new WeakMap<
+  RecoveryAnalysisContext,
+  ReadonlyMap<ts.Symbol, readonly RecoverySymbolReference[]>
+>();
+
+/**
+ * Every production identifier and element access grouped by the canonical symbol it resolves to.
+ * TypeScript caches a node's own resolution, so a rule that walks the whole tree looking for one
+ * authority pays for the walk rather than the resolution: over `src/` the first such pass measured 4.9s
+ * and each later one 0.7s (10-core Apple M-series, 2026-09-17). A rule that asks who references a
+ * symbol therefore reads this index rather than walking for it. The index may not outlive the checker
+ * that resolved it, and is reachable only through the context that owns that checker.
+ */
+function symbolReferences(
+  context: RecoveryAnalysisContext,
+): ReadonlyMap<ts.Symbol, readonly RecoverySymbolReference[]> {
+  const cached = symbolReferencesByContext.get(context);
+  if (cached) {
+    return cached;
+  }
+  const index = new Map<ts.Symbol, RecoverySymbolReference[]>();
+  for (const sourceFile of context.productionSourceFiles) {
+    const sourcePath = toAnalysisPath(context, sourceFile.fileName);
+    visitNodes(sourceFile, (node) => {
+      if (!ts.isIdentifier(node) && !ts.isElementAccessExpression(node)) {
+        return;
+      }
+      const symbol = symbolAt(context, node);
+      if (!symbol) {
+        return;
+      }
+      const references = index.get(symbol);
+      if (references === undefined) {
+        index.set(symbol, [{ sourcePath, node }]);
+      } else {
+        references.push({ sourcePath, node });
+      }
+    });
+  }
+  symbolReferencesByContext.set(context, index);
+  return index;
+}
+
+function referencesTo(context: RecoveryAnalysisContext, symbol: ts.Symbol): readonly RecoverySymbolReference[] {
+  return symbolReferences(context).get(symbol) ?? [];
 }
 
 function canonicalSymbol(checker: ts.TypeChecker, symbol: ts.Symbol | undefined): ts.Symbol | undefined {
@@ -2154,21 +2184,15 @@ function collectSourceDefinitionImportViolations(
     exportedSymbol(context, RECOVERY_CONTAINMENT_MODULE, 'defineCompositeRecoverySource'),
   ].filter((symbol): symbol is ts.Symbol => symbol !== undefined);
 
-  for (const sourceFile of context.productionSourceFiles) {
-    const sourcePath = toAnalysisPath(context, sourceFile.fileName);
-    if (
-      sourcePath === RECOVERY_CONTAINMENT_MODULE ||
-      RECOVERY_SOURCE_MATRIX.some((row) => row.sourceModule === sourcePath)
-    ) {
-      continue;
-    }
-    visitNodes(sourceFile, (node) => {
-      if (!ts.isIdentifier(node) && !ts.isElementAccessExpression(node)) {
-        return;
-      }
-      const authority = symbolAt(context, node);
-      if (!authority || !authorities.includes(authority) || isDeclarationName(node, authority)) {
-        return;
+  const allowedModules = new Set([
+    RECOVERY_CONTAINMENT_MODULE,
+    ...RECOVERY_SOURCE_MATRIX.map((row) => row.sourceModule),
+  ]);
+
+  for (const authority of authorities) {
+    for (const { sourcePath, node } of referencesTo(context, authority)) {
+      if (allowedModules.has(sourcePath) || isDeclarationName(node, authority)) {
+        continue;
       }
       violations.push(
         makeRecoveryViolation(
@@ -2179,7 +2203,7 @@ function collectSourceDefinitionImportViolations(
           RECOVERY_SOURCE_MATRIX.map((row) => row.sourceModule).join(', '),
         ),
       );
-    });
+    }
   }
 }
 
@@ -2203,17 +2227,10 @@ function collectRegistryViolations(context: RecoveryAnalysisContext, violations:
     }
   }
 
-  for (const sourceFile of context.productionSourceFiles) {
-    if (toAnalysisPath(context, sourceFile.fileName) === RECOVERY_CONTAINMENT_MODULE) {
-      continue;
-    }
-    visitNodes(sourceFile, (node) => {
-      if (!ts.isIdentifier(node) && !ts.isElementAccessExpression(node)) {
-        return;
-      }
-      const registry = symbolAt(context, node);
-      if (!registry || !registries.includes(registry)) {
-        return;
+  for (const registry of registries) {
+    for (const { sourcePath, node } of referencesTo(context, registry)) {
+      if (sourcePath === RECOVERY_CONTAINMENT_MODULE) {
+        continue;
       }
       violations.push(
         makeRecoveryViolation(
@@ -2224,7 +2241,7 @@ function collectRegistryViolations(context: RecoveryAnalysisContext, violations:
           RECOVERY_CONTAINMENT_MODULE,
         ),
       );
-    });
+    }
   }
 }
 
@@ -2328,26 +2345,13 @@ function collectRawAuthorityViolations(
       allowedScanBody: manifest.allowedScanBody,
     });
   }
-  if (authorities.size === 0) return;
-
-  for (const sourceFile of context.productionSourceFiles) {
-    visitNodes(sourceFile, (node) => {
-      if (!ts.isIdentifier(node) && !ts.isElementAccessExpression(node)) {
-        return;
-      }
-      const symbol = symbolAt(context, node);
-      if (symbol === undefined) {
-        return;
-      }
-      const authority = authorities.get(symbol);
-      if (authority === undefined) {
-        return;
-      }
+  for (const [symbol, authority] of authorities) {
+    for (const { node } of referencesTo(context, symbol)) {
       if (
         isNodeWithin(node, authority.declaration) ||
         authority.allowedScanBodies.some((scanBody) => isNodeWithin(node, scanBody))
       ) {
-        return;
+        continue;
       }
       violations.push(
         makeRecoveryViolation(
@@ -2358,7 +2362,7 @@ function collectRawAuthorityViolations(
           authority.allowedScanBody,
         ),
       );
-    });
+    }
   }
 }
 
@@ -2368,28 +2372,19 @@ function collectFactoryCompositionViolations(
   violations: RecoveryAuthorityViolation[],
 ): void {
   for (const inspection of inspections) {
-    for (const sourceFile of context.productionSourceFiles) {
-      const sourcePath = toAnalysisPath(context, sourceFile.fileName);
-      visitNodes(sourceFile, (node) => {
-        if (!ts.isIdentifier(node) && !ts.isElementAccessExpression(node)) {
-          return;
-        }
-        if (symbolAt(context, node) !== inspection.symbol) {
-          return;
-        }
-        if (isNodeWithin(node, inspection.declaration) || sourcePath === inspection.manifest.compositionSite) {
-          return;
-        }
-        violations.push(
-          makeRecoveryViolation(
-            context,
-            node,
-            inspection.symbol,
-            'startup-seal: a source factory may be referenced only by its exact composition site',
-            inspection.manifest.compositionSite,
-          ),
-        );
-      });
+    for (const { sourcePath, node } of referencesTo(context, inspection.symbol)) {
+      if (isNodeWithin(node, inspection.declaration) || sourcePath === inspection.manifest.compositionSite) {
+        continue;
+      }
+      violations.push(
+        makeRecoveryViolation(
+          context,
+          node,
+          inspection.symbol,
+          'startup-seal: a source factory may be referenced only by its exact composition site',
+          inspection.manifest.compositionSite,
+        ),
+      );
     }
   }
 }
@@ -3119,11 +3114,12 @@ describe('recovery authority boundary', () => {
       startupInputSeal: true,
     });
     assertNoRecoveryViolations(violations);
-    // Type-aware whole-program analysis over every production source, so this budget is hardware-bound
-    // rather than a hang signal — CI runners take roughly 6x a dev machine, and the previous 30s turned
-    // that into a failure that read like a violation. Measured locally: startup-input seal ~4.8s
-    // (type expansion), phase 1 ~2.9s, raw authority ~0.4s.
-  }, 120_000);
+    // Resolving the symbol behind every production identifier is what this costs, and it is paid once:
+    // measured 7.0s alone and 17.5s under the full unit suite (10-core Apple M-series, 2026-09-17). CI
+    // run 35189468102 (ubuntu-latest 4 vCPU, Node 26) measured this case at 66.0s against 31.5s under the
+    // same suite locally on the code it ran, a 2.1x ratio, and two runners on one tree measured a third
+    // apart; the budget is at least twice the CI cost that ratio predicts for 17.5s.
+  }, 80_000);
 
   it('accepts a fully sealed synthetic source, composite, and startup surface', () => {
     const violations = analyzeRecoveryAuthorityBoundary(recoveryFixtureContext('valid'), {

@@ -160,7 +160,11 @@ Tests run with:
 npm test
 ```
 
-That command runs the repo typecheck, `tests/unit/**` plus `tests/invariants/**`, and the debug-only simulation harness. Those suites cover CLI routing, client helpers, backend handlers, providers, workflow execution, KB behavior, discuss behavior, and shared contracts. `npm run test:simulation` is only a narrower single-batch shortcut for the harness.
+That command runs `tests/unit/**` plus `tests/invariants/**` and the debug-only simulation harness, and — only when `CI` is unset — the repo typecheck. Under CI the workflow runs `npm run typecheck:tests` as its own step, so the tree is typechecked once per gate and a type error fails under that step's name. Those suites cover CLI routing, client helpers, backend handlers, providers, workflow execution, KB behavior, discuss behavior, and shared contracts. `npm run test:simulation` is only a narrower single-batch shortcut for the harness.
+
+Each of the two vitest runs `npm test` makes writes its JSON report to `reports/vitest-default.json` and `reports/vitest-simulation.json` (git-ignored), and `npm test` prints the ten slowest cases and files from them, each case as `<duration>/<budget>`. CI uploads the directory as the `vitest-reports-node-<version>` artifact, kept for 7 days, on failed runs as well as green ones.
+
+The gate is on headroom rather than on any one limit: **a case must finish within its own budget divided by 1.5**, so a case fails the run even when it passed if it came within that margin — a case at 11 s of a 15 s budget is a timeout on the next slower machine. Set `CORAL_HEADROOM_RATIO` to change the ratio (a finite number of at least 1; anything else fails the run rather than falling back). Each case reports the budget it ran under through `vitest/setup.ts`, so a declared `it(..., 45_000)` is judged at 45 s and everything else at its config's default — 15 s for the unit and invariant tiers, and vitest's own 5 s for the simulation tier, which sets none. A case that reports no budget at all fails the gate too: it was measured against nothing, and that is not the same as having passed.
 
 It does **not** run `tests/integration/**`, which owns the multi-process suites — cross-version handoff, cold and warm start, and IPC carriage. Those need their own command:
 

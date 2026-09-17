@@ -1,11 +1,21 @@
-import { readFileSync, readdirSync } from 'node:fs';
-import { join, relative, resolve } from 'node:path';
+import { readFileSync } from 'node:fs';
+import { relative, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import ts from 'typescript';
 import { describe, expect, it } from 'vitest';
 
+import {
+  configDiagnostics,
+  createOverlayProgram,
+  createProductionProgram,
+  describeDiagnostic,
+  productionProgram,
+  sourceFileDiagnostics,
+} from '#tests/helpers/ts-production-program.js';
+
 const REPO_ROOT = fileURLToPath(new URL('../../', import.meta.url));
 const FIXTURE_ROOT = resolve(REPO_ROOT, 'tests/invariants/fixtures/process-observation-composition');
+const FIXTURE_SUBJECT = resolve(FIXTURE_ROOT, 'subject.ts');
 const PROCESS_PORT_PATH = 'src/runtime/ports.ts';
 const PROCESS_OWNER_PATTERN = /^src\/infra\/process-[^/]+\.ts$/u;
 
@@ -483,68 +493,6 @@ function canonicalPath(root: string, fileName: string): string {
   return relative(root, fileName).replaceAll('\\', '/');
 }
 
-function readTsConfig(root: string): ts.CompilerOptions {
-  const configPath = resolve(root, 'tsconfig.json');
-  const config = ts.readConfigFile(configPath, ts.sys.readFile);
-  if (config.error !== undefined) throw new Error(ts.flattenDiagnosticMessageText(config.error.messageText, '\n'));
-  const parsed = ts.parseJsonConfigFileContent(config.config, ts.sys, root, undefined, configPath);
-  return { ...parsed.options, composite: false, incremental: false, noEmit: true, tsBuildInfoFile: undefined };
-}
-
-function productionProgram(overlays: ReadonlyMap<string, string> = new Map()): ts.Program {
-  const srcRoot = resolve(REPO_ROOT, 'src');
-  const rootNames: string[] = [];
-  const visit = (directory: string): void => {
-    for (const entry of readdirSync(directory, { withFileTypes: true })) {
-      const path = join(directory, entry.name);
-      if (entry.isDirectory()) visit(path);
-      else if (entry.isFile() && entry.name.endsWith('.ts')) rootNames.push(path);
-    }
-  };
-  visit(srcRoot);
-  const options = readTsConfig(REPO_ROOT);
-  const overlayFiles = new Map([...overlays].map(([path, source]) => [resolve(REPO_ROOT, path), source]));
-  const defaultHost = ts.createCompilerHost(options, true);
-  const host: ts.CompilerHost = {
-    ...defaultHost,
-    fileExists: (fileName) => overlayFiles.has(fileName) || defaultHost.fileExists(fileName),
-    readFile: (fileName) => overlayFiles.get(fileName) ?? defaultHost.readFile(fileName),
-    getSourceFile: (fileName, languageVersion, onError, shouldCreateNewSourceFile) => {
-      const overlay = overlayFiles.get(fileName);
-      return overlay === undefined
-        ? defaultHost.getSourceFile(fileName, languageVersion, onError, shouldCreateNewSourceFile)
-        : ts.createSourceFile(fileName, overlay, languageVersion, true, ts.ScriptKind.TS);
-    },
-  };
-  return ts.createProgram({ rootNames: [...rootNames, ...overlayFiles.keys()], options, host });
-}
-
-function fixtureProgram(source: string): ts.Program {
-  const path = resolve(FIXTURE_ROOT, 'subject.ts');
-  const options: ts.CompilerOptions = {
-    target: ts.ScriptTarget.ES2022,
-    module: ts.ModuleKind.ESNext,
-    moduleResolution: ts.ModuleResolutionKind.Bundler,
-    strict: true,
-    skipLibCheck: true,
-    noEmit: true,
-  };
-  const defaultHost = ts.createCompilerHost(options, true);
-  const host: ts.CompilerHost = {
-    ...defaultHost,
-    fileExists: (fileName) => fileName === path || defaultHost.fileExists(fileName),
-    readFile: (fileName) => (fileName === path ? source : defaultHost.readFile(fileName)),
-    getSourceFile: (fileName, languageVersion, onError, shouldCreateNewSourceFile) =>
-      fileName === path
-        ? ts.createSourceFile(fileName, source, languageVersion, true, ts.ScriptKind.TS)
-        : defaultHost.getSourceFile(fileName, languageVersion, onError, shouldCreateNewSourceFile),
-    writeFile: () => {
-      throw new Error('Process observation fixture Programs are read-only.');
-    },
-  };
-  return ts.createProgram({ rootNames: [path], options, host });
-}
-
 function canonicalSymbol(checker: ts.TypeChecker, symbol: ts.Symbol | undefined): ts.Symbol | undefined {
   if (symbol === undefined) return undefined;
   return (symbol.flags & ts.SymbolFlags.Alias) === 0 ? symbol : checker.getAliasedSymbol(symbol);
@@ -575,12 +523,7 @@ function semanticUnion(type: ts.Type): readonly ts.Type[] {
 }
 
 function createContext(program: ts.Program, root: string, registrySpecs: readonly RegistrySpec[]): AnalysisContext {
-  const diagnostics = [
-    ...program.getConfigFileParsingDiagnostics(),
-    ...program.getOptionsDiagnostics(),
-    ...program.getSyntacticDiagnostics(),
-    ...program.getSemanticDiagnostics(),
-  ];
+  const diagnostics = configDiagnostics(program);
   if (diagnostics.length > 0) {
     throw new Error(
       ts.formatDiagnosticsWithColorAndContext(diagnostics, {
@@ -615,21 +558,65 @@ function isUnusableType(type: ts.Type): boolean {
   return (type.flags & (ts.TypeFlags.Any | ts.TypeFlags.Unknown | ts.TypeFlags.Never)) !== 0;
 }
 
+function matchesEntry(context: AnalysisContext, entry: RegistryEntry, type: ts.Type): boolean {
+  if (type === entry.type) return true;
+  const alias = canonicalSymbol(context.checker, type.aliasSymbol);
+  const registeredAlias = canonicalSymbol(context.checker, entry.type.aliasSymbol);
+  if (alias !== undefined && alias === registeredAlias) return true;
+  if (STRUCTURAL_SUBTYPE_REGISTRY.has(entry.key) && context.checker.isTypeAssignableTo(type, entry.type)) {
+    return true;
+  }
+  if ((type.flags & ts.TypeFlags.Object) !== 0 && entry.union.includes(type)) return true;
+  const union = semanticUnion(type);
+  if (union.length >= 2 && context.checker.isTypeAssignableTo(type, entry.type)) return true;
+  return union.some((member) => (member.flags & ts.TypeFlags.Object) !== 0 && entry.union.includes(member));
+}
+
 function registeredEntry(context: AnalysisContext, type: ts.Type): RegistryEntry | undefined {
   if (isUnusableType(type)) return undefined;
-  return context.registry.find((entry) => {
-    if (type === entry.type) return true;
-    const alias = canonicalSymbol(context.checker, type.aliasSymbol);
-    const registeredAlias = canonicalSymbol(context.checker, entry.type.aliasSymbol);
-    if (alias !== undefined && alias === registeredAlias) return true;
-    if (STRUCTURAL_SUBTYPE_REGISTRY.has(entry.key) && context.checker.isTypeAssignableTo(type, entry.type)) {
-      return true;
+  return context.registry.find((entry) => matchesEntry(context, entry, type));
+}
+
+const carriedEntriesByContext = new WeakMap<AnalysisContext, WeakMap<ts.Type, ReadonlySet<RegistryEntry>>>();
+
+/**
+ * Every registry entry a type carries through its type arguments and call-signature returns, answered
+ * for the whole registry in one traversal and memoized per type. The reachable set is what decides, so
+ * asking one entry at a time re-walks the same type graph per entry and re-runs the assignability checks
+ * `matchesEntry` needs, which measured 1.8s of this invariant's cost over `src/` (10-core Apple
+ * M-series, 2026-09-17). A memo may not outlive the checker that produced the types it keys on, and is
+ * therefore reachable only through the context that owns that checker.
+ */
+function carriedEntries(context: AnalysisContext, type: ts.Type): ReadonlySet<RegistryEntry> {
+  let memo = carriedEntriesByContext.get(context);
+  if (memo === undefined) {
+    memo = new WeakMap();
+    carriedEntriesByContext.set(context, memo);
+  }
+  const cached = memo.get(type);
+  if (cached !== undefined) return cached;
+
+  const carried = new Set<RegistryEntry>();
+  const seen = new Set<ts.Type>([type]);
+  const pending = [type];
+  while (pending.length > 0) {
+    const current = pending.pop()!;
+    if (isUnusableType(current)) continue;
+    for (const entry of context.registry) {
+      if (matchesEntry(context, entry, current)) carried.add(entry);
     }
-    if ((type.flags & ts.TypeFlags.Object) !== 0 && entry.union.includes(type)) return true;
-    const union = semanticUnion(type);
-    if (union.length >= 2 && context.checker.isTypeAssignableTo(type, entry.type)) return true;
-    return union.some((member) => (member.flags & ts.TypeFlags.Object) !== 0 && entry.union.includes(member));
-  });
+    const reached = [
+      ...typeArguments(context, current),
+      ...current.getCallSignatures().map((signature) => signature.getReturnType()),
+    ];
+    for (const next of reached) {
+      if (seen.has(next)) continue;
+      seen.add(next);
+      pending.push(next);
+    }
+  }
+  memo.set(type, carried);
+  return carried;
 }
 
 type UnionDiscriminator = Readonly<{
@@ -708,12 +695,8 @@ function typeCarriesVocabulary(context: AnalysisContext, type: ts.Type, seen = n
   });
 }
 
-function typeCarriesRegistry(context: AnalysisContext, type: ts.Type, seen = new Set<ts.Type>()): boolean {
-  if (seen.has(type) || isUnusableType(type)) return false;
-  seen.add(type);
-  if (registeredEntry(context, type) !== undefined) return true;
-  if (typeArguments(context, type).some((argument) => typeCarriesRegistry(context, argument, seen))) return true;
-  return type.getCallSignatures().some((signature) => typeCarriesRegistry(context, signature.getReturnType(), seen));
+function typeCarriesRegistry(context: AnalysisContext, type: ts.Type): boolean {
+  return carriedEntries(context, type).size > 0;
 }
 
 function declarationName(node: BodyFunction): string | undefined {
@@ -916,10 +899,9 @@ function sourceVocabularyViolations(
 function functionRegistryCarriers(context: AnalysisContext, node: BodyFunction): string[] {
   const carriers = new Set<string>();
   for (const parameter of node.parameters) {
-    const type = context.checker.getTypeAtLocation(parameter);
+    const carried = carriedEntries(context, context.checker.getTypeAtLocation(parameter));
     for (const entry of context.registry) {
-      const scoped = { ...context, registry: [entry] };
-      if (typeCarriesRegistry(scoped, type)) carriers.add(`${entry.key} parameter ${parameter.name.getText()}`);
+      if (carried.has(entry)) carriers.add(`${entry.key} parameter ${parameter.name.getText()}`);
     }
   }
   const visit = (child: ts.Node): void => {
@@ -927,9 +909,10 @@ function functionRegistryCarriers(context: AnalysisContext, node: BodyFunction):
     if (ts.isCallExpression(child)) {
       const type = context.checker.getTypeAtLocation(child);
       const promised = promisedType(context, type);
+      const carried = carriedEntries(context, type);
+      const promisedCarried = promised === undefined ? undefined : carriedEntries(context, promised);
       for (const entry of context.registry) {
-        const scoped = { ...context, registry: [entry] };
-        if (typeCarriesRegistry(scoped, type) || (promised !== undefined && typeCarriesRegistry(scoped, promised))) {
+        if (carried.has(entry) || promisedCarried?.has(entry) === true) {
           carriers.add(`${entry.key} call ${child.expression.getText()}`);
         }
       }
@@ -1191,34 +1174,34 @@ function enforceDebts(violations: readonly Violation[], debts: ReadonlyMap<strin
   return failures.sort();
 }
 
+/**
+ * The mutated fixture is the subject under test, so it is the one file whose own diagnostics still
+ * have to be proven here — nothing else type-checks a source that exists only as a string.
+ */
 function fixtureContext(
   source: string,
   registrySpecs: readonly RegistrySpec[] = [{ key: 'subject.ts#Observation', undecided: ['unobservable'] }],
 ): AnalysisContext {
-  const root = FIXTURE_ROOT;
-  return createContext(fixtureProgram(source), root, registrySpecs);
-}
-
-function diagnosticsFor(program: ts.Program, path: string): string[] {
-  const fileName = resolve(REPO_ROOT, path);
-  const source = program.getSourceFile(fileName);
-  if (source === undefined) throw new Error(`Missing process-observation fixture '${path}'.`);
-  return [...program.getSyntacticDiagnostics(source), ...program.getSemanticDiagnostics(source)].map(
-    (diagnostic) => `TS${diagnostic.code}: ${ts.flattenDiagnosticMessageText(diagnostic.messageText, '\n')}`,
-  );
+  const program = createOverlayProgram(new Map([[FIXTURE_SUBJECT, source]]));
+  const diagnostics = sourceFileDiagnostics(program, FIXTURE_SUBJECT).map(describeDiagnostic);
+  if (diagnostics.length > 0) {
+    throw new Error(`Process observation fixture does not compile:\n${diagnostics.join('\n')}`);
+  }
+  return createContext(program, FIXTURE_ROOT, registrySpecs);
 }
 
 const PRODUCTION_CONTEXT = createContext(productionProgram(), REPO_ROOT, REGISTRY);
 
 describe('process observation vocabulary composes without collapsing its third answer', () => {
-  // This case resolves types across every `src/` file rather than reading text, so it is CPU-bound where the
-  // suite's 15s default was calibrated for I/O-bound cases (see `vitest/default.ts`). Measured 3.8-4.1s on a
-  // 24-core host and over 15s on a GitHub 2-core runner, which this suite deliberately oversubscribes to four
-  // workers; the budget below carries that contention factor and still fails a hung walk promptly.
+  // Asks the checker for the type of every parameter and every call expression under `src/`, which no
+  // memo removes: measured 8.6s alone and 20.4s under the full unit suite (10-core Apple M-series,
+  // 2026-09-17). CI run 35189468102 (ubuntu-latest 4 vCPU, Node 26) measured this case at 37.2s against
+  // 18.9s under the same suite locally on the code it ran, a 2.0x ratio, and two runners on one tree
+  // measured a third apart; the budget is at least twice the CI cost that ratio predicts for 20.4s.
   it('keeps process-owned vocabulary and its composition explicit', () => {
     expect(enforceAllowlist(sourceVocabularyViolations(PRODUCTION_CONTEXT), SOURCE_VOCABULARY_EXEMPTIONS)).toEqual([]);
     expect(enforceDebts(compositionViolations(PRODUCTION_CONTEXT), COMPOSITION_DEBTS)).toEqual([]);
-  }, 60_000);
+  }, 90_000);
 
   it('rejects primitive and null-bearing members added to ProcessPort', () => {
     const source = readFileSync(resolve(FIXTURE_ROOT, 'subject.ts.txt'), 'utf8');
@@ -1422,16 +1405,18 @@ describe('process observation vocabulary composes without collapsing its third a
         '  evidence: ProviderServerFailedSpawnAbsenceEvidence<4_133>,',
       );
 
-    const program = productionProgram(
+    const program = createProductionProgram(
       new Map([
         [path, source],
         [leaderNegativePath, leaderOnlySettlement],
         [mismatchNegativePath, mismatchedGroupSettlement],
       ]),
     );
-    expect(diagnosticsFor(program, path)).toEqual([]);
-    expect(diagnosticsFor(program, leaderNegativePath)).toEqual([expect.stringMatching(/TS2741:/u)]);
-    expect(diagnosticsFor(program, mismatchNegativePath)).toEqual([
+    expect(sourceFileDiagnostics(program, path).map(describeDiagnostic)).toEqual([]);
+    expect(sourceFileDiagnostics(program, leaderNegativePath).map(describeDiagnostic)).toEqual([
+      expect.stringMatching(/TS2741:/u),
+    ]);
+    expect(sourceFileDiagnostics(program, mismatchNegativePath).map(describeDiagnostic)).toEqual([
       expect.stringMatching(/TS2322:/u),
       expect.stringMatching(/TS2322:/u),
     ]);

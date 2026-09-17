@@ -5,45 +5,33 @@ import { fileURLToPath } from 'node:url';
 import { describe, expect, it } from 'vitest';
 import ts from 'typescript';
 
+import {
+  createProgramOver,
+  describeDiagnostic,
+  productionProgram,
+  sourceFileDiagnostics,
+} from '#tests/helpers/ts-production-program.js';
+
 const REPO_ROOT = fileURLToPath(new URL('../../', import.meta.url));
 const POLICY_FILE = 'src/coordinator/services/provider-proxy-recovery-policy.ts';
+const INHERITANCE_FILE = 'src/coordinator/services/provider-proxy-set/inheritance.ts';
+const DISAPPEARANCE_FILE = 'src/coordinator/services/provider-containment-disappearance.ts';
+const RECONCILER_FILE = 'src/coordinator/services/provider-operation-reconciler.ts';
+const SET_LIFECYCLE_FILE = 'src/coordinator/services/provider-proxy-set/index.ts';
 
-function createProductionProgram(overlays: ReadonlyMap<string, string> = new Map()): ts.Program {
-  const configPath = resolve(REPO_ROOT, 'tsconfig.json');
-  const config = ts.readConfigFile(configPath, ts.sys.readFile);
-  if (config.error) throw new Error(ts.flattenDiagnosticMessageText(config.error.messageText, '\n'));
-  const parsed = ts.parseJsonConfigFileContent(config.config, ts.sys, REPO_ROOT, undefined, configPath);
-  const options = {
-    ...parsed.options,
-    composite: false,
-    incremental: false,
-    noEmit: true,
-    tsBuildInfoFile: undefined,
-  };
-  const overlayFiles = new Map([...overlays].map(([path, source]) => [resolve(REPO_ROOT, path), source]));
-  const host = ts.createCompilerHost(options);
-  const readFile = host.readFile.bind(host);
-  const fileExists = host.fileExists.bind(host);
-  const getSourceFile = host.getSourceFile.bind(host);
-  host.readFile = (fileName) => overlayFiles.get(fileName) ?? readFile(fileName);
-  host.fileExists = (fileName) => overlayFiles.has(fileName) || fileExists(fileName);
-  host.getSourceFile = (fileName, languageVersion, onError, shouldCreateNewSourceFile) => {
-    const overlay = overlayFiles.get(fileName);
-    return overlay === undefined
-      ? getSourceFile(fileName, languageVersion, onError, shouldCreateNewSourceFile)
-      : ts.createSourceFile(fileName, overlay, languageVersion, true, ts.ScriptKind.TS);
-  };
-  return ts.createProgram({
-    rootNames: [
-      ...parsed.fileNames.filter((fileName) => fileName.startsWith(resolve(REPO_ROOT, 'src'))),
-      ...overlayFiles.keys(),
-    ],
-    options,
-    host,
-  });
-}
+/**
+ * The production files analyzeAdversarialProgram resolves by name. Each must be a root of, or reachable
+ * by import from, whatever program it is handed, or its lookup throws rather than reporting an escape.
+ */
+const ADVERSARIAL_ROOTS: readonly string[] = [
+  POLICY_FILE,
+  INHERITANCE_FILE,
+  DISAPPEARANCE_FILE,
+  RECONCILER_FILE,
+  SET_LIFECYCLE_FILE,
+].map((path) => resolve(REPO_ROOT, path));
 
-const PROGRAM = createProductionProgram();
+const PROGRAM = productionProgram();
 const CHECKER = PROGRAM.getTypeChecker();
 const SOURCE_FILES = PROGRAM.getSourceFiles().filter(
   (sourceFile) => !sourceFile.isDeclarationFile && sourceFile.fileName.startsWith(`${resolve(REPO_ROOT, 'src')}/`),
@@ -206,14 +194,30 @@ const OWNED_SYMBOLS: readonly OwnedSymbol[] = [
  * inventoried below.
  */
 
+const OWNED_INDEX_BY_SYMBOL = new Map<ts.Symbol, number>();
+const OWNED_INDEX_BY_DECLARATION = new Map<ts.Declaration, number>();
+for (const [index, candidate] of OWNED_SYMBOLS.entries()) {
+  if (!OWNED_INDEX_BY_SYMBOL.has(candidate.symbol)) OWNED_INDEX_BY_SYMBOL.set(candidate.symbol, index);
+  for (const declaration of candidate.declarations) {
+    if (!OWNED_INDEX_BY_DECLARATION.has(declaration)) OWNED_INDEX_BY_DECLARATION.set(declaration, index);
+  }
+}
+
+/**
+ * The owned symbol a resolved symbol is, by identity or by a shared declaration. The earliest entry
+ * reached either way wins: the expected inventories carry one owned key per reference, so a later entry
+ * sharing a declaration with an earlier one may not replace it. The answer may not be a scan of the
+ * owned set.
+ */
 function matchOwnedSymbol(symbol: ts.Symbol | undefined): OwnedSymbol | undefined {
   const canonical = canonicalSymbol(symbol);
   if (canonical === undefined) return undefined;
-  return OWNED_SYMBOLS.find(
-    (candidate) =>
-      candidate.symbol === canonical ||
-      (canonical.declarations?.some((declaration) => candidate.declarations.has(declaration)) ?? false),
-  );
+  let earliest = OWNED_INDEX_BY_SYMBOL.get(canonical);
+  for (const declaration of canonical.declarations ?? []) {
+    const index = OWNED_INDEX_BY_DECLARATION.get(declaration);
+    if (index !== undefined && (earliest === undefined || index < earliest)) earliest = index;
+  }
+  return earliest === undefined ? undefined : OWNED_SYMBOLS[earliest];
 }
 
 function relativePath(file: ts.SourceFile): string {
@@ -364,20 +368,42 @@ function isExactCallCallee(node: ts.Node): boolean {
 
 type ReferenceRecorder = (file: ts.SourceFile, node: ts.Node, symbol: ts.Symbol | undefined, nodeKind: string) => void;
 
+/**
+ * A contextual property reference is a property of the literal's contextual type under the written
+ * member name, so only an owned symbol declared under that same name can match it — which holds while
+ * `src/` has no key-remapped mapped type (`[K in keyof T as …]`) and no namespace contextual type over an
+ * alias-renamed export, the two constructs that would let a property keep a declaration under another
+ * name. Asking for the
+ * contextual type of a literal that writes no owned member name therefore cannot find one, and asking
+ * for it on every literal measured a sixth of the project-wide reference pass (10-core Apple M-series,
+ * 2026-09-17).
+ */
+const OWNED_MEMBER_NAMES = new Set(
+  OWNED_SYMBOLS.flatMap((candidate) => [
+    candidate.symbol.name,
+    ...[...candidate.declarations].flatMap((declaration) => {
+      const name = ts.getNameOfDeclaration(declaration);
+      return name !== undefined && (ts.isIdentifier(name) || ts.isStringLiteralLike(name)) ? [name.text] : [];
+    }),
+  ]),
+);
+
 function recordContextualProperties(file: ts.SourceFile, node: ts.ObjectLiteralExpression, record: ReferenceRecorder) {
-  const contextual = CHECKER.getContextualType(node);
-  if (contextual === undefined) return;
-  for (const property of node.properties) {
+  const members = node.properties.flatMap((property) => {
     if (
       !ts.isPropertyAssignment(property) &&
       !ts.isMethodDeclaration(property) &&
       !ts.isShorthandPropertyAssignment(property)
     ) {
-      continue;
+      return [];
     }
     const name = property.name;
-    if (name === undefined) continue;
-    const memberName = name.getText(file).replaceAll(/["']/gu, '');
+    return name === undefined ? [] : [{ property, memberName: name.getText(file).replaceAll(/["']/gu, '') }];
+  });
+  if (!members.some(({ memberName }) => OWNED_MEMBER_NAMES.has(memberName))) return;
+  const contextual = CHECKER.getContextualType(node);
+  if (contextual === undefined) return;
+  for (const { property, memberName } of members) {
     record(file, property, contextual.getProperty(memberName), `Contextual${ts.SyntaxKind[property.kind]}`);
   }
 }
@@ -939,10 +965,10 @@ function analyzeAdversarialProgram(program: ts.Program, path: string): Adversari
     return resolved;
   };
   const policyFile = fileAt(POLICY_FILE);
-  const inheritanceFile = fileAt('src/coordinator/services/provider-proxy-set/inheritance.ts');
-  const disappearanceFile = fileAt('src/coordinator/services/provider-containment-disappearance.ts');
-  const reconcilerFile = fileAt('src/coordinator/services/provider-operation-reconciler.ts');
-  const lifecycleFile = fileAt('src/coordinator/services/provider-proxy-set/index.ts');
+  const inheritanceFile = fileAt(INHERITANCE_FILE);
+  const disappearanceFile = fileAt(DISAPPEARANCE_FILE);
+  const reconcilerFile = fileAt(RECONCILER_FILE);
+  const lifecycleFile = fileAt(SET_LIFECYCLE_FILE);
   const localOwned = new Map<ts.Symbol, string>([
     [member(exported(policyFile, 'ProviderProxyRecoveryDispatcher'), 'begin'), 'ProviderProxyRecoveryDispatcher.begin'],
     [member(exported(policyFile, 'ProviderProxyRecoveryArbiter'), 'start'), 'ProviderProxyRecoveryArbiter.start'],
@@ -1068,22 +1094,6 @@ function analyzeAdversarialProgram(program: ts.Program, path: string): Adversari
   return { bindingEscapes, valueEscapes, ownedOccurrences, rejections };
 }
 
-function diagnosticsFor(program: ts.Program, path: string): string[] {
-  const fileName = resolve(REPO_ROOT, path);
-  return ts
-    .getPreEmitDiagnostics(program)
-    .filter((diagnostic) => diagnostic.file?.fileName === fileName)
-    .map((diagnostic) => `TS${diagnostic.code}: ${ts.flattenDiagnosticMessageText(diagnostic.messageText, '\n')}`);
-}
-
-/**
- * Every adversarial case below builds its own TypeScript program over production sources and takes ~21-27s on
- * the slower supported Node major, so each one needs its own `}, 45_000)` budget — the file-wide default is
- * 15s (`vitest/default.ts`). Vitest attaches that argument to the case it CLOSES, not the one it precedes, and
- * because it renders directly above the next `it(` it reads as though it covers it. Cases here have
- * timed out in CI for exactly that misreading, each fixed one at a time. When adding a case, give it its own
- * budget rather than assuming the line above yours applies to you.
- */
 describe('provider proxy recovery policy construction', () => {
   it('enforces recovery-policy boundaries and rejection inventories', () => {
     const references = collectReferences();
@@ -1340,11 +1350,20 @@ describe('provider proxy recovery policy construction', () => {
       forbiddenAllSettled: [],
       forbiddenMethods: [],
     });
-  }, 45_000);
+    // A budget argument binds the case it closes, and this one resolves the symbol behind every call,
+    // access and identifier under `src/`: measured 6.7s alone and 16.0s under the full unit suite
+    // (10-core Apple M-series, 2026-09-17). CI run 35189468102 (ubuntu-latest 4 vCPU, Node 26) measured
+    // this case at 27.1s against 13.5s under the same suite locally on the code it ran, a 2.0x ratio, and
+    // two runners on one tree measured a third apart; the budget is at least twice the CI cost that ratio
+    // predicts for 16.0s.
+  }, 70_000);
 
   it('rejects destructured dispatcher and arbiter consumers', () => {
+    // Rooting only what analyzeAdversarialProgram names measured 0.52s against 1.29s for this case with
+    // every `src/` file rooted, for byte-identical diagnostics (10-core Apple M-series, 2026-09-17).
     const path = 'src/adversarial-destructured-recovery-consumer.ts';
-    const program = createProductionProgram(
+    const program = createProgramOver(
+      ADVERSARIAL_ROOTS,
       new Map([
         [
           path,
@@ -1373,7 +1392,9 @@ export function consume(
     );
 
     expect({
-      diagnostics: diagnosticsFor(program, path).filter((diagnostic) => diagnostic.startsWith('TS2684:')),
+      diagnostics: sourceFileDiagnostics(program, path)
+        .map(describeDiagnostic)
+        .filter((diagnostic) => diagnostic.startsWith('TS2684:')),
       invariant: analyzeAdversarialProgram(program, path).bindingEscapes,
     }).toEqual({
       diagnostics: [
@@ -1385,11 +1406,12 @@ export function consume(
         `${path} :: consume :: BindingElement value escape for ProviderProxyRecoveryDispatcher.begin`,
       ],
     });
-  }, 45_000);
+  });
 
   it('rejects a destructured fatal sink value escape', () => {
     const path = 'src/adversarial-destructured-recovery-fatal-sink.ts';
-    const program = createProductionProgram(
+    const program = createProgramOver(
+      ADVERSARIAL_ROOTS,
       new Map([
         [
           path,
@@ -1408,17 +1430,18 @@ export function escape(sinks: ProviderProxyRecoveryTurnSinks, error: ProviderPro
     );
 
     expect({
-      diagnostics: diagnosticsFor(program, path),
+      diagnostics: sourceFileDiagnostics(program, path).map(describeDiagnostic),
       invariant: analyzeAdversarialProgram(program, path).valueEscapes,
     }).toEqual({
       diagnostics: [],
       invariant: [`${path} :: escape :: BindingElement value escape for ProviderProxyRecoveryTurnSinks.fatal`],
     });
-  }, 45_000);
+  });
 
   it('rejects a raw-result method value escape', () => {
     const path = 'src/adversarial-provider-recovery-raw-result.ts';
-    const program = createProductionProgram(
+    const program = createProgramOver(
+      ADVERSARIAL_ROOTS,
       new Map([
         [
           path,
@@ -1440,7 +1463,7 @@ export function escape(
     );
 
     expect({
-      diagnostics: diagnosticsFor(program, path),
+      diagnostics: sourceFileDiagnostics(program, path).map(describeDiagnostic),
       invariant: analyzeAdversarialProgram(program, path).valueEscapes,
     }).toEqual({
       diagnostics: [],
@@ -1448,11 +1471,12 @@ export function escape(
         `${path} :: escape :: PropertyAccessExpression value escape for ProviderContainmentDisappearanceConsumer.containmentDisappeared`,
       ],
     });
-  }, 45_000);
+  });
 
   it('rejects an external facade consumer that erases fatal provenance', () => {
     const path = 'src/adversarial-provider-recovery-consumer.ts';
-    const program = createProductionProgram(
+    const program = createProgramOver(
+      ADVERSARIAL_ROOTS,
       new Map([
         [
           path,
@@ -1474,7 +1498,7 @@ export async function erase(...args: Parameters<typeof recover>) {
     );
     const analysis = analyzeAdversarialProgram(program, path);
 
-    expect(diagnosticsFor(program, path)).toEqual([]);
+    expect(sourceFileDiagnostics(program, path).map(describeDiagnostic)).toEqual([]);
     expect(analysis.ownedOccurrences).toEqual([
       `${path} :: <module> :: ImportSpecifier :: recoverProviderProxySetOrdinarily`,
       `${path} :: erase :: CallExpression :: recoverProviderProxySetOrdinarily`,
@@ -1484,11 +1508,12 @@ export async function erase(...args: Parameters<typeof recover>) {
         `${path} :: erase :: catch#1 :: consumed=[recoverProviderProxySetOrdinarily] :: returned=[{ kind: 'temporarily-unavailable'`,
       ),
     ]);
-  }, 45_000);
+  });
 
   it('documents parameter-carried destructuring that erases fatal provenance', () => {
     const path = 'src/adversarial-parameter-carried-recovery-consumer.ts';
-    const program = createProductionProgram(
+    const program = createProgramOver(
+      ADVERSARIAL_ROOTS,
       new Map([
         [
           path,
@@ -1518,7 +1543,7 @@ export async function erase(
     const limitationNotice = checkerSource.slice(noticeStart, noticeEnd);
 
     expect({
-      diagnostics: diagnosticsFor(program, path),
+      diagnostics: sourceFileDiagnostics(program, path).map(describeDiagnostic),
       ownedOccurrences: analysis.ownedOccurrences,
       rejections: analysis.rejections,
       namesDestructuredFunctionParameters: limitationNotice.includes('destructured function parameters'),
@@ -1528,11 +1553,12 @@ export async function erase(
       rejections: [expect.stringContaining(`${path} :: erase :: catch#1 :: consumed=[]`)],
       namesDestructuredFunctionParameters: true,
     });
-  }, 45_000);
+  });
 
   it('rejects catch relabeling of dispatcher fatal evidence', () => {
     const path = 'src/adversarial-provider-recovery-relabel.ts';
-    const program = createProductionProgram(
+    const program = createProgramOver(
+      ADVERSARIAL_ROOTS,
       new Map([
         [
           path,
@@ -1558,17 +1584,18 @@ export async function relabel(...args: Parameters<typeof recoverProviderProxySet
     );
     const analysis = analyzeAdversarialProgram(program, path);
 
-    expect(diagnosticsFor(program, path)).toEqual([]);
+    expect(sourceFileDiagnostics(program, path).map(describeDiagnostic)).toEqual([]);
     expect(analysis.rejections).toEqual([
       expect.stringMatching(
         /catch#1 :: consumed=\[isProviderProxyRecoveryFatalError, recoverProviderProxySetOrdinarily\] :: returned=\[\{ kind: 'temporarily-unavailable'/u,
       ),
     ]);
-  }, 45_000);
+  });
 
   it('keeps dispatcher fatal origin private', () => {
     const path = 'src/adversarial-fatal-construction.ts';
-    const program = createProductionProgram(
+    const program = createProgramOver(
+      ADVERSARIAL_ROOTS,
       new Map([
         [
           path,
@@ -1591,13 +1618,13 @@ export const structural: ProviderProxySetLifecycleFatalError = {
         ],
       ]),
     );
-    const diagnostics = diagnosticsFor(program, path);
+    const diagnostics = sourceFileDiagnostics(program, path).map(describeDiagnostic);
 
     expect(diagnostics).toEqual([
       expect.stringContaining("'ProviderProxySetLifecycleFatalError' only refers to a type"),
       expect.stringContaining("Property '[providerProxyRecoveryFatalOrigin]' is missing"),
     ]);
-  }, 45_000);
+  });
 
   it('keeps the producer registry closed and explicit', () => {
     const source = readFileSync(resolve(REPO_ROOT, POLICY_FILE), 'utf8');

@@ -545,13 +545,49 @@ function topLevelValueDeclarations(sourceFile: ts.SourceFile): ReadonlyMap<strin
   return declarations;
 }
 
+type LocalReexport = Readonly<{ path: string; localName: string; exportedName: string }>;
+
+function localReexports(sourceFile: ts.SourceFile, path: string): LocalReexport[] {
+  return sourceFile.statements.flatMap((statement) => {
+    if (
+      !ts.isExportDeclaration(statement) ||
+      statement.moduleSpecifier !== undefined ||
+      statement.isTypeOnly ||
+      statement.exportClause === undefined ||
+      !ts.isNamedExports(statement.exportClause)
+    ) {
+      return [];
+    }
+    return statement.exportClause.elements.flatMap((element) =>
+      element.isTypeOnly
+        ? []
+        : [{ path, localName: element.propertyName?.text ?? element.name.text, exportedName: element.name.text }],
+    );
+  });
+}
+
+// Keyed on the memoized production program's own SourceFiles and may not outlive it; see
+// productionProgram in tests/helpers/ts-production-program.ts.
+const TOP_LEVEL_DECLARATIONS: ReadonlyMap<string, ReadonlyMap<string, ts.Node>> = new Map(
+  [...SOURCE_FILES_BY_CANONICAL_PATH].map(
+    ([path, sourceFile]) => [path, topLevelValueDeclarations(sourceFile)] as const,
+  ),
+);
+const LOCAL_REEXPORTS: readonly LocalReexport[] = [...SOURCE_FILES_BY_CANONICAL_PATH].flatMap(([path, sourceFile]) =>
+  localReexports(sourceFile, path),
+);
+const REFERENCED_IDENTIFIERS = new WeakMap<ts.Node, ReadonlySet<string>>();
+
 function referencedIdentifiers(node: ts.Node): ReadonlySet<string> {
+  const memoized = REFERENCED_IDENTIFIERS.get(node);
+  if (memoized !== undefined) return memoized;
   const names = new Set<string>();
   const visit = (child: ts.Node): void => {
     if (ts.isIdentifier(child)) names.add(child.text);
     ts.forEachChild(child, visit);
   };
   visit(node);
+  REFERENCED_IDENTIFIERS.set(node, names);
   return names;
 }
 
@@ -562,10 +598,6 @@ function decisionTaintPaths(imports: readonly ImportedRuntimeSymbol[]): Readonly
       return [key, [key]] as const;
     }),
   );
-  const declarations = new Map(
-    [...SOURCE_FILES_BY_CANONICAL_PATH].map(([path, sourceFile]) => [path, topLevelValueDeclarations(sourceFile)]),
-  );
-
   let changed = true;
   while (changed) {
     changed = false;
@@ -584,7 +616,7 @@ function decisionTaintPaths(imports: readonly ImportedRuntimeSymbol[]): Readonly
       }
     }
 
-    for (const [path, moduleDeclarations] of declarations) {
+    for (const [path, moduleDeclarations] of TOP_LEVEL_DECLARATIONS) {
       for (const [name, declaration] of moduleDeclarations) {
         const declarationKey = symbolKey(path, name);
         if (paths.has(declarationKey)) continue;
@@ -598,27 +630,12 @@ function decisionTaintPaths(imports: readonly ImportedRuntimeSymbol[]): Readonly
       }
     }
 
-    for (const [path, sourceFile] of SOURCE_FILES_BY_CANONICAL_PATH) {
-      for (const statement of sourceFile.statements) {
-        if (
-          !ts.isExportDeclaration(statement) ||
-          statement.moduleSpecifier !== undefined ||
-          statement.isTypeOnly ||
-          statement.exportClause === undefined ||
-          !ts.isNamedExports(statement.exportClause)
-        ) {
-          continue;
-        }
-        for (const element of statement.exportClause.elements) {
-          if (element.isTypeOnly) continue;
-          const localName = element.propertyName?.text ?? element.name.text;
-          const localPath = paths.get(symbolKey(path, localName));
-          const exportedKey = symbolKey(path, element.name.text);
-          if (localPath !== undefined && !paths.has(exportedKey)) {
-            paths.set(exportedKey, [exportedKey, ...localPath]);
-            changed = true;
-          }
-        }
+    for (const { path, localName, exportedName } of LOCAL_REEXPORTS) {
+      const localPath = paths.get(symbolKey(path, localName));
+      const exportedKey = symbolKey(path, exportedName);
+      if (localPath !== undefined && !paths.has(exportedKey)) {
+        paths.set(exportedKey, [exportedKey, ...localPath]);
+        changed = true;
       }
     }
   }

@@ -36,7 +36,7 @@ describe('provider binding ownership', () => {
     }
 
     expect(violations).toEqual([]);
-  }, 15_000);
+  });
 
   it('detects cross-provider and non-registration imports independent of alias spelling', () => {
     expect(bindingImportViolation('src/providers/beta/execution.ts', 'src/providers/alpha/binding.ts')).toContain(

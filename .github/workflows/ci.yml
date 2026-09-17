@@ -40,13 +40,26 @@ jobs:
       # quality gate, and none of them ran here. `npm run build` typechecks src
       # only, so nothing caught a type error under tests/ — a change that brands
       # or narrows a widely-used type churns fixtures, and only `typecheck:tests`
-      # sees them.
+      # sees them. This step is also the gate's only whole-tree typecheck: see
+      # scripts/test.mjs for why `npm test` leaves it to this step under CI.
       - run: npm run typecheck:tests
       - run: npm run lint
       - run: npm run format:check
       - run: npm run knip
       - run: npm run build
       - run: npm test
+      # These reports are the gate's only structured per-case record: the console
+      # log carries a passing case's time as text, and only above vitest's 300 ms
+      # slow threshold. A case that is about to time out on a slower runner is
+      # passing on this one, so the reports are kept for failed runs too, which is
+      # where the comparison against the last green run starts.
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: vitest-reports-node-${{ matrix.node-version }}
+          path: reports/
+          retention-days: 7
+          if-no-files-found: warn
       # `npm test` runs only tests/unit, tests/invariants and the simulation
       # suite. tests/integration was outside the gate entirely, so the
       # cross-version handoff, cold/warm start and IPC suites went unrun and two

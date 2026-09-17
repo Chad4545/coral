@@ -4,20 +4,14 @@ import { describe, expect, it } from 'vitest';
 import ts from 'typescript';
 
 import { listProductionSourceFiles, toCanonicalSrcPath } from '#tests/helpers/ts-import-scanner.js';
+import { createOverlayProgram, createProgramOver } from '#tests/helpers/ts-production-program.js';
 
 const REPO_ROOT = resolve(import.meta.dirname, '../..');
 // A root may join this scan only after every offender within it is consumed or
 // marked as a justified discard.
 const SCANNED_ROOTS = ['src/coordinator', 'src/jobs', 'src/recovery'] as const;
 const FILES = SCANNED_ROOTS.flatMap((root) => listProductionSourceFiles(resolve(REPO_ROOT, root)));
-const COMPILER_OPTIONS = {
-  module: ts.ModuleKind.NodeNext,
-  moduleResolution: ts.ModuleResolutionKind.NodeNext,
-  skipLibCheck: true,
-  strictNullChecks: true,
-  target: ts.ScriptTarget.ESNext,
-} satisfies ts.CompilerOptions;
-const PROGRAM = ts.createProgram(FILES, COMPILER_OPTIONS);
+const PROGRAM = createProgramOver(FILES);
 const FIXTURE_ROOT = resolve(REPO_ROOT, 'tests/invariants/fixtures/must-use-union-return');
 
 type Offender = Readonly<{ file: string; line: number; text: string }>;
@@ -145,17 +139,7 @@ function collectOffenders(program: ts.Program, sourceFiles: readonly ts.SourceFi
 function fixtureProgram(name: string): { program: ts.Program; sourceFile: ts.SourceFile } {
   const fixturePath = resolve(FIXTURE_ROOT, `${name}.ts`);
   const source = readFileSync(`${fixturePath}.txt`, 'utf8');
-  const host = ts.createCompilerHost(COMPILER_OPTIONS, true);
-  const defaultFileExists = host.fileExists;
-  const defaultGetSourceFile = host.getSourceFile;
-  const defaultReadFile = host.readFile;
-  host.fileExists = (fileName) => fileName === fixturePath || defaultFileExists(fileName);
-  host.readFile = (fileName) => (fileName === fixturePath ? source : defaultReadFile(fileName));
-  host.getSourceFile = (fileName, languageVersion, onError, shouldCreateNewSourceFile) =>
-    fileName === fixturePath
-      ? ts.createSourceFile(fileName, source, languageVersion, true, ts.ScriptKind.TS)
-      : defaultGetSourceFile(fileName, languageVersion, onError, shouldCreateNewSourceFile);
-  const program = ts.createProgram({ rootNames: [fixturePath], options: COMPILER_OPTIONS, host });
+  const program = createOverlayProgram(new Map([[fixturePath, source]]));
   const sourceFile = program.getSourceFile(fixturePath);
   if (sourceFile === undefined) throw new Error(`Must-use fixture '${name}' was not compiled.`);
   return { program, sourceFile };

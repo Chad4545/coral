@@ -3,6 +3,7 @@ dist/
 *.tsbuildinfo
 ref/
 tmp/
+reports/
 
 .claude/settings.local.json
 clients/build/

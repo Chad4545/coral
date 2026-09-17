@@ -28,7 +28,10 @@ const REPO_ROOT = join(__dirname, '..', '..');
 // `tests` is scanned too: a double that answers a boolean behind a cast is how the conversion's bugs stayed
 // green, and a test that coerces a liveness value is asserting nothing.
 const SCANNED_ROOTS = ['src', 'tools', 'tests'] as const;
-const LIVENESS_PROBE = /^(observeProcessLiveness|observeLiveness)$/;
+const LIVENESS_PROBES = ['observeProcessLiveness', 'observeLiveness'] as const;
+const IS_LIVENESS_PROBE = new RegExp(`^(?:${LIVENESS_PROBES.join('|')})$`, 'u');
+const MENTIONS_LIVENESS_PROBE = new RegExp(LIVENESS_PROBES.join('|'), 'u');
+const MENTIONS_LIVENESS_PROBE_GLOBAL = new RegExp(LIVENESS_PROBES.join('|'), 'gu');
 
 type Offender = Readonly<{ file: string; line: number; text: string }>;
 
@@ -50,7 +53,7 @@ function listSourceFiles(root: string): string[] {
 function isLivenessCall(node: ts.Node): node is ts.CallExpression {
   if (!ts.isCallExpression(node)) return false;
   const callee = ts.isPropertyAccessExpression(node.expression) ? node.expression.name : node.expression;
-  return ts.isIdentifier(callee) && LIVENESS_PROBE.test(callee.text);
+  return ts.isIdentifier(callee) && IS_LIVENESS_PROBE.test(callee.text);
 }
 
 /** Whether this expression is consumed as a truth value rather than compared against a literal. */
@@ -98,6 +101,18 @@ function livenessBoundNames(source: ts.SourceFile): ReadonlySet<string> {
   return names;
 }
 
+/**
+ * Whether a file's text could hold a coercion at all.
+ *
+ * Every offender this rule reports is a call to one of `LIVENESS_PROBES` or a name bound directly to one
+ * in the same file, so both require the probe's own identifier in that file's text. A file without it
+ * cannot hold an offender, and parsing it finds nothing: the case measured 3.50s parsing every `.ts` under
+ * `src`, `tools` and `tests` against 0.63s with this filter (10-core Apple M-series, 2026-09-17).
+ */
+function mentionsLivenessProbe(text: string): boolean {
+  return MENTIONS_LIVENESS_PROBE.test(text);
+}
+
 /** The scan itself, over one file's text, so it can be run against a fixture as well as against the tree. */
 function coercionsIn(fileName: string, text: string): Offender[] {
   const offenders: Offender[] = [];
@@ -118,13 +133,25 @@ function coercionsIn(fileName: string, text: string): Offender[] {
   return offenders;
 }
 
+const COERCIONS = [
+  ['a direct call negated', 'if (!observeLiveness(pid)) throw new Error("x");'],
+  ['a direct call as a condition', 'if (observeProcessLiveness(pid)) kill(pid);'],
+  ['an alias negated', 'const state = observeLiveness(pid);\nif (!state) throw new Error("x");'],
+  ['an alias as a condition', 'const state = observeProcessLiveness(pid);\nif (state) kill(pid);'],
+  ['an alias in a ternary', 'const state = observeLiveness(pid);\nconst x = state ? 1 : 2;'],
+  ['an alias in a logical chain', 'const state = observeLiveness(pid);\nconst x = state && other;'],
+  ['an alias interpolated', 'const state = observeLiveness(pid);\nconst x = `${state}`;'],
+] as const;
+
 describe('a liveness answer is compared, never coerced', () => {
   it('no call site uses ProcessLiveness as a truth value', () => {
     const offenders: Offender[] = [];
     for (const root of SCANNED_ROOTS) {
       for (const filePath of listSourceFiles(root)) {
+        const text = readFileSync(filePath, 'utf-8');
+        if (!mentionsLivenessProbe(text)) continue;
         const canonical = relative(REPO_ROOT, filePath).replace(/\\/gu, '/');
-        offenders.push(...coercionsIn(canonical, readFileSync(filePath, 'utf-8')));
+        offenders.push(...coercionsIn(canonical, text));
       }
     }
 
@@ -136,16 +163,16 @@ describe('a liveness answer is compared, never coerced', () => {
   // The scan itself, against shapes the tree does not contain — which is the point: a rule with no negative
   // fixture is a rule nobody has seen fail. The alias case is the one that mattered; the first version of this
   // rule looked only at the call's own parent and let it through.
-  it.each([
-    ['a direct call negated', 'if (!observeLiveness(pid)) throw new Error("x");'],
-    ['a direct call as a condition', 'if (observeProcessLiveness(pid)) kill(pid);'],
-    ['an alias negated', 'const state = observeLiveness(pid);\nif (!state) throw new Error("x");'],
-    ['an alias as a condition', 'const state = observeProcessLiveness(pid);\nif (state) kill(pid);'],
-    ['an alias in a ternary', 'const state = observeLiveness(pid);\nconst x = state ? 1 : 2;'],
-    ['an alias in a logical chain', 'const state = observeLiveness(pid);\nconst x = state && other;'],
-    ['an alias interpolated', 'const state = observeLiveness(pid);\nconst x = `${state}`;'],
-  ])('catches %s', (_label, snippet) => {
+  it.each(COERCIONS)('catches %s', (_label, snippet) => {
     expect(coercionsIn('fixture.ts', snippet)).not.toHaveLength(0);
+  });
+
+  // The tree scan parses only the files whose text names a probe, so a caught shape that does not name one
+  // would be a violation the scan never reaches. Renaming the probe out of a caught shape must therefore
+  // make it uncatchable — otherwise the filter is skipping files this rule can still fire on.
+  it.each(COERCIONS)('catches %s only for naming a probe', (_label, snippet) => {
+    expect(mentionsLivenessProbe(snippet)).toBe(true);
+    expect(coercionsIn('fixture.ts', snippet.replace(MENTIONS_LIVENESS_PROBE_GLOBAL, 'other'))).toEqual([]);
   });
 
   it.each([
