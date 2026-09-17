@@ -964,19 +964,19 @@ async function stopLifecycleController(
     }
   }
 
-  if (disposition.disposition === 'held' && disposition.recovery.automaticRetry.status === 'scheduled') {
+  if (disposition.disposition === 'held') {
     try {
       await vi.waitFor(
         async () => {
           disposition = await controller.waitForShutdown();
-          if (disposition.disposition === 'held' && disposition.recovery.automaticRetry.status === 'scheduled') {
+          if (disposition.disposition === 'held') {
             throw new Error('automatic cleanup is still scheduled');
           }
         },
         { timeout: 5_000 },
       );
     } catch (error: unknown) {
-      throw new Error('Automatic lifecycle cleanup did not reach finalized or waiting-for-operator within 5s.', {
+      throw new Error('Automatic lifecycle cleanup did not reach a terminal disposition within 5s.', {
         cause: error,
       });
     }
@@ -1865,16 +1865,11 @@ describe('lifecycle recovery', () => {
     try {
       await controller.start();
       await expect(controller.shutdown('test-teardown')).resolves.toMatchObject({
-        disposition: 'held',
-        recovery: {
-          retainedOwnership: {
-            cleanupObligations: expect.arrayContaining([
-              'child termination',
-              'crashed job terminalization',
-              'provider control and IPC authority release',
-            ]),
-          },
-        },
+        disposition: 'finalized-with-losses',
+        undischarged: expect.arrayContaining([
+          expect.objectContaining({ label: 'child termination' }),
+          expect.objectContaining({ label: 'crashed job terminalization' }),
+        ]),
       });
 
       expect(markJobsAsErrorFn).not.toHaveBeenCalled();

@@ -62,7 +62,7 @@ export function isShutdownReason(reason: string): reason is ShutdownReason {
   return shutdownReasons.has(reason);
 }
 
-function shutdownModeFromReason(reason: ShutdownReason): ShutdownMode {
+export function shutdownModeFromReason(reason: ShutdownReason): ShutdownMode {
   if (reason === 'replaced' || reason === 'sigterm' || reason === 'provider-proxy-lifecycle-fatal') return 'handoff';
   return 'hard';
 }
@@ -686,7 +686,7 @@ function buildHardShutdownConsequences({
         storeServicesAvailable = storeServicesRef.tryGet() !== null;
       }),
     retainedAuthority: () => cleanupContribution('store services availability check'),
-    remainder: { owner: 'successor-recovery', via: 'startup store recovery' },
+    remainder: { owner: 'successor-recovery', evidence: { kind: 'startup-store-recovery' } },
   };
   const providerHostShutdown: ShutdownObligation = {
     label: 'provider host shutdown',
@@ -785,7 +785,7 @@ function buildHardShutdownConsequences({
       return confirmedTask(() => markJobsAsErrorFn('Backend shutting down', signal));
     },
     retainedAuthority: () => cleanupContribution('crashed job terminalization'),
-    remainder: { owner: 'successor-recovery', via: 'startup liveness recovery' },
+    remainder: { owner: 'successor-recovery', evidence: { kind: 'startup-liveness-recovery' } },
   };
 
   return {

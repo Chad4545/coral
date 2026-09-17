@@ -59,7 +59,17 @@ function buildHarness(opts: {
   const callLog: CallLog = [];
   const logLines: string[] = [];
 
-  const runtime = { time } as unknown as Runtime;
+  const runtime = {
+    time,
+    paths: { coral: { coordinator: { runDir: '/tmp/coral' } } },
+    storage: {
+      existsSync: () => false,
+      readFileSync: () => {
+        throw new Error('unexpected read');
+      },
+      writeAtomicDurableSync: () => true,
+    },
+  } as unknown as Runtime;
 
   const server = {
     closeAllConnections: () => {
@@ -187,10 +197,11 @@ async function flush(rounds = 16): Promise<void> {
 }
 
 type ShutdownSequenceHold = Extract<Awaited<ReturnType<typeof runShutdownSequence>>, { disposition: 'held' }>;
-
-function retryHeldFinalization(held: ShutdownSequenceHold): ReturnType<typeof runShutdownSequence> {
-  return held.retry();
-}
+type ShutdownSequenceUnaccepted = Extract<
+  Awaited<ReturnType<typeof runShutdownSequence>>,
+  { disposition: 'unaccepted' }
+>;
+type ShutdownSequenceLoss = Exclude<Awaited<ReturnType<typeof runShutdownSequence>>, { disposition: 'settled' }>;
 
 function requireHeld(disposition: Awaited<ReturnType<typeof runShutdownSequence>>): ShutdownSequenceHold {
   expect(disposition.disposition).toBe('held');
@@ -198,14 +209,24 @@ function requireHeld(disposition: Awaited<ReturnType<typeof runShutdownSequence>
   return disposition;
 }
 
-function heldFailureDetail(held: ShutdownSequenceHold): string {
-  return held.undischarged
-    .map(({ label, error }) => `${label}: ${error instanceof Error ? error.message : String(error)}`)
+function requireUnaccepted(disposition: Awaited<ReturnType<typeof runShutdownSequence>>): ShutdownSequenceUnaccepted {
+  expect(disposition.disposition).toBe('unaccepted');
+  if (disposition.disposition !== 'unaccepted') throw new Error('expected unaccepted shutdown finalization');
+  return disposition;
+}
+
+function failureDetail(disposition: ShutdownSequenceLoss): string {
+  return disposition.undischarged
+    .map(({ label, settlement }) => `${label}: ${settlement.cause}: ${settlement.detail}`)
     .join(' | ');
 }
 
+function heldFailureDetail(held: ShutdownSequenceHold): string {
+  return failureDetail(held);
+}
+
 describe('runShutdownSequence drain budget', () => {
-  it('keeps a destructive sweep join and process-exit gate held through the budget and a second signal', async () => {
+  it('does not rerun a timed-out destructive sweep before transferring its process-exit remainder', async () => {
     let finishSweep!: () => void;
     const sweepSettlement = new Promise<void>((resolve) => {
       finishSweep = resolve;
@@ -252,18 +273,21 @@ describe('runShutdownSequence drain budget', () => {
 
     if (sequence === undefined) throw new Error('shutdown signal did not start the sequence');
     const held = requireHeld(await sequence);
-    expect(held.exit).toBe('store-epoch-sweep-settlement');
     expect(held.retryAfter).toBeInstanceOf(Promise);
     const executeAdvertisedExit = held.retry;
     expect(executeAdvertisedExit).toBeTypeOf('function');
 
-    finishSweep();
-    harness.time.tick(100);
+    harness.time.tick(50);
     await held.retryAfter;
-    await expect(executeAdvertisedExit()).resolves.toEqual({ disposition: 'settled' });
-    expect(harness.callLog.indexOf('storeEpochSweep.joined')).toBeLessThan(
-      harness.callLog.indexOf('closeIpcServerFn:start'),
-    );
+    await expect(executeAdvertisedExit()).resolves.toMatchObject({
+      disposition: 'delegated',
+      undischarged: expect.arrayContaining([expect.objectContaining({ label: 'store epoch sweep cancellation' })]),
+    });
+    expect(acceptProcessExitRemainder).toHaveBeenCalledOnce();
+    expect(harness.callLog.filter((entry) => entry === 'storeEpochSweep.stop')).toHaveLength(1);
+    expect(harness.closeIpcCalled()).toBe(true);
+    finishSweep();
+    await flush();
   });
 
   it('runs provider-host recovery before closing provider-operation mutation admission', async () => {
@@ -295,17 +319,10 @@ describe('runShutdownSequence drain budget', () => {
     }
 
     const held = requireHeld(await sequence);
-    expect(held).toMatchObject({
-      reason: 'provider-operation-mutations-unsettled',
-      exit: 'admitted-provider-operation-mutation-settlement',
-      retainedAuthority: {
-        ipcSocket: true,
-        cleanupObligations: expect.arrayContaining([
-          'provider operation mutation drain',
-          'provider-operation:job-1:operation-1',
-        ]),
-      },
-    });
+    expect(heldFailureDetail(held)).toContain('provider operation mutation drain:');
+    expect(held.retainedAuthority.cleanupObligations).toEqual(
+      expect.arrayContaining(['provider operation mutation drain', 'provider-operation:job-1:operation-1']),
+    );
     expect(stopProviderOperationReconciler).toHaveBeenCalledOnce();
     expect(order).toEqual(['provider-host-recovery', 'mutation-admission-close']);
   });
@@ -347,12 +364,11 @@ describe('runShutdownSequence drain budget', () => {
     expect(harness.closeIpcCalled()).toBe(true);
   });
 
-  it('keeps mutation admission open through an authority-null representation retry gap', async () => {
+  it('names authority-null representation and mutation-admission losses before releasing authority', async () => {
     let settleRepresentationRelease!: (disposition: { kind: 'released' }) => void;
     const representationReleaseSettlement = new Promise<{ kind: 'released' }>((resolve) => {
       settleRepresentationRelease = resolve;
     });
-    let releasePending = true;
     const stopProviderOperationReconciler = vi.fn(() => ({ kind: 'drained' as const }));
     const harness = buildHarness({ stopProviderOperationReconciler });
     const receipt = {
@@ -366,44 +382,38 @@ describe('runShutdownSequence drain budget', () => {
       shutdown: async () => receipt,
       cleanupObligations: () => ({
         ...receipt,
-        representationReleaseHolds: releasePending
-          ? [
-              {
-                label: 'provider proxy representation release authority-null',
-                proxyInstanceId: 'authority-null',
-                pendingOperations: ['provider-operation:job-1:operation-1'],
-                disposition: {
-                  kind: 'operational-retry-owned' as const,
-                  exit: 'provider-proxy-set-release-retry' as const,
-                },
-                exit: 'provider-proxy-representation-release-settlement' as const,
-                settlement: representationReleaseSettlement,
-              },
-            ]
-          : [],
+        representationReleaseHolds: [
+          {
+            label: 'provider proxy representation release authority-null',
+            proxyInstanceId: 'authority-null',
+            pendingOperations: ['provider-operation:job-1:operation-1'],
+            disposition: {
+              kind: 'operational-retry-owned' as const,
+              exit: 'provider-proxy-set-release-retry' as const,
+            },
+            exit: 'provider-proxy-representation-release-settlement' as const,
+            settlement: representationReleaseSettlement,
+          },
+        ],
       }),
     };
 
-    const held = requireHeld(await runShutdownSequence(harness.ctx));
+    const terminal = requireUnaccepted(await runShutdownSequence(harness.ctx));
 
     expect(stopProviderOperationReconciler).not.toHaveBeenCalled();
-    expect(held.retainedAuthority).toMatchObject({
-      providerControlProxyInstanceIds: [],
-      cleanupObligations: expect.arrayContaining([
-        'provider proxy representation release authority-null',
-        'provider-operation:job-1:operation-1',
+    expect(terminal.undischarged).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({ label: 'provider host drain for handoff' }),
+        expect.objectContaining({ label: 'provider operation mutation drain' }),
       ]),
-    });
-    expect(harness.closeIpcCalled()).toBe(false);
-
-    releasePending = false;
-    settleRepresentationRelease({ kind: 'released' });
-    await expect(held.retry()).resolves.toEqual({ disposition: 'settled' });
-    expect(stopProviderOperationReconciler).toHaveBeenCalledOnce();
+    );
     expect(harness.closeIpcCalled()).toBe(true);
+    settleRepresentationRelease({ kind: 'released' });
+    await flush();
+    expect(stopProviderOperationReconciler).not.toHaveBeenCalled();
   });
 
-  it('names the operator successor for a fatal representation release', async () => {
+  it('names a fatal representation release as a terminal loss without retaining authority', async () => {
     const authorityCalls: string[] = [];
     const set = fakeSet('release-pending', authorityCalls);
     const fatalError = new Error('fatal release remains operator-owned') as never;
@@ -419,7 +429,6 @@ describe('runShutdownSequence drain budget', () => {
       successor,
       operatorDispositionRecording: { kind: 'recorded' as const },
     });
-    let releasePending = true;
     const harness = buildHarness({ providerProxyAuthority: { liveSets: () => [set] } });
     const receipt = {
       kind: 'provider-hosts-quiesced' as const,
@@ -432,53 +441,37 @@ describe('runShutdownSequence drain budget', () => {
       shutdown: async () => receipt,
       cleanupObligations: () => ({
         ...receipt,
-        representationReleaseHolds: releasePending
-          ? [
-              {
-                label: 'provider proxy representation release release-pending',
-                proxyInstanceId: 'release-pending',
-                pendingOperations: ['provider-operation:job-1:operation-1'],
-                disposition: {
-                  kind: 'fatal-successor-pending' as const,
-                  exit: 'provider-proxy-set-operator-abandonment' as const,
-                  error: fatalError,
-                  successor,
-                  operatorDispositionRecording: { kind: 'recorded' as const },
-                },
-                exit: 'provider-proxy-representation-release-settlement' as const,
-                settlement: representationReleaseSettlement,
-              },
-            ]
-          : [],
+        representationReleaseHolds: [
+          {
+            label: 'provider proxy representation release release-pending',
+            proxyInstanceId: 'release-pending',
+            pendingOperations: ['provider-operation:job-1:operation-1'],
+            disposition: {
+              kind: 'fatal-successor-pending' as const,
+              exit: 'provider-proxy-set-operator-abandonment' as const,
+              error: fatalError,
+              successor,
+              operatorDispositionRecording: { kind: 'recorded' as const },
+            },
+            exit: 'provider-proxy-representation-release-settlement' as const,
+            settlement: representationReleaseSettlement,
+          },
+        ],
       }),
     };
 
-    const held = requireHeld(await runShutdownSequence(harness.ctx));
+    const terminal = requireUnaccepted(await runShutdownSequence(harness.ctx));
 
-    expect(held).toMatchObject({
-      exit: 'required-cleanup-capability-confirmation-or-durable-operator-abandonment',
-      retainedAuthority: {
-        providerControlProxyInstanceIds: ['release-pending'],
-        operatorActions: expect.arrayContaining([
-          {
-            kind: 'provider-proxy-set-containment',
-            proxyInstanceId: 'release-pending',
-            inspectCommand: 'coral-cli backend status',
-            actionCommand: 'coral-cli backend provider-proxy-set abandon <set-token>',
-          },
-        ]),
-      },
-    });
-    expect(held.undischarged).toEqual(
+    expect(terminal.undischarged).toEqual(
       expect.arrayContaining([
         expect.objectContaining({
-          error: expect.objectContaining({ message: expect.stringContaining('disposition=fatal-successor-pending') }),
+          settlement: expect.objectContaining({
+            detail: expect.stringContaining('disposition=fatal-successor-pending'),
+          }),
         }),
       ]),
     );
-
-    releasePending = false;
-    await expect(held.retry()).resolves.toEqual({ disposition: 'settled' });
+    expect(harness.closeIpcCalled()).toBe(true);
   });
 
   it('returns a hold within drainTimeout + small slack when an async-cooperative finalizer hangs', async () => {
@@ -541,30 +534,38 @@ describe('runShutdownSequence drain budget', () => {
 
     expect(disposition).toMatchObject({
       disposition: 'delegated',
-      undischarged: [{ label: 'hooks.onShutdown', remainder: { owner: 'process-exit' }, error: expect.any(Error) }],
+      undischarged: [
+        {
+          label: 'hooks.onShutdown',
+          remainder: { owner: 'process-exit' },
+          settlement: { cause: 'rejected', detail: expect.stringContaining('hook unavailable') },
+        },
+      ],
     });
     expect(harness.closeIpcCalled()).toBe(true);
     expect(attempts).toBe(1);
     expect(requestExit).not.toHaveBeenCalled();
   });
 
-  it('retains authority when no process-exit owner accepts a rejected finalizer', async () => {
+  it('releases authority and names the loss when no process-exit owner accepts a rejected finalizer', async () => {
     const harness = buildHarness({
       hooksOnShutdown: async () => {
         throw new Error('hook unavailable');
       },
     });
 
-    const held = requireHeld(await runShutdownSequence(harness.ctx));
+    const terminal = requireUnaccepted(await runShutdownSequence(harness.ctx));
 
-    expect(held.retainedAuthority).toMatchObject({
-      ipcSocket: true,
-      cleanupObligations: ['hooks.onShutdown', 'provider control and IPC authority release'],
-    });
-    expect(harness.closeIpcCalled()).toBe(false);
+    expect(terminal.undischarged).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({ label: 'hooks.onShutdown' }),
+        expect.objectContaining({ label: 'process-exit-remainder-acceptance' }),
+      ]),
+    );
+    expect(harness.closeIpcCalled()).toBe(true);
   });
 
-  it('retains authority when process exit refuses a rejected finalizer', async () => {
+  it('releases authority and names the loss when process exit refuses a rejected finalizer', async () => {
     const harness = buildHarness({
       hooksOnShutdown: async () => {
         throw new Error('hook unavailable');
@@ -572,14 +573,19 @@ describe('runShutdownSequence drain budget', () => {
       acceptProcessExitRemainder: () => ({ kind: 'refused', detail: 'exit owner unavailable' }),
     });
 
-    const held = requireHeld(await runShutdownSequence(harness.ctx));
+    const terminal = requireUnaccepted(await runShutdownSequence(harness.ctx));
 
-    expect(held.retainedAuthority.ipcSocket).toBe(true);
-    expect(harness.closeIpcCalled()).toBe(false);
+    expect(terminal.undischarged).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({ label: 'hooks.onShutdown' }),
+        expect.objectContaining({ label: 'process-exit-remainder-acceptance' }),
+      ]),
+    );
+    expect(harness.closeIpcCalled()).toBe(true);
     expect(harness.logLines).toContain('process-exit remainder acceptance refused: exit owner unavailable\n');
   });
 
-  it('reports recovery teardown timeout and joins its in-flight settlement on retry', async () => {
+  it('reports a recovery teardown timeout without rerunning its in-flight settlement', async () => {
     const harness = buildHarness({ hooksOnShutdown: async () => {} });
     let settleTeardown!: () => void;
     let activeTeardown: Promise<void> | null = null;
@@ -601,14 +607,12 @@ describe('runShutdownSequence drain budget', () => {
     const held = requireHeld(await sequence);
 
     expect(heldFailureDetail(held)).toContain('recovery coordinator teardown: timed-out');
-    expect(held.retainedAuthority.cleanupObligations).toContain('recovery coordinator teardown');
     expect(harness.closeIpcCalled()).toBe(false);
-
-    const retry = held.retry();
-    await flush(64);
     expect(teardownStarts).toBe(1);
     settleTeardown();
-    await expect(retry).resolves.toEqual({ disposition: 'settled' });
+    await flush(64);
+    await expect(held.retry()).resolves.toMatchObject({ disposition: 'unaccepted' });
+    expect(harness.closeIpcCalled()).toBe(true);
     expect(teardownStarts).toBe(1);
   });
 
@@ -634,7 +638,7 @@ describe('runShutdownSequence drain budget', () => {
     expect(harness.closeIpcCalled()).toBe(false);
   });
 
-  it('keeps shutdown held when KB daemon disposal reports an unclosed process', async () => {
+  it('names an unclosed KB daemon as a terminal loss', async () => {
     const harness = buildHarness({ hooksOnShutdown: async () => {} });
     const retryAfter = new Promise<void>(() => undefined);
     harness.ctx.kbDaemonSupervisor = {
@@ -655,14 +659,12 @@ describe('runShutdownSequence drain budget', () => {
       harness.time.tick(100);
       await flush();
     }
-    const held = requireHeld(await sequence);
+    const terminal = requireUnaccepted(await sequence);
 
-    expect(held).toMatchObject({
-      reason: 'kb-daemon-shutdown-unsettled',
-      exit: 'kb-daemon-process-close',
-    });
-    expect(held.retainedAuthority.cleanupObligations).toContain('kb child shutdown');
-    expect(harness.closeIpcCalled()).toBe(false);
+    expect(terminal.undischarged).toEqual(
+      expect.arrayContaining([expect.objectContaining({ label: 'kb child shutdown' })]),
+    );
+    expect(harness.closeIpcCalled()).toBe(true);
   });
 
   it('holds hard shutdown when provider-host containment exceeds the lifecycle deadline', async () => {
@@ -710,7 +712,7 @@ describe('runShutdownSequence drain budget', () => {
     expect(harness.closeIpcCalled()).toBe(false);
   });
 
-  it('reaps cleanup obligations from an independent snapshot after provider-host shutdown rejects', async () => {
+  it('names cleanup obligations from an independent snapshot after provider-host shutdown rejects', async () => {
     const harness = buildHarness({ reason: 'test-teardown', hooksOnShutdown: async () => {} });
     const stopAndReap = vi.fn(async () => ({ disappearanceReceipt: 'gone:retained-proxy' }));
     const retry = vi.fn(async () => ({ kind: 'absence-confirmed' as const, strandedArtifacts: [] }));
@@ -749,26 +751,13 @@ describe('runShutdownSequence drain budget', () => {
       }),
     };
 
-    const held = await runShutdownSequence(harness.ctx);
-    expect(held).toMatchObject({
-      disposition: 'held',
-      reason: 'required-shutdown-step-unsettled',
-      retainedAuthority: {
-        operatorActions: expect.arrayContaining([
-          expect.objectContaining({
-            kind: 'provider-proxy-set-containment',
-            proxyInstanceId: 'retained-proxy',
-          }),
-        ]),
-      },
-    });
+    const terminal = requireUnaccepted(await runShutdownSequence(harness.ctx));
+
+    expect(failureDetail(terminal)).toContain('provider host shutdown: rejected:');
 
     expect(stopAndReap).not.toHaveBeenCalled();
     expect(retry).not.toHaveBeenCalled();
-    if (held.disposition !== 'held') throw new Error('expected held shutdown finalization');
-    await expect(held.retry()).resolves.toEqual({ disposition: 'settled' });
-    expect(stopAndReap).toHaveBeenCalledOnce();
-    expect(retry).toHaveBeenCalledOnce();
+    expect(harness.closeIpcCalled()).toBe(true);
   });
 
   it('releases authority when crash terminalization rejects', async () => {
@@ -823,8 +812,8 @@ describe('runShutdownSequence drain budget', () => {
       undischarged: [
         {
           label: 'crashed job terminalization',
-          remainder: { owner: 'successor-recovery', via: 'startup liveness recovery' },
-          error: expect.objectContaining({ message: 'injected crash terminalization failure' }),
+          remainder: { owner: 'successor-recovery', evidence: { kind: 'startup-liveness-recovery' } },
+          settlement: { cause: 'rejected', detail: expect.stringContaining('injected crash terminalization failure') },
         },
       ],
     });
@@ -847,13 +836,11 @@ describe('runShutdownSequence drain budget', () => {
             owner: 'launch-coordinator',
           };
 
-    const held = requireHeld(await runShutdownSequence(harness.ctx));
+    const terminal = requireUnaccepted(await runShutdownSequence(harness.ctx));
 
     expect(harness.ctx.markJobsAsErrorFn).not.toHaveBeenCalled();
-    expect(heldFailureDetail(held)).toContain('child termination: unconfirmed');
-    expect(held.retainedAuthority.operatorActions).toContainEqual(
-      expect.objectContaining({ kind: 'shutdown-obligation-abandonment' }),
-    );
+    expect(failureDetail(terminal)).toContain('child termination: unconfirmed');
+    expect(harness.closeIpcCalled()).toBe(true);
   });
 
   it('keeps pending launch settlement and registered child termination as separate obligations', async () => {
@@ -910,21 +897,19 @@ describe('runShutdownSequence drain budget', () => {
           };
     };
 
-    const held = requireHeld(await runShutdownSequence(harness.ctx));
+    const terminal = requireUnaccepted(await runShutdownSequence(harness.ctx));
 
     expect(stages).toEqual(['pending-launch-settlement', 'registered-child-termination']);
-    expect(heldFailureDetail(held)).toContain('pending launch settlement: unconfirmed');
-    expect(heldFailureDetail(held)).toContain('child termination: unconfirmed');
-    expect(held.retainedAuthority.cleanupObligations).toEqual(
-      expect.arrayContaining(['pending launch settlement', 'child termination']),
-    );
-    expect(held.retainedAuthority.operatorActions).toEqual(
+    expect(failureDetail(terminal)).toContain('pending launch settlement: unconfirmed');
+    expect(failureDetail(terminal)).toContain('child termination: unconfirmed');
+    expect(terminal.undischarged).toEqual(
       expect.arrayContaining([
-        expect.objectContaining({ kind: 'retained-job-containment', jobId: 'pending-job' }),
-        expect.objectContaining({ kind: 'retained-job-containment', jobId: 'published-job' }),
+        expect.objectContaining({ label: 'pending launch settlement' }),
+        expect.objectContaining({ label: 'child termination' }),
       ]),
     );
     expect(harness.ctx.markJobsAsErrorFn).not.toHaveBeenCalled();
+    expect(harness.closeIpcCalled()).toBe(true);
   });
 
   it('holds hard shutdown and names a durable child that remains alive at the deadline', async () => {
@@ -997,13 +982,10 @@ describe('runShutdownSequence drain budget', () => {
       },
     } as never);
 
-    const held = requireHeld(await runShutdownSequence(harness.ctx));
+    const terminal = requireUnaccepted(await runShutdownSequence(harness.ctx));
     expect(harness.callLog).toContain('discuss.dispose');
-    expect(heldFailureDetail(held)).toContain('child termination:');
-    expect(held.retainedAuthority.operatorActions).toContainEqual(
-      expect.objectContaining({ kind: 'shutdown-obligation-abandonment' }),
-    );
-    expect(harness.closeIpcCalled()).toBe(false);
+    expect(failureDetail(terminal)).toContain('child termination:');
+    expect(harness.closeIpcCalled()).toBe(true);
   });
 
   it('emits a budget-exhausted skip log for finalizers reached after the deadline', async () => {
@@ -1194,9 +1176,10 @@ describe('runShutdownSequence drain budget', () => {
     const ledger = createShutdownSettlementLedger({ budgetMs: 900, time, log: () => {}, pollMs: 50 });
 
     await expect(ledger.run(retrying)).resolves.toMatchObject({ kind: 'declined', cause: 'rejected' });
-    const held = requireHeld(await ledger.gate(boundary));
-    await expect(held.retry()).resolves.toEqual({ disposition: 'settled' });
+    const terminal = requireUnaccepted(await ledger.gate(boundary));
 
+    expect(failureDetail(terminal)).toContain('retrying finalizer: rejected:');
+    expect(attempts).toBe(1);
     expect(wallNow).not.toHaveBeenCalled();
   });
 
@@ -1216,7 +1199,7 @@ describe('runShutdownSequence drain budget', () => {
     );
   });
 
-  it('retains hard-mode IPC and provider control until child cleanup retry confirms absence', async () => {
+  it('releases hard-mode IPC and provider control after naming unresolved child cleanup', async () => {
     const authorityCalls: string[] = [];
     const set = fakeSet('hard-held', authorityCalls);
     const harness = buildHarness({ reason: 'test-teardown', hooksOnShutdown: async () => {} });
@@ -1276,44 +1259,14 @@ describe('runShutdownSequence drain budget', () => {
         : { kind: 'all-children-observed-absent' };
     };
 
-    const held = await runShutdownSequence(harness.ctx);
+    const terminal = requireUnaccepted(await runShutdownSequence(harness.ctx));
 
-    expect(held).toMatchObject({
-      disposition: 'held',
-      reason: 'required-shutdown-step-unsettled',
-      retainedAuthority: {
-        ipcSocket: true,
-        providerControlProxyInstanceIds: ['hard-held'],
-        cleanupObligations: [
-          'child termination',
-          'crashed job terminalization',
-          'provider control and IPC authority release',
-        ],
-        operatorActions: expect.arrayContaining([
-          {
-            kind: 'retained-job-containment',
-            jobId: 'hard-held-job',
-            provider: 'claude',
-            jobDir: '/tmp/coral/jobs/hard-held-job',
-            actionCommand: 'coral-cli abort jobs hard-held-job',
-          },
-          {
-            kind: 'provider-proxy-set-containment',
-            proxyInstanceId: 'hard-held',
-            inspectCommand: 'coral-cli backend status',
-            actionCommand: 'coral-cli backend provider-proxy-set abandon <set-token>',
-          },
-        ]),
-      },
-    });
-    expect(authorityCalls).toEqual(['reap:hard-held']);
-    if (held.disposition !== 'held') throw new Error('expected held shutdown finalization');
-
-    await expect(retryHeldFinalization(held)).resolves.toEqual({ disposition: 'settled' });
+    expect(failureDetail(terminal)).toContain('child termination: unconfirmed:');
+    expect(childCleanupAttempts).toBe(1);
     expect(authorityCalls).toEqual(['reap:hard-held', 'heartbeats:hard-held', 'control:hard-held', 'closeIpc']);
   });
 
-  it('retains handoff IPC and provider control until an identified host cleanup retry settles', async () => {
+  it('releases handoff IPC and provider control after naming a failed host drain', async () => {
     const authorityCalls: string[] = [];
     const set = fakeSet('handoff-held', authorityCalls);
     const harness = buildHarness({ reason: 'replaced', hooksOnShutdown: async () => {} });
@@ -1346,44 +1299,18 @@ describe('runShutdownSequence drain budget', () => {
       authorityCalls.push('closeIpc');
     };
 
-    const held = await runShutdownSequence(harness.ctx);
+    const terminal = requireUnaccepted(await runShutdownSequence(harness.ctx));
 
-    expect(held).toMatchObject({
-      disposition: 'held',
-      reason: 'required-shutdown-step-unsettled',
-      retainedAuthority: {
-        ipcSocket: true,
-        providerControlProxyInstanceIds: ['handoff-held'],
-        cleanupObligations: [
-          'provider host drain for handoff',
-          'provider operation mutation drain',
-          'components disposeAll',
-          'provider control and IPC authority release',
-        ],
-        operatorActions: expect.arrayContaining([
-          {
-            kind: 'provider-proxy-set-containment',
-            proxyInstanceId: 'handoff-held',
-            inspectCommand: 'coral-cli backend status',
-            actionCommand: 'coral-cli backend provider-proxy-set abandon <set-token>',
-          },
-        ]),
-      },
-    });
-    expect(authorityCalls).toEqual([]);
-    if (held.disposition !== 'held') throw new Error('expected held shutdown finalization');
-
-    await expect(retryHeldFinalization(held)).resolves.toEqual({ disposition: 'settled' });
+    expect(failureDetail(terminal)).toContain('provider host drain for handoff: rejected:');
+    expect(drainAttempts).toBe(1);
     expect(authorityCalls).toEqual(['heartbeats:handoff-held', 'control:handoff-held', 'closeIpc']);
   });
 
-  it('durably abandons a declined app-server quiesce through its exact recovery action', async () => {
+  it('names declined app-server quiescence and releases authority without an operator action', async () => {
     const authorityCalls: string[] = [];
-    let abandoned = false;
     const harness = buildHarness({
       reason: 'replaced',
       hooksOnShutdown: async () => {},
-      isShutdownObligationAbandoned: (subject) => abandoned && subject === 'app-server-handoff-quiesce',
     });
     harness.ctx.handoffQuiescePorts = () => [
       { quiesceAppServerJobsForHandoff: async () => Promise.reject(new Error('quiescence unavailable')) },
@@ -1392,20 +1319,10 @@ describe('runShutdownSequence drain budget', () => {
       authorityCalls.push('closeIpc');
     };
 
-    const held = requireHeld(await runShutdownSequence(harness.ctx));
-    expect(heldFailureDetail(held)).toContain(
+    const terminal = requireUnaccepted(await runShutdownSequence(harness.ctx));
+    expect(failureDetail(terminal)).toContain(
       'app-server handoff quiesce: unconfirmed: port 1: Error: quiescence unavailable',
     );
-    expect(held.retainedAuthority.operatorActions).toContainEqual({
-      kind: 'shutdown-obligation-abandonment',
-      subject: 'app-server-handoff-quiesce',
-      inspectCommand: 'coral-cli backend shutdown-recovery status',
-      actionCommand: 'coral-cli backend shutdown-recovery abandon app-server-handoff-quiesce',
-    });
-    expect(authorityCalls).toEqual([]);
-
-    abandoned = true;
-    await expect(held.retry()).resolves.toEqual({ disposition: 'settled' });
     expect(authorityCalls).toEqual(['closeIpc']);
   });
 
@@ -1485,7 +1402,7 @@ describe('runShutdownSequence drain budget', () => {
     expect(harness.callLog.filter((call) => call === 'lifecycleReactor.dispose')).toHaveLength(1);
   });
 
-  it('snapshots and retries handoff cleanup obligations after drain failure', async () => {
+  it('snapshots handoff cleanup obligations as named losses after drain failure', async () => {
     const authorityCalls: string[] = [];
     const retainedSet = fakeSet('handoff-drain-held', authorityCalls);
     const retryAcquisition = vi.fn(async () => ({ kind: 'absence-confirmed' as const, strandedArtifacts: [] }));
@@ -1526,34 +1443,16 @@ describe('runShutdownSequence drain budget', () => {
       authorityCalls.push('closeIpc');
     };
 
-    const held = await runShutdownSequence(harness.ctx);
+    const terminal = requireUnaccepted(await runShutdownSequence(harness.ctx));
 
-    expect(held).toMatchObject({
-      disposition: 'held',
-      retainedAuthority: {
-        ipcSocket: true,
-        providerControlProxyInstanceIds: ['handoff-drain-held'],
-        cleanupObligations: [
-          'provider host drain for handoff',
-          'provider acquisition pending-handoff-acquisition',
-          'provider operation mutation drain',
-          'components disposeAll',
-          'provider control and IPC authority release',
-        ],
-      },
-    });
+    expect(failureDetail(terminal)).toContain('provider host drain for handoff: rejected:');
     expect(retryAcquisition).not.toHaveBeenCalled();
-    expect(authorityCalls).toEqual([]);
-    if (held.disposition !== 'held') throw new Error('expected held shutdown finalization');
-
-    await expect(held.retry()).resolves.toEqual({ disposition: 'settled' });
-    expect(retryAcquisition).toHaveBeenCalledOnce();
     expect(authorityCalls).toEqual(['heartbeats:handoff-drain-held', 'control:handoff-drain-held', 'closeIpc']);
   });
 });
 
 describe('settlement ledger exit gate', () => {
-  it('joins a timed-out non-abort-aware obligation before retrying it', async () => {
+  it('does not rerun a timed-out non-abort-aware obligation', async () => {
     const time = new VirtualTime();
     let settleTask!: (confirmation: { confirmed: true }) => void;
     const taskSettlement = new Promise<{ confirmed: true }>((resolve) => {
@@ -1580,16 +1479,16 @@ describe('settlement ledger exit gate', () => {
     time.tick(100);
     await expect(initial).resolves.toMatchObject({ kind: 'declined', cause: 'timed-out' });
     const held = requireHeld(await ledger.gate(authorityRelease));
+    const terminal = requireUnaccepted(await held.retry());
 
-    const retry = held.retry();
-    await flush();
     expect(task).toHaveBeenCalledOnce();
+    expect(failureDetail(terminal)).toContain('deferred finalizer: timed-out: exceeded 100ms');
     settleTask({ confirmed: true });
-    await expect(retry).resolves.toEqual({ disposition: 'settled' });
+    await flush();
     expect(task).toHaveBeenCalledOnce();
   });
 
-  it('prepares authority release before process-exit remainder acceptance', async () => {
+  it('prepares and commits authority release before reporting an unaccepted remainder', async () => {
     const time = new VirtualTime();
     const authorityPreparationTask = vi.fn(async () => ({ confirmed: true as const, token: {} }));
     const authorityReleaseTask = vi.fn(async () => ({ confirmed: true as const }));
@@ -1610,18 +1509,14 @@ describe('settlement ledger exit gate', () => {
     const ledger = createShutdownSettlementLedger({ budgetMs: 1_000, time, log: () => {}, pollMs: 50 });
 
     await expect(ledger.run(blocked)).resolves.toMatchObject({ kind: 'declined', cause: 'rejected' });
-    const held = requireHeld(await ledger.gate(authorityRelease));
+    const terminal = requireUnaccepted(await ledger.gate(authorityRelease));
 
     expect(authorityPreparationTask).toHaveBeenCalledOnce();
-    expect(authorityReleaseTask).not.toHaveBeenCalled();
-    expect(held.retainedAuthority).toMatchObject({
-      ipcSocket: true,
-      cleanupObligations: ['commit-started finalization', 'authority release'],
-      operatorActions: [],
-    });
+    expect(authorityReleaseTask).toHaveBeenCalledOnce();
+    expect(failureDetail(terminal)).toContain('commit-started recovery finalization: rejected:');
   });
 
-  it('gives every retry its own budget before transferring the exact final process-exit remainder', async () => {
+  it('retries only the boundary before transferring the exact final process-exit remainder', async () => {
     const time = new VirtualTime();
     const retryOrder: string[] = [];
     const hangingTask = vi.fn(() => {
@@ -1686,22 +1581,24 @@ describe('settlement ledger exit gate', () => {
     expect(laterTask).not.toHaveBeenCalled();
     expect(authorityPrepareTask).toHaveBeenCalledOnce();
     expect(hangingTask).toHaveBeenCalledOnce();
-    expect(authorityReleaseTask).not.toHaveBeenCalled();
-    expect(retryOrder).toEqual(['prepare']);
-    time.tick(225);
+    expect(authorityReleaseTask).toHaveBeenCalledOnce();
+    expect(retryOrder).toEqual(['prepare', 'accept', 'commit']);
     const retried = await retry;
 
     expect(retried).toMatchObject({
       disposition: 'delegated',
-      undischarged: [{ label: 'process-exit finalizer', remainder: { owner: 'process-exit' } }],
+      undischarged: expect.arrayContaining([
+        expect.objectContaining({ label: 'process-exit finalizer', remainder: { owner: 'process-exit' } }),
+        expect.objectContaining({ label: 'later finalizer', remainder: { owner: 'process-exit' } }),
+      ]),
     });
     if (retried.disposition !== 'delegated') throw new Error('expected delegated shutdown');
-    expect(laterTask).toHaveBeenCalledOnce();
+    expect(laterTask).not.toHaveBeenCalled();
     expect(authorityReleaseTask).toHaveBeenCalledOnce();
     expect(retried.acceptance.remainder).toBe(offeredRemainder);
     expect(retried.undischarged).toBe(retried.acceptance.remainder.undischarged);
-    expect(retried.undischarged[0]?.error).toEqual(expect.objectContaining({ message: 'timed-out: exceeded 225ms' }));
-    expect(retryOrder).toEqual(['prepare', 'later', 'accept', 'commit']);
+    expect(retried.undischarged[0]?.settlement).toEqual({ cause: 'timed-out', detail: 'exceeded 900ms' });
+    expect(retryOrder).toEqual(['prepare', 'accept', 'commit']);
     expect(requestExit).not.toHaveBeenCalled();
   });
 
@@ -1812,7 +1709,7 @@ describe('settlement ledger exit gate', () => {
     expect(commit).not.toHaveBeenCalled();
   });
 
-  it('retains authority when acceptance names a different remainder', async () => {
+  it('names an acceptance identity mismatch and still releases authority', async () => {
     const time = new VirtualTime();
     const logLines: string[] = [];
     const obligation: ShutdownObligation = {
@@ -1821,9 +1718,9 @@ describe('settlement ledger exit gate', () => {
         throw new Error('successor not accepted');
       },
       retainedAuthority: () => ({ cleanupObligations: ['startup recovery handoff'] }),
-      remainder: { owner: 'successor-recovery', via: 'startup recovery' },
+      remainder: { owner: 'successor-recovery', evidence: { kind: 'startup-store-recovery' } },
     };
-    const commit = vi.fn<ShutdownAuthorityReleaseBoundary['commit']>();
+    const commit = vi.fn<ShutdownAuthorityReleaseBoundary['commit']>(async () => ({ confirmed: true }));
     const boundary: ShutdownAuthorityReleaseBoundary = {
       label: 'authority release',
       prepare: () => Promise.resolve({ confirmed: true, token: {} }),
@@ -1843,19 +1740,22 @@ describe('settlement ledger exit gate', () => {
     });
 
     await ledger.run(obligation);
-    const held = requireHeld(await ledger.gate(boundary));
+    const terminal = requireUnaccepted(await ledger.gate(boundary));
 
-    expect(held.undischarged).toEqual([
-      expect.objectContaining({
-        label: 'startup recovery handoff',
-        remainder: { owner: 'successor-recovery', via: 'startup recovery' },
-      }),
-    ]);
-    expect(commit).not.toHaveBeenCalled();
+    expect(terminal.undischarged).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          label: 'startup recovery handoff',
+          remainder: { owner: 'successor-recovery', evidence: { kind: 'startup-store-recovery' } },
+        }),
+        expect.objectContaining({ label: 'process-exit-remainder-acceptance' }),
+      ]),
+    );
+    expect(commit).toHaveBeenCalledOnce();
     expect(logLines).toContain('process-exit remainder acceptance did not identify the offered remainder\n');
   });
 
-  it('settles a clean boundary retry after offering every empty remainder set', async () => {
+  it('settles a clean boundary retry after offering the empty remainder set once', async () => {
     const time = new VirtualTime();
     const commit = vi
       .fn<ShutdownAuthorityReleaseBoundary['commit']>()
@@ -1883,8 +1783,8 @@ describe('settlement ledger exit gate', () => {
     const held = requireHeld(await ledger.gate(boundary));
 
     await expect(held.retry()).resolves.toEqual({ disposition: 'settled' });
-    expect(accept).toHaveBeenCalledTimes(2);
-    expect(offeredRemainders).toEqual([{ undischarged: [] }, { undischarged: [] }]);
+    expect(accept).toHaveBeenCalledOnce();
+    expect(offeredRemainders).toEqual([{ undischarged: [] }]);
     expect(commit).toHaveBeenCalledTimes(2);
   });
 
@@ -1902,7 +1802,7 @@ describe('settlement ledger exit gate', () => {
         throw new Error('successor not accepted');
       },
       retainedAuthority: () => ({ cleanupObligations: ['startup recovery handoff'] }),
-      remainder: { owner: 'successor-recovery', via: 'startup recovery' },
+      remainder: { owner: 'successor-recovery', evidence: { kind: 'startup-store-recovery' } },
     };
     const authorityRelease: ShutdownAuthorityReleaseBoundary = {
       label: 'authority release',
@@ -1931,8 +1831,8 @@ describe('settlement ledger exit gate', () => {
       undischarged: [
         {
           label: 'startup recovery handoff',
-          remainder: { owner: 'successor-recovery', via: 'startup recovery' },
-          error: expect.objectContaining({ message: 'successor not accepted' }),
+          remainder: { owner: 'successor-recovery', evidence: { kind: 'startup-store-recovery' } },
+          settlement: { cause: 'rejected', detail: expect.stringContaining('successor not accepted') },
         },
       ],
     });
@@ -2094,7 +1994,9 @@ function registryOf(sets: readonly ProviderProxySetAuthority[]): ProviderProxyAu
 }
 
 async function shutdownFailureDetail(ctx: Parameters<typeof runShutdownSequence>[0]): Promise<string> {
-  return heldFailureDetail(requireHeld(await runShutdownSequence(ctx)));
+  const disposition = await runShutdownSequence(ctx);
+  if (disposition.disposition === 'settled') throw new Error('expected shutdown losses');
+  return failureDetail(disposition);
 }
 
 describe('required provider-proxy shutdown steps', () => {
@@ -2268,7 +2170,7 @@ describe('required provider-proxy shutdown steps', () => {
     ]);
   });
 
-  it('holds the shutdown when a reap completes without confirming disappearance', async () => {
+  it('names the loss when a reap completes without confirming disappearance', async () => {
     const callLog: CallLog = [];
     const harness = buildHarness({
       reason: 'test-teardown',
@@ -2280,14 +2182,12 @@ describe('required provider-proxy shutdown steps', () => {
 
     // "The reap RPC returned" is not "the containment is gone"; reporting clean success here would leave a
     // live provider carrier behind a shutdown that claimed to have removed it.
-    const held = requireHeld(await runShutdownSequence(harness.ctx));
-    expect(heldFailureDetail(held)).toMatch(/unconfirmed: p1: a recorded root is still alive/u);
-    expect(held.retainedAuthority.operatorActions).toContainEqual(
-      expect.objectContaining({ kind: 'provider-proxy-set-containment', proxyInstanceId: 'p1' }),
-    );
+    const terminal = requireUnaccepted(await runShutdownSequence(harness.ctx));
+    expect(failureDetail(terminal)).toMatch(/unconfirmed: p1: a recorded root is still alive/u);
+    expect(harness.closeIpcCalled()).toBe(true);
   });
 
-  it('holds with an operator action when a reap rejects, then retries the declined row', async () => {
+  it('names a rejected reap without retrying the declined row', async () => {
     const callLog: CallLog = [];
     let reapAttempts = 0;
     const harness = buildHarness({
@@ -2305,14 +2205,11 @@ describe('required provider-proxy shutdown steps', () => {
       ]),
     });
 
-    const held = requireHeld(await runShutdownSequence(harness.ctx));
-    expect(heldFailureDetail(held)).toMatch(/p1: .*signal refused/u);
-    expect(held.retainedAuthority.operatorActions).toContainEqual(
-      expect.objectContaining({ kind: 'provider-proxy-set-containment', proxyInstanceId: 'p1' }),
-    );
+    const terminal = requireUnaccepted(await runShutdownSequence(harness.ctx));
+    expect(failureDetail(terminal)).toMatch(/p1: .*signal refused/u);
     expect(callLog).toContain('reap:p2');
-    await expect(held.retry()).resolves.toEqual({ disposition: 'settled' });
-    expect(reapAttempts).toBe(2);
+    expect(reapAttempts).toBe(1);
+    expect(harness.closeIpcCalled()).toBe(true);
   });
 
   it('retains the IPC socket when provider control cannot be released', async () => {
@@ -2378,26 +2275,53 @@ describe('required provider-proxy shutdown steps', () => {
   });
 
   it('exhausts a never-settling control close through the production lifecycle continuation', async () => {
-    const initiateControlClose = vi.fn(() => new Promise<never>(() => {}));
+    const finalizationOrder: string[] = [];
+    const initiateControlClose = vi.fn(() => {
+      finalizationOrder.push('boundary');
+      return new Promise<never>(() => {});
+    });
     const authority = registryOf([fakeSet('hung-control', [], { initiateControlClose })]);
     const harness = buildHarness({ hooksOnShutdown: async () => {}, providerProxyAuthority: authority });
+    const remainderDocuments: string[] = [];
+    let remainderDocument: string | null = null;
+    const lifecycleRuntime = {
+      ...harness.runtime,
+      storage: {
+        ...harness.runtime.storage,
+        existsSync: () => remainderDocument !== null,
+        readFileSync: () => {
+          if (remainderDocument === null) throw new Error('remainder document is absent');
+          return remainderDocument;
+        },
+        writeAtomicDurableSync: (_path: string, data: string) => {
+          finalizationOrder.push('record');
+          remainderDocument = data;
+          remainderDocuments.push(data);
+          return true;
+        },
+      },
+    } as Runtime;
     let lifecycle: 'running' | 'draining' | 'stopped' = 'running';
     const runtimeState = {
       ...harness.ctx.runtimeState,
       getLifecycle: () => lifecycle,
       setLifecycle: (next: typeof lifecycle) => {
         lifecycle = next;
+        if (next === 'stopped') finalizationOrder.push('stopped');
       },
     };
-    const onStopped = vi.fn();
+    const onStopped = vi.fn((exitCode: number) => {
+      finalizationOrder.push(`exit:${exitCode}`);
+    });
+    const logLines: string[] = [];
     const controller = createLifecycle(
       {
         identity: {
           pluginRoot: '/plugin',
           instanceId: 'boundary-exhaustion',
-          log: () => {},
+          log: (message: string) => logLines.push(message),
         },
-        runtime: harness.runtime,
+        runtime: lifecycleRuntime,
         storeFormat: {},
         backendPid: 4_242,
         runtimeState,
@@ -2421,7 +2345,10 @@ describe('required provider-proxy shutdown steps', () => {
           throw new Error('unexpected discuss context lookup');
         },
         writeBackendInfoFn: () => {},
-        removeBackendInfoIfOwnerFn: () => {},
+        removeBackendInfoIfOwnerFn: () => {
+          finalizationOrder.push('withdraw');
+          return { kind: 'refused', detail: 'discovery read denied' };
+        },
         cleanupStaleJobsFn: () => {},
         markJobsAsErrorFn: harness.ctx.markJobsAsErrorFn,
         terminateAllFn: harness.ctx.terminateAllFn,
@@ -2453,11 +2380,17 @@ describe('required provider-proxy shutdown steps', () => {
     await flush(64);
     const held = await initial;
     expect(isLifecycleShutdownTerminal(held)).toBe(false);
+    if (isLifecycleShutdownTerminal(held)) throw new Error('expected the initial boundary attempt to remain held');
+    expect(held.recovery.automaticRetry).toEqual({ status: 'scheduled', attemptsStarted: 1, attemptLimit: 3 });
 
     harness.time.tick(50);
     await flush(64);
     harness.time.tick(HANDOFF_DRAIN_TIMEOUT_MS / 2);
     await flush(64);
+    const second = await controller.waitForShutdown();
+    expect(isLifecycleShutdownTerminal(second)).toBe(false);
+    if (isLifecycleShutdownTerminal(second)) throw new Error('expected the second boundary attempt to remain held');
+    expect(second.recovery.automaticRetry).toEqual({ status: 'scheduled', attemptsStarted: 2, attemptLimit: 3 });
     harness.time.tick(50);
     await flush(64);
     harness.time.tick(HANDOFF_DRAIN_TIMEOUT_MS / 2);
@@ -2471,11 +2404,28 @@ describe('required provider-proxy shutdown steps', () => {
           label: 'provider control and IPC authority release',
           remainder: { owner: 'process-exit' },
         }),
+        expect.objectContaining({
+          label: 'backend discovery withdrawal',
+          remainder: { owner: 'process-exit' },
+        }),
       ]),
     });
     expect(initiateControlClose).toHaveBeenCalledOnce();
     expect(onStopped).toHaveBeenCalledWith(1);
     expect(lifecycle).toBe('stopped');
+    expect(finalizationOrder).toEqual(['boundary', 'stopped', 'record', 'withdraw', 'record', 'exit:1']);
+    expect(remainderDocuments).toHaveLength(2);
+    const rewritten = JSON.parse(remainderDocuments[1] ?? '{}') as {
+      records?: Array<{ instanceId?: string; exitCode?: number; entries?: Array<{ label?: string }> }>;
+    };
+    expect(rewritten.records).toEqual([
+      expect.objectContaining({
+        instanceId: 'boundary-exhaustion',
+        exitCode: 1,
+        entries: expect.arrayContaining([expect.objectContaining({ label: 'backend discovery withdrawal' })]),
+      }),
+    ]);
+    expect(logLines).toContain('backend discovery withdrawal refused (discovery read denied)\n');
   });
 
   it('stops every heartbeat before initiating any close', async () => {

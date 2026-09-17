@@ -1,4 +1,5 @@
 import { formatError } from '../infra/error-format.js';
+import type { ProcessIncarnation } from '../infra/node-process.js';
 import type { TimePort } from '../infra/port-types.js';
 import {
   SettlementLedger,
@@ -12,9 +13,19 @@ import {
 } from '../obligation/settlement.js';
 import type { ShutdownObligationSubject } from '../obligation/shutdown-abandonment.js';
 
+export type SuccessorRecoveryEvidence =
+  | Readonly<{
+      kind: 'durable-cli-runtime';
+      jobId: string;
+      pid: number;
+      leaderIncarnation: ProcessIncarnation;
+    }>
+  | Readonly<{ kind: 'startup-store-recovery' }>
+  | Readonly<{ kind: 'startup-liveness-recovery' }>;
+
 export type UndischargedRemainder =
   | Readonly<{ owner: 'process-exit' }>
-  | Readonly<{ owner: 'successor-recovery'; via: string }>;
+  | Readonly<{ owner: 'successor-recovery'; evidence: SuccessorRecoveryEvidence }>;
 
 export type ShutdownHoldReason =
   | 'kb-daemon-shutdown-unsettled'
@@ -66,7 +77,7 @@ export type ShutdownRetainedAuthority = Readonly<{
 export type ShutdownUndischarged = Readonly<{
   label: string;
   remainder: UndischargedRemainder;
-  error: unknown;
+  settlement: Readonly<Pick<Extract<Settlement, { kind: 'declined' }>, 'cause' | 'detail'>>;
 }>;
 
 export type ProcessExitRemainder = Readonly<{
@@ -174,7 +185,7 @@ function declinedFailure(
   return {
     label,
     remainder,
-    error: settlement.error ?? new Error(`${settlement.cause}: ${settlement.detail}`),
+    settlement: { cause: settlement.cause, detail: settlement.detail },
   };
 }
 

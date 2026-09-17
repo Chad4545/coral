@@ -415,19 +415,19 @@ async function stopLifecycleController(
     }
   }
 
-  if (disposition.disposition === 'held' && disposition.recovery.automaticRetry.status === 'scheduled') {
+  if (disposition.disposition === 'held') {
     try {
       await vi.waitFor(
         async () => {
           disposition = await controller.waitForShutdown();
-          if (disposition.disposition === 'held' && disposition.recovery.automaticRetry.status === 'scheduled') {
+          if (disposition.disposition === 'held') {
             throw new Error('automatic cleanup is still scheduled');
           }
         },
         { timeout: 5_000 },
       );
     } catch (error: unknown) {
-      throw new Error('Automatic lifecycle cleanup did not reach finalized or waiting-for-operator within 5s.', {
+      throw new Error('Automatic lifecycle cleanup did not reach a terminal disposition within 5s.', {
         cause: error,
       });
     }
