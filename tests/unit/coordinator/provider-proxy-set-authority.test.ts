@@ -8,6 +8,7 @@ import { join } from 'node:path';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 
 import { buildGuardianSpawnUndo } from '#src/coordinator/live/provider-proxy/spawn-undo.js';
+import { ProviderHostOwnerTornDown } from '#src/coordinator/services/provider-host-administration.js';
 import {
   createProviderProxySetAuthority,
   type ProviderProxySetAuthorityDependencies,
@@ -286,7 +287,6 @@ describe('createProviderProxySetAuthority: RPC response validation', () => {
       close: () => {},
     };
     const controls = authorityWithProxyClient(proxyClient).providerHosts;
-    if (controls === undefined) throw new Error('provider-host controls were not composed');
 
     await expect(controls.list()).rejects.toThrow(/Work directory must be absolute and normalized/u);
   });
@@ -324,7 +324,6 @@ describe('createProviderProxySetAuthority: RPC response validation', () => {
       close: () => {},
     };
     const controls = authorityWithProxyClient(proxyClient).providerHosts;
-    if (controls === undefined) throw new Error('provider-host controls were not composed');
 
     await expect(controls.list()).resolves.toEqual([]);
     await expect(
@@ -350,6 +349,47 @@ describe('createProviderProxySetAuthority: RPC response validation', () => {
       'provider-host.evict.v2',
     ]);
   });
+
+  it.each(['list', 'inspect'] as const)(
+    'never sends the legacy %s after control is released under the current method-absent reply',
+    async (route) => {
+      const methods: string[] = [];
+      const failure = {
+        kind: 'json-rpc-error' as const,
+        jsonRpcCode: -32_601,
+        protocolCode: 'method_not_found' as const,
+        admissionReason: null,
+        heartbeatRefusal: null,
+      };
+      let releaseControl: (() => Promise<void>) | null = null;
+      const proxyClient: ControlClient = {
+        exchange: async (method) => {
+          methods.push(method);
+          const error = new ControlClientError('control_call_failed', 'method not found', 'remote-response', failure);
+          await releaseControl?.();
+          return controlExchangeForTest({ kind: 'response', response: { kind: 'refusal', failure, error } });
+        },
+        faulted: new Promise<never>(() => undefined),
+        onFault: () => () => undefined,
+        close: () => {},
+      };
+      const authority = authorityWithProxyClient(proxyClient);
+      releaseControl = () => authority.initiateControlClose();
+
+      const call =
+        route === 'list'
+          ? authority.providerHosts.list()
+          : authority.providerHosts.inspect({
+              provider: 'codex',
+              fingerprint: 'a'.repeat(64),
+              instanceId: 'host',
+              leaseMode: 'shared',
+            });
+
+      await expect(call).rejects.toBeInstanceOf(ProviderHostOwnerTornDown);
+      expect(methods).toEqual([`provider-host.${route}.v2`]);
+    },
+  );
 });
 
 describe('createProviderProxySetAuthority: commitContainment', () => {

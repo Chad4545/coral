@@ -2,6 +2,10 @@ import { describe, expect, it } from 'vitest';
 
 import { shutdownObligationAbandonMethod } from '#src/obligation/shutdown-abandonment.js';
 import {
+  providerHostEvictRpcSpec,
+  providerHostInspectRpcSpec,
+  providerHostListRpcSpec,
+  providerHostListV2RpcSpec,
   providerProxySetContainBooleanRpcSpec,
   providerProxySetContainRpcSpec,
   jobsAbortRpcSpec,
@@ -23,22 +27,22 @@ describe('operational catalog IPC lifecycle admission', () => {
     jobsAbortRpcSpec.name,
     providerProxySetContainRpcSpec.name,
     providerProxySetContainBooleanRpcSpec.name,
+    providerHostListRpcSpec.name,
+    providerHostListV2RpcSpec.name,
+    providerHostInspectRpcSpec.name,
+    providerHostEvictRpcSpec.name,
     shutdownObligationAbandonMethod,
     'transport.health',
   ])('admits %s while the coordinator drains', (method) => {
     expect(ipcRouteLifecycleAdmission(method)).toBe('running-or-draining');
   });
 
-  it.each([
-    'jobs.list',
-    'sessions.create',
-    'transport.kb.restart',
-    // Absent from the operational catalog, so unknown to this lookup.
-    'coordinator.provider_host.evict',
-    'no.such.method',
-  ])('requires a running coordinator for %s', (method) => {
-    expect(ipcRouteLifecycleAdmission(method)).toBe('running');
-  });
+  it.each(['jobs.list', 'sessions.create', 'transport.kb.restart', 'no.such.method'])(
+    'requires a running coordinator for %s',
+    (method) => {
+      expect(ipcRouteLifecycleAdmission(method)).toBe('running');
+    },
+  );
 
   it('derives admission from requiresRunningLifecycle for every IPC operational spec', () => {
     const mismatched = ipcSpecs.filter(
@@ -59,6 +63,16 @@ describe('operational catalog IPC refusal disposition', () => {
       expect(ipcRouteRefusalDisposition(method)).toBe('spawn-successor');
     },
   );
+
+  it.each([
+    providerHostListRpcSpec.name,
+    providerHostListV2RpcSpec.name,
+    providerHostInspectRpcSpec.name,
+    providerHostEvictRpcSpec.name,
+  ])('reports the refusal for %s, which no successor could discharge', (method) => {
+    expect(readIpcOperationalSpec(method)?.dispatch.kind).toBe('catalog');
+    expect(ipcRouteRefusalDisposition(method)).toBe('report-refusal');
+  });
 
   it.each([shutdownObligationAbandonMethod, 'transport.health', 'jobs.list', 'no.such.method'])(
     'reports the refusal for %s, which no catalog dispatch admits',

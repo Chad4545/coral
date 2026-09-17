@@ -14,7 +14,7 @@ import type { HostRef } from '../../providers/host-inventory-schema.js';
 import type {
   ProviderHostEvictResponse,
   ProviderHostInspectResponse,
-  ProviderHostListResponse,
+  ProviderHostListV2Response,
   ProviderProxySetContainBooleanRequest,
   ProviderProxySetContainBooleanResponse,
   ProviderProxySetContainRequest,
@@ -69,7 +69,7 @@ export interface RecoveryQuarantineRequestPort {
 }
 
 export interface ProviderHostRequestPort {
-  list(): Promise<ProviderHostListResponse>;
+  list(): Promise<ProviderHostListV2Response>;
   inspect(
     selector: Readonly<{ hostRef: HostRef }> | Readonly<{ workDir: CanonicalWorkDir }>,
   ): Promise<ProviderHostInspectResponse>;

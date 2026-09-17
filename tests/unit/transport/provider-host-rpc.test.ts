@@ -10,10 +10,12 @@ import { encodeHostRef } from '#src/providers/host-ref-codec.js';
 import type { HostRef } from '#src/providers/contract.js';
 import { canonicalizeWorkDir } from '#src/runtime/canonical-work-dir.js';
 import { executeCatalogRequest } from '#src/transport/dispatch.js';
+import { coordinatorHttpRoutes } from '#src/transport/http/handler.js';
 import {
   providerHostEvictRpcSpec,
   providerHostInspectRpcSpec,
   providerHostListRpcSpec,
+  providerHostListV2RpcSpec,
 } from '#src/transport/rpc/catalog.js';
 import type { HttpHandlerPorts } from '#src/transport/server-ports.js';
 
@@ -105,6 +107,25 @@ describe('provider-host RPC authorization', () => {
     expect(providerHostEvictRpcSpec.requires).toBe('system:shutdown');
   });
 
+  it('projects each list generation onto its own HTTP route, and only v2 can carry a torn-down owner', () => {
+    expect(coordinatorHttpRoutes).toContainEqual({
+      method: 'GET',
+      path: '/coordinator/provider-hosts',
+      spec: providerHostListRpcSpec,
+    });
+    expect(coordinatorHttpRoutes).toContainEqual({
+      method: 'GET',
+      path: '/coordinator/provider-hosts/v2',
+      spec: providerHostListV2RpcSpec,
+    });
+    expect(providerHostListV2RpcSpec.requires).toBe(providerHostListRpcSpec.requires);
+    expect(
+      providerHostListV2RpcSpec.responseSchema.parse({ hosts: [], tornDownOwnerIds: ['provider-proxy:set-a'] }),
+    ).toEqual({ hosts: [], tornDownOwnerIds: ['provider-proxy:set-a'] });
+    expect(providerHostListRpcSpec.responseSchema.safeParse({ hosts: [], tornDownOwnerIds: [] }).success).toBe(false);
+    expect(providerHostListV2RpcSpec.responseSchema.safeParse({ hosts: [] }).success).toBe(false);
+  });
+
   it.each([
     ['inspect', providerHostInspectRpcSpec, 'inspect'],
     ['evict', providerHostEvictRpcSpec, 'evict'],
@@ -183,6 +204,10 @@ describe('provider-host RPC authorization', () => {
     [
       'provider_host_stale',
       'Rerun `coral-cli backend provider-host list` and act only on a currently listed reference.',
+    ],
+    [
+      'provider_host_owner_torn_down',
+      'Run `coral-cli backend status`. If the coordinator is draining, its successor re-establishes control; retry there once it serves. If the drain is held on the control release, end it with `coral-cli backend shutdown-recovery abandon provider-control-and-ipc-authority-release`. If it is not draining, `coral-cli backend status` reports the released set under its own token; resolve it with `coral-cli backend provider-proxy-set contain <set-token>` or `coral-cli backend provider-proxy-set abandon <set-token>`, or retry the original command once succession completes.',
     ],
   ] as const)('returns actionable remediation for %s', async (code, remediation) => {
     const inspect = vi.fn(async () => {
@@ -339,12 +364,107 @@ describe('provider-host RPC authorization', () => {
       ownerId: 'proxy-a',
     };
     const ports = {
-      providerHosts: { list: vi.fn(async () => ({ hosts: [record] })), inspect: vi.fn(), evict: vi.fn() },
+      providerHosts: {
+        list: vi.fn(async () => ({ hosts: [record], tornDownOwnerIds: [] })),
+        inspect: vi.fn(),
+        evict: vi.fn(),
+      },
     } as unknown as HttpHandlerPorts;
 
     await expect(executeCatalogRequest(providerHostListRpcSpec, {}, ports, operator)).resolves.toMatchObject({
       kind: 'unary',
       body: { hosts: [record] },
+    });
+  });
+
+  it('refuses an eviction whose owner released administration control without deciding the host', async () => {
+    const ref: HostRef = {
+      provider: 'codex',
+      fingerprint: 'c'.repeat(64),
+      instanceId: 'torn-down-host',
+      leaseMode: 'shared',
+    };
+    const encodedRef = encodeHostRef(ref);
+    const evict = vi.fn(async () => {
+      throw Object.assign(new Error('provider_host_owner_torn_down'), {
+        code: 'provider_host_owner_torn_down',
+        ownerIds: ['provider-proxy:set-a'],
+        matches: [ref],
+      });
+    });
+    const ports = { providerHosts: { list: vi.fn(), inspect: vi.fn(), evict } } as unknown as HttpHandlerPorts;
+
+    await expect(
+      executeCatalogRequest(providerHostEvictRpcSpec, { hostRef: ref }, ports, operator),
+    ).resolves.toMatchObject({
+      kind: 'unary',
+      statusCode: 503,
+      body: {
+        code: 'provider_host_owner_torn_down',
+        message: `This coordinator has released administration control of provider-proxy:set-a and can no longer ask them, so it cannot say whether ${encodedRef} exists there.`,
+        detail: { ownerIds: ['provider-proxy:set-a'], hostRefs: [encodedRef] },
+      },
+    });
+  });
+
+  it('names the work directory, never a placeholder, when a selector resolves on no owner that answered', async () => {
+    const inspect = vi.fn(async () => {
+      throw Object.assign(new Error('provider_host_owner_torn_down'), {
+        code: 'provider_host_owner_torn_down',
+        ownerIds: ['provider-proxy:set-a'],
+        matches: [],
+        workDir: process.cwd(),
+      });
+    });
+    const ports = { providerHosts: { list: vi.fn(), inspect, evict: vi.fn() } } as unknown as HttpHandlerPorts;
+
+    const answered = await executeCatalogRequest(
+      providerHostInspectRpcSpec,
+      { workDir: '.', projectRoot: process.cwd() },
+      ports,
+      operator,
+    );
+    expect(answered).toMatchObject({
+      kind: 'unary',
+      statusCode: 503,
+      body: {
+        code: 'provider_host_owner_torn_down',
+        message: `This coordinator has released administration control of provider-proxy:set-a and can no longer ask them, so it cannot say whether any host for work directory ${process.cwd()} exists there.`,
+        detail: { ownerIds: ['provider-proxy:set-a'], hostRefs: [], workDir: process.cwd() },
+      },
+    });
+    expect(JSON.stringify(answered)).not.toContain('<ref>');
+  });
+
+  it('carries the owners a draining coordinator can no longer observe through the v2 inventory response', async () => {
+    const ports = {
+      providerHosts: {
+        list: vi.fn(async () => ({ hosts: [], tornDownOwnerIds: ['provider-proxy:set-a'] })),
+        inspect: vi.fn(),
+        evict: vi.fn(),
+      },
+    } as unknown as HttpHandlerPorts;
+
+    await expect(executeCatalogRequest(providerHostListV2RpcSpec, {}, ports, operator)).resolves.toMatchObject({
+      kind: 'unary',
+      body: { hosts: [], tornDownOwnerIds: ['provider-proxy:set-a'] },
+    });
+  });
+
+  it('refuses the v1 inventory it cannot represent a torn-down owner in, and keeps its exact shape otherwise', async () => {
+    const list = vi.fn(async () => ({ hosts: [], tornDownOwnerIds: ['provider-proxy:set-a'] }));
+    const ports = { providerHosts: { list, inspect: vi.fn(), evict: vi.fn() } } as unknown as HttpHandlerPorts;
+
+    await expect(executeCatalogRequest(providerHostListRpcSpec, {}, ports, operator)).resolves.toMatchObject({
+      kind: 'unary',
+      statusCode: 503,
+      body: { code: 'provider_host_inventory_unavailable', detail: { ownerIds: ['provider-proxy:set-a'] } },
+    });
+
+    list.mockResolvedValue({ hosts: [], tornDownOwnerIds: [] });
+    await expect(executeCatalogRequest(providerHostListRpcSpec, {}, ports, operator)).resolves.toEqual({
+      kind: 'unary',
+      body: { hosts: [] },
     });
   });
 

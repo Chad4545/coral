@@ -71,6 +71,7 @@ import { seedTestSessionProjection } from '#tests/helpers/session.js';
 import { providerOperationRecord } from '#tests/unit/store/provider-operation-fixtures.js';
 import { testIncarnation } from '#tests/helpers/process-incarnation.js';
 import { createProviderOperationStartupOwnership } from '#src/coordinator/services/recovery/provider-operation-startup-ownership.js';
+import { unexercisedProviderHostControls } from '#tests/helpers/provider-host-controls.js';
 
 /** The build these fixture worlds belong to; capsules built from the same fixtures are inheritable, not foreign. */
 const FIXTURE_BUILD_SET_ID = '00000000-0000-4000-8000-000000000004';
@@ -211,6 +212,7 @@ describe('provider proxy operation routing', () => {
     let deadline = TEST_AUTONOMOUS_DEADLINE;
     const base = {
       proxyInstanceId: setIdentity.proxyInstanceId,
+      providerHosts: unexercisedProviderHostControls,
       get autonomousDeadline() {
         return deadline;
       },
@@ -352,6 +354,7 @@ async function createSharedSetHarness(control: SharedSetControl) {
   const authority = createProviderProxyOperationAuthority({
     base: {
       proxyInstanceId: setIdentity.proxyInstanceId,
+      providerHosts: unexercisedProviderHostControls,
       autonomousDeadline: TEST_AUTONOMOUS_DEADLINE,
       stopAndReap,
       commitContainment,

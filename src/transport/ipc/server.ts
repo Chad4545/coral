@@ -26,6 +26,7 @@ import { isRelocatedSocket } from '../../infra/path/index.js';
 import { documentedCoralSetupError, type DocumentedCoralSetupErrorCode } from '../../runtime/errors.js';
 import { createLineFramer, FrameTooLargeError } from '../line-framing.js';
 import {
+  providerHostEvictRpcSpec,
   providerProxySetContainBooleanRpcSpec,
   providerProxySetContainRpcSpec,
   rpcCatalog,
@@ -39,7 +40,7 @@ import {
   type ShutdownObligationAbandonRequest,
   type ShutdownObligationAbandonResult,
 } from '../../obligation/shutdown-abandonment.js';
-import { type CatalogRequestExecution, executeCatalogRequest } from '../dispatch.js';
+import { authorizationFailurePayload, type CatalogRequestExecution, executeCatalogRequest } from '../dispatch.js';
 import { writeAuditEvent, writeAuthorizationDecisionAudit } from '../../infra/audit-log.js';
 import { buildJsonRpcError } from '../../infra/json-rpc.js';
 import { formatError } from '../../infra/error-format.js';
@@ -259,7 +260,8 @@ function acceptedDrainingRecovery(method: string): boolean {
     method === 'jobs.abort' ||
     method === shutdownObligationAbandonMethod ||
     method === providerProxySetContainRpcSpec.name ||
-    method === providerProxySetContainBooleanRpcSpec.name
+    method === providerProxySetContainBooleanRpcSpec.name ||
+    method === providerHostEvictRpcSpec.name
   );
 }
 
@@ -293,14 +295,16 @@ function authenticateIpcRequest(auth: IpcAuthMetadata | undefined, rpcPorts: Htt
   return IPC_OPERATOR_PRINCIPAL;
 }
 
-function authorizationFailurePayload(spec: IpcOperationalSpec): typeof IPC_UNAUTHORIZED_RESPONSE {
+/** The manual shutdown and KB-restart routes answer every authorization refusal in their own documented
+ *  vocabulary; no other operational route has one. */
+function routeCredentialRefusal(spec: IpcOperationalSpec): typeof IPC_UNAUTHORIZED_RESPONSE | null {
   if (spec.dispatch.kind === 'shutdown') {
     return SHUTDOWN_UNAUTHORIZED_RESPONSE;
   }
   if (spec.dispatch.kind === 'kb-restart') {
     return KB_RESTART_UNAUTHORIZED_RESPONSE;
   }
-  return IPC_UNAUTHORIZED_RESPONSE;
+  return null;
 }
 
 function authorizeIpcOperation(
@@ -314,8 +318,16 @@ function authorizeIpcOperation(
   if (authz.ok) {
     return null;
   }
-  const payload = authorizationFailurePayload(spec);
-  return requestErrorResponse(request.id, payload.message, payload);
+  const credentialRefusal = routeCredentialRefusal(spec);
+  // `IPC_UNAUTHORIZED_RESPONSE` names a credential the caller never presented; a principal that authenticated
+  // and only lacks the capability is a settled authorization answer, and must read the same on this gate as
+  // on catalog dispatch or the operator loses the nested-session instruction and its exit code.
+  if (credentialRefusal !== null || principal === null) {
+    const payload = credentialRefusal ?? IPC_UNAUTHORIZED_RESPONSE;
+    return requestErrorResponse(request.id, payload.message, payload);
+  }
+  const { code, message, detail } = authorizationFailurePayload(authz, principal);
+  return requestErrorResponse(request.id, message, { code, message, detail });
 }
 
 function readPingSnapshot(rpcPorts: HttpHandlerPorts): {

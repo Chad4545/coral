@@ -82,6 +82,7 @@ function proxyHeartbeatFault(error: unknown): ProviderProxyAuthorityFault {
 }
 
 import { providerOperationRecord } from '../../store/provider-operation-fixtures.js';
+import { unexercisedProviderHostControls } from '#tests/helpers/provider-host-controls.js';
 
 const TEST_PUBLICATION_RECEIPT = { kind: 'provider-proxy-set-published' } as PublicationReceipt;
 
@@ -525,6 +526,7 @@ function createHarness(
   const readPhase = (): string => readProviderOperation(db, record.operation)?.phase ?? 'missing';
   const authority: DurableProviderProxyOperationAuthority = {
     proxyInstanceId: record.operation.proxyInstanceId,
+    providerHosts: unexercisedProviderHostControls,
     autonomousDeadline: {
       orphanTimeoutMs: Number.MAX_SAFE_INTEGER,
       adoptionWindowMs: Number.MAX_SAFE_INTEGER,

@@ -56,6 +56,7 @@ import {
 } from '#tests/helpers/provider-proxy-recovery-dispatcher.js';
 import { createPublicationUnknownAcquisitionSessionFixture } from '#tests/helpers/provider-proxy-acquisition-session.js';
 import { testProviderProxySetLifecycleDurability } from '#tests/helpers/provider-proxy-set-lifecycle-durability.js';
+import { unexercisedProviderHostControls } from '#tests/helpers/provider-host-controls.js';
 
 /** The build this fixture lifecycle belongs to — the same one `providerOperationRecord` stamps on its identities, so a discovered capsule is inheritable rather than foreign. */
 const FIXTURE_BUILD_SET_ID = '00000000-0000-4000-8000-000000000004';
@@ -87,6 +88,7 @@ function fakeProxySet(proxyInstanceId: string): ProviderProxySetAuthority {
   return {
     proxyInstanceId: /^[0-9a-f]{8}-/u.test(proxyInstanceId) ? proxyInstanceId : randomUUID(),
     stopAndReap,
+    providerHosts: unexercisedProviderHostControls,
     commitContainment: commitContainmentFrom(stopAndReap),
     stopHeartbeats: () => {},
     initiateControlClose: async () => {},

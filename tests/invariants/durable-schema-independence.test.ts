@@ -124,6 +124,7 @@ const IN_MEMORY_PERSISTENCE_CONTEXT_SCHEMAS = new Set<SchemaKey>([
   'src/transport/rpc/catalog.ts#providerHostEvictResponseSchema',
   'src/transport/rpc/catalog.ts#providerHostInspectResponseSchema',
   'src/transport/rpc/catalog.ts#providerHostListResponseSchema',
+  'src/transport/rpc/catalog.ts#providerHostListV2ResponseSchema',
   'src/transport/rpc/catalog.ts#providerProxySetContainBooleanResponseSchema',
   'src/transport/rpc/catalog.ts#providerProxySetContainResponseSchema',
   'src/transport/rpc/catalog.ts#unreadableProviderOperationDiscardResultSchema',

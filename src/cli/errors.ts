@@ -162,6 +162,7 @@ export function errorCodeToExit(code: string, httpStatus?: number): number {
     code === 'backend_shutting_down' ||
     code === 'coordinator_drain_unanswered' ||
     code === 'provider_host_inventory_unavailable' ||
+    code === 'provider_host_owner_torn_down' ||
     LAUNCH_AND_DOMAIN_RETRY_LATER_ERROR_CODES.has(code) ||
     httpStatus === 503
   ) {

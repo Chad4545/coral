@@ -134,6 +134,9 @@ import {
   providerHostInspectResponseSchema,
   providerHostListRequestSchema,
   providerHostListResponseSchema,
+  providerHostListRpcSpec,
+  providerHostListV2ResponseSchema,
+  providerHostListV2RpcSpec,
   providerHostSelectorRequestSchema,
   providerProxySetContainBooleanRpcSpec,
   providerProxySetContainBooleanRequestSchema,
@@ -145,7 +148,7 @@ import {
   unreadableProviderOperationDiscardResultSchema,
   type ProviderHostEvictResponse,
   type ProviderHostInspectResponse,
-  type ProviderHostListResponse,
+  type ProviderHostListV2Response,
   type ProviderHostSelectorRequest,
   type ProviderProxySetContainBooleanResponse,
   type ProviderProxySetContainRequest,
@@ -560,7 +563,7 @@ export type UnreadableProviderOperationDiscardCommandResult =
       }>);
 
 export interface ProviderHostCommandOperations {
-  list(): Promise<ProviderHostListResponse>;
+  list(): Promise<ProviderHostListV2Response>;
   inspect(request: ProviderHostSelectorRequest): Promise<ProviderHostInspectResponse>;
   evict(request: ProviderHostSelectorRequest): Promise<ProviderHostEvictResponse>;
 }
@@ -1327,7 +1330,15 @@ export function createProviderHostCommandOperations(
   return {
     list: async () => {
       const params = providerHostListRequestSchema.parse({});
-      return providerHostListResponseSchema.parse(await request('coordinator.provider_host.list', params));
+      try {
+        return providerHostListV2ResponseSchema.parse(await request(providerHostListV2RpcSpec.name, params));
+      } catch (error: unknown) {
+        if (!(error instanceof IpcRpcError) || error.rpcCode !== -32601) throw error;
+        // A coordinator without the v2 route cannot report an owner it could not ask, and refuses the whole
+        // listing when it has one, so an answered v1 listing is complete.
+        const v1 = providerHostListResponseSchema.parse(await request(providerHostListRpcSpec.name, params));
+        return providerHostListV2ResponseSchema.parse({ hosts: v1.hosts, tornDownOwnerIds: [] });
+      }
     },
     inspect: async (input) => {
       const params = providerHostSelectorRequestSchema.parse(input);
@@ -2094,12 +2105,20 @@ export function parseProviderHostSelector(
   return { workDir: workDir as string, projectRoot: process.cwd() };
 }
 
-export function formatProviderHostList(response: ProviderHostListResponse): string {
-  if (response.hosts.length === 0) return 'No provider hosts.';
+export function formatProviderHostList(response: ProviderHostListV2Response): string {
+  // Ahead of the header, because a line-oriented reader would otherwise take it for a row.
+  const unobserved =
+    response.tornDownOwnerIds.length === 0
+      ? []
+      : [
+          `provider_host_owner_torn_down: administration control released for ${response.tornDownOwnerIds.join(', ')}; their hosts are not listed.`,
+          formatBackendStatusCommand(),
+        ];
+  if (response.hosts.length === 0) return [...unobserved, 'No provider hosts.'].join('\n');
   const rows = response.hosts.map((host) =>
     [encodeHostRef(host.ref), host.status, host.ownerId, host.ref.provider, host.spec.cwd ?? '-'].join('\t'),
   );
-  return ['HOST_REF\tSTATUS\tOWNER\tPROVIDER\tWORK_DIR', ...rows].join('\n');
+  return [...unobserved, 'HOST_REF\tSTATUS\tOWNER\tPROVIDER\tWORK_DIR', ...rows].join('\n');
 }
 
 export function formatProviderHostInspect(response: ProviderHostInspectResponse): string {

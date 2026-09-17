@@ -89,6 +89,7 @@ import {
   createTestProviderProxyRecoveryDispatcher,
 } from '#tests/helpers/provider-proxy-recovery-dispatcher.js';
 import { testProviderProxySetLifecycleDurability } from '#tests/helpers/provider-proxy-set-lifecycle-durability.js';
+import { unexercisedProviderHostControls } from '#tests/helpers/provider-host-controls.js';
 
 /** The build this fixture lifecycle belongs to — the same one `providerOperationRecord` stamps on its identities, so a discovered capsule is inheritable rather than foreign. */
 const FIXTURE_BUILD_SET_ID = '00000000-0000-4000-8000-000000000004';
@@ -598,6 +599,7 @@ describe('createProviderProxyAcquisitionSteps', () => {
     });
     mockedCreateSetAuthority.mockImplementation((options) => ({
       proxyInstanceId: options.proxyInstanceId,
+      providerHosts: unexercisedProviderHostControls,
       autonomousDeadline: {
         orphanTimeoutMs: Number.MAX_SAFE_INTEGER,
         adoptionWindowMs: Number.MAX_SAFE_INTEGER,
@@ -718,6 +720,7 @@ describe('createProviderProxyAcquisitionSteps', () => {
     });
     mockedCreateSetAuthority.mockImplementation((options) => ({
       proxyInstanceId: options.proxyInstanceId,
+      providerHosts: unexercisedProviderHostControls,
       autonomousDeadline: {
         orphanTimeoutMs: Number.MAX_SAFE_INTEGER,
         adoptionWindowMs: Number.MAX_SAFE_INTEGER,
@@ -865,6 +868,7 @@ describe('createProviderProxyAcquisitionSteps', () => {
     });
     mockedCreateSetAuthority.mockImplementation((options) => ({
       proxyInstanceId: options.proxyInstanceId,
+      providerHosts: unexercisedProviderHostControls,
       autonomousDeadline: {
         orphanTimeoutMs: Number.MAX_SAFE_INTEGER,
         adoptionWindowMs: Number.MAX_SAFE_INTEGER,

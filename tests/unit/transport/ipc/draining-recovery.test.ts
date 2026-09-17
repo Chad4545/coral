@@ -11,6 +11,8 @@ import type { HttpHandlerPorts } from '#src/transport/server-ports.js';
 import type { ProviderProxySetAddress } from '#src/provider-proxy/set-address.js';
 import { shutdownObligationAbandonMethod } from '#src/obligation/shutdown-abandonment.js';
 import type { ProviderProxySetContainResponse } from '#src/transport/rpc/catalog.js';
+import { ProviderHostAdministrationError } from '#src/coordinator/services/provider-host-administration.js';
+import type { HostRef } from '#src/providers/contract.js';
 
 const tempRoots: string[] = [];
 const PROJECT_ROOT = realpathSync(fileURLToPath(new URL('../../../../', import.meta.url)));
@@ -18,6 +20,43 @@ const setIdentity: ProviderProxySetAddress = {
   buildSetId: '11111111-1111-4111-8111-111111111111',
   hostFingerprint: 'a'.repeat(64),
   proxyInstanceId: '22222222-2222-4222-8222-222222222222',
+};
+
+const providerHostRef: HostRef = {
+  provider: 'codex',
+  fingerprint: 'b'.repeat(64),
+  instanceId: '33333333-3333-4333-8333-333333333333',
+  leaseMode: 'shared',
+};
+const providerHostRow = {
+  ref: providerHostRef,
+  status: 'shutdown-held' as const,
+  spec: {
+    provider: 'codex',
+    command: 'codex',
+    args: ['app-server'],
+    cwd: null,
+    leaseMode: 'shared' as const,
+    idleRetirement: 'never' as const,
+  },
+  host: {
+    owner: 'coordinator' as const,
+    hostKey: 'held-host-key',
+    identityKey: 'held-host-identity-key',
+    ownerJobId: null,
+    pid: 4321,
+    processGroupId: 4321,
+    observation: 'unobservable' as const,
+    successorOwner: null,
+    operatorExit: 'retry-provider-shutdown',
+  },
+  diagnostics: {
+    hostLog: { entries: [], retainedBytes: 0, truncatedBeforeSeq: 0 },
+    completedObservations: [],
+    factsTruncatedBeforeSeq: 0,
+  },
+  diagnosticsRetention: { ownerBudgetTruncated: false },
+  ownerId: 'coordinator:test-instance',
 };
 
 function socketPath(): string {
@@ -96,6 +135,24 @@ function createDrainingPorts(containmentKind: 'contained' | 'abandoned' = 'aband
       contain: vi.fn(async () => containmentResult(containmentKind)),
       containBoolean: vi.fn(async () => containmentResult(containmentKind)),
     },
+    providerHosts: {
+      list: vi.fn(async () => ({ hosts: [providerHostRow], tornDownOwnerIds: [] })),
+      inspect: vi.fn(async () => ({ host: providerHostRow })),
+      evict: vi.fn(async () => ({ ownerId: providerHostRow.ownerId, hostRef: providerHostRef })),
+    },
+  } as unknown as HttpHandlerPorts;
+}
+
+function createRunningPorts(): HttpHandlerPorts {
+  const draining = createDrainingPorts('contained');
+  return {
+    ...draining,
+    admin: {
+      ...draining.admin,
+      getLifecycleState: () => 'running',
+      isLifecycleRunning: () => true,
+      isDrainRequested: () => false,
+    },
   } as unknown as HttpHandlerPorts;
 }
 
@@ -125,6 +182,8 @@ afterEach(() => {
   for (const root of tempRoots.splice(0)) rmSync(root, { recursive: true, force: true });
 });
 
+// Every `wakeRetainedShutdown` negative below must be asserted after the `finally` close: while the socket
+// is still open, not-woken is indistinguishable from not-yet-woken.
 describe('draining IPC recovery ingress', () => {
   it('authenticates exact shutdown-obligation abandonment and wakes only after durable acceptance', async () => {
     const ports = createDrainingPorts();
@@ -217,6 +276,12 @@ describe('draining IPC recovery ingress', () => {
       params: { setIdentity, abandonWithoutAbsence: false },
       invoked: (ports: HttpHandlerPorts) => ports.providerProxySets?.containBoolean,
       containmentKind: 'contained' as const,
+    },
+    {
+      method: 'coordinator.provider_host.evict',
+      params: { hostRef: providerHostRef },
+      invoked: (ports: HttpHandlerPorts) => ports.providerHosts?.evict,
+      containmentKind: undefined,
     },
   ])(
     'keeps $method authenticated and wakes retained shutdown after an accepted response',
@@ -399,6 +464,137 @@ describe('draining IPC recovery ingress', () => {
     } finally {
       await closeIpcServer(listener);
     }
+  });
+
+  it.each([
+    {
+      route: 'list',
+      method: 'coordinator.provider_host.list',
+      params: {},
+      invoked: (ports: HttpHandlerPorts) => ports.providerHosts?.list,
+      expected: { hosts: [providerHostRow] },
+    },
+    {
+      route: 'list.v2',
+      method: 'coordinator.provider_host.list.v2',
+      params: {},
+      invoked: (ports: HttpHandlerPorts) => ports.providerHosts?.list,
+      expected: { hosts: [providerHostRow], tornDownOwnerIds: [] },
+    },
+    {
+      route: 'inspect',
+      method: 'coordinator.provider_host.inspect',
+      params: { hostRef: providerHostRef },
+      invoked: (ports: HttpHandlerPorts) => ports.providerHosts?.inspect,
+      expected: { host: providerHostRow },
+    },
+  ])(
+    'observes provider hosts through $route while draining without waking the retained shutdown',
+    async ({ method, params, invoked, expected }) => {
+      const ports = createDrainingPorts();
+      const listener = createIpcServer(ports);
+      const wakeRetainedShutdown = vi.fn();
+      listener.onShutdownRecoveryAccepted = wakeRetainedShutdown;
+      const path = socketPath();
+      await listenIpcServer(listener, path);
+
+      try {
+        await expect(
+          requestIpcMethod(path, method, params, { auth: { kind: 'boot', token: 'boot-token' } }),
+        ).resolves.toEqual(expected);
+        expect(invoked(ports)).toHaveBeenCalledOnce();
+      } finally {
+        await closeIpcServer(listener);
+      }
+      expect(wakeRetainedShutdown).not.toHaveBeenCalled();
+    },
+  );
+
+  it.each([
+    {
+      refusal: 'a shutdown hold',
+      error: new ProviderHostAdministrationError('provider_host_shutdown_held', {
+        ownerIds: [providerHostRow.ownerId],
+        matches: [providerHostRef],
+        hold: {
+          kind: 'held',
+          observation: 'unobservable',
+          successorOwner: null,
+          operatorExit: 'retry-provider-shutdown',
+        },
+      }),
+      code: 'provider_host_shutdown_held',
+    },
+    {
+      refusal: 'a torn-down owner',
+      error: new ProviderHostAdministrationError('provider_host_owner_torn_down', {
+        ownerIds: ['provider-proxy:22222222-2222-4222-8222-222222222222'],
+        matches: [providerHostRef],
+      }),
+      code: 'provider_host_owner_torn_down',
+    },
+  ])('keeps the retained shutdown held when eviction answers $refusal', async ({ error, code }) => {
+    const ports = createDrainingPorts();
+    ports.providerHosts!.evict = vi.fn(async () => {
+      throw error;
+    });
+    const listener = createIpcServer(ports);
+    const wakeRetainedShutdown = vi.fn();
+    listener.onShutdownRecoveryAccepted = wakeRetainedShutdown;
+    const path = socketPath();
+    await listenIpcServer(listener, path);
+
+    try {
+      await expect(
+        requestIpcMethod(
+          path,
+          'coordinator.provider_host.evict',
+          { hostRef: providerHostRef },
+          { auth: { kind: 'boot', token: 'boot-token' } },
+        ),
+      ).rejects.toMatchObject({ data: { code } });
+      expect(ports.providerHosts?.evict).toHaveBeenCalledOnce();
+    } finally {
+      await closeIpcServer(listener);
+    }
+    expect(wakeRetainedShutdown).not.toHaveBeenCalled();
+  });
+
+  // Arming the continuation without the `draining` precondition would call `requestShutdownRetry` on a
+  // coordinator with no shutdown in flight, which starts one.
+  it.each([
+    {
+      method: 'jobs.abort',
+      params: { jobs: ['live-job'], projectRoot: PROJECT_ROOT },
+      invoked: (ports: HttpHandlerPorts) => ports.jobs.abort,
+    },
+    {
+      method: 'coordinator.provider_proxy_set.contain.v2',
+      params: { setIdentity, mode: 'contain' },
+      invoked: (ports: HttpHandlerPorts) => ports.providerProxySets?.contain,
+    },
+    {
+      method: 'coordinator.provider_host.evict',
+      params: { hostRef: providerHostRef },
+      invoked: (ports: HttpHandlerPorts) => ports.providerHosts?.evict,
+    },
+  ])('never drains a healthy coordinator after a successful $method', async ({ method, params, invoked }) => {
+    const ports = createRunningPorts();
+    const listener = createIpcServer(ports);
+    const wakeRetainedShutdown = vi.fn();
+    listener.onShutdownRecoveryAccepted = wakeRetainedShutdown;
+    const path = socketPath();
+    await listenIpcServer(listener, path);
+
+    try {
+      await expect(
+        requestIpcMethod(path, method, params, { auth: { kind: 'boot', token: 'boot-token' } }),
+      ).resolves.toBeDefined();
+      expect(invoked(ports)).toHaveBeenCalledOnce();
+    } finally {
+      await closeIpcServer(listener);
+    }
+    expect(wakeRetainedShutdown).not.toHaveBeenCalled();
   });
 
   it('keeps unrelated catalog methods closed while draining', async () => {

@@ -29,6 +29,7 @@ import {
 import { PROXY_CONTROL_RPC_TIMEOUT_MS } from '#src/provider-proxy/protocol.js';
 import { createPublicationUnknownAcquisitionSessionFixture } from '#tests/helpers/provider-proxy-acquisition-session.js';
 import { createEntry, createSharedSpec, runtime } from '#tests/unit/coordinator/live/provider-hosts/helpers.js';
+import { unexercisedProviderHostControls } from '#tests/helpers/provider-host-controls.js';
 
 const readProcessIncarnation = vi.fn<(pid: number, platform: NodeJS.Platform) => ProcessIncarnation | null>(() =>
   testIncarnation(1_700_000_000),
@@ -60,6 +61,7 @@ function fakeSet(): ProviderProxyOperationAuthority {
   const proxyInstanceId = '00000000-0000-4000-8000-000000000002';
   return {
     proxyInstanceId,
+    providerHosts: unexercisedProviderHostControls,
     stopAndReap: async () => ({ disappearanceReceipt: 'r' }),
     commitContainment: async () => ({ kind: 'containment-absent', disappearanceReceipt: 'r' }),
     stopHeartbeats: () => {},

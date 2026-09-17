@@ -12,6 +12,7 @@ import {
   canonicalHandoffOperationSet,
 } from '../../../provider-proxy/handoff-capsule.js';
 import type { ProviderProxyOperationSnapshot } from '../../services/operation-registry.js';
+import { ProviderHostOwnerTornDown } from '../../services/provider-host-administration.js';
 import {
   providerProxyAdoptionWindowMs,
   providerProxyHeartbeatHoldBound,
@@ -452,6 +453,15 @@ export function createProviderProxySetAuthority(
     },
   };
 
+  /** Only an unsent call proves the owner was never asked: every answer, refusal, timeout, and lost reply
+   *  reached a control that existed at send time and must keep its own failure. */
+  let controlReleased = false;
+
+  const sendOrRefuse = (method: string, params: unknown, timeoutMs: number): Promise<ControlExchange> => {
+    if (controlReleased) throw new ProviderHostOwnerTornDown();
+    return proxyClient.exchange(method, params, timeoutMs);
+  };
+
   const commitContainment = (signal: AbortSignal): Promise<ContainmentCommitOutcome> => {
     // Containment roots must come from the guardian's cumulative enforcer state, never coordinator claims.
     return commitProviderProxyGuardianContainment(
@@ -475,19 +485,19 @@ export function createProviderProxySetAuthority(
       list: async () => {
         const params = providerHostListParamsSchema.parse({});
         const current = controlMethodAvailability(
-          await proxyClient.exchange('provider-host.list.v2', params, PROXY_STATUS_RPC_TIMEOUT_MS),
+          await sendOrRefuse('provider-host.list.v2', params, PROXY_STATUS_RPC_TIMEOUT_MS),
         );
         if (current.kind === 'answered') {
           return providerHostListResultV2Schema.parse(requireControlResult('provider-host.list.v2', current.exchange))
             .hosts;
         }
-        const legacy = await proxyClient.exchange('provider-host.list.v1', params, PROXY_STATUS_RPC_TIMEOUT_MS);
+        const legacy = await sendOrRefuse('provider-host.list.v1', params, PROXY_STATUS_RPC_TIMEOUT_MS);
         return providerHostListResultV1Schema.parse(requireControlResult('provider-host.list.v1', legacy)).hosts;
       },
       inspect: async (hostRef) => {
         const params = providerHostInspectParamsSchema.parse({ hostRef });
         const current = controlMethodAvailability(
-          await proxyClient.exchange('provider-host.inspect.v2', params, PROXY_STATUS_RPC_TIMEOUT_MS),
+          await sendOrRefuse('provider-host.inspect.v2', params, PROXY_STATUS_RPC_TIMEOUT_MS),
         );
         if (current.kind === 'answered') {
           const result = providerHostInspectResultV2Schema.parse(
@@ -495,7 +505,7 @@ export function createProviderProxySetAuthority(
           );
           return result.state === 'matched' ? result.host : null;
         }
-        const legacy = await proxyClient.exchange('provider-host.inspect.v1', params, PROXY_STATUS_RPC_TIMEOUT_MS);
+        const legacy = await sendOrRefuse('provider-host.inspect.v1', params, PROXY_STATUS_RPC_TIMEOUT_MS);
         const result = providerHostInspectResultV1Schema.parse(
           requireControlResult('provider-host.inspect.v1', legacy),
         );
@@ -504,7 +514,7 @@ export function createProviderProxySetAuthority(
       terminalEviction: async (hostRef) => {
         const params = providerHostEvictParamsSchema.parse({ hostRef });
         const current = controlMethodAvailability(
-          await proxyClient.exchange('provider-host.terminal-eviction.v2', params, PROXY_STATUS_RPC_TIMEOUT_MS),
+          await sendOrRefuse('provider-host.terminal-eviction.v2', params, PROXY_STATUS_RPC_TIMEOUT_MS),
         );
         if (current.kind === 'method-absent') return null;
         const result = providerHostTerminalEvictionResultV2Schema.parse(
@@ -517,7 +527,7 @@ export function createProviderProxySetAuthority(
         return providerHostEvictResultV2Schema.parse(
           requireControlResult(
             'provider-host.evict.v2',
-            await proxyClient.exchange('provider-host.evict.v2', params, PROXY_CONTROL_RPC_TIMEOUT_MS),
+            await sendOrRefuse('provider-host.evict.v2', params, PROXY_CONTROL_RPC_TIMEOUT_MS),
           ),
         );
       },
@@ -538,6 +548,7 @@ export function createProviderProxySetAuthority(
       heartbeats.reaper.stop();
     },
     initiateControlClose: async () => {
+      controlReleased = true;
       proxyClient.close();
       guardianClient.close();
       reaperClient.close();

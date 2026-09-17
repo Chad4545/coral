@@ -20,6 +20,7 @@ import type { IpcListener } from '#src/transport/ipc/server.js';
 import type { Runtime } from '#src/runtime/ports.js';
 import { VirtualTime } from '#tools/simulation/core/virtual-time.js';
 import { testIncarnation } from '#tests/helpers/process-incarnation.js';
+import { unexercisedProviderHostControls } from '#tests/helpers/provider-host-controls.js';
 
 type CallLog = string[];
 
@@ -1742,6 +1743,7 @@ function fakeSet(
 ): ProviderProxySetAuthority {
   return {
     proxyInstanceId,
+    providerHosts: unexercisedProviderHostControls,
     stopAndReap: async () => {
       callLog.push(`reap:${proxyInstanceId}`);
       return { disappearanceReceipt: `gone:${proxyInstanceId}` };

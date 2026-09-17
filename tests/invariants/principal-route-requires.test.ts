@@ -11,6 +11,7 @@ const expectedRpcRequires = {
   'coordinator.recovery_quarantine.clear': 'system:debug',
   'coordinator.recovery_quarantine.discard_provider_operation': 'system:shutdown',
   'coordinator.provider_host.list': 'system:debug',
+  'coordinator.provider_host.list.v2': 'system:debug',
   'coordinator.provider_host.inspect': 'system:debug',
   'coordinator.provider_host.evict': 'system:shutdown',
   'coordinator.provider_proxy_set.contain': 'system:shutdown',
@@ -77,6 +78,10 @@ type ExpectedOperationalRouteId =
   | 'ipc.coordinator.shutdown-obligation.abandon'
   | 'ipc.transport.kb.restart'
   | 'ipc.jobs.abort.drain-recovery'
+  | 'ipc.provider-host.list.drain-observation'
+  | 'ipc.provider-host.list-v2.drain-observation'
+  | 'ipc.provider-host.inspect.drain-observation'
+  | 'ipc.provider-host.evict.drain-recovery'
   | 'ipc.provider-proxy-set.contain.drain-recovery'
   | 'ipc.provider-proxy-set.contain-boolean.drain-recovery';
 
@@ -194,6 +199,42 @@ const expectedOperationalSpecs = {
     requiresRunningLifecycle: false,
     dispatchKind: 'catalog',
     onRefusal: 'spawn-successor',
+    authentication: 'principal',
+  },
+  'ipc.provider-host.list.drain-observation': {
+    transport: 'ipc',
+    method: 'coordinator.provider_host.list',
+    requires: 'system:debug',
+    requiresRunningLifecycle: false,
+    dispatchKind: 'catalog',
+    onRefusal: 'report-refusal',
+    authentication: 'principal',
+  },
+  'ipc.provider-host.list-v2.drain-observation': {
+    transport: 'ipc',
+    method: 'coordinator.provider_host.list.v2',
+    requires: 'system:debug',
+    requiresRunningLifecycle: false,
+    dispatchKind: 'catalog',
+    onRefusal: 'report-refusal',
+    authentication: 'principal',
+  },
+  'ipc.provider-host.inspect.drain-observation': {
+    transport: 'ipc',
+    method: 'coordinator.provider_host.inspect',
+    requires: 'system:debug',
+    requiresRunningLifecycle: false,
+    dispatchKind: 'catalog',
+    onRefusal: 'report-refusal',
+    authentication: 'principal',
+  },
+  'ipc.provider-host.evict.drain-recovery': {
+    transport: 'ipc',
+    method: 'coordinator.provider_host.evict',
+    requires: 'system:shutdown',
+    requiresRunningLifecycle: false,
+    dispatchKind: 'catalog',
+    onRefusal: 'report-refusal',
     authentication: 'principal',
   },
   'ipc.provider-proxy-set.contain.drain-recovery': {
