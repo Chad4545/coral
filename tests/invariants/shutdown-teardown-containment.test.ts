@@ -195,11 +195,11 @@ function hasProperties(node: ts.ObjectLiteralExpression, required: readonly stri
 }
 
 function hasShutdownHeldPayload(node: ts.ObjectLiteralExpression): boolean {
-  return hasProperties(node, ['reason', 'exit', 'retryAfter', 'deferredFailures', 'retainedAuthority', 'retry']);
+  return hasProperties(node, ['reason', 'exit', 'retryAfter', 'undischarged', 'retainedAuthority', 'retry']);
 }
 
 function hasShutdownDelegatedPayload(node: ts.ObjectLiteralExpression): boolean {
-  return hasProperties(node, ['owner', 'deferredFailures', 'acceptance']);
+  return hasProperties(node, ['undischarged', 'acceptance']);
 }
 
 function isSettlementGateConstruction(node: ts.ObjectLiteralExpression): boolean {
@@ -634,7 +634,7 @@ describe('shutdown teardown containment invariant', () => {
     const mutation = parseSource(
       competingPath,
       `function competingConstructor() {
-        return { disposition: 'delegated', owner: 'process-exit', deferredFailures: [], acceptance: {} } as const;
+        return { disposition: 'delegated', undischarged: [], acceptance: {} } as const;
       }`,
     );
     expect(shutdownDispositionConstructorViolations(mutation)).toEqual([

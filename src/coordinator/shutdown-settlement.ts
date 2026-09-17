@@ -63,14 +63,14 @@ export type ShutdownRetainedAuthority = Readonly<{
   operatorActions: readonly ShutdownOperatorAction[];
 }>;
 
-export type ShutdownDeferredFailure = Readonly<{
+export type ShutdownUndischarged = Readonly<{
   label: string;
+  remainder: UndischargedRemainder;
   error: unknown;
 }>;
 
 export type ProcessExitRemainder = Readonly<{
-  owner: 'process-exit';
-  deferredFailures: readonly ShutdownDeferredFailure[];
+  undischarged: readonly ShutdownUndischarged[];
 }>;
 
 export type ProcessExitRemainderAcceptance =
@@ -80,10 +80,9 @@ export type ProcessExitRemainderAcceptance =
 type AcceptedProcessExitRemainder = Extract<ProcessExitRemainderAcceptance, { kind: 'accepted' }>;
 
 export type ShutdownSequenceDisposition = SettlementDisposition<
-  'process-exit',
   ShutdownHoldReason,
   ShutdownHoldExit,
-  ShutdownDeferredFailure,
+  ShutdownUndischarged,
   ShutdownRetainedAuthority,
   AcceptedProcessExitRemainder
 >;
@@ -116,9 +115,8 @@ export type ShutdownSettlementLedger = SettlementLedger<
   ShutdownRetainedAuthority,
   ShutdownHoldReason,
   ShutdownHoldExit,
-  'process-exit',
   AcceptedProcessExitRemainder,
-  ShutdownDeferredFailure
+  ShutdownUndischarged
 >;
 
 export type ShutdownSettlementLedgerOptions = Readonly<{
@@ -170,10 +168,12 @@ function defaultHold(): ShutdownHold {
 
 function declinedFailure(
   label: string,
+  remainder: UndischargedRemainder,
   settlement: Extract<Settlement, { kind: 'declined' }>,
-): ShutdownDeferredFailure {
+): ShutdownUndischarged {
   return {
     label,
+    remainder,
     error: settlement.error ?? new Error(`${settlement.cause}: ${settlement.detail}`),
   };
 }
@@ -197,8 +197,10 @@ function acceptProcessExitRemainder(
   accept: (remainder: ProcessExitRemainder) => ProcessExitRemainderAcceptance,
   log: (message: string) => void,
 ): AcceptedProcessExitRemainder | null {
-  const deferredFailures = declined.map(({ obligation, settlement }) => declinedFailure(obligation.label, settlement));
-  const remainder: ProcessExitRemainder = { owner: 'process-exit', deferredFailures };
+  const undischarged = declined.map(({ obligation, settlement }) =>
+    declinedFailure(obligation.label, obligation.remainder, settlement),
+  );
+  const remainder: ProcessExitRemainder = { undischarged };
   try {
     const acceptance = accept(remainder);
     if (acceptance.kind === 'accepted') {
@@ -221,9 +223,8 @@ export function createShutdownSettlementLedger(options: ShutdownSettlementLedger
     ShutdownRetainedAuthority,
     ShutdownHoldReason,
     ShutdownHoldExit,
-    'process-exit',
     AcceptedProcessExitRemainder,
-    ShutdownDeferredFailure
+    ShutdownUndischarged
   >({
     budgetMs: options.budgetMs,
     time: options.time,
@@ -231,13 +232,12 @@ export function createShutdownSettlementLedger(options: ShutdownSettlementLedger
     pollMs: options.pollMs,
     remainderRole,
     boundaryRemainder: { owner: 'process-exit' },
-    delegatedOwner: 'process-exit',
     ...(accept === undefined
       ? {}
       : {
           acceptDelegatedRemainder: (declined) => acceptProcessExitRemainder(declined, accept, options.log),
         }),
-    acceptedFailures: (acceptance) => acceptance.remainder.deferredFailures,
+    acceptedUndischarged: (acceptance) => acceptance.remainder.undischarged,
     failure: declinedFailure,
     foldRetainedAuthority,
     defaultHold,

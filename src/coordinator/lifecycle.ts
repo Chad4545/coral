@@ -44,11 +44,11 @@ import {
 import type {
   ProcessExitRemainder,
   ProcessExitRemainderAcceptance,
-  ShutdownDeferredFailure,
   ShutdownHoldExit,
   ShutdownHoldReason,
   ShutdownOperatorAction,
   ShutdownSequenceDisposition,
+  ShutdownUndischarged,
 } from './shutdown-settlement.js';
 import type { LaunchTerminationFn } from './live/admission.js';
 import type { HandoffQuiescePort } from './execution-service.js';
@@ -867,11 +867,10 @@ export type LifecycleShutdownDisposition =
     }>
   | Readonly<{
       disposition: 'transfer-pending';
-      owner: 'process-exit';
       reason: LifecycleShutdownHoldReason;
-      deferredFailures: readonly ShutdownDeferredFailure[];
+      undischarged: readonly ShutdownUndischarged[];
       acceptance: Extract<ProcessExitRemainderAcceptance, { kind: 'accepted' }>;
-      boundaryFailure: ShutdownDeferredFailure;
+      boundaryFailure: ShutdownUndischarged;
       recovery: LifecycleShutdownRecovery;
     }>;
 
@@ -1450,9 +1449,8 @@ export function createLifecycle(
           ? { disposition: 'held', reason: disposition.reason, recovery }
           : {
               disposition: 'transfer-pending',
-              owner: disposition.owner,
               reason: disposition.reason,
-              deferredFailures: disposition.deferredFailures,
+              undischarged: disposition.undischarged,
               acceptance: disposition.acceptance,
               boundaryFailure: disposition.boundaryFailure,
               recovery,

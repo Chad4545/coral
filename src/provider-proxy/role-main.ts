@@ -1322,7 +1322,6 @@ interface RoleProbeHeldSettlementDisposition extends HeldSettlementDisposition<
 }
 
 const roleProbeSettlementGate = new SettlementGate<
-  never,
   'process-incarnation-probes-unsettled',
   'process-incarnation-probe-settlement',
   never,
@@ -1338,7 +1337,7 @@ async function settleRoleShutdownProbes(): Promise<RoleProbeSettlementDispositio
     reason: 'process-incarnation-probes-unsettled',
     exit: 'process-incarnation-probe-settlement',
     retryAfter: disposition.untilSettled,
-    deferredFailures: [],
+    undischarged: [],
     retainedAuthority: disposition.unsettled,
     retry: settleRoleShutdownProbes,
   });
